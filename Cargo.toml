@@ -21,7 +21,7 @@ crossterm = "0.28"
 # No hf-hub / reqwest / tokio: model weights are imported from a local bundle only.
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
+candle-transformers = "0.11.0"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 safetensors = "0.4.5"
 
