@@ -1,0 +1,47 @@
+{
+  "committed": 3,
+  "fixture_blake3": "88b52e5020f303824ab3555f52e71ee605a40b80d29cc3e5e253c7c4b9d4ba33",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "pi-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 160,
+        "start": 92
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "pi-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 284,
+        "start": 161
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "pi-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 573,
+        "start": 460
+      },
+      "text": "带时间戳的中文",
+      "timestamp": "2026-01-01T00:01:00Z"
+    }
+  ],
+  "session_native_id": "sess-1",
+  "skipped": 1
+}

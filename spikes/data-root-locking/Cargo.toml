@@ -1,0 +1,23 @@
+[package]
+name = "data-root-locking-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 可丢弃探针（不进 crates/）：验证 data-root 级独占 writer lease、
+# 双进程竞争、CAS activation、stale-lock 处理；Plan #5 仅作历史证据来源。
+
+# 独立 workspace，避免被父目录意外纳入
+[workspace]
+
+[[bin]]
+name = "data-root-locking-spike"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+fs4 = { version = "0.13", features = ["sync"] }
+tempfile = "3"
+
+[profile.release]
+debug = false

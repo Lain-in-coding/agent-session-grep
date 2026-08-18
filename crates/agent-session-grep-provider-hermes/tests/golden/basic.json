@@ -1,0 +1,16 @@
+{
+  "session_id": "hermes-sess-0001",
+  "model": "hermes-3-synthetic",
+  "base_url": "http://localhost:11434",
+  "session_start": "2026-04-18T04:53:25.274422",
+  "last_updated": "2026-04-18T05:12:00",
+  "message_count": 6,
+  "messages": [
+    {"role": "system", "content": "You are a coding agent."},
+    {"role": "user", "content": "hello world", "timestamp": "2026-04-18T04:53:26"},
+    {"role": "assistant", "content": "", "reasoning": "only thinking"},
+    {"role": "assistant", "content": "hi there", "reasoning": "thinking hard"},
+    {"role": "tool", "content": "tool output", "tool_call_id": "tc-1", "tool_name": "read_file"},
+    {"role": "user", "content": "next question"}
+  ]
+}

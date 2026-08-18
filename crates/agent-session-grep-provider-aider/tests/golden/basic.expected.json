@@ -1,0 +1,60 @@
+{
+  "committed": 4,
+  "fixture_blake3": "b7f948bc73f1c26fde17ef98f920a84131978bd2bcfe32e4ca19e4be45912218",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "aider-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 58,
+        "start": 45
+      },
+      "text": "What is Rust?",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "aider-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 153,
+        "start": 65
+      },
+      "text": "Rust is a systems programming language.\nApplied edit to src/main.rs\nIt compiles cleanly.",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "aider-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 171,
+        "start": 159
+      },
+      "text": "中文问题",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "aider-msg-3",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 3,
+      "span": {
+        "end": 193,
+        "start": 178
+      },
+      "text": "答案是 42。",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": "2026-01-01 12:00:00",
+  "skipped": 0
+}

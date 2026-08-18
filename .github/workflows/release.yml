@@ -1,0 +1,300 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to build without creating a GitHub Release"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+jobs:
+  quality:
+    name: required CI quality gates
+    uses: ./.github/workflows/ci.yml
+
+  prepare:
+    name: validate release inputs
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Resolve and validate tag provenance
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v[0-9A-Za-z][0-9A-Za-z.+-]*$') {
+            throw "release tag must match v* and be safe for an archive name: $tag"
+          }
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          $tagCommit = (git rev-parse "$tag`^{commit}").Trim()
+          if ($tagCommit -ne $sourceCommit) {
+            throw "checked-out commit does not match $tag"
+          }
+          $version = $tag.Substring(1)
+          $sourceDateEpoch = (git show -s --format=%ct HEAD).Trim()
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "source_commit=$sourceCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "source_date_epoch=$sourceDateEpoch" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Generate locked metadata and validate manifest versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Path 'release-inputs' | Out-Null
+          cargo metadata --locked --format-version 1 |
+            Set-Content -Encoding utf8NoBOM -Path 'release-inputs/cargo-metadata.json'
+          python scripts/release/build-manifest.py validate `
+            --workspace . `
+            --tag '${{ steps.release.outputs.tag }}' `
+            --version '${{ steps.release.outputs.version }}' `
+            --metadata 'release-inputs/cargo-metadata.json'
+          git diff --exit-code -- Cargo.toml Cargo.lock
+
+      - name: Generate path-free third-party dependency inventory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/release/build-manifest.py inventory `
+            --workspace . `
+            --metadata 'release-inputs/cargo-metadata.json' `
+            --version '${{ steps.release.outputs.version }}' `
+            --output-dir 'release-inputs'
+          Remove-Item 'release-inputs/cargo-metadata.json'
+
+      - name: Upload common release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-inputs-${{ steps.release.outputs.tag }}
+          path: |
+            release-inputs/THIRD-PARTY-DEPENDENCIES.json
+            release-inputs/THIRD-PARTY-DEPENDENCIES.csv
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [prepare, quality]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: agent-session-grep.exe
+            archive_format: zip
+            rustflags: -C target-feature=+crt-static
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: agent-session-grep
+            archive_format: tar.gz
+            rustflags: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: agent-session-grep
+            archive_format: tar.gz
+            rustflags: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: agent-session-grep
+            archive_format: tar.gz
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Download common release inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-inputs-${{ needs.prepare.outputs.tag }}
+          path: release-inputs
+
+      - name: Build locked release binary
+        shell: pwsh
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked --release --target '${{ matrix.target }}' `
+            -p agent-session-grep-cli --bin agent-session-grep
+          git diff --exit-code -- Cargo.toml Cargo.lock
+
+      - name: Synthetic release smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $binary = (Resolve-Path (Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}')).Path
+          python scripts/verify-release.py --asg $binary
+
+      - name: Build deterministic unsigned archive and manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $binary = (Resolve-Path (Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}')).Path
+          python scripts/release/build-manifest.py package `
+            --workspace . `
+            --binary $binary `
+            --dependency-json 'release-inputs/THIRD-PARTY-DEPENDENCIES.json' `
+            --dependency-csv 'release-inputs/THIRD-PARTY-DEPENDENCIES.csv' `
+            --target '${{ matrix.target }}' `
+            --tag '${{ needs.prepare.outputs.tag }}' `
+            --version '${{ needs.prepare.outputs.version }}' `
+            --source-commit '${{ needs.prepare.outputs.source_commit }}' `
+            --source-date-epoch '${{ needs.prepare.outputs.source_date_epoch }}' `
+            --archive-format '${{ matrix.archive_format }}' `
+            --output-dir dist
+
+      - name: Upload unsigned target artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-target-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    name: assemble checksums and release bundle
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Download target artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-target-${{ needs.prepare.outputs.tag }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download common dependency inventory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-inputs-${{ needs.prepare.outputs.tag }}
+          path: dist
+
+      - name: Validate bundle members and write SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifests = @(Get-ChildItem -File 'dist/*.manifest.json')
+          $archives = @(Get-ChildItem -File 'dist/*.zip') + @(Get-ChildItem -File 'dist/*.tar.gz')
+          if ($manifests.Count -ne 4 -or $archives.Count -ne 4) {
+            throw "expected four archives and four manifests; found $($archives.Count) archives and $($manifests.Count) manifests"
+          }
+          $expectedTargets = @(
+            'x86_64-pc-windows-msvc',
+            'x86_64-unknown-linux-gnu',
+            'x86_64-apple-darwin',
+            'aarch64-apple-darwin'
+          )
+          $actualTargets = @($manifests | ForEach-Object {
+            $manifest = Get-Content -Raw $_.FullName | ConvertFrom-Json
+            if ($manifest.release.tag -ne '${{ needs.prepare.outputs.tag }}' -or
+                $manifest.release.version -ne '${{ needs.prepare.outputs.version }}' -or
+                $manifest.release.source_commit -ne '${{ needs.prepare.outputs.source_commit }}' -or
+                -not $manifest.release.unsigned) {
+              throw "release provenance mismatch in $($_.Name)"
+            }
+            $manifest.release.target
+          } | Sort-Object)
+          if (Compare-Object ($expectedTargets | Sort-Object) $actualTargets) {
+            throw 'release bundle target set does not match the promised matrix'
+          }
+          python scripts/release/build-manifest.py checksums `
+            --directory dist `
+            --output dist/SHA256SUMS
+
+      - name: Upload complete unsigned release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-session-grep-${{ needs.prepare.outputs.tag }}-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish unsigned GitHub Release assets
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [prepare, assemble]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download complete release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-session-grep-${{ needs.prepare.outputs.tag }}-unsigned
+          path: dist
+
+      - name: Create or update the tag's unsigned GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = @(Get-ChildItem -File dist | ForEach-Object { $_.FullName })
+          gh release view $env:RELEASE_TAG --json tagName 1>$null 2>$null
+          $releaseExists = $LASTEXITCODE -eq 0
+          if ($releaseExists) {
+            gh release upload $env:RELEASE_TAG @assets --clobber
+          } else {
+            gh release create $env:RELEASE_TAG @assets `
+              --verify-tag `
+              --title "agent-session-grep $env:RELEASE_TAG" `
+              --notes "Unsigned release archives with SHA-256 checksums, dependency inventory, and self-reported provenance manifests. Signing, notarization, and cryptographic attestation are external release gates."
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub Release asset publication failed'
+          }

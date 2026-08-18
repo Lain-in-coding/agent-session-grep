@@ -1,0 +1,43 @@
+{
+  "$schema": "agent-session-grep.environment-manifest/v1",
+  "_comment": "Template for the platform/environment manifest required by the release rehearsal runbook. Fill in every field; a rehearsal run without a completed manifest is invalid.",
+
+  "platform": {
+    "os": "<windows | macos | linux>",
+    "os_version": "<e.g. 22631.4169 | 14.5 | 22.04>",
+    "os_build": "<e.g. 22631 | 23F79 | 5.15.0-131-generic>",
+    "arch": "<x86_64 | aarch64>"
+  },
+
+  "clean_image": {
+    "type": "<vm | container>",
+    "identifier": "<VM snapshot name or container image digest>",
+    "notes": "<any deviations from a stock clean install>"
+  },
+
+  "installer": {
+    "artifact": "<path or URL to the installer script used>",
+    "sha256": "<SHA-256 hex digest of the installer artifact>",
+    "binary_sha256": "<SHA-256 hex digest of the installed binary>"
+  },
+
+  "toolchain": {
+    "rustc": "<rustc --version output>",
+    "cargo": "<cargo --version output>",
+    "python": "<python --version output>",
+    "git": "<git --version output>"
+  },
+
+  "provider_fixtures": {
+    "source": "<synthetic | authorized-real>",
+    "license": "<license name or 'synthetic — no license needed'>",
+    "redaction_status": "<not-applicable | redacted | verified-clean>",
+    "notes": "<provenance details>"
+  },
+
+  "rehearsal": {
+    "run_id": "<unique run identifier>",
+    "date": "<YYYY-MM-DD>",
+    "operator": "<operator identifier (not a personal name)>"
+  }
+}

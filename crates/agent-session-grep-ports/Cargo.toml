@@ -1,0 +1,13 @@
+[package]
+name = "agent-session-grep-ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

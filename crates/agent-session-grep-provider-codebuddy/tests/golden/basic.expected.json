@@ -1,0 +1,47 @@
+{
+  "committed": 3,
+  "fixture_blake3": "91c89b552a91af07963822c50ec3ddb5dba3ae7ffb9ae439b9ada6aac3d72276",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "codebuddy-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 183,
+        "start": 106
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "codebuddy-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 316,
+        "start": 184
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "codebuddy-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 579,
+        "start": 466
+      },
+      "text": "中文问题",
+      "timestamp": "2026-01-01T00:05:00Z"
+    }
+  ],
+  "session_native_id": "sess-1",
+  "skipped": 1
+}

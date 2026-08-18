@@ -1,0 +1,47 @@
+{
+  "committed": 3,
+  "fixture_blake3": "f49913760c18a993159225ff5987bbd1f949e1167e5ade25e04088aa3a114dff",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "qoder-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 172,
+        "start": 107
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "qoder-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 298,
+        "start": 173
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "qoder-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 572,
+        "start": 471
+      },
+      "text": "中文问题",
+      "timestamp": "2026-01-01T00:05:00Z"
+    }
+  ],
+  "session_native_id": "sess-1",
+  "skipped": 1
+}

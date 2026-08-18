@@ -1,0 +1,6 @@
+{"type":"context.append_message","message":{"role":"user","content":"hello world"}}
+{"type":"context.append_message","message":{"role":"assistant","content":[{"text":"part1"},{"text":"part2"}]}}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"evt-1"}}
+{"type":"context.append_message","message":{"role":"system","content":"system prompt"}}
+not json at all
+{"type":"context.append_message","message":{"role":"user","content":""}}

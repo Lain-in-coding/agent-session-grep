@@ -1,0 +1,58 @@
+{
+  "fixture_blake3": "353c769f70a98fca417b3f30eb059d2d65eddb7ab423a90f521d455a34e11aca",
+  "session_native_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "committed": 5,
+  "skipped": 1,
+  "messages": [
+    {
+      "seq": 0,
+      "native_id": "00000000-0000-4000-8000-000000000001",
+      "parent_native_id": null,
+      "role": "user",
+      "text": "golden 根消息：hello from a synthetic transcript.",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "is_sidechain": false,
+      "span": { "start": 0, "end": 354 }
+    },
+    {
+      "seq": 1,
+      "native_id": "00000000-0000-4000-8000-000000000002",
+      "parent_native_id": "00000000-0000-4000-8000-000000000001",
+      "role": "assistant",
+      "text": "你好，世界！🚀 多字节 span 必须按字节计。\n第二个 text block（emoji：🌏）。",
+      "timestamp": "2026-01-01T00:00:05.000Z",
+      "is_sidechain": false,
+      "span": { "start": 355, "end": 900 }
+    },
+    {
+      "seq": 2,
+      "native_id": "00000000-0000-4000-8000-000000000006",
+      "parent_native_id": "00000000-0000-4000-8000-000000000002",
+      "role": "user",
+      "text": "sidechain 分支消息（RTL 混排：مرحبا שלום）",
+      "timestamp": "2026-01-01T00:00:08.000Z",
+      "is_sidechain": true,
+      "span": { "start": 1195, "end": 1516 }
+    },
+    {
+      "seq": 3,
+      "native_id": "00000000-0000-4000-8000-000000000007",
+      "parent_native_id": "00000000-0000-4000-8000-000000000006",
+      "role": "tool",
+      "text": "ok\ntool 结果正文（供检索的合成输出）",
+      "timestamp": "2026-01-01T00:00:09.000Z",
+      "is_sidechain": true,
+      "span": { "start": 1517, "end": 1925 }
+    },
+    {
+      "seq": 4,
+      "native_id": "00000000-0000-4000-8000-000000000008",
+      "parent_native_id": "00000000-0000-4000-8000-000000000002",
+      "role": "assistant",
+      "text": "收尾消息，带转义：\"quoted\" 与反斜杠 \\ 结束。",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 1926, "end": 2222 }
+    }
+  ]
+}

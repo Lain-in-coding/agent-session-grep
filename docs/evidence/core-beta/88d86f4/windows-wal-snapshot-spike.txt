@@ -1,0 +1,18 @@
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running `spikes\sqlite-snapshot-wal\target\release\sqlite-snapshot-wal-spike.exe`
+=== sqlite-snapshot-wal spike ===
+环境记录：
+  os            = windows
+  arch          = x86_64
+  sqlite_version= 3.53.2
+
+=== 结论汇总 ===
+  [PASS] A 裸复制主库(缺 -wal)丢数据 — live=5000 行, 裸复制副本读到=-1 行（副本更少即坐实风险）
+  [PASS] B Backup API 一致快照 — live=5000 行, Backup 快照读到=5000 行（相等即一致）
+  [PASS] C VACUUM INTO 一致快照 — live=5000 行, VACUUM INTO 快照读到=5000 行（相等即一致）
+  [PASS] D 旧快照写入期间可只读打开 — 冻结时=5000, 写入后源库=6000, 旧快照仍读=5000（旧快照不变即成立）
+
+Contract / decision evidence：
+  快照实现：Backup API / VACUUM INTO 通过 → 正式 bundle 快照禁止裸 fs::copy 主库；
+  不可变 bundle：旧快照只读打开成立 → 可作为 cursor 分页 pinning 的证据输入；
+  历史审查#13：断言 A 若复现，即坐实裸复制丢事务风险，正式存储记录应引用本证据。

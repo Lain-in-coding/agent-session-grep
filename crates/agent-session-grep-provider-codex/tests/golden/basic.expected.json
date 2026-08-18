@@ -1,0 +1,47 @@
+{
+  "committed": 3,
+  "fixture_blake3": "f0a5321fe749e3035e87af6f678837451cc93071ce5bc9f77fe54b8d5ea727b1",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "msg-fx-0001",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 761,
+        "start": 542
+      },
+      "text": "请帮我检查一下解析器的字节跨度 🚀",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "msg-fx-0002",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 1228,
+        "start": 940
+      },
+      "text": "跨度以字节计，end 排他。\nCJK 与 emoji ✅ 均按 UTF-8 字节计算。",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "msg-fx-0004",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 1852,
+        "start": 1623
+      },
+      "text": "再确认一次：event_msg 镜像不会被重复计数 😀",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": "0198aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+  "skipped": 1
+}

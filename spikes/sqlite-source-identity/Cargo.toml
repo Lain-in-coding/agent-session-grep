@@ -1,0 +1,28 @@
+[package]
+name = "sqlite-source-identity-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "可丢弃探针：验证 SQLite 类 provider 源（ForgeCode/Kiro 式单库多会话）能否纳入 ReadOnlySourceSnapshot 契约。不进 crates/。"
+
+# 独立 workspace，避免被父目录意外纳入
+[workspace]
+
+[[bin]]
+name = "sqlite-source-identity-spike"
+path = "src/main.rs"
+
+[[bin]]
+name = "phase2"
+path = "src/bin/phase2.rs"
+
+[[bin]]
+name = "schema_probe"
+path = "src/bin/schema_probe.rs"
+
+[dependencies]
+# 与其他 spike 对齐；backup feature 用于只读一致快照。
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+blake3 = "1"
+anyhow = "1.0"
+tempfile = "3"

@@ -1,0 +1,48 @@
+{
+  "committed": 4,
+  "fixture_blake3": "cdf89cc8c2ea720591e36776b59ece29102b4a73e12acee75ca9007f7cf5bd46",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "cline-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": null,
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cline-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": null,
+      "text": "hi there",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cline-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": null,
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cline-msg-3",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 3,
+      "span": null,
+      "text": "final answer",
+      "timestamp": "2026-01-01T00:01:00Z"
+    }
+  ],
+  "session_native_id": null,
+  "skipped": 0
+}

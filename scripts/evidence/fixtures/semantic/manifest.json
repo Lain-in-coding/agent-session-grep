@@ -1,0 +1,3396 @@
+{
+  "schema_version": "agent-session-grep.semantic-benchmark-manifest/v1",
+  "corpus_version": "1",
+  "seed": 20260815,
+  "generator": "scripts/evidence/semantic_benchmark.py",
+  "provenance": {
+    "kind": "deterministic_synthetic",
+    "contains_real_transcripts": false,
+    "templates": "all content is hand-authored inside scripts/evidence/semantic_benchmark.py; no provider transcript content, paths, or identities are copied"
+  },
+  "corpus": {
+    "provider": "claude-code",
+    "session_count": 200,
+    "message_count": 2000,
+    "language_mix": {
+      "zh": 879,
+      "en": 691,
+      "code": 430
+    },
+    "planted": {
+      "near_duplicate_pairs": 40,
+      "paraphrase_pairs": 40
+    },
+    "fixture_hash": "411cba9fa287542b30c3dd64555199d0546bc22889175b3ec3444e4a6f0332dc",
+    "hash_algorithm": "sha256"
+  },
+  "plants": [
+    {
+      "plant_id": "dup-001",
+      "kind": "near_duplicate",
+      "topic": "ferroflux",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          93,
+          6
+        ],
+        [
+          99,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000937",
+        "msg_v1_00000000-0000-4000-8000-000000001000"
+      ]
+    },
+    {
+      "plant_id": "dup-002",
+      "kind": "near_duplicate",
+      "topic": "nebulamail",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          73,
+          2
+        ],
+        [
+          151,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000733",
+        "msg_v1_00000000-0000-4000-8000-000000001520"
+      ]
+    },
+    {
+      "plant_id": "dup-003",
+      "kind": "near_duplicate",
+      "topic": "quantleap",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          96,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000962",
+        "msg_v1_00000000-0000-4000-8000-000000000033"
+      ]
+    },
+    {
+      "plant_id": "dup-004",
+      "kind": "near_duplicate",
+      "topic": "velocipod",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          51,
+          6
+        ],
+        [
+          175,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000517",
+        "msg_v1_00000000-0000-4000-8000-000000001758"
+      ]
+    },
+    {
+      "plant_id": "dup-005",
+      "kind": "near_duplicate",
+      "topic": "spriggan",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          63,
+          0
+        ],
+        [
+          28,
+          0
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000631",
+        "msg_v1_00000000-0000-4000-8000-000000000281"
+      ]
+    },
+    {
+      "plant_id": "dup-006",
+      "kind": "near_duplicate",
+      "topic": "lumenbox",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          129,
+          7
+        ],
+        [
+          44,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001298",
+        "msg_v1_00000000-0000-4000-8000-000000000447"
+      ]
+    },
+    {
+      "plant_id": "dup-007",
+      "kind": "near_duplicate",
+      "topic": "driftwood",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          177,
+          0
+        ],
+        [
+          3,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001771",
+        "msg_v1_00000000-0000-4000-8000-000000000037"
+      ]
+    },
+    {
+      "plant_id": "dup-008",
+      "kind": "near_duplicate",
+      "topic": "kestrelwing",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          132,
+          2
+        ],
+        [
+          60,
+          5
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001323",
+        "msg_v1_00000000-0000-4000-8000-000000000606"
+      ]
+    },
+    {
+      "plant_id": "dup-009",
+      "kind": "near_duplicate",
+      "topic": "mossgate",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          128,
+          3
+        ],
+        [
+          19,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001284",
+        "msg_v1_00000000-0000-4000-8000-000000000195"
+      ]
+    },
+    {
+      "plant_id": "dup-010",
+      "kind": "near_duplicate",
+      "topic": "embertide",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          50,
+          1
+        ],
+        [
+          37,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000502",
+        "msg_v1_00000000-0000-4000-8000-000000000375"
+      ]
+    },
+    {
+      "plant_id": "dup-011",
+      "kind": "near_duplicate",
+      "topic": "oakshield",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          24,
+          8
+        ],
+        [
+          30,
+          3
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000249",
+        "msg_v1_00000000-0000-4000-8000-000000000304"
+      ]
+    },
+    {
+      "plant_id": "dup-012",
+      "kind": "near_duplicate",
+      "topic": "riverstone",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          84,
+          5
+        ],
+        [
+          93,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000846",
+        "msg_v1_00000000-0000-4000-8000-000000000935"
+      ]
+    },
+    {
+      "plant_id": "dup-013",
+      "kind": "near_duplicate",
+      "topic": "hollowspire",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          41,
+          3
+        ],
+        [
+          164,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000414",
+        "msg_v1_00000000-0000-4000-8000-000000001649"
+      ]
+    },
+    {
+      "plant_id": "dup-014",
+      "kind": "near_duplicate",
+      "topic": "frostfern",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          128,
+          9
+        ],
+        [
+          162,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001290",
+        "msg_v1_00000000-0000-4000-8000-000000001623"
+      ]
+    },
+    {
+      "plant_id": "dup-015",
+      "kind": "near_duplicate",
+      "topic": "cloudberry",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          153,
+          1
+        ],
+        [
+          119,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001532",
+        "msg_v1_00000000-0000-4000-8000-000000001199"
+      ]
+    },
+    {
+      "plant_id": "dup-016",
+      "kind": "near_duplicate",
+      "topic": "thornhive",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          24,
+          0
+        ],
+        [
+          33,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000241",
+        "msg_v1_00000000-0000-4000-8000-000000000340"
+      ]
+    },
+    {
+      "plant_id": "dup-017",
+      "kind": "near_duplicate",
+      "topic": "pebblepath",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          123,
+          8
+        ],
+        [
+          15,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001239",
+        "msg_v1_00000000-0000-4000-8000-000000000155"
+      ]
+    },
+    {
+      "plant_id": "dup-018",
+      "kind": "near_duplicate",
+      "topic": "sunforged",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          137,
+          9
+        ],
+        [
+          128,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001380",
+        "msg_v1_00000000-0000-4000-8000-000000001287"
+      ]
+    },
+    {
+      "plant_id": "dup-019",
+      "kind": "near_duplicate",
+      "topic": "wispthread",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          158,
+          4
+        ],
+        [
+          1,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001585",
+        "msg_v1_00000000-0000-4000-8000-000000000017"
+      ]
+    },
+    {
+      "plant_id": "dup-020",
+      "kind": "near_duplicate",
+      "topic": "gildedown",
+      "languages": [
+        "code",
+        "code"
+      ],
+      "slots": [
+        [
+          36,
+          6
+        ],
+        [
+          51,
+          0
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000367",
+        "msg_v1_00000000-0000-4000-8000-000000000511"
+      ]
+    },
+    {
+      "plant_id": "dup-021",
+      "kind": "near_duplicate",
+      "topic": "ferroflux",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          125,
+          2
+        ],
+        [
+          36,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001253",
+        "msg_v1_00000000-0000-4000-8000-000000000362"
+      ]
+    },
+    {
+      "plant_id": "dup-022",
+      "kind": "near_duplicate",
+      "topic": "nebulamail",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          181,
+          0
+        ],
+        [
+          84,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001811",
+        "msg_v1_00000000-0000-4000-8000-000000000843"
+      ]
+    },
+    {
+      "plant_id": "dup-023",
+      "kind": "near_duplicate",
+      "topic": "quantleap",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          156,
+          8
+        ],
+        [
+          190,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001569",
+        "msg_v1_00000000-0000-4000-8000-000000001905"
+      ]
+    },
+    {
+      "plant_id": "dup-024",
+      "kind": "near_duplicate",
+      "topic": "velocipod",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          89,
+          8
+        ],
+        [
+          78,
+          0
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000899",
+        "msg_v1_00000000-0000-4000-8000-000000000781"
+      ]
+    },
+    {
+      "plant_id": "dup-025",
+      "kind": "near_duplicate",
+      "topic": "spriggan",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          40,
+          9
+        ],
+        [
+          173,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000410",
+        "msg_v1_00000000-0000-4000-8000-000000001740"
+      ]
+    },
+    {
+      "plant_id": "dup-026",
+      "kind": "near_duplicate",
+      "topic": "lumenbox",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          186,
+          6
+        ],
+        [
+          88,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001867",
+        "msg_v1_00000000-0000-4000-8000-000000000890"
+      ]
+    },
+    {
+      "plant_id": "dup-027",
+      "kind": "near_duplicate",
+      "topic": "driftwood",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          2,
+          2
+        ],
+        [
+          124,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000023",
+        "msg_v1_00000000-0000-4000-8000-000000001243"
+      ]
+    },
+    {
+      "plant_id": "dup-028",
+      "kind": "near_duplicate",
+      "topic": "kestrelwing",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          168,
+          0
+        ],
+        [
+          67,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001681",
+        "msg_v1_00000000-0000-4000-8000-000000000673"
+      ]
+    },
+    {
+      "plant_id": "dup-029",
+      "kind": "near_duplicate",
+      "topic": "mossgate",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          144,
+          7
+        ],
+        [
+          43,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001448",
+        "msg_v1_00000000-0000-4000-8000-000000000439"
+      ]
+    },
+    {
+      "plant_id": "dup-030",
+      "kind": "near_duplicate",
+      "topic": "embertide",
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          13,
+          5
+        ],
+        [
+          61,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000136",
+        "msg_v1_00000000-0000-4000-8000-000000000617"
+      ]
+    },
+    {
+      "plant_id": "dup-031",
+      "kind": "near_duplicate",
+      "topic": "oakshield",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          34,
+          5
+        ],
+        [
+          67,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000346",
+        "msg_v1_00000000-0000-4000-8000-000000000680"
+      ]
+    },
+    {
+      "plant_id": "dup-032",
+      "kind": "near_duplicate",
+      "topic": "riverstone",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          116,
+          3
+        ],
+        [
+          46,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001164",
+        "msg_v1_00000000-0000-4000-8000-000000000462"
+      ]
+    },
+    {
+      "plant_id": "dup-033",
+      "kind": "near_duplicate",
+      "topic": "hollowspire",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          38,
+          9
+        ],
+        [
+          121,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000390",
+        "msg_v1_00000000-0000-4000-8000-000000001217"
+      ]
+    },
+    {
+      "plant_id": "dup-034",
+      "kind": "near_duplicate",
+      "topic": "frostfern",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          149,
+          5
+        ],
+        [
+          109,
+          5
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001496",
+        "msg_v1_00000000-0000-4000-8000-000000001096"
+      ]
+    },
+    {
+      "plant_id": "dup-035",
+      "kind": "near_duplicate",
+      "topic": "cloudberry",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          88,
+          3
+        ],
+        [
+          63,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000884",
+        "msg_v1_00000000-0000-4000-8000-000000000637"
+      ]
+    },
+    {
+      "plant_id": "dup-036",
+      "kind": "near_duplicate",
+      "topic": "thornhive",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          117,
+          4
+        ],
+        [
+          129,
+          3
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001175",
+        "msg_v1_00000000-0000-4000-8000-000000001294"
+      ]
+    },
+    {
+      "plant_id": "dup-037",
+      "kind": "near_duplicate",
+      "topic": "pebblepath",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          49,
+          6
+        ],
+        [
+          28,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000497",
+        "msg_v1_00000000-0000-4000-8000-000000000285"
+      ]
+    },
+    {
+      "plant_id": "dup-038",
+      "kind": "near_duplicate",
+      "topic": "sunforged",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          44,
+          2
+        ],
+        [
+          91,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000443",
+        "msg_v1_00000000-0000-4000-8000-000000000915"
+      ]
+    },
+    {
+      "plant_id": "dup-039",
+      "kind": "near_duplicate",
+      "topic": "wispthread",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          90,
+          6
+        ],
+        [
+          100,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000907",
+        "msg_v1_00000000-0000-4000-8000-000000001003"
+      ]
+    },
+    {
+      "plant_id": "dup-040",
+      "kind": "near_duplicate",
+      "topic": "gildedown",
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          48,
+          9
+        ],
+        [
+          154,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000490",
+        "msg_v1_00000000-0000-4000-8000-000000001543"
+      ]
+    },
+    {
+      "plant_id": "par-001",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          3,
+          5
+        ],
+        [
+          53,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000036",
+        "msg_v1_00000000-0000-4000-8000-000000000535"
+      ]
+    },
+    {
+      "plant_id": "par-002",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          26,
+          6
+        ],
+        [
+          19,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000267",
+        "msg_v1_00000000-0000-4000-8000-000000000199"
+      ]
+    },
+    {
+      "plant_id": "par-003",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          106,
+          1
+        ],
+        [
+          122,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001062",
+        "msg_v1_00000000-0000-4000-8000-000000001227"
+      ]
+    },
+    {
+      "plant_id": "par-004",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          183,
+          2
+        ],
+        [
+          83,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001833",
+        "msg_v1_00000000-0000-4000-8000-000000000838"
+      ]
+    },
+    {
+      "plant_id": "par-005",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          95,
+          0
+        ],
+        [
+          139,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000951",
+        "msg_v1_00000000-0000-4000-8000-000000001393"
+      ]
+    },
+    {
+      "plant_id": "par-006",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          114,
+          8
+        ],
+        [
+          60,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001149",
+        "msg_v1_00000000-0000-4000-8000-000000000609"
+      ]
+    },
+    {
+      "plant_id": "par-007",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          94,
+          7
+        ],
+        [
+          119,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000948",
+        "msg_v1_00000000-0000-4000-8000-000000001192"
+      ]
+    },
+    {
+      "plant_id": "par-008",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          26,
+          3
+        ],
+        [
+          74,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000264",
+        "msg_v1_00000000-0000-4000-8000-000000000750"
+      ]
+    },
+    {
+      "plant_id": "par-009",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          11,
+          0
+        ],
+        [
+          117,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000111",
+        "msg_v1_00000000-0000-4000-8000-000000001178"
+      ]
+    },
+    {
+      "plant_id": "par-010",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          103,
+          4
+        ],
+        [
+          142,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001035",
+        "msg_v1_00000000-0000-4000-8000-000000001429"
+      ]
+    },
+    {
+      "plant_id": "par-011",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          196,
+          9
+        ],
+        [
+          165,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001970",
+        "msg_v1_00000000-0000-4000-8000-000000001657"
+      ]
+    },
+    {
+      "plant_id": "par-012",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          6,
+          4
+        ],
+        [
+          109,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000065",
+        "msg_v1_00000000-0000-4000-8000-000000001097"
+      ]
+    },
+    {
+      "plant_id": "par-013",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          67,
+          6
+        ],
+        [
+          197,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000677",
+        "msg_v1_00000000-0000-4000-8000-000000001973"
+      ]
+    },
+    {
+      "plant_id": "par-014",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          61,
+          0
+        ],
+        [
+          157,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000611",
+        "msg_v1_00000000-0000-4000-8000-000000001579"
+      ]
+    },
+    {
+      "plant_id": "par-015",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          152,
+          9
+        ],
+        [
+          128,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001530",
+        "msg_v1_00000000-0000-4000-8000-000000001282"
+      ]
+    },
+    {
+      "plant_id": "par-016",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          58,
+          7
+        ],
+        [
+          140,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000588",
+        "msg_v1_00000000-0000-4000-8000-000000001410"
+      ]
+    },
+    {
+      "plant_id": "par-017",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          190,
+          7
+        ],
+        [
+          189,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001908",
+        "msg_v1_00000000-0000-4000-8000-000000001893"
+      ]
+    },
+    {
+      "plant_id": "par-018",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          124,
+          4
+        ],
+        [
+          116,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001245",
+        "msg_v1_00000000-0000-4000-8000-000000001168"
+      ]
+    },
+    {
+      "plant_id": "par-019",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          87,
+          7
+        ],
+        [
+          83,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000878",
+        "msg_v1_00000000-0000-4000-8000-000000000839"
+      ]
+    },
+    {
+      "plant_id": "par-020",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "slots": [
+        [
+          20,
+          5
+        ],
+        [
+          71,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000206",
+        "msg_v1_00000000-0000-4000-8000-000000000712"
+      ]
+    },
+    {
+      "plant_id": "par-021",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          128,
+          5
+        ],
+        [
+          156,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001286",
+        "msg_v1_00000000-0000-4000-8000-000000001562"
+      ]
+    },
+    {
+      "plant_id": "par-022",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          186,
+          4
+        ],
+        [
+          22,
+          1
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001865",
+        "msg_v1_00000000-0000-4000-8000-000000000222"
+      ]
+    },
+    {
+      "plant_id": "par-023",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          64,
+          8
+        ],
+        [
+          113,
+          3
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000649",
+        "msg_v1_00000000-0000-4000-8000-000000001134"
+      ]
+    },
+    {
+      "plant_id": "par-024",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          89,
+          1
+        ],
+        [
+          87,
+          5
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000892",
+        "msg_v1_00000000-0000-4000-8000-000000000876"
+      ]
+    },
+    {
+      "plant_id": "par-025",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          50,
+          4
+        ],
+        [
+          109,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000505",
+        "msg_v1_00000000-0000-4000-8000-000000001099"
+      ]
+    },
+    {
+      "plant_id": "par-026",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          133,
+          7
+        ],
+        [
+          157,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001338",
+        "msg_v1_00000000-0000-4000-8000-000000001578"
+      ]
+    },
+    {
+      "plant_id": "par-027",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          107,
+          0
+        ],
+        [
+          60,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001071",
+        "msg_v1_00000000-0000-4000-8000-000000000610"
+      ]
+    },
+    {
+      "plant_id": "par-028",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          189,
+          3
+        ],
+        [
+          123,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001894",
+        "msg_v1_00000000-0000-4000-8000-000000001240"
+      ]
+    },
+    {
+      "plant_id": "par-029",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          50,
+          8
+        ],
+        [
+          13,
+          0
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000509",
+        "msg_v1_00000000-0000-4000-8000-000000000131"
+      ]
+    },
+    {
+      "plant_id": "par-030",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "zh",
+        "zh"
+      ],
+      "slots": [
+        [
+          3,
+          7
+        ],
+        [
+          172,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000038",
+        "msg_v1_00000000-0000-4000-8000-000000001729"
+      ]
+    },
+    {
+      "plant_id": "par-031",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          97,
+          3
+        ],
+        [
+          186,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000974",
+        "msg_v1_00000000-0000-4000-8000-000000001863"
+      ]
+    },
+    {
+      "plant_id": "par-032",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          182,
+          2
+        ],
+        [
+          135,
+          6
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001823",
+        "msg_v1_00000000-0000-4000-8000-000000001357"
+      ]
+    },
+    {
+      "plant_id": "par-033",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          18,
+          3
+        ],
+        [
+          159,
+          2
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000184",
+        "msg_v1_00000000-0000-4000-8000-000000001593"
+      ]
+    },
+    {
+      "plant_id": "par-034",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          189,
+          9
+        ],
+        [
+          92,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001900",
+        "msg_v1_00000000-0000-4000-8000-000000000928"
+      ]
+    },
+    {
+      "plant_id": "par-035",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          129,
+          5
+        ],
+        [
+          152,
+          0
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001296",
+        "msg_v1_00000000-0000-4000-8000-000000001521"
+      ]
+    },
+    {
+      "plant_id": "par-036",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          33,
+          6
+        ],
+        [
+          15,
+          9
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000337",
+        "msg_v1_00000000-0000-4000-8000-000000000160"
+      ]
+    },
+    {
+      "plant_id": "par-037",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          9,
+          8
+        ],
+        [
+          132,
+          4
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000099",
+        "msg_v1_00000000-0000-4000-8000-000000001325"
+      ]
+    },
+    {
+      "plant_id": "par-038",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          192,
+          0
+        ],
+        [
+          149,
+          7
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001921",
+        "msg_v1_00000000-0000-4000-8000-000000001498"
+      ]
+    },
+    {
+      "plant_id": "par-039",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          84,
+          3
+        ],
+        [
+          48,
+          8
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000844",
+        "msg_v1_00000000-0000-4000-8000-000000000489"
+      ]
+    },
+    {
+      "plant_id": "par-040",
+      "kind": "paraphrase",
+      "topic": null,
+      "languages": [
+        "en",
+        "en"
+      ],
+      "slots": [
+        [
+          36,
+          2
+        ],
+        [
+          72,
+          3
+        ]
+      ],
+      "message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000363",
+        "msg_v1_00000000-0000-4000-8000-000000000724"
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "id": "semq-0001",
+      "query": "ferroflux invalidate_stale",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000937",
+        "msg_v1_00000000-0000-4000-8000-000000001000"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0094",
+        "semcorp-s0100"
+      ],
+      "plant_id": "dup-001",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0002",
+      "query": "FerrofluxCache epoch invalidation",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000937",
+        "msg_v1_00000000-0000-4000-8000-000000001000"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0094",
+        "semcorp-s0100"
+      ],
+      "plant_id": "dup-001",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0003",
+      "query": "nebulamail drain_queue",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000733",
+        "msg_v1_00000000-0000-4000-8000-000000001520"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0074",
+        "semcorp-s0152"
+      ],
+      "plant_id": "dup-002",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0004",
+      "query": "quantleap_jobs next_run_ms",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000962",
+        "msg_v1_00000000-0000-4000-8000-000000000033"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0097",
+        "semcorp-s0004"
+      ],
+      "plant_id": "dup-003",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0005",
+      "query": "velocipod migrations checksums",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000517",
+        "msg_v1_00000000-0000-4000-8000-000000001758"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0052",
+        "semcorp-s0176"
+      ],
+      "plant_id": "dup-004",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0006",
+      "query": "spriggan pipeline lint",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000631",
+        "msg_v1_00000000-0000-4000-8000-000000000281"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0064",
+        "semcorp-s0029"
+      ],
+      "plant_id": "dup-005",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0007",
+      "query": "spriggan-lint spriggan-test workers",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000631",
+        "msg_v1_00000000-0000-4000-8000-000000000281"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0064",
+        "semcorp-s0029"
+      ],
+      "plant_id": "dup-005",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0008",
+      "query": "lumenbox aggregate_window",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001298",
+        "msg_v1_00000000-0000-4000-8000-000000000447"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0130",
+        "semcorp-s0045"
+      ],
+      "plant_id": "dup-006",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0009",
+      "query": "driftwood tail_and_ship",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001771",
+        "msg_v1_00000000-0000-4000-8000-000000000037"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0178",
+        "semcorp-s0004"
+      ],
+      "plant_id": "dup-007",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0010",
+      "query": "kestrelwing allow_burst",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001323",
+        "msg_v1_00000000-0000-4000-8000-000000000606"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0133",
+        "semcorp-s0061"
+      ],
+      "plant_id": "dup-008",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0011",
+      "query": "mossgate rollout kill_switch",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001284",
+        "msg_v1_00000000-0000-4000-8000-000000000195"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0129",
+        "semcorp-s0020"
+      ],
+      "plant_id": "dup-009",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0012",
+      "query": "mossgate_new_ui rollout percentage",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001284",
+        "msg_v1_00000000-0000-4000-8000-000000000195"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0129",
+        "semcorp-s0020"
+      ],
+      "plant_id": "dup-009",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0013",
+      "query": "embertide_jobs attempts",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000502",
+        "msg_v1_00000000-0000-4000-8000-000000000375"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0051",
+        "semcorp-s0038"
+      ],
+      "plant_id": "dup-010",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0014",
+      "query": "oakshield rotate_secret",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000249",
+        "msg_v1_00000000-0000-4000-8000-000000000304"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0025",
+        "semcorp-s0031"
+      ],
+      "plant_id": "dup-011",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0015",
+      "query": "riverstone reload_config",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000846",
+        "msg_v1_00000000-0000-4000-8000-000000000935"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0085",
+        "semcorp-s0094"
+      ],
+      "plant_id": "dup-012",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0016",
+      "query": "hollowspire cache_key",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000414",
+        "msg_v1_00000000-0000-4000-8000-000000001649"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0042",
+        "semcorp-s0165"
+      ],
+      "plant_id": "dup-013",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0017",
+      "query": "hollowspire cache_key hexdigest",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000414",
+        "msg_v1_00000000-0000-4000-8000-000000001649"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0042",
+        "semcorp-s0165"
+      ],
+      "plant_id": "dup-013",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0018",
+      "query": "frostfern snapshots retention",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001290",
+        "msg_v1_00000000-0000-4000-8000-000000001623"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0129",
+        "semcorp-s0163"
+      ],
+      "plant_id": "dup-014",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0019",
+      "query": "cloudberry idempotency ttl_seconds",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001532",
+        "msg_v1_00000000-0000-4000-8000-000000001199"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0154",
+        "semcorp-s0120"
+      ],
+      "plant_id": "dup-015",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0020",
+      "query": "thornhive topics routing",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000241",
+        "msg_v1_00000000-0000-4000-8000-000000000340"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0025",
+        "semcorp-s0034"
+      ],
+      "plant_id": "dup-016",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0021",
+      "query": "pebblepath trace_span",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001239",
+        "msg_v1_00000000-0000-4000-8000-000000000155"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0124",
+        "semcorp-s0016"
+      ],
+      "plant_id": "dup-017",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0022",
+      "query": "pebblepath trace_span SpanId",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001239",
+        "msg_v1_00000000-0000-4000-8000-000000000155"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0124",
+        "semcorp-s0016"
+      ],
+      "plant_id": "dup-017",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0023",
+      "query": "sunforged validate_schema",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001380",
+        "msg_v1_00000000-0000-4000-8000-000000001287"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0138",
+        "semcorp-s0129"
+      ],
+      "plant_id": "dup-018",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0024",
+      "query": "wispthread drain_connections",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001585",
+        "msg_v1_00000000-0000-4000-8000-000000000017"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0159",
+        "semcorp-s0002"
+      ],
+      "plant_id": "dup-019",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0025",
+      "query": "gildedown rules line_break",
+      "category": "code",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000367",
+        "msg_v1_00000000-0000-4000-8000-000000000511"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0037",
+        "semcorp-s0052"
+      ],
+      "plant_id": "dup-020",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0026",
+      "query": "ferroflux 时间戳排序 竞态条件",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001253",
+        "msg_v1_00000000-0000-4000-8000-000000000362"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0126",
+        "semcorp-s0037"
+      ],
+      "plant_id": "dup-021",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0027",
+      "query": "ferroflux 时间戳排序 竞态条件 日志时间线",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001253",
+        "msg_v1_00000000-0000-4000-8000-000000000362"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0126",
+        "semcorp-s0037"
+      ],
+      "plant_id": "dup-021",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0028",
+      "query": "nebulamail 投递重试 邮件队列",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001811",
+        "msg_v1_00000000-0000-4000-8000-000000000843"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0182",
+        "semcorp-s0085"
+      ],
+      "plant_id": "dup-022",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0029",
+      "query": "quantleap 时区偏移 触发窗口",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001569",
+        "msg_v1_00000000-0000-4000-8000-000000001905"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0157",
+        "semcorp-s0191"
+      ],
+      "plant_id": "dup-023",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0030",
+      "query": "velocipod 断点续跑 锁超时",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000899",
+        "msg_v1_00000000-0000-4000-8000-000000000781"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0090",
+        "semcorp-s0079"
+      ],
+      "plant_id": "dup-024",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0031",
+      "query": "spriggan 流水线 工件上传",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000410",
+        "msg_v1_00000000-0000-4000-8000-000000001740"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0041",
+        "semcorp-s0174"
+      ],
+      "plant_id": "dup-025",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0032",
+      "query": "spriggan 流水线 工件上传 告警",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000410",
+        "msg_v1_00000000-0000-4000-8000-000000001740"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0041",
+        "semcorp-s0174"
+      ],
+      "plant_id": "dup-025",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0033",
+      "query": "lumenbox 采样丢失 下采样",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001867",
+        "msg_v1_00000000-0000-4000-8000-000000000890"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0187",
+        "semcorp-s0089"
+      ],
+      "plant_id": "dup-026",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0034",
+      "query": "driftwood 背压 重复投递",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000023",
+        "msg_v1_00000000-0000-4000-8000-000000001243"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0003",
+        "semcorp-s0125"
+      ],
+      "plant_id": "dup-027",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0035",
+      "query": "kestrelwing 滑动窗口 限流窗口",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001681",
+        "msg_v1_00000000-0000-4000-8000-000000000673"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0169",
+        "semcorp-s0068"
+      ],
+      "plant_id": "dup-028",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0036",
+      "query": "mossgate 版本兼容 规则求值",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001448",
+        "msg_v1_00000000-0000-4000-8000-000000000439"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0145",
+        "semcorp-s0044"
+      ],
+      "plant_id": "dup-029",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0037",
+      "query": "mossgate 版本兼容 规则求值 同步阻塞",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001448",
+        "msg_v1_00000000-0000-4000-8000-000000000439"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0145",
+        "semcorp-s0044"
+      ],
+      "plant_id": "dup-029",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0038",
+      "query": "embertide 手动重投 死信",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000136",
+        "msg_v1_00000000-0000-4000-8000-000000000617"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0014",
+        "semcorp-s0062"
+      ],
+      "plant_id": "dup-030",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0039",
+      "query": "oakshield secret rotation access audit",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000346",
+        "msg_v1_00000000-0000-4000-8000-000000000680"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0035",
+        "semcorp-s0068"
+      ],
+      "plant_id": "dup-031",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0040",
+      "query": "riverstone file watch staged rollout",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001164",
+        "msg_v1_00000000-0000-4000-8000-000000000462"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0117",
+        "semcorp-s0047"
+      ],
+      "plant_id": "dup-032",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0041",
+      "query": "hollowspire conditional requests compressed storage",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000390",
+        "msg_v1_00000000-0000-4000-8000-000000001217"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0039",
+        "semcorp-s0122"
+      ],
+      "plant_id": "dup-033",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0042",
+      "query": "hollowspire conditional requests compressed storage mechanisms design",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000390",
+        "msg_v1_00000000-0000-4000-8000-000000001217"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0039",
+        "semcorp-s0122"
+      ],
+      "plant_id": "dup-033",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0043",
+      "query": "frostfern integrity check snapshot backup",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001496",
+        "msg_v1_00000000-0000-4000-8000-000000001096"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0150",
+        "semcorp-s0110"
+      ],
+      "plant_id": "dup-034",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0044",
+      "query": "cloudberry concurrent writes expiry sweep",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000884",
+        "msg_v1_00000000-0000-4000-8000-000000000637"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0089",
+        "semcorp-s0064"
+      ],
+      "plant_id": "dup-035",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0045",
+      "query": "thornhive heartbeat timeout subscription matching",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001175",
+        "msg_v1_00000000-0000-4000-8000-000000001294"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0118",
+        "semcorp-s0130"
+      ],
+      "plant_id": "dup-036",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0046",
+      "query": "pebblepath distributed tracing log correlation",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000497",
+        "msg_v1_00000000-0000-4000-8000-000000000285"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0050",
+        "semcorp-s0029"
+      ],
+      "plant_id": "dup-037",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0047",
+      "query": "pebblepath distributed tracing log correlation profiling cycles",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000497",
+        "msg_v1_00000000-0000-4000-8000-000000000285"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0050",
+        "semcorp-s0029"
+      ],
+      "plant_id": "dup-037",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0048",
+      "query": "sunforged error locations strict mode",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000443",
+        "msg_v1_00000000-0000-4000-8000-000000000915"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0045",
+        "semcorp-s0092"
+      ],
+      "plant_id": "dup-038",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0049",
+      "query": "wispthread signal handling health-check deregistration",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000907",
+        "msg_v1_00000000-0000-4000-8000-000000001003"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0091",
+        "semcorp-s0101"
+      ],
+      "plant_id": "dup-039",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0050",
+      "query": "gildedown ignore patterns lint rules",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000490",
+        "msg_v1_00000000-0000-4000-8000-000000001543"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0049",
+        "semcorp-s0155"
+      ],
+      "plant_id": "dup-040",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0051",
+      "query": "失效消息 时间戳排序",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000036",
+        "msg_v1_00000000-0000-4000-8000-000000000535"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0004",
+        "semcorp-s0054"
+      ],
+      "plant_id": "par-001",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0052",
+      "query": "invalidation notices monotonic ordering",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000036",
+        "msg_v1_00000000-0000-4000-8000-000000000535"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0004",
+        "semcorp-s0054"
+      ],
+      "plant_id": "par-001",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0053",
+      "query": "队列积压 投递重试",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000267",
+        "msg_v1_00000000-0000-4000-8000-000000000199"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0027",
+        "semcorp-s0020"
+      ],
+      "plant_id": "par-002",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0054",
+      "query": "触发窗口 时区偏移",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001062",
+        "msg_v1_00000000-0000-4000-8000-000000001227"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0107",
+        "semcorp-s0123"
+      ],
+      "plant_id": "par-003",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0055",
+      "query": "迁移脚本 锁超时",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001833",
+        "msg_v1_00000000-0000-4000-8000-000000000838"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0184",
+        "semcorp-s0084"
+      ],
+      "plant_id": "par-004",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0056",
+      "query": "失败重试 并发作业",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000951",
+        "msg_v1_00000000-0000-4000-8000-000000001393"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0096",
+        "semcorp-s0140"
+      ],
+      "plant_id": "par-005",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0057",
+      "query": "retries forever parallel jobs",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000951",
+        "msg_v1_00000000-0000-4000-8000-000000001393"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0096",
+        "semcorp-s0140"
+      ],
+      "plant_id": "par-005",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0058",
+      "query": "指标聚合 采样丢失",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001149",
+        "msg_v1_00000000-0000-4000-8000-000000000609"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0115",
+        "semcorp-s0061"
+      ],
+      "plant_id": "par-006",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0059",
+      "query": "日志采集 重复投递",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000948",
+        "msg_v1_00000000-0000-4000-8000-000000001192"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0095",
+        "semcorp-s0120"
+      ],
+      "plant_id": "par-007",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0060",
+      "query": "滑动窗口 拒绝策略",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000264",
+        "msg_v1_00000000-0000-4000-8000-000000000750"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0027",
+        "semcorp-s0075"
+      ],
+      "plant_id": "par-008",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0061",
+      "query": "灰度发布 回退开关",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000111",
+        "msg_v1_00000000-0000-4000-8000-000000001178"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0012",
+        "semcorp-s0118"
+      ],
+      "plant_id": "par-009",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0062",
+      "query": "staged rollout emergency shutoff",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000111",
+        "msg_v1_00000000-0000-4000-8000-000000001178"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0012",
+        "semcorp-s0118"
+      ],
+      "plant_id": "par-009",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0063",
+      "query": "重试队列 最大尝试次数",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001035",
+        "msg_v1_00000000-0000-4000-8000-000000001429"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0104",
+        "semcorp-s0143"
+      ],
+      "plant_id": "par-010",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0064",
+      "query": "密钥轮换 吊销",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001970",
+        "msg_v1_00000000-0000-4000-8000-000000001657"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0197",
+        "semcorp-s0166"
+      ],
+      "plant_id": "par-011",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0065",
+      "query": "配置热更新 原子切换",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000065",
+        "msg_v1_00000000-0000-4000-8000-000000001097"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0007",
+        "semcorp-s0110"
+      ],
+      "plant_id": "par-012",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0066",
+      "query": "代理缓存 缓存键",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000677",
+        "msg_v1_00000000-0000-4000-8000-000000001973"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0068",
+        "semcorp-s0198"
+      ],
+      "plant_id": "par-013",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0067",
+      "query": "hit ratio computed key",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000677",
+        "msg_v1_00000000-0000-4000-8000-000000001973"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0068",
+        "semcorp-s0198"
+      ],
+      "plant_id": "par-013",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0068",
+      "query": "快照备份 保留策略",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000611",
+        "msg_v1_00000000-0000-4000-8000-000000001579"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0062",
+        "semcorp-s0158"
+      ],
+      "plant_id": "par-014",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0069",
+      "query": "幂等键 冲突检测",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001530",
+        "msg_v1_00000000-0000-4000-8000-000000001282"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0153",
+        "semcorp-s0129"
+      ],
+      "plant_id": "par-015",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0070",
+      "query": "发布订阅 主题路由",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000588",
+        "msg_v1_00000000-0000-4000-8000-000000001410"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0059",
+        "semcorp-s0141"
+      ],
+      "plant_id": "par-016",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0071",
+      "query": "链路追踪 日志关联",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001908",
+        "msg_v1_00000000-0000-4000-8000-000000001893"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0191",
+        "semcorp-s0190"
+      ],
+      "plant_id": "par-017",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0072",
+      "query": "span decision correlation ids",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001908",
+        "msg_v1_00000000-0000-4000-8000-000000001893"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0191",
+        "semcorp-s0190"
+      ],
+      "plant_id": "par-017",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0073",
+      "query": "模式校验 引用解析",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001245",
+        "msg_v1_00000000-0000-4000-8000-000000001168"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0125",
+        "semcorp-s0117"
+      ],
+      "plant_id": "par-018",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0074",
+      "query": "优雅停机 连接排空",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000878",
+        "msg_v1_00000000-0000-4000-8000-000000000839"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0088",
+        "semcorp-s0084"
+      ],
+      "plant_id": "par-019",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0075",
+      "query": "排版规则 自动修复",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000206",
+        "msg_v1_00000000-0000-4000-8000-000000000712"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0021",
+        "semcorp-s0072"
+      ],
+      "plant_id": "par-020",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0076",
+      "query": "缓存一致性 失效消息",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001286",
+        "msg_v1_00000000-0000-4000-8000-000000001562"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0129",
+        "semcorp-s0157"
+      ],
+      "plant_id": "par-021",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0077",
+      "query": "过期通告 先后次序",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001286",
+        "msg_v1_00000000-0000-4000-8000-000000001562"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0129",
+        "semcorp-s0157"
+      ],
+      "plant_id": "par-021",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0078",
+      "query": "幂等键 投递重试",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001865",
+        "msg_v1_00000000-0000-4000-8000-000000000222"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0187",
+        "semcorp-s0023"
+      ],
+      "plant_id": "par-022",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0079",
+      "query": "锁竞争 错过补偿",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000649",
+        "msg_v1_00000000-0000-4000-8000-000000001134"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0065",
+        "semcorp-s0114"
+      ],
+      "plant_id": "par-023",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0080",
+      "query": "排序执行 断点续跑",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000892",
+        "msg_v1_00000000-0000-4000-8000-000000000876"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0090",
+        "semcorp-s0088"
+      ],
+      "plant_id": "par-024",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0081",
+      "query": "工件上传 失败重试",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000505",
+        "msg_v1_00000000-0000-4000-8000-000000001099"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0051",
+        "semcorp-s0110"
+      ],
+      "plant_id": "par-025",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0082",
+      "query": "产物推送 重试机制",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000505",
+        "msg_v1_00000000-0000-4000-8000-000000001099"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0051",
+        "semcorp-s0110"
+      ],
+      "plant_id": "par-025",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0083",
+      "query": "存储压缩 时间窗口",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001338",
+        "msg_v1_00000000-0000-4000-8000-000000001578"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0134",
+        "semcorp-s0158"
+      ],
+      "plant_id": "par-026",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0084",
+      "query": "轮转检测 背压",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001071",
+        "msg_v1_00000000-0000-4000-8000-000000000610"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0108",
+        "semcorp-s0061"
+      ],
+      "plant_id": "par-027",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0085",
+      "query": "令牌桶 限流窗口",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001894",
+        "msg_v1_00000000-0000-4000-8000-000000001240"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0190",
+        "semcorp-s0124"
+      ],
+      "plant_id": "par-028",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0086",
+      "query": "审计日志 灰度发布",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000509",
+        "msg_v1_00000000-0000-4000-8000-000000000131"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0051",
+        "semcorp-s0014"
+      ],
+      "plant_id": "par-029",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0087",
+      "query": "留痕记录 分组",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000509",
+        "msg_v1_00000000-0000-4000-8000-000000000131"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0051",
+        "semcorp-s0014"
+      ],
+      "plant_id": "par-029",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0088",
+      "query": "消息过期 手动重投",
+      "category": "zh",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000038",
+        "msg_v1_00000000-0000-4000-8000-000000001729"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0004",
+        "semcorp-s0173"
+      ],
+      "plant_id": "par-030",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0089",
+      "query": "access audit revoke",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000974",
+        "msg_v1_00000000-0000-4000-8000-000000001863"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0098",
+        "semcorp-s0187"
+      ],
+      "plant_id": "par-031",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0090",
+      "query": "hot reload atomic swap",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001823",
+        "msg_v1_00000000-0000-4000-8000-000000001357"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0183",
+        "semcorp-s0136"
+      ],
+      "plant_id": "par-032",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0091",
+      "query": "batch invalidation cache hit ratio",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000184",
+        "msg_v1_00000000-0000-4000-8000-000000001593"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0019",
+        "semcorp-s0160"
+      ],
+      "plant_id": "par-033",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0092",
+      "query": "purge revalidating",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000184",
+        "msg_v1_00000000-0000-4000-8000-000000001593"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0019",
+        "semcorp-s0160"
+      ],
+      "plant_id": "par-033",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0093",
+      "query": "restore drills integrity check",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001900",
+        "msg_v1_00000000-0000-4000-8000-000000000928"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0190",
+        "semcorp-s0093"
+      ],
+      "plant_id": "par-034",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0094",
+      "query": "concurrent writes conflict detection",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001296",
+        "msg_v1_00000000-0000-4000-8000-000000001521"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0130",
+        "semcorp-s0153"
+      ],
+      "plant_id": "par-035",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0095",
+      "query": "subscription matching durable ordering",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000337",
+        "msg_v1_00000000-0000-4000-8000-000000000160"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0034",
+        "semcorp-s0016"
+      ],
+      "plant_id": "par-036",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0096",
+      "query": "tail latency context propagation",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000099",
+        "msg_v1_00000000-0000-4000-8000-000000001325"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0010",
+        "semcorp-s0133"
+      ],
+      "plant_id": "par-037",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0097",
+      "query": "sampling logic trace header",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000099",
+        "msg_v1_00000000-0000-4000-8000-000000001325"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0010",
+        "semcorp-s0133"
+      ],
+      "plant_id": "par-037",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0098",
+      "query": "strict mode reference resolution",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000001921",
+        "msg_v1_00000000-0000-4000-8000-000000001498"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0193",
+        "semcorp-s0150"
+      ],
+      "plant_id": "par-038",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0099",
+      "query": "signal handling graceful shutdown",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000844",
+        "msg_v1_00000000-0000-4000-8000-000000000489"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0085",
+        "semcorp-s0049"
+      ],
+      "plant_id": "par-039",
+      "gold_derivation": "generator_plant_bookkeeping"
+    },
+    {
+      "id": "semq-0100",
+      "query": "line breaking lint rules",
+      "category": "en",
+      "gold_message_ids": [
+        "msg_v1_00000000-0000-4000-8000-000000000363",
+        "msg_v1_00000000-0000-4000-8000-000000000724"
+      ],
+      "gold_session_ids": [
+        "semcorp-s0037",
+        "semcorp-s0073"
+      ],
+      "plant_id": "par-040",
+      "gold_derivation": "generator_plant_bookkeeping"
+    }
+  ],
+  "benchmark_contract": {
+    "modes": [
+      "lexical",
+      "semantic",
+      "hybrid"
+    ],
+    "k_values": [
+      5,
+      10,
+      20
+    ],
+    "latency_percentiles": [
+      "p50",
+      "p95"
+    ],
+    "thresholds": {
+      "state": "pending",
+      "note": "recall/latency thresholds are frozen only after a benchmark run against a real imported embedding model; runs under the bigram-hash vectorizer can never set thresholds"
+    },
+    "repeat_counts": {
+      "state": "pending",
+      "planned": 3,
+      "note": "frozen together with the thresholds once a real-model run is recorded; the runner reports the repeat count it actually used"
+    }
+  }
+}

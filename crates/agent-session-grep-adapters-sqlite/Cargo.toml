@@ -1,0 +1,27 @@
+[package]
+name = "agent-session-grep-adapters-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-application = { path = "../agent-session-grep-application" }
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+# default-features = false 去掉 rusqlite 的 default 特性(cache 仅用于
+# prepare_cached API,本项目未使用;ffi-sqlite-wasm-rs 是 wasm 目标专属),
+# 从而从 release 图里剔除 hashlink/hashbrown-0.17/foldhash-0.2 重复依赖。
+# "trace" 仅供测试的 SQL 语句计数守卫使用(sqlite3_trace_v2 钩子),归入 dev-dependencies。
+# "functions" 供时间过滤谓词的 ISO-8601 → sort-key 标量函数注册。
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "functions"] }
+serde_json.workspace = true
+blake3.workspace = true
+# 与 spikes/data-root-locking 同一原语：OS 独占文件锁作 writer lease 权威。
+# features = ["sync"] 是 fs4 的 default,不必重复声明。
+fs4 = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "trace"] }

@@ -1,0 +1,302 @@
+# WSL2 Linux x64 build/test/smoke evidence
+# Shared copy redacts the local home path; command results are unchanged
+# Source commit: 88d86f4
+# Scope: WSL2 Ubuntu 22.04 / glibc 2.35 only; not glibc 2.31 or distribution certification
+kernel=6.6.87.2-microsoft-standard-WSL2
+arch=x86_64
+ldd (Ubuntu GLIBC 2.35-0ubuntu3.13) 2.35
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+binary: rustc
+commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+commit-date: 2026-07-14
+host: x86_64-unknown-linux-gnu
+release: 1.97.1
+LLVM version: 22.1.6
+cargo 1.97.1 (c980f4866 2026-06-30)
+=== RELEASE BUILD ===
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling thiserror v2.0.19
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling blake3 v1.8.5
+   Compiling libsqlite3-sys v0.38.1
+   Compiling rustix v1.1.4
+   Compiling syn v3.0.2
+   Compiling fs4 v0.13.1
+   Compiling thiserror-impl v2.0.19
+   Compiling serde_derive v1.0.229
+   Compiling agent-session-grep-domain v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-domain)
+   Compiling agent-session-grep-ports v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-ports)
+   Compiling agent-session-grep-application v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-application)
+   Compiling agent-session-grep-provider-codex v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-provider-codex)
+   Compiling agent-session-grep-provider-claude v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-provider-claude)
+   Compiling rusqlite v0.40.1
+   Compiling agent-session-grep-adapters-sqlite v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-adapters-sqlite)
+   Compiling agent-session-grep-cli v0.1.0 (/mnt/c/AgentSessions/crates/agent-session-grep-cli)
+    Finished `release` profile [optimized] target(s) in 55.05s
+=== DIRECT SMOKE ===
+agent-session-grep-cli 0.1.0
+{"command":"config.paths","data":{"cache":"<redacted-home>/.cache/agentsessions","config":"<redacted-home>/.config/agentsessions/config.toml","data":"<redacted-home>/.local/share/agentsessions","logs":"<redacted-home>/.local/share/agentsessions/logs"},"frame_type":"response","meta":{"duration_ms":0,"generation":null},"ok":true,"outcome":"success","page":{"has_more":false,"next_cursor":null},"request_id":"cli-949-1784975967528","schema_version":"1.0","warnings":[]}
+=== WORKSPACE TESTS ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.69s
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_adapters_sqlite-743935eb97bf4468)
+
+running 55 tests
+test lease::tests::false_lock_result_is_writer_busy ... ok
+test lease::tests::contention_lock_error_is_writer_busy ... ok
+test lease::tests::non_contention_lock_error_is_backend ... ok
+test lease::tests::true_lock_result_is_acquired ... ok
+test cas::tests::missing_current_reads_as_zero ... ok
+test cas::tests::cas_from_zero_bootstraps ... ok
+test cas::tests::cas_succeeds_when_expected_matches ... ok
+test cas::tests::cas_rejects_stale_baseline ... ok
+test lease::tests::second_acquire_is_denied_without_disclosing_path ... ok
+test lease::tests::acquire_and_read_record ... ok
+test source_fs::tests::capture_and_verify_stable_file ... ok
+test lease::tests::drop_releases_for_next_holder ... ok
+test source_fs::tests::append_is_detected ... ok
+test source_fs::tests::equal_length_content_replacement_is_detected_by_fingerprint ... ok
+test source_fs::tests::snapshot_fs_read_verified_roundtrip ... ok
+test source_fs::tests::truncate_is_detected ... ok
+test tests::catalog_put_get_roundtrip ... ok
+test tests::fresh_db_reports_current_schema_version ... ok
+test tests::commit_rejects_mismatched_payload ... ok
+test tests::catalog_put_overwrites ... ok
+test tests::duplicate_source_paths_are_rejected ... ok
+test tests::catalog_list_is_sorted_and_limited ... ok
+test tests::duplicate_message_error_does_not_disclose_source_path ... ok
+test tests::non_contention_sqlite_failure_remains_backend ... ok
+test tests::commit_rejects_stale_base_generation ... ok
+test tests::deleting_by_wire_id_removes_search_row ... ok
+test tests::commit_batch_is_idempotent ... ok
+test tests::commit_batch_writes_all_entries ... ok
+test tests::empty_source_scan_tombstones_prior_membership ... ok
+test tests::fresh_store_starts_at_generation_zero ... ok
+test tests::interrupted_batch_count_observes_without_mutating ... ok
+test tests::index_batch_commits_and_advances_generation ... ok
+test tests::query_respects_limit ... ok
+test tests::moving_message_to_new_source_is_atomic ... ok
+test tests::rebuild_leaves_durable_activated_journal_row ... ok
+test tests::rebuild_on_empty_catalog_yields_empty_index ... ok
+test tests::recover_aborts_orphan_building_intents ... ok
+test tests::rebuild_removes_orphan_fts_rows_not_in_catalog ... ok
+test tests::rebuild_reprojects_fts_from_catalog_and_advances_generation ... ok
+test tests::sqlite_busy_maps_to_retryable_writer_busy ... ok
+test tests::sqlite_locked_maps_to_retryable_writer_busy ... ok
+test tests::rebuild_restores_search_after_index_data_wiped ... ok
+test tests::recover_does_not_touch_activated_batches ... ok
+test tests::reindex_is_idempotent ... ok
+test tests::search_finds_indexed_and_rebuilds_id ... ok
+test tests::shared_wire_id_with_conflicting_identity_metadata_is_rejected ... ok
+test tests::shared_message_survives_one_source_shrinking ... ok
+test tests::source_rescan_tombstones_removed_messages ... ok
+test tests::unchanged_source_rescan_does_not_advance_generation ... ok
+test tests::standalone_index_populates_wire_mapping ... ok
+test tests::source_batch_permutations_produce_identical_state ... ok
+test tests::newer_schema_is_rejected ... ok
+test tests::reopen_preserves_data_and_is_idempotent ... ok
+test tests::v1_db_migrates_to_v2_with_generation_zero ... ok
+test tests::v3_db_migrates_source_membership_table ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running unittests src/bin/sqlite_process_helper.rs (target/debug/deps/sqlite_process_helper-30a6111da570f1bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_evidence.rs (target/debug/deps/process_evidence-b48c26c9b0fef10e)
+
+running 4 tests
+test killed_holder_releases_production_writer_lease_without_deleting_lock_file ... ok
+test stale_generation_intent_fails_closed_on_production_store ... ok
+test production_open_for_write_allows_exactly_one_process ... ok
+test production_open_recovers_durable_intent_without_changing_catalog_or_generation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_application-21914acade0708f2)
+
+running 10 tests
+test tests::list_rejects_zero_limit ... ok
+test tests::search_rejects_empty_query ... ok
+test tests::search_rejects_zero_limit ... ok
+test tests::status_returns_catalog_count ... ok
+test tests::stage_discards_partial_on_mid_parse_fatal ... ok
+test tests::get_returns_payload ... ok
+test tests::stage_returns_all_messages_on_success ... ok
+test tests::search_returns_hits ... ok
+test tests::stage_rejects_ambiguous_variant ... ok
+test tests::list_returns_stable_entries ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/agent-session-grep-9b604f432749d819)
+
+running 9 tests
+test protocol::tests::exit_codes_follow_contract ... ok
+test protocol::tests::output_mode_rejects_unknown_or_missing_value ... ok
+test protocol::tests::port_error_categories_map_to_catalog ... ok
+test protocol::tests::invariant_violation_is_internal ... ok
+test protocol::tests::writer_busy_maps_from_port_error ... ok
+test protocol::tests::success_envelope_is_well_formed ... ok
+test protocol::tests::published_error_catalog_matches_runtime_mapping ... ok
+test protocol::tests::error_envelope_carries_code_and_retryable ... ok
+test protocol::tests::published_envelope_schema_contains_runtime_contract ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/e2e.rs (target/debug/deps/e2e-af787e09fc2899ab)
+
+running 32 tests
+test help_flag_lists_commands_without_db ... ok
+test doctor_reports_ok_without_db ... ok
+test doctor_envelope_shape_has_meta_generation_null ... ok
+test config_paths_reports_platform_directories ... ok
+test invalid_output_mode_exits_with_code_2 ... ok
+test get_missing_returns_null_payload ... ok
+test human_error_writes_diagnostic_to_stderr_only ... ok
+test get_malformed_id_is_usage_error ... ok
+test index_rebuild_on_empty_db_succeeds ... ok
+test jsonl_output_is_one_complete_frame_per_line ... ok
+test doctor_with_db_reports_generation_and_recovery_evidence ... ok
+test index_rebuild_reprojects_and_keeps_search_working ... ok
+test ingest_auto_selects_codex_and_ignores_event_mirror ... ok
+test ingest_preserves_native_uuid_identity_and_threading ... ok
+test ingest_search_get_roundtrip_via_binary ... ok
+test output_json_flag_produces_well_formed_envelope ... ok
+test missing_subcommand_is_usage_error ... ok
+test robot_envelope_shape_on_error ... ok
+test index_search_get_roundtrip ... ok
+test robot_envelope_shape_on_success ... ok
+test robot_flag_produces_same_json_envelope ... ok
+test version_flag_prints_version_without_db ... ok
+test show_missing_returns_null_entity ... ok
+test show_malformed_id_is_usage_error ... ok
+test list_and_status_report_catalog_contents ... ok
+test sync_requires_at_least_one_file ... ok
+test unknown_subcommand_is_usage_error ... ok
+test sync_all_or_nothing_on_bad_source ... ok
+test show_returns_normalized_role_and_text ... ok
+test sync_commits_then_reports_unchanged_on_resync ... ok
+test sync_tombstones_message_removed_from_source ... ok
+test perf_baseline_100_messages_index_and_search ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.67s
+
+     Running tests/provider_matrix.rs (target/debug/deps/provider_matrix-194296f7791b4a21)
+
+running 2 tests
+test matrix_marks_both_providers_experimental_not_beta ... ok
+test matrix_declares_each_provider_id_and_variant ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_domain-244a1898914a53ae)
+
+running 14 tests
+test ids::tests::from_wire_rejects_unknown_prefix ... ok
+test error::tests::code_is_stable ... ok
+test ids::tests::native_preserves_and_prefixes ... ok
+test ids::tests::derived_digest_length ... ok
+test ids::tests::derive_is_deterministic ... ok
+test ids::tests::framing_prevents_boundary_collision ... ok
+test ids::tests::from_wire_roundtrips_kind_and_value ... ok
+test tests::sidechain_and_timestamp_fields_carried ... ok
+test tests::non_monotonic_seq_rejected ... ok
+test tests::parent_with_wrong_kind_rejected ... ok
+test ids::tests::kind_domain_separation ... ok
+test tests::valid_session_passes ... ok
+test tests::valid_parent_link_passes ... ok
+test tests::wrong_id_kind_rejected ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_ports-fbf571145a94b42a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_provider_claude-ed6e1b5d0d47e52f)
+
+running 5 tests
+test tests::probe_rejects_empty ... ok
+test tests::parse_skips_broken_line_recoverably ... ok
+test tests::probe_rejects_non_jsonl ... ok
+test tests::parse_extracts_conversational_messages ... ok
+test tests::probe_confirms_claude_jsonl ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_provider_codex-7a2852cb3d37957e)
+
+running 6 tests
+test tests::probe_rejects_empty ... ok
+test tests::probe_rejects_non_jsonl ... ok
+test tests::parse_skips_broken_line_recoverably ... ok
+test tests::parse_takes_authoritative_message_ignores_event_mirror ... ok
+test tests::probe_rejects_claude_code_jsonl ... ok
+test tests::probe_confirms_codex_rollout ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_session_grep_testkit-7c31cef84d1f6cf1)
+
+running 8 tests
+test tests::fake_provider_ambiguous_signals_ambiguous ... ok
+test tests::fake_provider_structural_fatal_errors_on_parse ... ok
+test tests::fake_provider_good_parses_all_messages ... ok
+test tests::in_memory_reindex_is_idempotent ... ok
+test tests::in_memory_store_roundtrips_and_searches ... ok
+test tests::assert_read_only_passes_for_pure_read ... ok
+test tests::session_builder_is_deterministic ... ok
+test tests::session_builder_produces_valid_session ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests agent_session_grep_adapters_sqlite
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_application
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_domain
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_ports
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_provider_claude
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_provider_codex
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_session_grep_testkit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

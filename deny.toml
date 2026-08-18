@@ -1,0 +1,61 @@
+# cargo-deny 配置：供应链安全门（许可与依赖审计依据见 docs/operations/REUSE-LICENSE-AUDIT.md）。
+#
+# schema 依据 cargo-deny 官方文档（licenses/advisories cfg）：
+# - 近版本 licenses 全默认拒绝，必须显式 allow；已移除 deny/copyleft/default 字段。
+# - 近版本 advisories 移除 vulnerability/unsound/notice/severity-threshold，
+#   所有漏洞/unsound 一律 error；这里只保留仍有效的 yanked/unmaintained/ignore。
+#
+# 本地运行：cargo deny check
+# CI 运行见 .github/workflows/ci.yml 的 deny 步骤。
+
+[advisories]
+# RustSec 漏洞库；漏洞/unsound 默认即 error，无需逐项声明。
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# 只允许与本项目 MIT OR Apache-2.0 兼容的宽松许可。
+# 依赖树若引入不在此列的许可，检查失败——供应链许可污染的第一道门。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# 供应链最小化：多版本重复依赖仅告警（切片期依赖少，收敛后可升级为 deny）。
+multiple-versions = "warn"
+wildcards = "deny"
+# workspace 内 path 依赖不写 version 会被判为 wildcard，这是本地依赖的正常写法，
+# 放行它们；对 crates.io 依赖的 wildcard 仍然 deny。
+allow-wildcard-paths = true
+# 零网络出站保证的第二道门：HTTP client / 服务框架 crate 一律禁止进入依赖树，
+# 与 crates/agent-session-grep-cli/tests/network_egress.rs 的静态断言同源。
+deny = [
+    { name = "reqwest", reason = "zero-egress: HTTP client" },
+    { name = "hyper", reason = "zero-egress: HTTP client" },
+    { name = "ureq", reason = "zero-egress: HTTP client" },
+    { name = "isahc", reason = "zero-egress: HTTP client" },
+    { name = "surf", reason = "zero-egress: HTTP client" },
+    { name = "attohttpc", reason = "zero-egress: HTTP client" },
+    { name = "curl", reason = "zero-egress: HTTP client" },
+    { name = "quinn", reason = "zero-egress: transport" },
+    { name = "quiche", reason = "zero-egress: transport" },
+    { name = "tiny_http", reason = "zero-egress: HTTP server" },
+    { name = "rouille", reason = "zero-egress: HTTP server" },
+    { name = "warp", reason = "zero-egress: HTTP server" },
+    { name = "axum", reason = "zero-egress: HTTP server" },
+    { name = "tokio", reason = "zero-egress: async runtime" },
+    { name = "async-std", reason = "zero-egress: async runtime" },
+]
+
+[sources]
+# 只信任 crates.io 官方源；未知 registry / git 源一律拒绝。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

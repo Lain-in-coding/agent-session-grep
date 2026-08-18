@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
+<title>agent-session-grep / local observatory</title>
+<style>
+:root {
+  color-scheme: dark;
+  --ink: #e5edf4;
+  --muted: #8ea2b5;
+  --line: #263646;
+  --panel: #101a24;
+  --panel-raised: #152535;
+  --canvas: #081018;
+  --signal: #73e6c1;
+  --signal-dim: #2d846f;
+  --warning: #f2bf6b;
+  --danger: #ef847e;
+  --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--canvas); color: var(--ink); font-family: var(--sans); }
+body::before { content: ""; display: block; height: 4px; background: linear-gradient(90deg, var(--signal-dim), var(--signal), transparent 72%); }
+.shell { max-width: 1320px; margin: 0 auto; padding: 28px 24px 48px; }
+.masthead { display: flex; justify-content: space-between; gap: 24px; align-items: flex-end; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+.eyebrow { color: var(--signal); font: 600 0.72rem/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; }
+h1 { margin: 8px 0 0; font: 650 clamp(1.8rem, 4vw, 3.6rem)/0.95 var(--sans); letter-spacing: -0.06em; }
+.subtitle { max-width: 30rem; margin: 8px 0 0; color: var(--muted); font-size: 0.92rem; }
+.status { min-width: 15rem; padding: 12px 14px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); font: 0.78rem/1.35 var(--mono); }
+.status.ok { color: var(--signal); border-color: var(--signal-dim); }
+.status.error { color: var(--danger); }
+.toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 10px; margin: 24px 0 14px; }
+input, select, button { border: 1px solid var(--line); border-radius: 3px; color: var(--ink); background: var(--panel); font: inherit; }
+input, select { min-height: 40px; padding: 0 11px; }
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+button { min-height: 40px; padding: 0 14px; cursor: pointer; }
+button.primary { color: #06110e; background: var(--signal); border-color: var(--signal); font-weight: 700; }
+button.quiet { color: var(--signal); }
+button:disabled { opacity: 0.42; cursor: not-allowed; }
+.filters { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: var(--muted); font-size: 0.78rem; }
+.filters label { display: flex; align-items: center; gap: 7px; }
+.filters input, .filters select { min-height: 32px; font-size: 0.8rem; }
+.filters input[type="number"] { width: 76px; }
+.filters input[type="checkbox"] { accent-color: var(--signal); }
+.rule { height: 1px; margin: 22px 0; background: var(--line); }
+.meta-row { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font: 0.76rem var(--mono); }
+.retrieval { color: var(--signal); }
+.results { display: grid; gap: 10px; margin-top: 14px; }
+.hit { display: block; width: 100%; padding: 16px; text-align: left; background: var(--panel); border-color: var(--line); transition: border-color 140ms ease, transform 140ms ease; }
+.hit:hover { border-color: var(--signal-dim); transform: translateX(3px); }
+.hit-head { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font: 0.74rem var(--mono); }
+.hit-score { color: var(--signal); }
+.hit-text { margin-top: 9px; color: var(--ink); line-height: 1.55; }
+.hit-session { margin-top: 9px; color: var(--muted); font: 0.76rem var(--mono); }
+.empty { padding: 38px 16px; border: 1px dashed var(--line); color: var(--muted); text-align: center; }
+.actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 16px; }
+#contextPanel { display: none; margin-top: 30px; padding: 20px; border: 1px solid var(--line); background: var(--panel); }
+#contextPanel.open { display: block; }
+.context-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+.context-head h2 { margin: 0; font-size: 1.05rem; }
+.context-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.context-controls select { min-height: 32px; font-size: 0.8rem; }
+.message { padding: 13px 0; border-top: 1px solid var(--line); }
+.message-meta { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font: 0.72rem var(--mono); }
+.message-body { margin: 8px 0 0; white-space: pre-wrap; line-height: 1.55; }
+.message button { min-height: 28px; padding: 0 8px; color: var(--muted); font: 0.7rem var(--mono); }
+pre { max-height: 20rem; overflow: auto; padding: 13px; border: 1px solid var(--line); background: var(--canvas); color: var(--muted); font: 0.75rem/1.5 var(--mono); white-space: pre-wrap; }
+@media (max-width: 760px) {
+  .shell { padding: 20px 14px 36px; }
+  .masthead { display: block; }
+  .status { margin-top: 18px; }
+  .toolbar { grid-template-columns: 1fr 1fr; }
+  .toolbar input { grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) { .hit { transition: none; } }
+</style>
+</head>
+<body>
+<main class="shell">
+  <header class="masthead">
+    <div>
+      <div class="eyebrow">local session observatory</div>
+      <h1>Find the thread.</h1>
+      <p class="subtitle">A private, loopback-only window into indexed agent history. Every result is served by the same contract as the CLI.</p>
+    </div>
+    <div id="status" class="status" role="status">Connecting to local catalog…</div>
+  </header>
+
+  <section aria-label="Search controls">
+    <div class="toolbar">
+      <input id="query" type="search" placeholder="Search messages, decisions, errors…" autocomplete="off">
+      <select id="mode" aria-label="Retrieval mode">
+        <option value="lexical">Lexical</option>
+        <option value="semantic">Semantic</option>
+        <option value="hybrid">Hybrid</option>
+      </select>
+      <select id="provider" aria-label="Provider"><option value="">All providers</option></select>
+      <button id="searchButton" class="primary" type="button">Search</button>
+    </div>
+    <div class="filters">
+      <label>Page size <input id="limit" type="number" value="20" min="1" max="100"></label>
+      <label><input id="includeSystem" type="checkbox"> Include system messages</label>
+      <label><input id="groupBySession" type="checkbox"> Group by session</label>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+  <div class="meta-row"><span id="resultMeta">Waiting for a query.</span><span id="retrievalMode" class="retrieval"></span></div>
+  <section id="results" class="results" aria-live="polite"><div class="empty">Type a query to inspect the catalog.</div></section>
+  <div class="actions"><button id="loadMore" class="quiet" type="button" disabled>Load next page</button><button id="handoff" class="quiet" type="button" disabled>Preview handoff pack</button></div>
+
+  <section id="contextPanel" aria-label="Session context">
+    <div class="context-head"><h2 id="contextTitle">Session context</h2><button id="closeContext" class="quiet" type="button">Close</button></div>
+    <div class="context-controls">
+      <select id="contextPolicy" aria-label="Context branch"><option value="mainline">Mainline</option><option value="full">Full graph</option></select>
+      <select id="contextLevel" aria-label="Context detail"><option value="raw">Messages</option><option value="talks">Talks</option><option value="sessions">Session summary</option></select>
+      <button id="refreshContext" class="quiet" type="button">Refresh context</button>
+      <button id="resumePreview" class="quiet" type="button">Preview resume</button>
+    </div>
+    <div id="contextMessages"></div>
+    <pre id="previewOutput" hidden></pre>
+  </section>
+</main>
+<script>
+const url = new URL(window.location.href);
+const token = url.searchParams.get('token') || '';
+if (token) window.history.replaceState(null, '', url.pathname);
+const authHeaders = {'Authorization': 'Bearer ' + token};
+let activeSession = '';
+let nextCursor = null;
+let lastQuery = '';
+
+function payload(body) { return body && body.data ? body.data : (body || {}); }
+function setStatus(text, kind) {
+  const node = document.getElementById('status');
+  node.textContent = text;
+  node.className = 'status' + (kind ? ' ' + kind : '');
+}
+function clear(node) { node.replaceChildren(); }
+function text(node, value) { node.textContent = value == null ? '' : String(value); }
+function button(label, className, onClick) {
+  const node = document.createElement('button');
+  node.type = 'button'; node.className = className || 'quiet'; node.textContent = label; node.addEventListener('click', onClick); return node;
+}
+async function api(path) {
+  const response = await fetch(path, {headers: authHeaders, credentials: 'same-origin'});
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error((body.error && body.error.message) || 'HTTP ' + response.status);
+  return body;
+}
+function showPreview(value) {
+  const node = document.getElementById('previewOutput');
+  node.hidden = false; node.textContent = JSON.stringify(value, null, 2);
+}
+async function init() {
+  try {
+    const statusBody = await api('/health');
+    const status = payload(statusBody);
+    setStatus('Connected · generation ' + (status.generation == null ? '?' : status.generation), 'ok');
+    await loadProviders();
+  } catch (error) { setStatus('Unavailable · ' + error.message, 'error'); }
+}
+async function loadProviders() {
+  const body = await api('/api/providers');
+  const providers = payload(body).providers || [];
+  const select = document.getElementById('provider');
+  for (const provider of providers) {
+    const option = document.createElement('option');
+    option.value = provider.provider_id || provider.id || '';
+    option.textContent = (provider.provider_id || provider.id || 'unknown') + ' · ' + (provider.maturity || 'unknown');
+    select.appendChild(option);
+  }
+}
+function queryParams(cursor) {
+  const params = new URLSearchParams({q: lastQuery, mode: document.getElementById('mode').value, limit: document.getElementById('limit').value});
+  const provider = document.getElementById('provider').value;
+  if (provider) params.set('provider', provider);
+  if (cursor) params.set('cursor', cursor);
+  if (document.getElementById('includeSystem').checked) params.set('include_system', 'true');
+  if (document.getElementById('groupBySession').checked) params.set('group_by_session', 'true');
+  return params;
+}
+async function doSearch(cursor) {
+  const query = document.getElementById('query').value.trim();
+  if (!query) return;
+  if (!cursor) { lastQuery = query; clear(document.getElementById('results')); }
+  try {
+    const body = await api('/api/search?' + queryParams(cursor));
+    const data = payload(body);
+    renderHits(data.hits || [], Boolean(cursor));
+    nextCursor = (body.page && body.page.next_cursor) || null;
+    document.getElementById('loadMore').disabled = !nextCursor;
+    text(document.getElementById('retrievalMode'), 'retrieval_mode: ' + (data.retrieval_mode || 'lexical'));
+    text(document.getElementById('resultMeta'), (data.hits || []).length + ' hits · generation ' + (data.generation == null ? '?' : data.generation));
+    document.getElementById('handoff').disabled = false;
+  } catch (error) { renderError(error.message); }
+}
+function renderError(message) {
+  const node = document.createElement('div'); node.className = 'empty'; text(node, 'The catalog could not answer: ' + message); clear(document.getElementById('results')); document.getElementById('results').appendChild(node);
+}
+function renderHits(hits, append) {
+  const results = document.getElementById('results');
+  if (!append) clear(results);
+  if (!hits.length && !append) { const empty = document.createElement('div'); empty.className = 'empty'; text(empty, 'No matching messages.'); results.appendChild(empty); return; }
+  for (const hit of hits) {
+    const card = button('', 'hit', () => loadContext(hit.session_id || ''));
+    const head = document.createElement('div'); head.className = 'hit-head';
+    const id = document.createElement('span'); text(id, hit.id || 'unknown');
+    const score = document.createElement('span'); score.className = 'hit-score'; text(score, Number(hit.score || 0).toFixed(3)); head.append(id, score);
+    const body = document.createElement('div'); body.className = 'hit-text'; text(body, hit.text || '');
+    card.append(head, body);
+    if (hit.session_id) { const session = document.createElement('div'); session.className = 'hit-session'; text(session, 'session · ' + hit.session_id); card.appendChild(session); }
+    results.appendChild(card);
+  }
+}
+async function loadContext(sessionId) {
+  if (!sessionId) return;
+  activeSession = sessionId;
+  document.getElementById('contextPanel').classList.add('open');
+  text(document.getElementById('contextTitle'), 'Session · ' + sessionId);
+  await refreshContext();
+}
+async function refreshContext() {
+  if (!activeSession) return;
+  try {
+    const params = new URLSearchParams({session: activeSession, policy: document.getElementById('contextPolicy').value, level: document.getElementById('contextLevel').value});
+    const body = await api('/api/context?' + params);
+    const data = payload(body); const messages = data.messages || []; const container = document.getElementById('contextMessages'); clear(container);
+    for (const message of messages) {
+      const item = document.createElement('article'); item.className = 'message';
+      const meta = document.createElement('div'); meta.className = 'message-meta';
+      const role = document.createElement('span'); const source = message.payload || {}; text(role, source.role || 'message');
+      const id = button('show ' + (message.message_id || message.id || ''), 'quiet', () => showEntity(message.message_id || message.id)); meta.append(role, id);
+      const bodyNode = document.createElement('div'); bodyNode.className = 'message-body'; text(bodyNode, source.text || JSON.stringify(source)); item.append(meta, bodyNode); container.appendChild(item);
+    }
+    if (!messages.length) { const empty = document.createElement('div'); empty.className = 'empty'; text(empty, 'This session has no messages at the selected level.'); container.appendChild(empty); }
+  } catch (error) { const node = document.getElementById('contextMessages'); clear(node); const empty = document.createElement('div'); empty.className = 'empty'; text(empty, error.message); node.appendChild(empty); }
+}
+async function showEntity(id) {
+  if (!id) return;
+  try { showPreview(payload(await api('/api/show?id=' + encodeURIComponent(id)))); } catch (error) { showPreview({error: error.message}); }
+}
+async function previewResume() {
+  if (!activeSession) return;
+  try { showPreview(payload(await api('/api/resume?session=' + encodeURIComponent(activeSession)))); } catch (error) { showPreview({error: error.message}); }
+}
+async function previewHandoff() {
+  if (!lastQuery) return;
+  try { showPreview(payload(await api('/api/handoff?q=' + encodeURIComponent(lastQuery)))); } catch (error) { showPreview({error: error.message}); }
+}
+document.getElementById('searchButton').addEventListener('click', () => doSearch());
+document.getElementById('query').addEventListener('keydown', event => { if (event.key === 'Enter') doSearch(); });
+document.getElementById('loadMore').addEventListener('click', () => doSearch(nextCursor));
+document.getElementById('handoff').addEventListener('click', previewHandoff);
+document.getElementById('refreshContext').addEventListener('click', refreshContext);
+document.getElementById('resumePreview').addEventListener('click', previewResume);
+document.getElementById('closeContext').addEventListener('click', () => document.getElementById('contextPanel').classList.remove('open'));
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+{
+  "committed": 3,
+  "fixture_blake3": "1c6bb30025c23a798706fecba8c3761a1793d4c928cceaa938fe2252af13c6d1",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "hermes-msg-1",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": null,
+      "text": "hello world",
+      "timestamp": "2026-04-18T04:53:26"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "hermes-msg-3",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": null,
+      "text": "[thinking]\nthinking hard\n[/thinking]\nhi there",
+      "timestamp": "2026-04-18T04:53:25.274422"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "hermes-msg-5",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": null,
+      "text": "next question",
+      "timestamp": "2026-04-18T04:53:25.274422"
+    }
+  ],
+  "session_native_id": "hermes-sess-0001",
+  "skipped": 0
+}

@@ -1,0 +1,47 @@
+{
+  "committed": 3,
+  "fixture_blake3": "c1f74eba9611947eec6986af678b3a637b81714e444a11219027353d76182463",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "openclaw-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 160,
+        "start": 92
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "openclaw-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 284,
+        "start": 161
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "openclaw-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 523,
+        "start": 410
+      },
+      "text": "带时间戳的中文",
+      "timestamp": "2026-01-01T00:01:00Z"
+    }
+  ],
+  "session_native_id": "sess-1",
+  "skipped": 1
+}

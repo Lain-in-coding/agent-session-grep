@@ -1,0 +1,2425 @@
+{
+  "excluded_prefixes": [
+    ".trellis/",
+    ".codex/",
+    ".codebuddy/",
+    ".agents/",
+    ".claude/",
+    "scripts/evidence/out/"
+  ],
+  "file_count": 482,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sha256": "86f5cf37fe6409fc4bb523263240e8007fe3d829a2dc4734fca7fc4dee2425a9",
+      "size_bytes": 661
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug-report.yml",
+      "sha256": "4ca29d7d967ea00e8c4baaeecbd3ed830c004ec220b3a5e827d9ca1e9580a08c",
+      "size_bytes": 2703
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature-request.yml",
+      "sha256": "b23adb3ebc9548e8399b107c295aa2308b423d596e1bcc2b1aa2acd6cd37a3e3",
+      "size_bytes": 2551
+    },
+    {
+      "path": ".github/dependabot.yml",
+      "sha256": "514557e7c5180a3f89e89cdc98112fd32c362216ae8478bfac4dcfee874f330f",
+      "size_bytes": 207
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "sha256": "e4814dd6e860c73ce220dccee79ed525e39343a9457423837f278c0556536880",
+      "size_bytes": 2146
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "c451c725ff6ad35a20e322d5a035941379fd9ed9351c2d139f6e658fae8decfc",
+      "size_bytes": 6574
+    },
+    {
+      "path": ".github/workflows/core-beta-evidence.yml",
+      "sha256": "856243328dfd956b6afe2320f0123e560a8a23062c85a6af454354e42c2fed43",
+      "size_bytes": 10278
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "sha256": "22e198330e7e476da2174b4d093c7a03d4a3ea1d7964071b768d13171235e7d8",
+      "size_bytes": 12169
+    },
+    {
+      "path": ".github/workflows/security-audit.yml",
+      "sha256": "9f3eb67765adc6ed228e16299ea34232c636d82eb4d658badf354c4ee111a509",
+      "size_bytes": 2003
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "b0b137436727e484f32a48d5e097e897516788f41254b09f9b80bb9cf7eb2c8f",
+      "size_bytes": 1199
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "c67b2e053fb303112825388f857a18be80c245f370b6b1e388d3e759e49aff4c",
+      "size_bytes": 4258
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "5015b43fc368818bc7ba9fdda4812e8312075cf90d3efb703b611c121260305a",
+      "size_bytes": 8264
+    },
+    {
+      "path": "CLAUDE.md",
+      "sha256": "c88412aebdb266a152e4adc4596a18ba5dcbf144a4e29c471b71d5fc11474ef5",
+      "size_bytes": 1922
+    },
+    {
+      "path": "CONTEXT.md",
+      "sha256": "eab5b8d3695c3e8ee4bc36a4aff23b409d4040269533530b71f26357b9d137e1",
+      "size_bytes": 18632
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "sha256": "3a1bd7f982712c1ff733c49b71b43fd3ce911be3f7855462a76108a7849bb2c6",
+      "size_bytes": 2931
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "aa0115f3a2ea0a1a17165dcd6dadbb30df591758aa8bb218b078fd43c18b2f84",
+      "size_bytes": 54844
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "0a71797d39755ee2ea09271343df94399d80cdf37298cbd35956235334b795e5",
+      "size_bytes": 2470
+    },
+    {
+      "path": "LICENSE-APACHE",
+      "sha256": "4fc39fae8dc096cd33c645cc59dc89214bb85bbe47ba8a0406e1013b9d3322b2",
+      "size_bytes": 11355
+    },
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "2bc8ec5d327b5f9b6edaa724e865cc1337279c5c2326d8d48abfd81460dce38e",
+      "size_bytes": 1060
+    },
+    {
+      "path": "NOTICE",
+      "sha256": "f2d3f7babe96b885bc035ec9d8afdfe653b9ed8d9c96cadbeb9517f871b2f687",
+      "size_bytes": 3849
+    },
+    {
+      "path": "README.md",
+      "sha256": "eeddb346b671a9cd7a00d0a3647316d3e6a462dd250bea0a9e4635992d5be4ac",
+      "size_bytes": 5785
+    },
+    {
+      "path": "SECURITY.md",
+      "sha256": "dc27e981c46843d55869108157b051234c2191cb69ed67d5a47af00bc6435097",
+      "size_bytes": 2736
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/Cargo.toml",
+      "sha256": "3863bc352ce36f4a2b7b74a4349f3e8a205fa5c56623aa6c456f81ab39b6d5f0",
+      "size_bytes": 1287
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/src/bin/sqlite_process_helper.rs",
+      "sha256": "b1aeb493c61643203963d2d88e0e96848ad0a9947921089da7234c1210b5c2a6",
+      "size_bytes": 5080
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/src/cas.rs",
+      "sha256": "bbca72fbe9bbb4f7121c48e4cc7a590a95fc86b91bca086467bf5eef730c0b7c",
+      "size_bytes": 5013
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/src/lease.rs",
+      "sha256": "dddd17f510a7bc811a6ab2d6e775a0c86b72dbafeac11db221eb68eeed7cbb96",
+      "size_bytes": 9818
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/src/lib.rs",
+      "sha256": "96556e9e294b64fad4900c2bd379a7ce28d7de48fd0cb5d082d0ec29c671771b",
+      "size_bytes": 610498
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/src/source_fs.rs",
+      "sha256": "c779460b39dcf4fb9262a3ed9753d513b049069d9b653c9630e865432566ee26",
+      "size_bytes": 15611
+    },
+    {
+      "path": "crates/agent-session-grep-adapters-sqlite/tests/process_evidence.rs",
+      "sha256": "cc224869f1c0e227904da6a230b118b20736a96f928b93f44f0c8daf2776d3c9",
+      "size_bytes": 4895
+    },
+    {
+      "path": "crates/agent-session-grep-application/Cargo.toml",
+      "sha256": "fc6b444debda707089dfe745bfb7e730dbd274e8281e76b75812b9ce9c236230",
+      "size_bytes": 1173
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/activity.rs",
+      "sha256": "6f724b38e327d22a58ce730fb5f3205c90812f3b7ff22d831fe58ac6c4079d9b",
+      "size_bytes": 14472
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/budget.rs",
+      "sha256": "374f5d67104a972476f4e67ac4e36d3d375754e881be7174baf8c62dc429587b",
+      "size_bytes": 12449
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/candle_embedding.rs",
+      "sha256": "fc5310022db2059d7cecc4a1195a0ea1440773faaae544a0d3c87e13dbed33d5",
+      "size_bytes": 29014
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/cjk.rs",
+      "sha256": "f924512e9e8e79c2a31c1f576f22fe801c9e763d07e7dfe3be3828a69220dee9",
+      "size_bytes": 5238
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/cursor.rs",
+      "sha256": "1671e18b08e1beb8578311c0e97b3821fae2d109f3a8cd5df48e9c5208dfa88e",
+      "size_bytes": 18464
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/embedding.rs",
+      "sha256": "c5dfe727e81e9063dc6513dbb99774797cd4a8bd9bb1ed52fc393a6f1f160d40",
+      "size_bytes": 8294
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/evidence.rs",
+      "sha256": "8e01ce8466280849837d1b61f13bd6846e690e9ec6c89d435369c83cad8fca3c",
+      "size_bytes": 7150
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/guidance.rs",
+      "sha256": "0caacb464172cffb73c59590f6c6bbc498c22d6d19b989ca489d4e2a86039fbf",
+      "size_bytes": 11974
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/handoff_pack.rs",
+      "sha256": "cd078967c4d87a17ca5b840fe199184876c8362f71cfbeffd505813dfef3535d",
+      "size_bytes": 37155
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/hybrid.rs",
+      "sha256": "d1d62e1a0fba789a18d47a25dcfa1bb1a802302c43e78a6d80325ef65375fd80",
+      "size_bytes": 5272
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/lib.rs",
+      "sha256": "92e0c6de53d04cc76a1d901aed7e547b97cc281e3740eef17ac22c79ca1a5ae3",
+      "size_bytes": 225514
+    },
+    {
+      "path": "crates/agent-session-grep-application/src/resume.rs",
+      "sha256": "89fe89e7097781ad54a13284296e38524edf9cfd1ef3a7c251441cb19e7be71f",
+      "size_bytes": 15275
+    },
+    {
+      "path": "crates/agent-session-grep-cli/Cargo.toml",
+      "sha256": "568e617ad0a43e87bca5f7d083b98ae358247fa9d7a3ea1e768beb04d8476266",
+      "size_bytes": 2790
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/bin/resume_smoke_provider.rs",
+      "sha256": "7cc3e2befef32e892f46186bf50aa998d184940a092bbb521a43ba1eca9a17e1",
+      "size_bytes": 973
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/hooks.rs",
+      "sha256": "d4edce8eaaf6fa79b8ea26911a1b9814278382f86d7d62e7767bc4e621adc41f",
+      "size_bytes": 10581
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/human.rs",
+      "sha256": "154dcb4a7659463a4e87392cb0810cb52d6b0194d426346516a2fe2b23ba256b",
+      "size_bytes": 70761
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/main.rs",
+      "sha256": "69b97b84d83cd4c26bc75b03a2b09f55f9c78bed836963a748b51a659ba000b3",
+      "size_bytes": 236242
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/mcp.rs",
+      "sha256": "1d5bbf99623068b2b5b7762ed8d48ca51a85554d78752c2386439dbbb600fa6c",
+      "size_bytes": 117241
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/protocol.rs",
+      "sha256": "47a8259e70f51e8c09e814217b0216671ec69c2f7513648a0102e7bc73cb40ce",
+      "size_bytes": 47995
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/redaction.rs",
+      "sha256": "1d7acb34294f5a019f15ecfcea467b3b05150a2651a629667287272b4ba48c95",
+      "size_bytes": 11018
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/serve.rs",
+      "sha256": "1744c6fbddc3df728870d5c0024e9a80e407305a943d51a8d05754a2fa902de6",
+      "size_bytes": 45304
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/tui/core.rs",
+      "sha256": "0432d98639f88490864c3cb70e4228f35e30dcff5e64ac0417e776104190fe64",
+      "size_bytes": 47536
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/tui/mod.rs",
+      "sha256": "2519b6363aa23d35ec2e5b505155025502eed9bf12333e513f7751fc36e48f80",
+      "size_bytes": 25206
+    },
+    {
+      "path": "crates/agent-session-grep-cli/src/web/index.html",
+      "sha256": "248c7b9d848712ef65572c87df82c621a7876dc4c86f557e19113d3266d16331",
+      "size_bytes": 16084
+    },
+    {
+      "path": "crates/agent-session-grep-cli/tests/e2e.rs",
+      "sha256": "efa9f709c27d6379c30a59c7ffbeb820bf4ce470a70b22f9edfb423362cc83bb",
+      "size_bytes": 205888
+    },
+    {
+      "path": "crates/agent-session-grep-cli/tests/e2e_consistency.rs",
+      "sha256": "f4ff2f538a0d8fa8fa545fff5b6fa718079190a48862bc3646bdae200c193e3e",
+      "size_bytes": 5490
+    },
+    {
+      "path": "crates/agent-session-grep-cli/tests/mcp_e2e.rs",
+      "sha256": "8f85580f8a7bda43016b2e975b40aca373ec35b8ee8231b23052468a4dc14094",
+      "size_bytes": 75665
+    },
+    {
+      "path": "crates/agent-session-grep-cli/tests/network_egress.rs",
+      "sha256": "6c5e51bf6887853764af71680d86da7f8de7b51fd914acf18b01376536a07a35",
+      "size_bytes": 4525
+    },
+    {
+      "path": "crates/agent-session-grep-cli/tests/provider_matrix.rs",
+      "sha256": "d97fbb6fcc82b4d5f9a45d19b473ee5a2b1328de5284e26d869d78404af75a4e",
+      "size_bytes": 14633
+    },
+    {
+      "path": "crates/agent-session-grep-domain/Cargo.toml",
+      "sha256": "2d7a2bfa886a50ebb145f7dbbacee99749a763b99a595b47073066be6f33cb7a",
+      "size_bytes": 304
+    },
+    {
+      "path": "crates/agent-session-grep-domain/src/error.rs",
+      "sha256": "19b5cc39a59a775880f987df5fbd56964c48f456544c51abbc85b73a6b4bbf3d",
+      "size_bytes": 2474
+    },
+    {
+      "path": "crates/agent-session-grep-domain/src/ids.rs",
+      "sha256": "be5cdac7c823954d11f6a2c6440f2704cb01e6c1428e391d94569f7c1adda41a",
+      "size_bytes": 38910
+    },
+    {
+      "path": "crates/agent-session-grep-domain/src/lib.rs",
+      "sha256": "3f9d4c22929447e0554de648d96e0e855c39de02c56d69f8597d21b5d79af54d",
+      "size_bytes": 29562
+    },
+    {
+      "path": "crates/agent-session-grep-domain/src/thread.rs",
+      "sha256": "a1c91d06463c16f6d9e352e6aef86429f2e246bb66cc19e2943d227e0c542a1c",
+      "size_bytes": 49838
+    },
+    {
+      "path": "crates/agent-session-grep-ports/Cargo.toml",
+      "sha256": "2deb74fa6422ad282a609ff7a6978119db72c4efd1e3564ccc6e1fe9e8743495",
+      "size_bytes": 358
+    },
+    {
+      "path": "crates/agent-session-grep-ports/src/capability.rs",
+      "sha256": "bc1fbda5428e3a4344ded1c1213b58d5a2681c72ac16346d073a705f8e8e65e1",
+      "size_bytes": 24079
+    },
+    {
+      "path": "crates/agent-session-grep-ports/src/handoff.rs",
+      "sha256": "023183938c628ddf889b9ee548490e54059a4d29415bc14589d0228e3fcd81d9",
+      "size_bytes": 9537
+    },
+    {
+      "path": "crates/agent-session-grep-ports/src/lib.rs",
+      "sha256": "ef0e5196257e497a97ae61e70cdf24e4f2c2029cf43ab60e20b11db0585e0c50",
+      "size_bytes": 71325
+    },
+    {
+      "path": "crates/agent-session-grep-ports/src/manifest.rs",
+      "sha256": "c79386d6ee72c7f17c5c4e9fdc1725a8b4b88dae2c2499ecfca6b95cae3868f1",
+      "size_bytes": 11012
+    },
+    {
+      "path": "crates/agent-session-grep-ports/src/redact.rs",
+      "sha256": "90327a5cd3c20b6d978ab4c51a86cc4a2be10b7e48d48c5ecd2d744ddd004774",
+      "size_bytes": 13307
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/Cargo.toml",
+      "sha256": "e406fb1c4ef16951e23ebd385ba350f8a0792fa6d444c467758da4cb007ea17b",
+      "size_bytes": 513
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/src/lib.rs",
+      "sha256": "d3ffb128485acf83703e388262847003f0619d6039533dd540bbbf6ad2b64318",
+      "size_bytes": 13140
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/tests/golden.rs",
+      "sha256": "b18d1a6073a33615c4ccda33ecf056f3412bc81456e2ca76426122b45b9a3c78",
+      "size_bytes": 7514
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/tests/golden/PROVENANCE.md",
+      "sha256": "73033f626a021cc191413b8bf5ebe8132bc79aa324f911bd4671adef13034c77",
+      "size_bytes": 2360
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/tests/golden/basic.expected.json",
+      "sha256": "442c5b168867818c45bbdfdc5447fff90d70d2428a82bbae72f2b7ba019c3779",
+      "size_bytes": 1402
+    },
+    {
+      "path": "crates/agent-session-grep-provider-aider/tests/golden/basic.md",
+      "sha256": "0f42a3b1694ed3f99785f3ec5418679f295986faa541b4741f713f21d4f4a771",
+      "size_bytes": 194
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/Cargo.toml",
+      "sha256": "32c2383abba2849f57cc2910fbd2759b2bf0d142b8332c8007794a71c73d84ab",
+      "size_bytes": 519
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/src/lib.rs",
+      "sha256": "8b9120d5836297aff68571079f013a6998ca3fe31df45e6a4ab6176b7806575c",
+      "size_bytes": 18458
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/tests/golden.rs",
+      "sha256": "09d7e9def04eb0f6524f86079ec3c61d2bc9d1dab9e3452f76f0caaf72d6884b",
+      "size_bytes": 8061
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/tests/golden/PROVENANCE.md",
+      "sha256": "c922edfd9c6a01aded68fff7d3219d6e743dcee8b5e946b7e55d8e71ab5dbe6e",
+      "size_bytes": 2856
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/tests/golden/basic.expected.json",
+      "sha256": "179447876e550d2e0bae514f120831f9ff7d652545a171d0925ecc8090f0fc70",
+      "size_bytes": 1343
+    },
+    {
+      "path": "crates/agent-session-grep-provider-antigravity/tests/golden/basic.jsonl",
+      "sha256": "5448ad7e44c1f210e3ac67a520ab2fc4e82b0da6a5570391204c572d4996e05c",
+      "size_bytes": 877
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/Cargo.toml",
+      "sha256": "6ef1f8894c78fe233cde8c06b4f6d97cf905158199b74758ba88038eac21f9ec",
+      "size_bytes": 514
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/src/lib.rs",
+      "sha256": "1866ca1b4896487d18d8861d20187a936bf5de67ca64637a92078e5dbe9bfdf2",
+      "size_bytes": 86209
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/tests/golden.rs",
+      "sha256": "f87b0676b26c389192bd8687c2032fe25710a20e4b00a15d7ff17d62b093bb01",
+      "size_bytes": 8542
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/tests/golden/PROVENANCE.md",
+      "sha256": "0f06a058a7a05d7d1ce93fc78e3a76b7130424b7d8d45bca5e3bd7e188d3a91d",
+      "size_bytes": 3022
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/tests/golden/basic.expected.json",
+      "sha256": "fa75cdaea4e0d30a1c1a8c8e732596171a3a60831ce8516635fa73ca303ee11f",
+      "size_bytes": 2058
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/tests/golden/basic.jsonl",
+      "sha256": "66021f365d0531a3088e06d08e2e6c19ddba378adee17718ee65439592b6bb48",
+      "size_bytes": 2223
+    },
+    {
+      "path": "crates/agent-session-grep-provider-claude/tests/properties.rs",
+      "sha256": "905929bca0d1ce6a243fbbb2bab9e86862b5e09ecf797323d57298c4cbee5a3d",
+      "size_bytes": 18828
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/Cargo.toml",
+      "sha256": "c8f0fde686b2bfa1a72bfe50a61ce83a740e8c1e4cf90ee9c1ca9f3d82254cda",
+      "size_bytes": 513
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/src/lib.rs",
+      "sha256": "de60d3f2bdfb9e2a884b5f87eaa28fadf9a52a5d486a881a0cfcb1ddfc2f2a92",
+      "size_bytes": 11510
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/tests/golden.rs",
+      "sha256": "4cbd9e0ecb29de816c98e2f8720a2b0ef5d2293faf4e90d138a5511d38c71f34",
+      "size_bytes": 6823
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/tests/golden/PROVENANCE.md",
+      "sha256": "0a4a0159e7fccd077adb667904f9428bcde566a7eb55cfde382c92bd7b618b10",
+      "size_bytes": 2319
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/tests/golden/basic.expected.json",
+      "sha256": "b54395e1ed34f08a30ac2f513b1c661b754527f2cbb2323d8301857a17aa6125",
+      "size_bytes": 1123
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cline/tests/golden/basic.json",
+      "sha256": "101636ec3e9fdaa9ea094aab2daa89eee08eaa12a011770b3b3ee6f308e45795",
+      "size_bytes": 379
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/Cargo.toml",
+      "sha256": "bb94ccf36be0f4edf29f2371aecffc6b0a02ea81098f814319fd37b1e0cec9a7",
+      "size_bytes": 517
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/src/lib.rs",
+      "sha256": "c9f9d05f6b9ff4b56f2d30dc068de57349162a5602b6c0238e348a7d07d90456",
+      "size_bytes": 22316
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/tests/golden.rs",
+      "sha256": "9f60c0c03722b074ad3078f1dde53f63e55782f03b17ccea5a9315100f60c1e5",
+      "size_bytes": 7961
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/tests/golden/PROVENANCE.md",
+      "sha256": "c170198fb3bd0eea25fe9c5f4af1cd2c8089794df189411e5f60b21351412f03",
+      "size_bytes": 2583
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/tests/golden/basic.expected.json",
+      "sha256": "d1869f2baccc7aca76b2f6248d5a8a76296671eec7dcd48064c2fb238ab61c8a",
+      "size_bytes": 1055
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codebuddy/tests/golden/basic.jsonl",
+      "sha256": "c0a4d8c43a9a5cb7d29e91915f1e5e5c4444c9981c4fd404de6c4db00c78187e",
+      "size_bytes": 580
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/Cargo.toml",
+      "sha256": "c923532bc2c835c064e58db9d0bb8b410eb7e9a2052956c49de5ab3b84449a2c",
+      "size_bytes": 513
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/src/lib.rs",
+      "sha256": "3eb2d23612c5fe23e2046f0c62c2feee07c4a11c0684f6e8f29eb886f4c11b1b",
+      "size_bytes": 75509
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/tests/golden.rs",
+      "sha256": "cb51dfe104c36ed489a97e16c69a06635cdc859101f36e520e2a26c504590b5b",
+      "size_bytes": 8892
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/tests/golden/PROVENANCE.md",
+      "sha256": "1ecea86cc553f92d28450b660af5d31becb2e13389affdf79f4a903c29dd700a",
+      "size_bytes": 2763
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/tests/golden/basic.expected.json",
+      "sha256": "f9f65b9c8cfd8a9ec075830276eb5121086d5d3b4cbfa6de2520c7c16a9f0502",
+      "size_bytes": 1170
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/tests/golden/basic.jsonl",
+      "sha256": "67be2ba30b3dde89040dc5874d114053663572b411970752b0dbe925c58715cb",
+      "size_bytes": 1853
+    },
+    {
+      "path": "crates/agent-session-grep-provider-codex/tests/properties.rs",
+      "sha256": "7158f5e8b8c01b5842e2740ed19d68a55dbef66cc3389953a7a59e352881efa5",
+      "size_bytes": 17397
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/Cargo.toml",
+      "sha256": "6198fa7c63ae271a8b1a8e40a892635a8576024cd2e6a0510c2f7fa1f65f381c",
+      "size_bytes": 526
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/src/lib.rs",
+      "sha256": "31ae57a2539d42e27228c516c4c9e60b51e65b6869d8f379d5276e579b265481",
+      "size_bytes": 26747
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/tests/golden.rs",
+      "sha256": "a0b013573154e2e9fff91cb5dff1a401bb39b251cbd94ca03addd0dce9152b30",
+      "size_bytes": 6753
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/tests/golden/PROVENANCE.md",
+      "sha256": "45116c351f997f61ef9772d32b33cfd69b87a988cb82a5ffba1c9b4f3f322b19",
+      "size_bytes": 2682
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/tests/golden/basic.db",
+      "sha256": "af01a6c3a2f4ad6f7c3f842834de96cc87dcb2a538f7b7251349e8042eb4260d",
+      "size_bytes": 12288
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/tests/golden/basic.expected.json",
+      "sha256": "5a7673f394fd31a248c32fef5e1c450537be9ce647c6fc324056f73fe1e87b58",
+      "size_bytes": 1540
+    },
+    {
+      "path": "crates/agent-session-grep-provider-cursor/tests/golden/generate_fixture.py",
+      "sha256": "10cb13d258330379dd1dc8e42662875d5d9abc0e4c3032375bbb2b742d582ebe",
+      "size_bytes": 2086
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/Cargo.toml",
+      "sha256": "1f4e12c329ece29e392bc648a08bb3ce2b9eb0dccf870ba3ed947ddc93f3bae7",
+      "size_bytes": 512
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/src/lib.rs",
+      "sha256": "2d65f6b9b9db08945276a02c80d1ad1d356fa8a87c0bb803203fdee5e5f8e9ba",
+      "size_bytes": 21110
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/tests/golden.rs",
+      "sha256": "5d48b14aca7ec8612d55efc4b60bebb17d5dc2682e4172e371c622484c43d054",
+      "size_bytes": 9093
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/tests/golden/PROVENANCE.md",
+      "sha256": "4172c52e73a33c97f79e33cf2f06b6390ab330bc96e92340c4e630084bd02b60",
+      "size_bytes": 3213
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/tests/golden/basic.expected.json",
+      "sha256": "0e471dcec7fd35a7b4ce24aa46452e27e0db1bc367763f9fd7ec2335fa1f73f2",
+      "size_bytes": 1584
+    },
+    {
+      "path": "crates/agent-session-grep-provider-grok/tests/golden/basic.jsonl",
+      "sha256": "7cb16fc98537c1c7b2011f461bdf78b40cd4e08e915aed3c470b07de49f1d0e5",
+      "size_bytes": 1141
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/Cargo.toml",
+      "sha256": "a987f39f07c4f44c795cfbf675532fed7748e41e73196686ebc712b81f6c5265",
+      "size_bytes": 444
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/src/lib.rs",
+      "sha256": "2f5a9c5b47f46c4bb6ae108d82491abf542517dafa060a8f1074cb769ef0613e",
+      "size_bytes": 14399
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/tests/golden.rs",
+      "sha256": "e229ca1b88e7b6b681eff4e7b99cde8f7a8797615ccb6ab5d6a40d560903fd28",
+      "size_bytes": 6780
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/tests/golden/PROVENANCE.md",
+      "sha256": "b13ee398fd7a7e9b186c7ef12f81116f1af0d6f36fa31977058597d44934ad60",
+      "size_bytes": 2297
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/tests/golden/basic.expected.json",
+      "sha256": "81fbf7b9741cf427c42b3dcd956e291d2c39a861ef9ed485a307e2882481bfdd",
+      "size_bytes": 993
+    },
+    {
+      "path": "crates/agent-session-grep-provider-hermes/tests/golden/basic.json",
+      "sha256": "65d29f4ce977a8996eb7325eaa3b7ce5a27daf8d621f571839bd8493c228f5ce",
+      "size_bytes": 690
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/Cargo.toml",
+      "sha256": "e1a8778176033de20bd52475d4fa29fb4b89fcf6932f8d3d2f5625d77191e698",
+      "size_bytes": 512
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/src/lib.rs",
+      "sha256": "b0ea1348df9eba3d2c0a921f372a1ec8b96a29a7ed3ed40bad8fcf0d6a5231db",
+      "size_bytes": 13581
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/tests/golden.rs",
+      "sha256": "a1b043826bf7dc58be49beb1e6aa024473f965e3389bcdb5047715bda16c5500",
+      "size_bytes": 7979
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/tests/golden/PROVENANCE.md",
+      "sha256": "d33408a3bd1a447241598e451264211f26c5076ec53d03645c5c4e7a8f022b37",
+      "size_bytes": 2257
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/tests/golden/basic.expected.json",
+      "sha256": "95157ed5a3fcd2c5936d1af4e196dfc73d760c0d5d33ee845be183fb10a1f2e2",
+      "size_bytes": 736
+    },
+    {
+      "path": "crates/agent-session-grep-provider-kimi/tests/golden/basic.jsonl",
+      "sha256": "3b33a155b5df97fcfa9bd7272e757541e44c48b4d6a32542293cc2934018497f",
+      "size_bytes": 454
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/Cargo.toml",
+      "sha256": "718a1c65e239525874448e1a8e21a677a5fed9123a880becbafe794247f67049",
+      "size_bytes": 516
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/src/lib.rs",
+      "sha256": "e484edeec517f44b504794dcd39a997dd59b7f3090a06bf470aaf5c61f747301",
+      "size_bytes": 17639
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/tests/golden.rs",
+      "sha256": "fb843b82748ed253a0c73de7b5357da762695042638c62a991284198b96c0313",
+      "size_bytes": 7957
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/tests/golden/PROVENANCE.md",
+      "sha256": "ac6b5a8c7a64449daa27b21d07a9e7071ceadc273ccc3e31affbe25e8f183075",
+      "size_bytes": 2433
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/tests/golden/basic.expected.json",
+      "sha256": "487139336c7e5cab87996207f4da9d5dab6a83f0a6cdfc2e37e3640576900035",
+      "size_bytes": 1060
+    },
+    {
+      "path": "crates/agent-session-grep-provider-openclaw/tests/golden/basic.jsonl",
+      "sha256": "18f4edd84ef60a40d559bf1f610f7a9b40d754ac12c0e94cc63f570ecc424867",
+      "size_bytes": 524
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/Cargo.toml",
+      "sha256": "446e25cea8ccbc0f608675e968450b590c98fc4489ab6d8f5f80fa895a386f1a",
+      "size_bytes": 598
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/src/lib.rs",
+      "sha256": "c5688edd493719cd83a753006cbeea16282e36237f37963edddd062894a4420c",
+      "size_bytes": 15113
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/tests/golden.rs",
+      "sha256": "733f452202b1148c5747413ed68d54845484c7bdef333e15df88ac409cfe23cb",
+      "size_bytes": 6761
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/tests/golden/PROVENANCE.md",
+      "sha256": "df6ba0029262c4b9164ff61b06d6c0c6932ff1daea04285edc3ca61b2fc54da8",
+      "size_bytes": 2737
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/tests/golden/basic.db",
+      "sha256": "e12c58212870db2927040af87aaa92e4f08e04ba91510b650de4fccaa02aa396",
+      "size_bytes": 28672
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/tests/golden/basic.expected.json",
+      "sha256": "7a79cf004ba8958615fdd419f13462518682cef101995a28fc8c4be7e0a385d3",
+      "size_bytes": 882
+    },
+    {
+      "path": "crates/agent-session-grep-provider-opencode/tests/golden/generate_fixture.py",
+      "sha256": "9ece8942bd641be90d6e8fc69ac704c593586136b5303d75a76d2660d5b27caa",
+      "size_bytes": 1954
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/Cargo.toml",
+      "sha256": "15700de5ea686942e40007386e119ac8ac44c06b1ddbfda092f96c9927ae57a8",
+      "size_bytes": 510
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/src/lib.rs",
+      "sha256": "a80abbc0b0a601a4436ddab7b277ece46be2399f8ba634f7be93651d0145174c",
+      "size_bytes": 17025
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/tests/golden.rs",
+      "sha256": "bcc55b5d48bdc8efcfb6702e8036cc0e3505eefbbc25e23c9eb17744b70759a1",
+      "size_bytes": 7897
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/tests/golden/PROVENANCE.md",
+      "sha256": "028c578c0ab70849c72b1b5de2dd47d2562710bce59762509f7e8a4aa0ef8240",
+      "size_bytes": 2543
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/tests/golden/basic.expected.json",
+      "sha256": "8ed79126508bb786323424dfc842bf2a4a70cc12714766eb4664c7c01d3b3bff",
+      "size_bytes": 1042
+    },
+    {
+      "path": "crates/agent-session-grep-provider-pi/tests/golden/basic.jsonl",
+      "sha256": "4b3ac40547cc3c65c5b4eb872c9772e7e826d62de770f2bc17476e360b79b7ad",
+      "size_bytes": 574
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/Cargo.toml",
+      "sha256": "b3c5a36a4c4aa4ac886cdc5e3d62ac5f5afd58c7aeec0959acbf6ebc78857152",
+      "size_bytes": 513
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/src/lib.rs",
+      "sha256": "29207e1b354bfbd8e084b76b7b5ae79926f1478f99c119ab6b2fabf82fae2149",
+      "size_bytes": 19950
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/tests/golden.rs",
+      "sha256": "1a18bf05d657a5da5adbbf130f3d7f26312fd1428163226332d6075aea7fb6ce",
+      "size_bytes": 7766
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/tests/golden/PROVENANCE.md",
+      "sha256": "c4c00b0d7523c5a8557d914cd2b0e022e251815325e1b1fad2e27aae7f721cfd",
+      "size_bytes": 2511
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/tests/golden/basic.expected.json",
+      "sha256": "929ac685a81c363f5e6fb3d014ba09d8e84137647b54fa6835e591e0deab6b22",
+      "size_bytes": 1043
+    },
+    {
+      "path": "crates/agent-session-grep-provider-qoder/tests/golden/basic.jsonl",
+      "sha256": "21c1858ff1c603025da82dce779d7a7aa9ca150b24c9f5a943fe972ed2a4fe80",
+      "size_bytes": 573
+    },
+    {
+      "path": "crates/agent-session-grep-testkit/Cargo.toml",
+      "sha256": "9834df3c917ed78a4fb78bc88e0e327b5dde8e0d67c790c2c39440e7bb384eb3",
+      "size_bytes": 345
+    },
+    {
+      "path": "crates/agent-session-grep-testkit/src/lib.rs",
+      "sha256": "af747246169d42ea56ba59951fb40414cb8b9b54b4104b50b029902696b0801d",
+      "size_bytes": 34951
+    },
+    {
+      "path": "deny.toml",
+      "sha256": "88913015a1a642bf7b888ae5411a81c2b847b8f3b48fdc7664044f2820ddf391",
+      "size_bytes": 2745
+    },
+    {
+      "path": "docs/PROVIDER-ADAPTER-CONTRIBUTOR-GUIDE.md",
+      "sha256": "ec1843756335691cd194175b8aed9d239a39bd25f1757eb0f18765dc2f986b35",
+      "size_bytes": 12118
+    },
+    {
+      "path": "docs/adr/ADR-0001-fulltext-search-engine.md",
+      "sha256": "b8f09525ecc4c255baaf80db4a90f20763141f9da680c984130812da60a0b25a",
+      "size_bytes": 3740
+    },
+    {
+      "path": "docs/adr/ADR-0002-platform-targets.md",
+      "sha256": "80618454abb8e1a39ec23a7383daa66665e1c002ad1309c58eb69b0cfde09572",
+      "size_bytes": 3809
+    },
+    {
+      "path": "docs/adr/ADR-0003-plain-text-only-search.md",
+      "sha256": "4de4760dbaefe245e48a33344f8445c0224d34008be0ec81c8b9c32be41cb1a6",
+      "size_bytes": 1772
+    },
+    {
+      "path": "docs/adr/ADR-0004-output-time-snippet-redaction.md",
+      "sha256": "7a557295cc1563a89404c1961258a502339a47105ab956e55735be2df49576a3",
+      "size_bytes": 1656
+    },
+    {
+      "path": "docs/adr/ADR-0005-not-found-exit-4.md",
+      "sha256": "2a57b3c2620e6ab32872acd029d1edda4e4731a7aace5435a46f7d3e7904d5f7",
+      "size_bytes": 1189
+    },
+    {
+      "path": "docs/adr/ADR-0006-machine-mode-help-envelope.md",
+      "sha256": "3679ac143b29f116675ac4a58ec1e8bec175c1cd32428f3123bc42968ecad29c",
+      "size_bytes": 1321
+    },
+    {
+      "path": "docs/adr/ADR-0007-cjk-bigram-indexing.md",
+      "sha256": "19cd561ac0644619e1b2e277349318082f8c7ec0eee56b7d2f1e146320df4fdb",
+      "size_bytes": 1661
+    },
+    {
+      "path": "docs/adr/ADR-0008-search-hit-session-context.md",
+      "sha256": "762cc20d77fae423f5178bc973d18068a50032ab008223f663b16b691406e7b2",
+      "size_bytes": 1411
+    },
+    {
+      "path": "docs/adr/ADR-0009-cross-boundary-output-redaction.md",
+      "sha256": "d46a7e281bd8c4549c6dcf7a5c59197398332b8a48189ab384dbf232fc052be7",
+      "size_bytes": 2387
+    },
+    {
+      "path": "docs/adr/ADR-0009-session-resume-metadata.md",
+      "sha256": "c7c8764f537addde06cbf98a703d6c5a5d0d03c57cc5880458645ac6940c1971",
+      "size_bytes": 2725
+    },
+    {
+      "path": "docs/adr/ADR-0010-provider-maturity-rollback.md",
+      "sha256": "4543b356d270c22bea393883d82cbd80c03ebda5bb0653ea6ca34669af930037",
+      "size_bytes": 7372
+    },
+    {
+      "path": "docs/architecture/R0-ARCHITECTURE-REVIEW.md",
+      "sha256": "847d80e9bf7b5c7d882daf4603ea098693f643a776ceef0df5fdcbc81ea4252a",
+      "size_bytes": 8183
+    },
+    {
+      "path": "docs/architecture/RFC-0001-canonical-model-and-stable-id.md",
+      "sha256": "21bbde832d456f1ad358101c909cbba79c2ef1f70bcc73716659cec5dd3ba4f2",
+      "size_bytes": 9172
+    },
+    {
+      "path": "docs/architecture/RFC-0002-provider-adapter-contract.md",
+      "sha256": "597d4cc9d43769bd5f884ecc7abec3e0ad772e8e1015637b83a8477383d6ee9c",
+      "size_bytes": 7854
+    },
+    {
+      "path": "docs/contracts/CONTRACT-cli-robot-mcp-draft.md",
+      "sha256": "d936454bb8e2d856f71beb04c3892a83375d95262a541c8a4628b8f6408998fb",
+      "size_bytes": 5997
+    },
+    {
+      "path": "docs/evidence/core-beta/88d86f4/core-beta-benchmark-full.json",
+      "sha256": "bf8b51d6f8ea8b3bc95ef9cf4096a052c60f83608ac4269b1cbdb10ee971e538",
+      "size_bytes": 28130
+    },
+    {
+      "path": "docs/evidence/core-beta/88d86f4/core-beta-benchmark-full.md",
+      "sha256": "582f6dfd36486b3822e4193a14a36275e9485be32f9b7e5ee78c34736eec727a",
+      "size_bytes": 2778
+    },
+    {
+      "path": "docs/evidence/core-beta/88d86f4/linux-wsl2-build-test-smoke.txt",
+      "sha256": "92d81b95f6c294b54fa824bb75abed989b1299697c863c514c47e5b4b41b113e",
+      "size_bytes": 14230
+    },
+    {
+      "path": "docs/evidence/core-beta/88d86f4/manifest.md",
+      "sha256": "079a99c87e3a3b1a8d1f44b0fe8ee830735e55d43078777a64372a79cf5ab30c",
+      "size_bytes": 5988
+    },
+    {
+      "path": "docs/evidence/core-beta/88d86f4/windows-wal-snapshot-spike.txt",
+      "sha256": "09a491a3cae4dee441b88d1050a18dd98fc3218f698dbe34c2a7599230993f1b",
+      "size_bytes": 1135
+    },
+    {
+      "path": "docs/evidence/integration-beta/real-data-regression.md",
+      "sha256": "33e65324ceb27138e35414b642c205269275b1a04ef6c9db3b9418e55cb6bbb7",
+      "size_bytes": 9825
+    },
+    {
+      "path": "docs/operations/INSTALL-AND-UPGRADE.md",
+      "sha256": "c68bf24036568327fffb0be05561ee48be4b51f2680a471aa4f513c03afead67",
+      "size_bytes": 7836
+    },
+    {
+      "path": "docs/operations/PUBLIC-HISTORY-SCRUB.md",
+      "sha256": "19c5c97b4e38d55c94e04f35cab45d1fba9581f2c12a3af34421d8316b1acc2c",
+      "size_bytes": 11317
+    },
+    {
+      "path": "docs/operations/REAL-DATA-REGRESSION.md",
+      "sha256": "1eeb17827916ede7f7e71cf48dad1d13a5d95f2e034cddd830f53ad114c7fc5b",
+      "size_bytes": 8153
+    },
+    {
+      "path": "docs/operations/REUSE-LICENSE-AUDIT.md",
+      "sha256": "9ac04834e7f05f0f688a6c8d0dbae8d3bd853695d7b2dea596d27b351fe87774",
+      "size_bytes": 9523
+    },
+    {
+      "path": "docs/operations/SEMANTIC-MODEL-BUNDLE.md",
+      "sha256": "cddbd84e17c162d9682da76e5d10cc417f6394323dfbe7c31bbc294b07453346",
+      "size_bytes": 7715
+    },
+    {
+      "path": "docs/operations/core-beta-evidence-matrix.md",
+      "sha256": "3e90b55c68368be7e94fcf346430625af6e7c391c54414a0570e949c772c4ed6",
+      "size_bytes": 14598
+    },
+    {
+      "path": "docs/operations/external-readiness-gate.md",
+      "sha256": "033d1a5c20bc4a697bc4ef74af47ff3eaac15a09ac789cdf2e88918b55bc6475",
+      "size_bytes": 3931
+    },
+    {
+      "path": "docs/operations/migration-v5-to-v6.md",
+      "sha256": "4dbb1f8cd61248ab12c1b954f93bddaf24f3697143ec5715f82893943a37040f",
+      "size_bytes": 2070
+    },
+    {
+      "path": "docs/operations/migration-v6-to-v7.md",
+      "sha256": "319d07d6bbf6c6ba3bfc45c96e09a74253adaf34018aade95744db00d773ab97",
+      "size_bytes": 4140
+    },
+    {
+      "path": "docs/operations/rebuild-and-migration-runbook.md",
+      "sha256": "5b5f18042a3e1019e3b471eba4157918e882f57afd05cb443674d6885327e39a",
+      "size_bytes": 11261
+    },
+    {
+      "path": "docs/performance-baseline-0.2.md",
+      "sha256": "ba1836b8d686695864f2581046f32535bef737ecf5ed9947aa3501d86a92f63d",
+      "size_bytes": 5235
+    },
+    {
+      "path": "docs/product/COMPETITOR-COMPARISON.md",
+      "sha256": "3a31be4730bcd7dbdade44cdb9b3b10400b1d3414852be633cb87cb7ca8e3729",
+      "size_bytes": 4256
+    },
+    {
+      "path": "docs/product/OPEN-SOURCE-ROADMAP.md",
+      "sha256": "5164a119a07ebc115af130cf2a7c3cd60771869017227ea24c3bed725115ea47",
+      "size_bytes": 10333
+    },
+    {
+      "path": "docs/product/PROVIDER-BETA-READINESS.md",
+      "sha256": "1fc97f0d90910167da81f1ad6c9e17e81a1b7ae2cff007a613fbd9d2c02fa441",
+      "size_bytes": 3333
+    },
+    {
+      "path": "docs/product/PROVIDER-MATURITY-MATRIX.md",
+      "sha256": "b700371d6e70a277d15471456a5346ca8a3198a8e0d7057d7d2c0737a4f9a9cf",
+      "size_bytes": 16279
+    },
+    {
+      "path": "docs/product/SLI-AND-BENCHMARK-FORMAT.md",
+      "sha256": "4b9dad078189e373e9a12f636accb84c9f7daaed5485a260a967a649cc2a561e",
+      "size_bytes": 5955
+    },
+    {
+      "path": "docs/release/environment-manifest.template.json",
+      "sha256": "f9d8586e2182bd7e79becf75edaab3755f5264d5f3f6c1b09086777ce51bec6e",
+      "size_bytes": 1449
+    },
+    {
+      "path": "docs/release/go-no-go.2026-08-16.md",
+      "sha256": "7cfc60e180341f1e1c056a9b0d5fb542dd0c7012a89fd3a686e0f218ad025bf2",
+      "size_bytes": 10212
+    },
+    {
+      "path": "docs/release/go-no-go.template.md",
+      "sha256": "78ffff771dc38242852e2a9ec04462feb6ee5a1adab2ae10c51edf4d8aa85488",
+      "size_bytes": 3122
+    },
+    {
+      "path": "docs/release/rehearsal-runbook.md",
+      "sha256": "60a7c9e2b4fabd5d3dff1d5d587c387e09d02098407c17d6b432b0504116ec5e",
+      "size_bytes": 15637
+    },
+    {
+      "path": "docs/security/FIXTURE-REDACTION-POLICY.md",
+      "sha256": "e36084ceaa15c6862c1127cec37a75d8bbd5c36937ec38fed748caf9d378c110",
+      "size_bytes": 2587
+    },
+    {
+      "path": "docs/security/THREAT-MODEL.md",
+      "sha256": "696944eeb1f50a7d5fdf8626d9007d540eab92d491408a53511ccd2f0d609e6c",
+      "size_bytes": 8207
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "2c191134b8b237019bc369f5878d9a9758f4b19dd8f67c02ae83130281f6e31f",
+      "size_bytes": 103
+    },
+    {
+      "path": "schemas/handoff/v1/pack.schema.json",
+      "sha256": "e904a517cd834f509aaf65ec2fed295ae5531306e8cf1ce3ce42e327885a7f06",
+      "size_bytes": 10203
+    },
+    {
+      "path": "schemas/robot/v1.1/envelope.schema.json",
+      "sha256": "37095779afe21a5a1dad4562cebe11aaf51c37bd21a8839ac0b08e79e866babe",
+      "size_bytes": 9243
+    },
+    {
+      "path": "schemas/robot/v1/envelope.schema.json",
+      "sha256": "847d494e35d8c0710aa49abe70718576dff3ff0d50b69dca701bbb60bcb2072c",
+      "size_bytes": 5897
+    },
+    {
+      "path": "schemas/robot/v1/error-catalog.json",
+      "sha256": "2822d59589cfdb75b859dbd03af7fd179ec80c7405442a3e9a736feef0cd8988",
+      "size_bytes": 4080
+    },
+    {
+      "path": "scripts/benchmark.py",
+      "sha256": "4d1a48010c5aaaf1e7f43a8ec4826befc3d31f81fe5285cfbdeeecb86f82841c",
+      "size_bytes": 6503
+    },
+    {
+      "path": "scripts/evidence/core_beta_benchmark.py",
+      "sha256": "2e5383ff68a332186f383486917860b52f5c0cc96f336490af0f26549f50d287",
+      "size_bytes": 36044
+    },
+    {
+      "path": "scripts/evidence/fixtures/gate/claude/session-alpha.jsonl",
+      "sha256": "b7ee2235bf5b26c7708236f883d6911f439f83b6739c5b4f7421a10b9376e1d5",
+      "size_bytes": 1103
+    },
+    {
+      "path": "scripts/evidence/fixtures/gate/claude/session-beta.jsonl",
+      "sha256": "c50b5efc361b50f8551b1bc26e4b22c7b0427c605b3aed36e84fb1ee48f67817",
+      "size_bytes": 1121
+    },
+    {
+      "path": "scripts/evidence/fixtures/gate/codex/rollout-gamma.jsonl",
+      "sha256": "2d52f1e0136e7944c8883953546a68be5948119eba8c4be239a466b4c1c36cf3",
+      "size_bytes": 1258
+    },
+    {
+      "path": "scripts/evidence/fixtures/gate/labels.json",
+      "sha256": "5cd06a2e57bfbabc9fb23f362c9ddccc9da554ebe8c5395967a70caae58f82dc",
+      "size_bytes": 2215
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0001.jsonl",
+      "sha256": "be2be00f16a5b42130e3c3959548c71c87a8cddfb8bd0cb91e4928bf863246d4",
+      "size_bytes": 3351
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0002.jsonl",
+      "sha256": "d23b5c9a4f239e331e2c85fef9fe844e5df834c08349be6135f949bdf995e869",
+      "size_bytes": 3448
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0003.jsonl",
+      "sha256": "a9810970c27525233d2415f8c1630eaf9eddf7b9cf44360350c8897c823bc356",
+      "size_bytes": 3215
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0004.jsonl",
+      "sha256": "dc47de05ed5c881d9951e765fe5793dd55abe3e2be2c56176b3793bda1433153",
+      "size_bytes": 3557
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0005.jsonl",
+      "sha256": "07888ffb2d163100e70dfb557707f877a1919eb17562f87911b42a8041011223",
+      "size_bytes": 3321
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0006.jsonl",
+      "sha256": "8ed0f9ecdd3bcc5354d918ff586646c7d6c7f561ff499e0e0309f9810f168577",
+      "size_bytes": 3288
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0007.jsonl",
+      "sha256": "5ce8ccfead87f0d2e0bc7100fd330b9c11216675397a8aadb7ed49165731659a",
+      "size_bytes": 3321
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0008.jsonl",
+      "sha256": "f63d31005a782b12669e9813721d553c8ab0231fa4f7e7bbdc6dcd448a178c5e",
+      "size_bytes": 3387
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0009.jsonl",
+      "sha256": "f46d07a60203b56e3310c4c67559ff86e007055765f1fcaf32f85e59e765c92d",
+      "size_bytes": 3277
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0010.jsonl",
+      "sha256": "4c1981d799eac51961fa0392c4c78e122d32eb30e7338eaeaeb7a8e59cb69aa6",
+      "size_bytes": 3248
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0011.jsonl",
+      "sha256": "a73ada8119fedcf77b35e3cf420abe5cf94c1d822d2153e9ec1998172a345acd",
+      "size_bytes": 3325
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0012.jsonl",
+      "sha256": "e28f9b74a7adc2fab21d255d448b83615a62ec76d095566806bcbb78f1d52298",
+      "size_bytes": 3229
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0013.jsonl",
+      "sha256": "80e36c5d100b9775efedd8ae9b8aca21327d1c785ad0349b422a76888bd776e9",
+      "size_bytes": 3373
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0014.jsonl",
+      "sha256": "4edf3828e5e33b03cdd01e320ea7443c77dcea7b1571b7d18847c0b0b62cbd4b",
+      "size_bytes": 3266
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0015.jsonl",
+      "sha256": "44ef333d287e6a9c4be42ee5bf72e3a7fa105c592ed6caa0923ed50b101e2d57",
+      "size_bytes": 3277
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0016.jsonl",
+      "sha256": "5961ee7e23370059ea03bf5242397c57e57397d618fff5f5ec241222d16eb0d5",
+      "size_bytes": 3466
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0017.jsonl",
+      "sha256": "f8f4f70c8a70f09077e267eed54d31db33828d1f4beab19370bbdb4ad8145551",
+      "size_bytes": 3271
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0018.jsonl",
+      "sha256": "ba6e3df029349e76c3d54677652b07a53729a66f7b5ef22b37e6cb128b3b1a2a",
+      "size_bytes": 3374
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0019.jsonl",
+      "sha256": "ee7124b43c8a808291c3706dc1d4f8ee26b0820e801c0b76910ed079816751ff",
+      "size_bytes": 3437
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0020.jsonl",
+      "sha256": "479076f8a27318623280fb806154120dc914909cc4342d8d0922975d3aebedd7",
+      "size_bytes": 3452
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0021.jsonl",
+      "sha256": "ea2776c7b7ad42e9ce6a3de435fdf2fd1b34df60edde81a8c5076fdbd58f94d1",
+      "size_bytes": 3226
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0022.jsonl",
+      "sha256": "d0fadb6059af6999dbf8664f0d01d7606c07257a66939016a51ecae14aa054b3",
+      "size_bytes": 3237
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0023.jsonl",
+      "sha256": "36fe4cbb43718e9c7623e08bd1cac70d0f2e2166ac55590a80dc56cb38d2515e",
+      "size_bytes": 3240
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0024.jsonl",
+      "sha256": "519ac812c0fc9d2f343676a4800793da3858736052f57e68b5a48a331481c201",
+      "size_bytes": 3344
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0025.jsonl",
+      "sha256": "5aa8bbe8e53f8678314cd71c08e1e69e56e484790708d9f79b1d3404ee6cdb63",
+      "size_bytes": 3422
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0026.jsonl",
+      "sha256": "520edcf058a2aa3a7e4c8ea49c3363143a3436cd6cc2531f2d6c285ef83f9b24",
+      "size_bytes": 3311
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0027.jsonl",
+      "sha256": "344959b29bee47e68c6b4375dfa24357ca72583cc5231fa8e19bee45dc6c0016",
+      "size_bytes": 3311
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0028.jsonl",
+      "sha256": "08cf6d0a91e7c67008aeda8efab34be9ba0ca94dd2079e690ff26f3c4fef4201",
+      "size_bytes": 3190
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0029.jsonl",
+      "sha256": "d3c9a7b5505621946521975c52e10a0900f4284e9e3279486581ebe46fe733ea",
+      "size_bytes": 3420
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0030.jsonl",
+      "sha256": "c4eeab0e70fa5751902275f3f0f41688d0a9084f3d2f252d856a6c59f962be0b",
+      "size_bytes": 3395
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0031.jsonl",
+      "sha256": "24a473500af92351848cdc0eba1c7df75362dbb064b62c5c9ee38de1cb4d27c9",
+      "size_bytes": 3361
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0032.jsonl",
+      "sha256": "548bae8a9bc1c06ec66c24c19e567515a6092018c111d0029012079283ade0da",
+      "size_bytes": 3213
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0033.jsonl",
+      "sha256": "ed1e55cc67a468ac50f81b72b5132666f8b98aec869e43f7c70f84c5ac0db3f7",
+      "size_bytes": 3606
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0034.jsonl",
+      "sha256": "7b6e4f4cd746fd025a35b375b34528a91b5339a5a550dd4406e89778676c7b19",
+      "size_bytes": 3296
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0035.jsonl",
+      "sha256": "435dc17e712119202ca9cc4a327709c362b1b4414be5bb7ef4aa7190f4c41414",
+      "size_bytes": 3309
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0036.jsonl",
+      "sha256": "51df6943ec2b66999dc463a094a76de69a953886ec9565cc135e8a4e5fe110a5",
+      "size_bytes": 3329
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0037.jsonl",
+      "sha256": "08478c723e6a984274d696c9e0ecaaf99a7dccca8a6551541a6c8e36f649417b",
+      "size_bytes": 3300
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0038.jsonl",
+      "sha256": "971fb9bab10c497da7fa1c06f3e6bbb389cfa2a79f11cce48c500347c6a5bbec",
+      "size_bytes": 3375
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0039.jsonl",
+      "sha256": "6b2f5a621c46cbb1882f762397b2cd35b4a4e4defce5b503baa645823d289151",
+      "size_bytes": 3500
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0040.jsonl",
+      "sha256": "eebe3fe52274bca8c081c4fc7cef0461f28cb83cefcc2dd167b7290c629e51c3",
+      "size_bytes": 3278
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0041.jsonl",
+      "sha256": "5e7c11d8e679e86d01344adc8514495503e90e41ad62f62fddfb37c64872009d",
+      "size_bytes": 3183
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0042.jsonl",
+      "sha256": "34749827fd086ddb11aeb579aad665e7cf6aa7f2412787a20d9938ee01c05fea",
+      "size_bytes": 3692
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0043.jsonl",
+      "sha256": "a4eaf4855de0ea2091bd19f63d9fbcfaff1712b6c598312f3f32062050c5d121",
+      "size_bytes": 3188
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0044.jsonl",
+      "sha256": "1f216a6ba33c305a83b28e9ab069362f70421ef787cb7200a98e516dbe900bb2",
+      "size_bytes": 3220
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0045.jsonl",
+      "sha256": "d025514438a974f06bb7ca352246297f72bee50c132895ad5028acd63d26a42f",
+      "size_bytes": 3434
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0046.jsonl",
+      "sha256": "c5907ad4e2dd8a600b7f575dea42afb93e67da8e739810caeda02c5db5f909d0",
+      "size_bytes": 3301
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0047.jsonl",
+      "sha256": "3624aea0388591b983b2795fd7f0d53be5e837cd755ff2056a0fea89e059e8d3",
+      "size_bytes": 3241
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0048.jsonl",
+      "sha256": "720621207735eb371669da9686cab812c8805db8ef13fedb9e6ebafaf87b59df",
+      "size_bytes": 3347
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0049.jsonl",
+      "sha256": "70c555eced998686e07ac45ccf917787f0e9de8d294d7c7399c31344832969fa",
+      "size_bytes": 3304
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0050.jsonl",
+      "sha256": "73616383f6bb2dc5ea6a57aca20edfc71ea29d173828db79c6a6807cae671360",
+      "size_bytes": 3256
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0051.jsonl",
+      "sha256": "5c84a18328d0528c7424ed1638a394f0af7f5057e8c6463ffed3273d518436cf",
+      "size_bytes": 3240
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0052.jsonl",
+      "sha256": "8c07fea980c152fa40fbf25d00771f22c05ad99bb7b5a71055d8958093813405",
+      "size_bytes": 3450
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0053.jsonl",
+      "sha256": "6c5fd6ea43c993a6ea43d10369f8dde4bb0f235e3f25d5b881381ae6c82c2975",
+      "size_bytes": 3326
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0054.jsonl",
+      "sha256": "0e85da02cd6905a5c444c1422cb6d77cea7c41aa643319d1a99fd083317a3531",
+      "size_bytes": 3307
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0055.jsonl",
+      "sha256": "3f66141517d25bddabcf56336246e27e300565caf1512df0857e5cd4bd5cd3ac",
+      "size_bytes": 3327
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0056.jsonl",
+      "sha256": "778e292039e0214c938874e677fc09d567fbc5c5849b4cf278d54e987bd75a0a",
+      "size_bytes": 3274
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0057.jsonl",
+      "sha256": "551f3413992060aa9de07fbb5cfea5c9109cc936a6c26414a1fdc0d9f46abd02",
+      "size_bytes": 3220
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0058.jsonl",
+      "sha256": "0f760b3c86a133ed937da675cd95fd5919067362cca4d01b2fac7d6d405e9004",
+      "size_bytes": 3290
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0059.jsonl",
+      "sha256": "48f79f75ba56fc64018b25f651334f5af354142cbe2796463bdcb1ea783ed357",
+      "size_bytes": 3359
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0060.jsonl",
+      "sha256": "19ee6d9547aef8b29de3bb43926c28b90172f98640ce561e98b5d59ea4ed177b",
+      "size_bytes": 3293
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0061.jsonl",
+      "sha256": "f47de8f3b3c3816f8c568ef3c564433b038487a4380a4d86779117ad18170647",
+      "size_bytes": 3460
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0062.jsonl",
+      "sha256": "6a9963782a20b000ec626a86a3ac9bdf0cbb92bb6bcc033b649c735ab85f0ba9",
+      "size_bytes": 3346
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0063.jsonl",
+      "sha256": "99752c10e4ca5d618d858cfaa016609b864d56479033dcbe2e6d8f0e53809bab",
+      "size_bytes": 3307
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0064.jsonl",
+      "sha256": "d9367c20154fd4dfa925dc391813d42f0cb41ba1a0bf647508739ed2ea5069de",
+      "size_bytes": 3417
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0065.jsonl",
+      "sha256": "3a17d26f705bdefaca9c6cabe785af19785af3d7b309f25850eae3f3ab01a4bc",
+      "size_bytes": 3359
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0066.jsonl",
+      "sha256": "2421b741307cf7d13f23471073e890dcd1aff72aa98bbe004e8967567ce3af5a",
+      "size_bytes": 3269
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0067.jsonl",
+      "sha256": "db1a9be939fa5662e81102d07662c9360f27b3d037e49f17968956de6128e6c3",
+      "size_bytes": 3413
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0068.jsonl",
+      "sha256": "3e96ff395280cffd931570c204ac38fc371e9e320d77c242eda0d427645ece6c",
+      "size_bytes": 3283
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0069.jsonl",
+      "sha256": "c4c54d0e98297dda0e0740ecdcbb96e9af40e8872ae4310eb3e209d3c2a01f58",
+      "size_bytes": 3334
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0070.jsonl",
+      "sha256": "6a2a603328a34bb49e38b3aac5b0d5d96573f03ede7c2e55e000b2952b6fa507",
+      "size_bytes": 3199
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0071.jsonl",
+      "sha256": "dc79de2e4ba13f37e8d1b7936d5f8d3ce789a02e105db1cbce2ceaa81428464f",
+      "size_bytes": 3520
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0072.jsonl",
+      "sha256": "f786d44e36b90c3338e78159fea6da57cbcab95250e43e5f2d80329057b4e113",
+      "size_bytes": 3373
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0073.jsonl",
+      "sha256": "51b4b167dfa822279ce1e31f073feb51765880a5bc9806cf44d6f9cbc6f41c34",
+      "size_bytes": 3251
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0074.jsonl",
+      "sha256": "31631e13766466d0f00644e9ffc7fd89f9823bc1225605cb4b89176ccf9023a8",
+      "size_bytes": 3432
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0075.jsonl",
+      "sha256": "a0b5ef7eb87c25a2a0a0acba30b8b67347c1962bcbfda737bab6bc065476867b",
+      "size_bytes": 3255
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0076.jsonl",
+      "sha256": "f580448c34952ff62d18dba573c88cf85faf61126b0c8f59a21cae2ad396c3ba",
+      "size_bytes": 3325
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0077.jsonl",
+      "sha256": "927a9153d0b656b05a8de1da66edf73ac84320aab9d614b79d44a2eb1129cb06",
+      "size_bytes": 3287
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0078.jsonl",
+      "sha256": "32eb772eb4ae6197ca266e8b9f0c962589717c1fd9ac6de16a6b161e35aa5f55",
+      "size_bytes": 3344
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0079.jsonl",
+      "sha256": "7012b8f0b711f81deaeb3424f459f285a3fdee13c13e9b72e32e638130876088",
+      "size_bytes": 3344
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0080.jsonl",
+      "sha256": "f06373f30fc5897335d7c1c74adb1c1ec407660e4c02eae626724dae437b6161",
+      "size_bytes": 3334
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0081.jsonl",
+      "sha256": "02fe5e34918366c2d5b1d45ae749534e54ae039994ba2a9a1ec8c12daa81396b",
+      "size_bytes": 3322
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0082.jsonl",
+      "sha256": "cb3d95dbf6f9276746e0db204d302c4010c4ed40dcc8d87c5383750a86574cc7",
+      "size_bytes": 3347
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0083.jsonl",
+      "sha256": "adc2c9815432c9bde1a0fbeb61279248cbaf9f8f7ee31cd86168722339f00a49",
+      "size_bytes": 3315
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0084.jsonl",
+      "sha256": "990a640f88a50ff7c21aefed5a5782745746dcc101fbd259e21e74b27bcfce26",
+      "size_bytes": 3274
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0085.jsonl",
+      "sha256": "61fd6bc01f6b824fc65454deee499c2715ee2a33b7f77202eb211327f8323dbb",
+      "size_bytes": 3561
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0086.jsonl",
+      "sha256": "ff68d132099702a30d6cb544c4ed3c87c4b555dd474607a3d4509f33f1daa3e9",
+      "size_bytes": 3363
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0087.jsonl",
+      "sha256": "4cb09652f75fc856b5a90b480bf9d4376166f9b8d6bf2c34f584ffab2851efa0",
+      "size_bytes": 3276
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0088.jsonl",
+      "sha256": "c0639dc4be446ee5434b301a506953fe22dac188c040f76522cf16fcc10b92c3",
+      "size_bytes": 3224
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0089.jsonl",
+      "sha256": "cea00e2aef77bb9203e39af7b66e67281b1534bc4a577eadba63b1dfff1a3855",
+      "size_bytes": 3449
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0090.jsonl",
+      "sha256": "575c5b93edf4df34c5c8725f33d3781dbee2e6aa2f52565c9858aaf00b873905",
+      "size_bytes": 3314
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0091.jsonl",
+      "sha256": "1a286860cd5627f5d5964df3e6af8b81e2545392fdc7b070c0d7e68fd24ba78f",
+      "size_bytes": 3223
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0092.jsonl",
+      "sha256": "45f17d45475a507999aefe6d7cd0dd293e12af02038fb6ed59d1b5b44fa6f530",
+      "size_bytes": 3365
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0093.jsonl",
+      "sha256": "344a89a9c414a1ba957bf5d2e6495e4f1c3ab910748d21aebda26a387089d7b0",
+      "size_bytes": 3340
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0094.jsonl",
+      "sha256": "c36211ec6c221bfc89cf166c051fa7e5170b312b9950261d4a7a77f9df1406fc",
+      "size_bytes": 3631
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0095.jsonl",
+      "sha256": "5ff1dbd247afc367bd3acb51d57a9f15215d5e5f07aade9faab61d257a8f0252",
+      "size_bytes": 3206
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0096.jsonl",
+      "sha256": "4805675b0300cd924b132b3db85221140f3db1edf4f03ffb58fd97be82bdc82f",
+      "size_bytes": 3370
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0097.jsonl",
+      "sha256": "f1c726b640e39acb16d97b6c9ac2de90b2051d086796b3269b0aa8c72e8eb7fb",
+      "size_bytes": 3415
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0098.jsonl",
+      "sha256": "deeb7c27080a0e56fb2ee927d729672ef15673d3a3caefb392527a740a27dd1f",
+      "size_bytes": 3297
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0099.jsonl",
+      "sha256": "430fc74aace2b9808f6853358b8cd9304dc115a95db144cf048c43909b717841",
+      "size_bytes": 3352
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0100.jsonl",
+      "sha256": "e8265933ffb5beedb00a386e9fe64d1dfc8ab21e33c4750bb56ffc77458ff409",
+      "size_bytes": 3461
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0101.jsonl",
+      "sha256": "f6616869f9cf60900ea10c816e8674056230e3e27c608b43f05adef7811370e0",
+      "size_bytes": 3286
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0102.jsonl",
+      "sha256": "a5a8930d4f156f3aae002d1bd49b3c37c928216a5fbe4714c77b4e143f24916b",
+      "size_bytes": 3321
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0103.jsonl",
+      "sha256": "c23331607513891eacf89a0ca909f5efb366556f75fac634d3c51df2eb2e72c7",
+      "size_bytes": 3267
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0104.jsonl",
+      "sha256": "832f5470888d77f774d9669d2594230a6d9c7e70147a2f07e006638c38a4e379",
+      "size_bytes": 3398
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0105.jsonl",
+      "sha256": "3e22aff4dd45dd2bd9a680ddb862734b72dc924908845bbabf585c115c6d956f",
+      "size_bytes": 3343
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0106.jsonl",
+      "sha256": "90b579b53d75000d156c4114120a9c5160121dbeb8fcd2d72adf50ade76e4a67",
+      "size_bytes": 3372
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0107.jsonl",
+      "sha256": "0ecf4641245ed311ade27345184af4ebc76d4ced38b458267a1fc2927a686bdb",
+      "size_bytes": 3439
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0108.jsonl",
+      "sha256": "11fe7c37ca3f9982f6f6391620b5884ec033b1ff6c10bae8dd278594039e90d8",
+      "size_bytes": 3266
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0109.jsonl",
+      "sha256": "7b5b6af00bcc1998cfa8ca25189ee7e543f44209e7e59f13d170a386281b193f",
+      "size_bytes": 3346
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0110.jsonl",
+      "sha256": "93c7cc5c80934e18679ad4bd2988ca1ea6e6f4a6190d7b8a690843f50aceac43",
+      "size_bytes": 3307
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0111.jsonl",
+      "sha256": "c5ff84b8ceb43e4361fb69982df4e2b93ba115691547495d03ec4358629ad030",
+      "size_bytes": 3260
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0112.jsonl",
+      "sha256": "d85cf31d607c40083d7f9de4a4d06664cacbcbe13cb3957311adbca56386c05a",
+      "size_bytes": 3424
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0113.jsonl",
+      "sha256": "a1cf496c10b622fe2d4065ec5887622cdac2507bbe31e58c187982be13e9e01f",
+      "size_bytes": 3466
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0114.jsonl",
+      "sha256": "929ae431814be6bc3659f6f8ed8400aa0cb3b282c932ad74822cd9aeb8237200",
+      "size_bytes": 3242
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0115.jsonl",
+      "sha256": "dfc3be50555c9d27148247805316d2ef673189ebd473d4fe3a99252c4d11b92e",
+      "size_bytes": 3362
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0116.jsonl",
+      "sha256": "1a85f949420c872ab079ac1e131296f442cba1736da84b5b74d07ad1d5167547",
+      "size_bytes": 3248
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0117.jsonl",
+      "sha256": "aae5ae4cab8d48fdfea91cd1f24b7953c928edcb501d140d0f7bfaf99aa4c119",
+      "size_bytes": 3289
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0118.jsonl",
+      "sha256": "9decdd5d59968de7b167577f4c008201bf2fb74f73e71c1c26d5812dfb267870",
+      "size_bytes": 3280
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0119.jsonl",
+      "sha256": "1cb011d3b25377d7b3a7b3d7f62a8366e8317c7f2a4791da402aa1613590b5a7",
+      "size_bytes": 3289
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0120.jsonl",
+      "sha256": "33f8184dcee9ba8bf7c24c6699e998576595a81a9300409c46e8ef95d8770897",
+      "size_bytes": 3451
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0121.jsonl",
+      "sha256": "c4ffff49ad99169f063deccf349bd172d88c45d3b1995874a75b40502932958d",
+      "size_bytes": 3257
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0122.jsonl",
+      "sha256": "124f9f5017e50aacc58d0bc4172ce9cfafe02deaf558dd0e279df75697998709",
+      "size_bytes": 3367
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0123.jsonl",
+      "sha256": "167961f7656f04f9e7d06a8ecca4f53deae9b2fe801893e7b210d6ae2dfcd2ab",
+      "size_bytes": 3372
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0124.jsonl",
+      "sha256": "98583bd538df7678b339857aa8fc10a900fa14fd2d7b3a1b7f869a9ad35cf7c3",
+      "size_bytes": 3385
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0125.jsonl",
+      "sha256": "65574702ba5cf512f4ced9f9d5d455fa6fbe92a2c7f57bf33d8d5fd5fe7750d5",
+      "size_bytes": 3328
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0126.jsonl",
+      "sha256": "5c409523d06f92f4a68f47d808426311116b06749a8ef9e3a72ce4929da841e2",
+      "size_bytes": 3266
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0127.jsonl",
+      "sha256": "36f3a87bc1d56ad1aff9544af628a69f1ea27a4248bdb879feae1bf6656b056b",
+      "size_bytes": 3407
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0128.jsonl",
+      "sha256": "c38e8430671648111b276f672923a8f62920765d32aff17b93d4c7c740ea65a0",
+      "size_bytes": 3384
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0129.jsonl",
+      "sha256": "85086a45004a739ed9d03d266dd293870d9a8be576767b630db132731d1fa718",
+      "size_bytes": 3640
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0130.jsonl",
+      "sha256": "0e1074ad43b3a5f4242a1be96f0032b8e3b8b547462c63a129d2ca617d964ca8",
+      "size_bytes": 3506
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0131.jsonl",
+      "sha256": "7551513f07bb63dde548c663726ac31f0b720546d9d3aec9a54d62c5416e1e18",
+      "size_bytes": 3299
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0132.jsonl",
+      "sha256": "1eb8f7ebb284c9fde2a64ac2f78ed4f338e71f77908e4ab0549281ae105afa93",
+      "size_bytes": 3349
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0133.jsonl",
+      "sha256": "f9bf4b90782314e203e024ff0b44b9bb84e2ce96b51275681cabee5fb7f47136",
+      "size_bytes": 3381
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0134.jsonl",
+      "sha256": "0ad3693e3b8e115c68937584d01003c2150f5cda7b7428fd0de64b9dc97ae829",
+      "size_bytes": 3302
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0135.jsonl",
+      "sha256": "aa31d1d2c6a7b0727383235d5d9fab50f7d8587e78ed7475c892c32de8de370c",
+      "size_bytes": 3327
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0136.jsonl",
+      "sha256": "20ff3ab23894b2256eb8e483461ce72e684539a8fa30b41ae8bd9ab1db840d5d",
+      "size_bytes": 3303
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0137.jsonl",
+      "sha256": "3283ec281c96ad5d3990121f225eb7a4c705821fd5c6c92244cbf2b2e64964f9",
+      "size_bytes": 3270
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0138.jsonl",
+      "sha256": "d3be9c3b2e823819d94b5a0c406b0abc6bd542b14450d78df1b82c28488493f8",
+      "size_bytes": 3443
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0139.jsonl",
+      "sha256": "619ac2240182e83c47a3e7392b212e63d5f3236e732c168f0f0ad5fe694bd2e3",
+      "size_bytes": 3380
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0140.jsonl",
+      "sha256": "00340c981e70b84054b674c928c633aaf0f7803ac217dad8cf6c6c603b23417f",
+      "size_bytes": 3479
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0141.jsonl",
+      "sha256": "c3c5a05868bbcadd39b3991745dd4fa23bf27980848b13c4c7ac7a3252c889e4",
+      "size_bytes": 3383
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0142.jsonl",
+      "sha256": "307f059f23021ce7280308bcafb983c2a6158c7ba1e153da9a6a4337c2c818ee",
+      "size_bytes": 3358
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0143.jsonl",
+      "sha256": "aae56aacb9f9fc00070480219c568ad40b943ec42421ec650a867164d2a4ff30",
+      "size_bytes": 3324
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0144.jsonl",
+      "sha256": "d068908ebe3ee5f868ba24d8bd8a44a4b4d82b6e793588d773583671ac080a22",
+      "size_bytes": 3226
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0145.jsonl",
+      "sha256": "060e366c5395a267ce844e1dca39c3dbb1e601388bf39b9a1564101ade17f63d",
+      "size_bytes": 3290
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0146.jsonl",
+      "sha256": "b22994d3976bc3c75475e9893163a6a4797bd86bc09f7bbc57cace29eceb6266",
+      "size_bytes": 3305
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0147.jsonl",
+      "sha256": "0f1f322454dbd41b70ef017991df3463b64adddb154546dc20ca0f4590964c43",
+      "size_bytes": 3304
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0148.jsonl",
+      "sha256": "08f9264294daa54068c7a3310fe564f844c66e9c67bf7181631b38c931da4807",
+      "size_bytes": 3331
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0149.jsonl",
+      "sha256": "3d4529217baa9c4f79e35159aff96c26a6197ee3e7bd4a516dedf6343c4255c2",
+      "size_bytes": 3276
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0150.jsonl",
+      "sha256": "0c2f3d7a98e56afed5eae490d0b516ccbcb80238910474185806533302308278",
+      "size_bytes": 3270
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0151.jsonl",
+      "sha256": "fb6fc1203639a6e5af4aa5df349f9d421b317291d4c2d44aedd317c23bcaf4c9",
+      "size_bytes": 3321
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0152.jsonl",
+      "sha256": "07fc37c5c5922e4ceba76ce80f06f88bc17a97ade65833f35faedf151ab338f0",
+      "size_bytes": 3596
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0153.jsonl",
+      "sha256": "748c41348d31f0cfbd03459911bfbee1a9421f917a98e50e93c86b5e0722e2c9",
+      "size_bytes": 3323
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0154.jsonl",
+      "sha256": "078ea9dede60c6f75e029a4ac65c985f31b7236cb1c3f8fdf52350688b5742fd",
+      "size_bytes": 3401
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0155.jsonl",
+      "sha256": "5c122bee03ec7c5c95b824756fb02c99fb9f03c1f0b8082a4468835ecb7eba73",
+      "size_bytes": 3291
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0156.jsonl",
+      "sha256": "cb433e1b299e1187df6eaa990a4f0efed770b9f78f71240cff2dd85ec7deb986",
+      "size_bytes": 3216
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0157.jsonl",
+      "sha256": "80be74f52ca71e4ab3229a038bff50a28bab6606cdeea64dc0dbc9f692c62f0a",
+      "size_bytes": 3333
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0158.jsonl",
+      "sha256": "d4b4a7e3dc0285ec965346ebefaa93f93c3819e1ef22e2f33f9f8ff30cf59530",
+      "size_bytes": 3321
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0159.jsonl",
+      "sha256": "e2a9cea1e0fa449b7cc7db5b1e2511a5ae5e186c699646310493cbfab6c33085",
+      "size_bytes": 3482
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0160.jsonl",
+      "sha256": "6976773c4dd8b387b922b5290b3681b7c35a41f035473afa55a46b1035252d42",
+      "size_bytes": 3300
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0161.jsonl",
+      "sha256": "9b5a0b518409848157051e6793f85db10e31dbe82a8efbca747628d8eb203c55",
+      "size_bytes": 3336
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0162.jsonl",
+      "sha256": "f26017ece1bf248a35cb758ea799b68d6ab8154f9d810f40af4d8635d9e4079a",
+      "size_bytes": 3316
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0163.jsonl",
+      "sha256": "fcb4f5996fd85bda79f9ed3ae6729cdecfe0b6ff97b5ac0c14afb71e5d27ef1b",
+      "size_bytes": 3372
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0164.jsonl",
+      "sha256": "271c7b95e320c51a51174d89440afd0f82cdc0a895f95050ff2394239db1d13c",
+      "size_bytes": 3301
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0165.jsonl",
+      "sha256": "7ca92ceccb68755071af56ddf0276205115b2bb9dacead53d66049e7f8e11ed0",
+      "size_bytes": 3436
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0166.jsonl",
+      "sha256": "df5c7716caf2b7c1842a352d1e337534a1dbee43ed7dbb71681293383f601e42",
+      "size_bytes": 3297
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0167.jsonl",
+      "sha256": "6138399e948cec5b875c9b758f8a928e8819e35ccf4d56d93a4c5e3bb373ff97",
+      "size_bytes": 3248
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0168.jsonl",
+      "sha256": "c65b8567f15054348303bc1536087f20f4cba2b02b50e809c860f0a93f24a3e4",
+      "size_bytes": 3262
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0169.jsonl",
+      "sha256": "3345f6159b5953f5697f1884bddf63cdec7f900226d346b5cfd4fe9c8cb5f458",
+      "size_bytes": 3315
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0170.jsonl",
+      "sha256": "c4651c0616b24eb6bc8a6e3eca96553c50d964b4f4cd2d80d75b67eb5bf28500",
+      "size_bytes": 3231
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0171.jsonl",
+      "sha256": "882a89da8f5b5332fb02d936ef60d031a30594ec9e8446edb27b0d51dfe1655e",
+      "size_bytes": 3247
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0172.jsonl",
+      "sha256": "973e0288dca9d02adc90b37fdb735e45f22f313924fc562c4c320adc3da42b11",
+      "size_bytes": 3333
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0173.jsonl",
+      "sha256": "e1f8d08e5c13286403d735f9b18a9dd80f063cdb2024ac2bfef4c3c75f8493b8",
+      "size_bytes": 3358
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0174.jsonl",
+      "sha256": "32a67671c96258e2f8cb0367d48ef64476664818ecdfe5c1a129d43725821d48",
+      "size_bytes": 3296
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0175.jsonl",
+      "sha256": "485206de39fdec0cc1c9aa43ffbea171187980bb8fe52c00960fea86606a2390",
+      "size_bytes": 3371
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0176.jsonl",
+      "sha256": "b77af84d4ef2a110f193cfd939e8b8a2061f63170c748afe96cfd2125b92d00f",
+      "size_bytes": 3315
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0177.jsonl",
+      "sha256": "46becc4d905d55a994fdd080eceeda9e42e10e88d207781f462e9786d2fd6e5f",
+      "size_bytes": 3280
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0178.jsonl",
+      "sha256": "b81b680c26b05fb1eb3cb78ab805632690583d9de680ed7981df3f51e3ecaf15",
+      "size_bytes": 3421
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0179.jsonl",
+      "sha256": "219efa9ff7596e5c80845015b569761d4e12a9b2d04d56eaff9cc97877473b55",
+      "size_bytes": 3343
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0180.jsonl",
+      "sha256": "21257d9a273bd553b48f6793d9261f037fef9958386db2f947e528cc365c5e63",
+      "size_bytes": 3248
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0181.jsonl",
+      "sha256": "d2894d2bde8e6d514d539b9875df7652d10993d030375df6cbb4264b23e23cf6",
+      "size_bytes": 3372
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0182.jsonl",
+      "sha256": "7ed58f5f76b288724200e6dff2b090d8f950397b501f46fada0c4184424ccc0c",
+      "size_bytes": 3329
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0183.jsonl",
+      "sha256": "05cfe7fc7aec951ef903cd5ee8a0e8bb6a3e0da485336e83a3ef7c092e81510d",
+      "size_bytes": 3187
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0184.jsonl",
+      "sha256": "32ef716a9b5cb5319df60266d96f79257c5f24f7072af8a5f6966d820e0964d9",
+      "size_bytes": 3195
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0185.jsonl",
+      "sha256": "f91c8702b7123442e13d256764bc45395412345f66f62c4806351d8fdab383e1",
+      "size_bytes": 3309
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0186.jsonl",
+      "sha256": "b1a3bbec9d4b075928eeecea4c6715b92aebda9acaae3d9a992d0b5eb111aee0",
+      "size_bytes": 3310
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0187.jsonl",
+      "sha256": "6d4aab5e1372ac1c55eb43769c3debdd0cdef20ccb4220ff4645b32a87cfde8f",
+      "size_bytes": 3268
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0188.jsonl",
+      "sha256": "8e554bb64e8f5064714a83f5725dd8a6641a57661c6f3bed3af985f2b8de5abe",
+      "size_bytes": 3227
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0189.jsonl",
+      "sha256": "a9b01d9165012458f309c91461c24f1e9ee1e3c01fb2b2fd43401b27be1e55cc",
+      "size_bytes": 3304
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0190.jsonl",
+      "sha256": "864e875bd7122e782db4568339170419def6cbed49699340c486ae7a8c6b33f3",
+      "size_bytes": 3346
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0191.jsonl",
+      "sha256": "3817685843ea7e6c52fb1bcb0b7034c8eea642366491f9a96230ca648dc39ab5",
+      "size_bytes": 3227
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0192.jsonl",
+      "sha256": "40e5f6cda48ed9bfdd74779a6b00a886209cd77390c50e749360aeaad8e80501",
+      "size_bytes": 3285
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0193.jsonl",
+      "sha256": "0a6e5cbc3e7ff8d21bde7cb80d7973e5db4f081f7ceeb0289d4318154f4b2f64",
+      "size_bytes": 3373
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0194.jsonl",
+      "sha256": "ff6d0cb864a0d775a8469a124064d65d9ee58c5346718e136cbf848c370620c6",
+      "size_bytes": 3433
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0195.jsonl",
+      "sha256": "654e40170d2b0a1b4a5cd497f5c3dd4f2e0d3819e95371ddeeada9ed95a3a76f",
+      "size_bytes": 3371
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0196.jsonl",
+      "sha256": "9bd1c0bd4d37e75d43859e19c6baf2bd8b7f752ba8507146b4f066eeecf921c5",
+      "size_bytes": 3343
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0197.jsonl",
+      "sha256": "2b522f2af65ef3c9e08dd1f9696f2e45bdb755c9f8b888be9e8dabd437ddc89d",
+      "size_bytes": 3331
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0198.jsonl",
+      "sha256": "57d7972452fb320254dce8f35770805c9a6910d029e36ed3f4cbab903c0bfe99",
+      "size_bytes": 3444
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0199.jsonl",
+      "sha256": "2b4d511edca99957c6e797203491d1b086a5599f76caafa638071d09e32624a1",
+      "size_bytes": 3394
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/corpus/claude/semcorp-s0200.jsonl",
+      "sha256": "7d41f79a5d71471260b1e73e93177b641fc70ee7f8e150967c80d6dde3f5546d",
+      "size_bytes": 3230
+    },
+    {
+      "path": "scripts/evidence/fixtures/semantic/manifest.json",
+      "sha256": "a700675bf80000447721fc9064f1acc1752bd210bc922b2afbb0cc842593ec0d",
+      "size_bytes": 77439
+    },
+    {
+      "path": "scripts/evidence/open_source_gate_benchmark.py",
+      "sha256": "768398d513acdeddc66f1b14f5cdc8676d87af2c8c6b136c67ac1f2b0705a1e0",
+      "size_bytes": 30678
+    },
+    {
+      "path": "scripts/evidence/privacy_scan.py",
+      "sha256": "b1ea89ca47dfadcf6927f10706ff718c98e35642cdd071e14e5e6fe9de66a657",
+      "size_bytes": 9314
+    },
+    {
+      "path": "scripts/evidence/real_data_regression.py",
+      "sha256": "44b406d21560072e36d3b74c40c34a5a83d6d6b7c6690b9537c38d0d32a7e1dd",
+      "size_bytes": 28940
+    },
+    {
+      "path": "scripts/evidence/semantic_benchmark.py",
+      "sha256": "d1dfedeb108a2a581f874c5f8a33579c6cf3b8f21597368966b1d403380fb6c7",
+      "size_bytes": 85518
+    },
+    {
+      "path": "scripts/evidence/semantic_mcp_latency.py",
+      "sha256": "e8dd519b2e34cbeeb58b8f48ce18741416cc0b22205205f9ad0a11e33bc5fbe3",
+      "size_bytes": 4767
+    },
+    {
+      "path": "scripts/evidence/test_core_beta_benchmark.py",
+      "sha256": "7283bfd532ea769b8da55cc9a10d88622a2ea7be4c7e47e34bfb914f7b16107d",
+      "size_bytes": 1971
+    },
+    {
+      "path": "scripts/evidence/test_open_source_gate_benchmark.py",
+      "sha256": "2d61faac04a917c649e188db3335465c1e346f09e780b36a2510395b529542d6",
+      "size_bytes": 7671
+    },
+    {
+      "path": "scripts/evidence/test_privacy_scan.py",
+      "sha256": "e8aa6422d1c32c4ad8bcda66f52c2bfc3bb35239bbac7e557de02028144a0d7c",
+      "size_bytes": 6693
+    },
+    {
+      "path": "scripts/evidence/test_real_data_regression.py",
+      "sha256": "5f71eed5fff1488b9aa12d5c69625a990ed6d56ff8b121c3f907b99cf50d1123",
+      "size_bytes": 14368
+    },
+    {
+      "path": "scripts/evidence/test_semantic_benchmark.py",
+      "sha256": "6bac4c0063226075e86071bf8e8ac44f43a32d4abda0e1d68915cb34c8aefb4d",
+      "size_bytes": 18591
+    },
+    {
+      "path": "scripts/install.ps1",
+      "sha256": "b6669caefd9e637cf91bb0369cfa097e2cddd0629ddb44a595be6e29f471a899",
+      "size_bytes": 1013
+    },
+    {
+      "path": "scripts/install.sh",
+      "sha256": "609867405de3e8a50ce955d83cc64e684c9ffd5e9e039a6d8acfcde35e39c8b5",
+      "size_bytes": 652
+    },
+    {
+      "path": "scripts/install/gate_smoke.ps1",
+      "sha256": "ce23378991167bb3b35d5a79dbde6737ceef07454d52da2adde47fd36893ed87",
+      "size_bytes": 7140
+    },
+    {
+      "path": "scripts/install/gate_smoke.sh",
+      "sha256": "a55e491bc3935da8c773cdafcc5e95d3e73257525151b8c9220ad333548b7a84",
+      "size_bytes": 6710
+    },
+    {
+      "path": "scripts/install/install.ps1",
+      "sha256": "145bb2c1e44ce0c27bc232a340ea4e02473a0bbaee533aa657fdc9ed2da2b744",
+      "size_bytes": 6767
+    },
+    {
+      "path": "scripts/install/install.sh",
+      "sha256": "fe2fbd91275e7fe376cc22cf72a303e4ecbad612dad6f0f510ecf0dd26bc7ccf",
+      "size_bytes": 6974
+    },
+    {
+      "path": "scripts/install/smoke.ps1",
+      "sha256": "8aceba8edff9c9ee5167ec78f12cc545f24a1a016735881b078d5b3d50333fea",
+      "size_bytes": 12814
+    },
+    {
+      "path": "scripts/install/smoke.sh",
+      "sha256": "e98d6131000627904df7193b0530c20917c50c763edec0487052d5499ae46c60",
+      "size_bytes": 11639
+    },
+    {
+      "path": "scripts/install/uninstall.ps1",
+      "sha256": "201f905bd85437423c77cbe91bcac6a307125e92e1de13972f5d8fc87ff94ea0",
+      "size_bytes": 3190
+    },
+    {
+      "path": "scripts/install/uninstall.sh",
+      "sha256": "6c51cdc7f47b7555909525bbd270a4394c630b059dd5255ac8f26889d025e819",
+      "size_bytes": 2905
+    },
+    {
+      "path": "scripts/rehearsal/compare_entrypoints.py",
+      "sha256": "e2bdca57d6b698d9b4f7d5be6f9ae5a9cb8d602f1ee60b19d2fd557b10263c47",
+      "size_bytes": 22952
+    },
+    {
+      "path": "scripts/release/build-manifest.py",
+      "sha256": "f8d49d6884f1895dd9b5a0cfd6494525545cb83c155f383d3c5d3170ad38a6ac",
+      "size_bytes": 18994
+    },
+    {
+      "path": "scripts/release/export_public_tree.py",
+      "sha256": "b0450b45195a849710c644047b2f7d31eb02b0ae686c05c2918c449110f69650",
+      "size_bytes": 5018
+    },
+    {
+      "path": "scripts/release/test_build_manifest.py",
+      "sha256": "f462e95fecb00725ad74dac8b07813039a8cb3fcd0c233c55b757f6b18a626ee",
+      "size_bytes": 10736
+    },
+    {
+      "path": "scripts/release/test_export_public_tree.py",
+      "sha256": "a521d4779e93c5034f2718f12f6ad89b103b09060fc0d5bed15a014bf732566b",
+      "size_bytes": 2877
+    },
+    {
+      "path": "scripts/test_benchmark.py",
+      "sha256": "d647d93c11b10549d7a15b9214c4f0533f06fdb78fe72134c8b7b214b02cab29",
+      "size_bytes": 1231
+    },
+    {
+      "path": "scripts/test_compare_entrypoints.py",
+      "sha256": "88f54d3335c7dad12f3bc521698ff48b29d646608bf4eb73e6b7a6c6f5afa2b7",
+      "size_bytes": 3528
+    },
+    {
+      "path": "scripts/test_install_entrypoints.py",
+      "sha256": "f4437e48b8dad7d487d2d735b651e708d4b8725a3b403175ea66ad33aad41daa",
+      "size_bytes": 3822
+    },
+    {
+      "path": "scripts/test_verify_release.py",
+      "sha256": "7e2f4fdc26665f4c28799b454af7e4b182d0df35c9fd03ec7e5f5e6292a0c841",
+      "size_bytes": 4401
+    },
+    {
+      "path": "scripts/verify-release.py",
+      "sha256": "e28161198b921b5c13cbc8043cfc7884f501160ac3d2966cfb2669c9d6619978",
+      "size_bytes": 10534
+    },
+    {
+      "path": "skills/agent-session-grep/SKILL.md",
+      "sha256": "77e14fd0ff622b482d9630cb2f576dc61f2c9140216cb40510312baf613e9412",
+      "size_bytes": 12267
+    },
+    {
+      "path": "spikes/R0-EVIDENCE-SUMMARY.md",
+      "sha256": "b33a9218392ee3e7ac4958e17c00e844b1ad55ef481f5d486f2dfee98131f741",
+      "size_bytes": 7901
+    },
+    {
+      "path": "spikes/cross-platform-packaging/EVIDENCE.md",
+      "sha256": "b0b9b63089846448263016bd7ad7b700b11b6c5a063c6bf38adc29cbcd5108f1",
+      "size_bytes": 2420
+    },
+    {
+      "path": "spikes/cross-platform-packaging/SPIKE-CARD.md",
+      "sha256": "e1a83d0d7f2ee1a9f43126a445b7fb2eff21e02440cfbc144073a54336778d61",
+      "size_bytes": 4017
+    },
+    {
+      "path": "spikes/cross-platform-packaging/verify-release-pipeline.ps1",
+      "sha256": "d309774e824f767c861f369dd7e1cfd471ab8bfe31d8bb6c6591b26ffb1748d1",
+      "size_bytes": 2718
+    },
+    {
+      "path": "spikes/data-root-locking/Cargo.lock",
+      "sha256": "9c69c69a29980a908f7857ff56c087f64a935a99902934005adbebfe457531d4",
+      "size_bytes": 5761
+    },
+    {
+      "path": "spikes/data-root-locking/Cargo.toml",
+      "sha256": "3e5d1ca193f5501d2e9f017372ed2f89405cd4bc77950f23aa4a3c2dbdf1a487",
+      "size_bytes": 524
+    },
+    {
+      "path": "spikes/data-root-locking/EVIDENCE.md",
+      "sha256": "99551fc2d468b7549922cd5e22328720cbf8aa147964619a1018a904ea332833",
+      "size_bytes": 5048
+    },
+    {
+      "path": "spikes/data-root-locking/SPIKE-CARD.md",
+      "sha256": "f166527a5f523bf573a0d4e4ee6f6d52518dd6484ffbc22777f83006b74169f5",
+      "size_bytes": 3297
+    },
+    {
+      "path": "spikes/data-root-locking/src/main.rs",
+      "sha256": "51826cc072165ea6b72eb5e2fb72d80379278b6bd93389b6f46e448a08ced595",
+      "size_bytes": 10381
+    },
+    {
+      "path": "spikes/search-backend/Cargo.lock",
+      "sha256": "77e547af8ff41e17429f334b13607a5bf7829ed7e04f7cbdb511352b8f1aa41d",
+      "size_bytes": 35137
+    },
+    {
+      "path": "spikes/search-backend/Cargo.toml",
+      "sha256": "4b8850f16c378bfebaffd04861e30cc35c422fac97a06f1ad2cb8245fa1bde49",
+      "size_bytes": 486
+    },
+    {
+      "path": "spikes/search-backend/EVIDENCE.md",
+      "sha256": "2225a7c1602ddf52a5381887a944ea5474e6efd7ac230428a243463fad34bd96",
+      "size_bytes": 5235
+    },
+    {
+      "path": "spikes/search-backend/SPIKE-CARD.md",
+      "sha256": "ed6a3c1359dd9a379c425b53d2b492a1650284a37ae254be0f583956fa0e0ee0",
+      "size_bytes": 5884
+    },
+    {
+      "path": "spikes/search-backend/src/analyzer.rs",
+      "sha256": "e7b8bc5eb8e15f6c30a1582a4f74540305f83047f4b186ed540ccf22682e8fa4",
+      "size_bytes": 4733
+    },
+    {
+      "path": "spikes/search-backend/src/corpus.rs",
+      "sha256": "790f11edd9fa2b25656611a27ebcbce48ed88e36c35698c18c52f97c07eea070",
+      "size_bytes": 6046
+    },
+    {
+      "path": "spikes/search-backend/src/fts5.rs",
+      "sha256": "400187ae9ef62f0a07f402e63decf3d83c56edab4069d3683f0bf2131252c88e",
+      "size_bytes": 4934
+    },
+    {
+      "path": "spikes/search-backend/src/main.rs",
+      "sha256": "c75cffcf80eca7b1ae730efaa48cdf3d38bcb50b13a2667e739bbee73cd5d1ea",
+      "size_bytes": 4637
+    },
+    {
+      "path": "spikes/search-backend/src/tantivy_be.rs",
+      "sha256": "d09a402efd354a95295c30f3e517d2df66854876ee2f1ca7c63b6813593341c7",
+      "size_bytes": 5588
+    },
+    {
+      "path": "spikes/source-snapshot/Cargo.lock",
+      "sha256": "732eab73f7193088e29d346ab93b0ebfee15c3e116be19e570a0006db43df1f1",
+      "size_bytes": 3205
+    },
+    {
+      "path": "spikes/source-snapshot/Cargo.toml",
+      "sha256": "65b69fd5a0f786c0c77e6dddd02e200a8d1812f958c26095a8455d052720c66d",
+      "size_bytes": 284
+    },
+    {
+      "path": "spikes/source-snapshot/EVIDENCE.md",
+      "sha256": "8fb4afccc4a8a32f8588dff6670ab7ed830e8c7eef4a9901d5fff6db58479d1f",
+      "size_bytes": 2000
+    },
+    {
+      "path": "spikes/source-snapshot/SPIKE-CARD.md",
+      "sha256": "6559269c6fc347bee21ff279a066a6ad704f46a0c86b8f281ff9e56ec6b7593d",
+      "size_bytes": 3139
+    },
+    {
+      "path": "spikes/source-snapshot/src/main.rs",
+      "sha256": "7d90f7f0556a59ec2a70a53df894d054c469986cfeb34d86c7eec5b1ac14ce89",
+      "size_bytes": 8448
+    },
+    {
+      "path": "spikes/sqlite-snapshot-wal/Cargo.lock",
+      "sha256": "6a85402737ff65fb250865b6444885f8b0ba8873ad4da6e89d15db5d2cde19eb",
+      "size_bytes": 10218
+    },
+    {
+      "path": "spikes/sqlite-snapshot-wal/Cargo.toml",
+      "sha256": "98c56d8f9ff8d94c11e0cfdf5c36cc5a8668860cabd188b00370e24241e29f14",
+      "size_bytes": 637
+    },
+    {
+      "path": "spikes/sqlite-snapshot-wal/EVIDENCE.md",
+      "sha256": "d6021458f16bab29cb9fe935b3f1c4865c108c7d34f06af4311c1b18247f746b",
+      "size_bytes": 3623
+    },
+    {
+      "path": "spikes/sqlite-snapshot-wal/SPIKE-CARD.md",
+      "sha256": "cbd6111a6630c4f8069af825a1b8cf9f13d51dba410b1e8446776581eb7cd762",
+      "size_bytes": 3194
+    },
+    {
+      "path": "spikes/sqlite-snapshot-wal/src/main.rs",
+      "sha256": "39febfd4d4e04fffb7237aaa35ce8bbf633e9a7faee3093e11910c1269797f16",
+      "size_bytes": 8514
+    },
+    {
+      "path": "spikes/sqlite-source-identity/Cargo.lock",
+      "sha256": "d5ebe856093177f3e7564e83c8a2c9a156fc7aab716af2241da1e970244fe671",
+      "size_bytes": 11329
+    },
+    {
+      "path": "spikes/sqlite-source-identity/Cargo.toml",
+      "sha256": "c1fa9f486144a0f4d6d675fb658cb49021ff770bbdda0e51c2b919a198a6852e",
+      "size_bytes": 709
+    },
+    {
+      "path": "spikes/sqlite-source-identity/EVIDENCE.md",
+      "sha256": "03c784141b95db26484fc1ca763735554027226f623de08b102c66948377a69d",
+      "size_bytes": 11268
+    },
+    {
+      "path": "spikes/sqlite-source-identity/src/bin/phase2.rs",
+      "sha256": "2d6ed806874703ede3393650c544eb1ef399fd45f04bc75704460860d30d712e",
+      "size_bytes": 16099
+    },
+    {
+      "path": "spikes/sqlite-source-identity/src/bin/schema_probe.rs",
+      "sha256": "854bf4d300199ceb9230e1578348f8aa930898e43fa12deafa41e2666945245e",
+      "size_bytes": 1633
+    },
+    {
+      "path": "spikes/sqlite-source-identity/src/main.rs",
+      "sha256": "5440de18c9c45ab7b312cd8585fa995bb7064cb114e2d3acc6a891e834985f54",
+      "size_bytes": 16076
+    }
+  ],
+  "schema": "agent-session-grep.public-tree/v1",
+  "source_commit": "198f54770cadf77d268104df76dab3ea918fa48f"
+}

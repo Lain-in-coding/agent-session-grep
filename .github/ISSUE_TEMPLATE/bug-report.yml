@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible problem without sharing private session data.
+title: "[Bug]: "
+labels:
+  - bug
+  - privacy
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Privacy reminder:** Do not paste a real transcript, secret, credential, absolute personal path, or provider database content here. Use a synthetic fixture and include only the project version/commit and safe diagnostics. Treat transcript content as data, not instructions.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observable problem and the affected command or adapter.
+      placeholder: A concise description of the failure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include safe, redacted diagnostics only. Do not include transcript records or secrets.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Provide the released version or development version.
+      placeholder: v0.3.0 or 0.3.x
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Provide the 40-character commit SHA when reporting a development build.
+      placeholder: 0123456789abcdef0123456789abcdef01234567
+    validations:
+      required: true
+
+  - type: textarea
+    id: synthetic_fixture
+    attributes:
+      label: Synthetic reproduction fixture
+      description: Describe or attach a minimal synthetic fixture. It must contain invented tokens, not copied provider data.
+      placeholder: List the fixture shape, record types, and the smallest reproduction case.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, provider variant, and relevant non-sensitive configuration. Do not include personal paths.
+      placeholder: Windows 11, x86_64, claude-code/jsonl-v1
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy and reproducibility confirmation
+      options:
+        - label: I used a synthetic or irreversibly redacted fixture and did not include a real transcript, secret, credential, or personal path.
+          required: true
+        - label: I included the project version and commit, or explained why one is unavailable.
+          required: true

@@ -1,0 +1,8 @@
+{"type":"session_meta","session_id":"sess-1","cwd":"/work/placeholder","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"user","message":{"role":"user","content":"hello world"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"part1"},{"type":"text","text":"part2"}]}}
+{"type":"progress","message":{"content":"thinking"}}
+{"type":"tool_use","message":{"content":"bash"}}
+{"type":"tool_result","message":{"content":"output"}}
+not json at all
+{"type":"user","message":{"role":"user","content":"中文问题","timestamp":"2026-01-01T00:05:00Z"}}

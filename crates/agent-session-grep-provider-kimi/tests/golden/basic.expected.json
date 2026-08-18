@@ -1,0 +1,34 @@
+{
+  "committed": 2,
+  "fixture_blake3": "ad708d7bbcf1f4be7d3318d725493bc93b84f9fcd18352b9d61abc8eb2c81185",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "kimi-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 83,
+        "start": 0
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "kimi-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 194,
+        "start": 84
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": null,
+  "skipped": 1
+}

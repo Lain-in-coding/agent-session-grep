@@ -1,0 +1,9 @@
+{"timestamp":"2026-07-26T08:00:00.000Z","type":"session_meta","payload":{"session_id":"0198aaaa-bbbb-7ccc-8ddd-eeeeffff0001","cwd":"/workspace/fixture-project","originator":"codex_cli_rs","cli_version":"9.9.9-fixture"}}
+{"timestamp":"2026-07-26T08:00:00.500Z","type":"turn_context","payload":{"cwd":"/workspace/fixture-project","approval_policy":"on-request","model":"fixture-model"}}
+{"timestamp":"2026-07-26T08:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"请帮我检查一下解析器的字节跨度 🚀"}}
+{"timestamp":"2026-07-26T08:00:01.000Z","type":"response_item","payload":{"type":"message","id":"msg-fx-0001","role":"user","content":[{"type":"input_text","text":"请帮我检查一下解析器的字节跨度 🚀"}]}}
+{"timestamp":"2026-07-26T08:00:02.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs-fx-0001","summary":[],"encrypted_content":"fixture-opaque-reasoning-blob"}}
+{"timestamp":"2026-07-26T08:00:03.000Z","type":"response_item","payload":{"type":"message","id":"msg-fx-0002","role":"assistant","content":[{"type":"output_text","text":"跨度以字节计，end 排他。"},{"type":"output_text","text":"CJK 与 emoji ✅ 均按 UTF-8 字节计算。"}]}}
+{"timestamp":"2026-07-26T08:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"跨度以字节计，end 排他。\nCJK 与 emoji ✅ 均按 UTF-8 字节计算。"}}
+{"timestamp":"2026-07-26T08:00:04.000Z","type":"response_item","payload":{"type":"message","id":"msg-fx-0003","role":"user","content":[{"type":"input_text","text":"这一行是故意截断的损坏记录
+{"timestamp":"2026-07-26T08:00:05.000Z","type":"response_item","payload":{"type":"message","id":"msg-fx-0004","role":"user","content":[{"type":"input_text","text":"再确认一次：event_msg 镜像不会被重复计数 😀"}]}}

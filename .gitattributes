@@ -1,0 +1,14 @@
+# Golden fixture and expected-output files must reach the parser byte-exact.
+# core.autocrlf would otherwise rewrite LF to CRLF on checkout and silently
+# shift every pinned byte span. `-text` opts these paths out of eol handling.
+crates/*/tests/golden/*.jsonl -text
+crates/*/tests/golden/*.json -text
+crates/*/tests/golden/*.md -text
+crates/*/tests/golden/*.expected.json -text
+# SQLite fixtures are binary; git must never touch their bytes or diff them.
+crates/*/tests/golden/*.db binary
+
+# Shell and Python sources must stay LF in the working tree: a CRLF blob
+# silently breaks every `set -euo pipefail` script on Unix CI.
+*.sh text eol=lf
+*.py text eol=lf

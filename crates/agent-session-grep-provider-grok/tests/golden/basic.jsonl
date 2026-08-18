@@ -1,0 +1,10 @@
+{"timestamp":"2026-01-01T00:00:00Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":"hello "},"_meta":{"promptIndex":0}}}
+{"timestamp":"2026-01-01T00:00:00Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":"world"},"_meta":{"promptIndex":0}}}
+{"timestamp":"2026-01-01T00:00:01Z","params":{"update":{"sessionUpdate":"agent_message_chunk","content":[{"text":"part1"},{"text":"part2"}]},"_meta":{"promptId":"p1"}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"_meta":{"bashCommand":"ls"},"text":"ignored tool meta"}},"_meta":{"promptIndex":1}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"next question"},"_meta":{"promptIndex":1}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":"   "},"_meta":{"promptId":"p1"}}}
+not json at all
+{"params":{"update":{"sessionUpdate":"unknown_kind","content":"ignored"}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"第三轮问题"},"_meta":{"promptIndex":2}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":"final answer"},"_meta":{"promptId":"p1"}}}

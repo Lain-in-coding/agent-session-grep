@@ -1,0 +1,12 @@
+[package]
+name = "agent-session-grep-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+blake3.workspace = true
