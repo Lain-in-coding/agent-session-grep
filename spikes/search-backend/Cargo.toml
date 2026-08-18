@@ -1,0 +1,19 @@
+# search-backend spike — 可丢弃探针，不进 crates/；归档时机由 R0 Architecture Review 决定
+# 目的：为 ADR-0001 提供 FTS5 vs Tantivy 的对照证据
+[package]
+name = "search-backend-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立 workspace，避免被父目录意外纳入
+[workspace]
+
+[dependencies]
+anyhow = "1.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
+tantivy = "0.26.1"
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-session-grep.dev/schemas/handoff/v1/pack.schema.json",
+  "title": "agent-session-grep Handoff Pack v1",
+  "description": "A versioned, reproducible context handoff pack. JSON is authoritative; the Markdown form is a deterministic projection of this structure (ADR: handoff-pack/v1).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "catalog_generation",
+    "generation_mode",
+    "query",
+    "created_at",
+    "matched_sessions",
+    "mainline",
+    "evidence",
+    "inference",
+    "budget",
+    "truncation",
+    "redaction",
+    "confidence"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "pack_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$",
+      "description": "Deterministic pack identifier derived from generation + query + filters + budget."
+    },
+    "catalog_generation": {
+      "type": ["integer", "string"],
+      "description": "The catalog generation pinned when the pack was assembled."
+    },
+    "generation_mode": {
+      "const": "deterministic",
+      "description": "How the pack was generated. Current builds emit deterministic only (PRD Q44 default: no model calls); local-LLM summaries would mark local_llm."
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["terms", "retrieval_mode"],
+      "properties": {
+        "terms": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 256 },
+          "maxItems": 64
+        },
+        "retrieval_mode": {
+          "enum": ["lexical", "semantic", "hybrid", "lexical_fallback"]
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "providers": {
+              "type": "array",
+              "items": { "type": "string" },
+              "maxItems": 16
+            },
+            "since": { "type": ["string", "null"] },
+            "until": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Deterministic ISO-8601 UTC timestamp derived from the pinned catalog generation (fixed base + generation seconds). The same generation/query/budget always yields the same value, so packs are byte-reproducible."
+    },
+    "matched_sessions": {
+      "type": "array",
+      "description": "Sessions matched by the query, ordered by relevance.",
+      "items": { "$ref": "#/$defs/matchedSession" },
+      "maxItems": 500
+    },
+    "mainline": {
+      "type": "array",
+      "description": "Mainline expansion: the canonical linear message view selected from the message graph.",
+      "items": { "$ref": "#/$defs/mainlineEntry" },
+      "maxItems": 2000
+    },
+    "evidence": {
+      "type": "array",
+      "description": "Original-text evidence spans. Never mixed with inference.",
+      "items": { "$ref": "#/$defs/evidenceEntry" },
+      "maxItems": 1000
+    },
+    "inference": {
+      "type": "array",
+      "description": "LLM-generated or derived summaries. Every entry MUST be marked inference; never placed in evidence.",
+      "items": { "$ref": "#/$defs/inferenceEntry" },
+      "maxItems": 500
+    },
+    "target": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Declared target provider/agent for the handoff. asg only emits the pack and suggested commands; it never injects into another agent.",
+      "properties": {
+        "provider_id": { "type": "string", "maxLength": 64 },
+        "agent": { "type": "string", "maxLength": 128 },
+        "suggested_command": { "type": ["string", "null"] }
+      }
+    },
+    "budget": { "$ref": "#/$defs/budget" },
+    "truncation": { "$ref": "#/$defs/truncation" },
+    "redaction": { "$ref": "#/$defs/redaction" },
+    "confidence": { "$ref": "#/$defs/confidence" },
+    "time_window": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Half-open time window [since, until) applied to the query, projected from the query filters. Null when neither bound is set.",
+      "properties": {
+        "since": { "type": ["string", "null"] },
+        "until": { "type": ["string", "null"] }
+      }
+    },
+    "provenance": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Pack provenance: target provider/session. Search-based packs have no single session/provider and stay null (never fabricated).",
+      "properties": {
+        "provider_id": { "type": ["string", "null"], "maxLength": 64 },
+        "session_id": {
+          "type": ["string", "null"],
+          "pattern": "^ses_v1_[A-Za-z0-9]+$"
+        }
+      }
+    },
+    "tool_activity": {
+      "type": "array",
+      "description": "Structured tool activity relevant to the matched sessions (optional projection).",
+      "items": { "type": "object" },
+      "maxItems": 500
+    },
+    "source_locators": {
+      "type": "array",
+      "description": "Source document locators (cursor/path references for evidence back-tracing). Never raw transcript paths in cross-boundary output.",
+      "items": { "$ref": "#/$defs/sourceLocator" },
+      "maxItems": 1000
+    }
+  },
+  "$defs": {
+    "matchedSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "relevance_score", "occurrences"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^ses_v1_[A-Za-z0-9]+$"
+        },
+        "provider_id": { "type": "string", "maxLength": 64 },
+        "title": { "type": ["string", "null"] },
+        "relevance_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "occurrences": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "mainlineEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message_id", "role", "ordinal"],
+      "properties": {
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg_v1_[A-Za-z0-9]+$"
+        },
+        "session_id": {
+          "type": "string",
+          "pattern": "^ses_v1_[A-Za-z0-9]+$"
+        },
+        "role": { "type": "string", "maxLength": 32 },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "text_preview": { "type": ["string", "null"], "maxLength": 8192 },
+        "is_sidechain": { "type": "boolean" }
+      }
+    },
+    "evidenceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message_id", "source_document_id", "text"],
+      "properties": {
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg_v1_[A-Za-z0-9]+$"
+        },
+        "source_document_id": {
+          "type": "string",
+          "pattern": "^doc_v1_[A-Za-z0-9]+$"
+        },
+        "session_id": {
+          "type": "string",
+          "pattern": "^ses_v1_[A-Za-z0-9]+$"
+        },
+        "span_start": { "type": ["integer", "null"], "minimum": 0 },
+        "span_end": { "type": ["integer", "null"], "minimum": 0 },
+        "text": { "type": "string", "maxLength": 65536 }
+      }
+    },
+    "inferenceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "enum": ["summary", "decision", "risk", "recommendation"] },
+        "text": { "type": "string", "maxLength": 8192 },
+        "source": { "enum": ["local_llm", "deterministic"] },
+        "model_id": { "type": ["string", "null"] }
+      }
+    },
+    "sourceLocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_document_id"],
+      "properties": {
+        "source_document_id": {
+          "type": "string",
+          "pattern": "^doc_v1_[A-Za-z0-9]+$"
+        },
+        "cursor": { "type": ["string", "null"] }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_tokens", "max_bytes", "used_tokens", "used_bytes"],
+      "properties": {
+        "max_tokens": { "type": "integer", "minimum": 0 },
+        "max_bytes": { "type": "integer", "minimum": 0 },
+        "used_tokens": { "type": "integer", "minimum": 0 },
+        "used_bytes": { "type": "integer", "minimum": 0 },
+        "max_evidence": { "type": "integer", "minimum": 0 },
+        "context_lines": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "truncation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truncated", "reason"],
+      "properties": {
+        "truncated": { "type": "boolean" },
+        "reason": { "enum": ["budget_exceeded", "max_items", "max_evidence", "max_bytes", "none"] },
+        "dropped_count": { "type": "integer", "minimum": 0 },
+        "dropped_locators": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceLocator" },
+          "maxItems": 500
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "status", "ruleset_version", "redacted_count"],
+      "properties": {
+        "mode": { "enum": ["default", "revealed"] },
+        "status": { "enum": ["applied", "none", "partial"] },
+        "ruleset_version": { "type": "string", "maxLength": 64 },
+        "redacted_count": { "type": "integer", "minimum": 0 },
+        "audit_id": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall", "per_session"],
+      "properties": {
+        "overall": { "enum": ["high", "medium", "low"] },
+        "per_session": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id", "confidence"],
+            "properties": {
+              "session_id": { "type": "string" },
+              "confidence": { "enum": ["high", "medium", "low"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

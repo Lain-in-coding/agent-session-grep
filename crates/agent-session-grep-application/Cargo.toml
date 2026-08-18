@@ -1,0 +1,36 @@
+[package]
+name = "agent-session-grep-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Optional local Candle + multilingual-e5-small backend. Off by default so the
+# published binary stays lexical-first and zero-egress. Weights are never
+# downloaded by this feature; use `asg model import --dir <bundle>`.
+semantic-candle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:safetensors",
+]
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+
+[dev-dependencies]
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }

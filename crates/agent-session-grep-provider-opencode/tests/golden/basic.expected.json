@@ -1,0 +1,38 @@
+{
+  "committed": 3,
+  "fixture_blake3": "2668cbd406801399ff026c5d9c33c7ce9f5713d941b2554dd79d1263933cf8c4",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "msg_1",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": null,
+      "text": "hello world\n中文 second line",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "msg_2",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": null,
+      "text": "hi there",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "msg_4",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": null,
+      "text": "final user question",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": "ses_1",
+  "skipped": 0
+}

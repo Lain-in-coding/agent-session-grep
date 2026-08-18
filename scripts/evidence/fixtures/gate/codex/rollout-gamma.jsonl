@@ -1,0 +1,6 @@
+{"timestamp":"2026-01-03T00:00:00.000Z","type":"session_meta","payload":{"session_id":"gate-gamma-0003","cwd":"/workspace/gate-fixture","originator":"codex_cli_rs","cli_version":"9.9.9-gate"}}
+{"timestamp":"2026-01-03T00:00:00.500Z","type":"turn_context","payload":{"cwd":"/workspace/gate-fixture","approval_policy":"on-request","model":"gate-model"}}
+{"timestamp":"2026-01-03T00:00:01.000Z","type":"response_item","payload":{"type":"message","id":"msg-gate-0001","role":"user","content":[{"type":"input_text","text":"zetacode how does deletion derivation work"}]}}
+{"timestamp":"2026-01-03T00:00:02.000Z","type":"response_item","payload":{"type":"message","id":"msg-gate-0002","role":"assistant","content":[{"type":"output_text","text":"zetacode tombstone derives only when relation_complete is true"}]}}
+{"timestamp":"2026-01-03T00:00:03.000Z","type":"response_item","payload":{"type":"message","id":"msg-gate-0003","role":"user","content":[{"type":"input_text","text":"zetacode what about incomplete scan"}]}}
+{"timestamp":"2026-01-03T00:00:04.000Z","type":"response_item","payload":{"type":"message","id":"msg-gate-0004","role":"assistant","content":[{"type":"output_text","text":"zetacode incomplete scan union observed claims and derive no delete"}]}}

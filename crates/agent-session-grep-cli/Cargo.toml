@@ -1,0 +1,60 @@
+[package]
+name = "agent-session-grep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+default-run = "agent-session-grep"
+
+[features]
+default = []
+# Optional real local semantic backend. Off by default; enable with
+# `--features semantic-candle` when building a semantic-capable binary.
+# The default release path stays bigram-hash / lexical-only.
+semantic-candle = ["agent-session-grep-application/semantic-candle"]
+
+[[bin]]
+name = "agent-session-grep"
+path = "src/main.rs"
+
+[[bin]]
+name = "asg"
+path = "src/main.rs"
+
+# Test-only fake provider for the resume smoke e2e test (never shipped to users).
+[[bin]]
+name = "resume-smoke-provider"
+path = "src/bin/resume_smoke_provider.rs"
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+agent-session-grep-application = { path = "../agent-session-grep-application" }
+agent-session-grep-adapters-sqlite = { path = "../agent-session-grep-adapters-sqlite" }
+agent-session-grep-provider-aider = { path = "../agent-session-grep-provider-aider" }
+agent-session-grep-provider-antigravity = { path = "../agent-session-grep-provider-antigravity" }
+agent-session-grep-provider-claude = { path = "../agent-session-grep-provider-claude" }
+agent-session-grep-provider-cline = { path = "../agent-session-grep-provider-cline" }
+agent-session-grep-provider-codex = { path = "../agent-session-grep-provider-codex" }
+agent-session-grep-provider-cursor = { path = "../agent-session-grep-provider-cursor" }
+agent-session-grep-provider-grok = { path = "../agent-session-grep-provider-grok" }
+agent-session-grep-provider-hermes = { path = "../agent-session-grep-provider-hermes" }
+agent-session-grep-provider-kimi = { path = "../agent-session-grep-provider-kimi" }
+agent-session-grep-provider-openclaw = { path = "../agent-session-grep-provider-openclaw" }
+agent-session-grep-provider-opencode = { path = "../agent-session-grep-provider-opencode" }
+agent-session-grep-provider-codebuddy = { path = "../agent-session-grep-provider-codebuddy" }
+agent-session-grep-provider-pi = { path = "../agent-session-grep-provider-pi" }
+agent-session-grep-provider-qoder = { path = "../agent-session-grep-provider-qoder" }
+serde = { workspace = true }
+serde_json.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+# 平台 CSPRNG(serve 会话 token 生成;getrandom 已在 lock 图中,经 tempfile dev-dep)
+getrandom = "0.4"
+
+[dev-dependencies]
+# default-features = false 与 adapters-sqlite 保持一致,避免 test 图的特性
+# 统一把 cache/ffi-sqlite-wasm-rs 重新拉回来。
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+tempfile = "3"

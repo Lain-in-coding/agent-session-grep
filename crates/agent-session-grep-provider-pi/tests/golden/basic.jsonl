@@ -1,0 +1,8 @@
+{"type":"session","id":"sess-1","cwd":"/home/user/proj","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"message","message":{"role":"user","content":"hello world"}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"part1"},{"type":"text","text":"part2"}]}}
+{"type":"session_info","name":"synthetic session"}
+{"type":"compaction","summary":"compacted state"}
+{"type":"message","message":{"role":"user","content":""}}
+not json at all
+{"type":"message","message":{"role":"user","content":"带时间戳的中文","timestamp":"2026-01-01T00:01:00Z"}}

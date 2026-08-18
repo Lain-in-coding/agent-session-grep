@@ -1,0 +1,17 @@
+[package]
+name = "source-snapshot-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 可丢弃 R0 探针，不进 crates/ 生产树。
+[[bin]]
+name = "source-snapshot-spike"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+tempfile = "3"
+
+[profile.release]
+debug = false

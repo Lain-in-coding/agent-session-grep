@@ -1,0 +1,64 @@
+{
+  "description": "Synthetic labeled query set for the open-source gate benchmark. No real transcripts. Message ids are native-derived StableId wire ids and therefore reproducible anywhere. Canonical session ids are NOT pinned here: they are digests over (provider, installation namespace, native id), so they change with the corpus path — the provider-native session ids below are pinned instead, and the harness resolves canonical ids at run time.",
+  "fixture_set_id": "gate-synthetic-v1",
+  "providers": ["claude-code", "codex"],
+  "queries": [
+    {
+      "id": "q-retry-budget",
+      "query": "gateprobe retry budget",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_00000001-0000-4000-8000-000000000001",
+        "msg_v1_00000001-0000-4000-8000-000000000002"
+      ],
+      "expected_provider_session_ids": ["gate-alpha-0001"]
+    },
+    {
+      "id": "q-backoff",
+      "query": "gateprobe backoff",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_00000001-0000-4000-8000-000000000003"
+      ],
+      "expected_provider_session_ids": ["gate-alpha-0001"]
+    },
+    {
+      "id": "q-indexing",
+      "query": "kairostopic indexing pipeline",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_00000002-0000-4000-8000-000000000001",
+        "msg_v1_00000002-0000-4000-8000-000000000002"
+      ],
+      "expected_provider_session_ids": ["gate-beta-0002"]
+    },
+    {
+      "id": "q-outbox",
+      "query": "kairostopic outbox durability",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_00000002-0000-4000-8000-000000000003"
+      ],
+      "expected_provider_session_ids": ["gate-beta-0002"]
+    },
+    {
+      "id": "q-tombstone",
+      "query": "zetacode tombstone",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_msg-gate-0002"
+      ],
+      "expected_provider_session_ids": ["gate-gamma-0003"]
+    },
+    {
+      "id": "q-incomplete-scan",
+      "query": "zetacode incomplete scan",
+      "category": "en",
+      "expected_message_ids": [
+        "msg_v1_msg-gate-0003",
+        "msg_v1_msg-gate-0004"
+      ],
+      "expected_provider_session_ids": ["gate-gamma-0003"]
+    }
+  ]
+}

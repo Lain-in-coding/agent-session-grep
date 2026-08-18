@@ -1,0 +1,145 @@
+{
+  "schema_version": "1.0",
+  "errors": [
+    {
+      "code": "invalid_request",
+      "layer": "domain",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 2,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Correct the request arguments and retry."
+    },
+    {
+      "code": "not_found",
+      "layer": "domain",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 4,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Verify the typed entity identifier."
+    },
+    {
+      "code": "source_io",
+      "layer": "storage",
+      "retryable": false,
+      "partial_allowed": true,
+      "cli_exit_code": 5,
+      "robot_ok": false,
+      "redaction": "path",
+      "operator_action": "Verify source existence and read permissions."
+    },
+    {
+      "code": "source_changed",
+      "layer": "storage",
+      "retryable": true,
+      "partial_allowed": true,
+      "cli_exit_code": 5,
+      "robot_ok": false,
+      "redaction": "path",
+      "operator_action": "Retry after the provider finishes writing the source."
+    },
+    {
+      "code": "snapshot_failed",
+      "layer": "storage",
+      "retryable": false,
+      "partial_allowed": true,
+      "cli_exit_code": 5,
+      "robot_ok": false,
+      "redaction": "path",
+      "operator_action": "Inspect source metadata and filesystem health."
+    },
+    {
+      "code": "catalog_error",
+      "layer": "storage",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 6,
+      "robot_ok": false,
+      "redaction": "body",
+      "operator_action": "Run doctor and inspect the derived data root."
+    },
+    {
+      "code": "provider_error",
+      "layer": "provider",
+      "retryable": false,
+      "partial_allowed": true,
+      "cli_exit_code": 7,
+      "robot_ok": false,
+      "redaction": "body",
+      "operator_action": "Check provider variant support and diagnostics."
+    },
+    {
+      "code": "capability_not_supported",
+      "layer": "application",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 7,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Requested capability is not declared by the provider; under --offline, operations requiring network are refused."
+    },
+    {
+      "code": "writer_busy",
+      "layer": "storage",
+      "retryable": true,
+      "partial_allowed": false,
+      "cli_exit_code": 6,
+      "robot_ok": false,
+      "redaction": "path",
+      "operator_action": "Wait for the current writer to finish and retry."
+    },
+    {
+      "code": "schema_incompatible",
+      "layer": "protocol",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 9,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Upgrade agent-session-grep or rebuild the derived data root."
+    },
+    {
+      "code": "cursor_invalid",
+      "layer": "protocol",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 2,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Discard the cursor and rerun the query from the start."
+    },
+    {
+      "code": "cursor_expired",
+      "layer": "protocol",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 2,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "Rerun the query to obtain a fresh cursor."
+    },
+    {
+      "code": "generation_mismatch",
+      "layer": "protocol",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 9,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "The index advanced; rerun the query against the new generation."
+    },
+    {
+      "code": "internal",
+      "layer": "application",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 70,
+      "robot_ok": false,
+      "redaction": "full",
+      "operator_action": "Collect safe diagnostics and report a defect."
+    }
+  ]
+}

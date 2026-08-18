@@ -1,0 +1,245 @@
+name: core-beta-evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/core-beta-evidence.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "scripts/evidence/**"
+      - "spikes/data-root-locking/**"
+      - "spikes/sqlite-snapshot-wal/**"
+      - "spikes/sqlite-source-identity/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/core-beta-evidence.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "scripts/evidence/**"
+      - "spikes/data-root-locking/**"
+      - "spikes/sqlite-snapshot-wal/**"
+      - "spikes/sqlite-source-identity/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+jobs:
+  platform-evidence:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            label: Windows x64 / MSVC
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: agent-session-grep.exe
+            rustflags: -C target-feature=+crt-static
+          - id: linux-gnu-x64
+            label: Ubuntu 22.04 / GNU x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: agent-session-grep
+            rustflags: ""
+          - id: macos-intel
+            label: macOS Intel / x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: agent-session-grep
+            rustflags: ""
+          - id: macos-arm64
+            label: macOS Apple Silicon / ARM64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: agent-session-grep
+            rustflags: ""
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.10"
+
+      - name: Install Rust toolchain and target
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release CLI
+        shell: pwsh
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked --release --target '${{ matrix.target }}' -p agent-session-grep-cli
+
+      - name: Direct binary smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Path 'evidence/ci' | Out-Null
+          $binary = Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}'
+          & $binary --version 2>&1 | Tee-Object -FilePath 'evidence/ci/version.txt'
+          & $binary --help 2>&1 | Tee-Object -FilePath 'evidence/ci/help.txt'
+          & $binary --output json config paths 2>&1 | Tee-Object -FilePath 'evidence/ci/config-paths.json'
+
+      - name: Benchmark harness smoke and schema validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $binary = Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}'
+          python -m unittest scripts/evidence/test_core_beta_benchmark.py
+          python scripts/evidence/core_beta_benchmark.py run `
+            --profile smoke `
+            --workspace . `
+            --output-dir 'evidence/ci/benchmark' `
+            --binary $binary `
+            --expected-commit '${{ github.sha }}' `
+            --disk 'GitHub-hosted runner; not release-certified' `
+            --filesystem 'runner default; not release-certified' `
+            --antivirus-state 'runner state not certified'
+          python scripts/evidence/core_beta_benchmark.py validate-report `
+            'evidence/ci/benchmark/core-beta-benchmark-smoke.json'
+
+      - name: SQLite adapter evidence tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked --target '${{ matrix.target }}' -p agent-session-grep-adapters-sqlite --all-targets -- --nocapture 2>&1 |
+            Tee-Object -FilePath 'evidence/ci/sqlite-adapter-tests.txt'
+
+      # Provider Beta evidence must execute on every named target, not only in
+      # the generic ci.yml matrix. These tests pin fixture bytes, canonical
+      # output, deterministic properties, and source-span round trips.
+      - name: Claude and Codex provider evidence tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked --target '${{ matrix.target }}' `
+            -p agent-session-grep-provider-claude `
+            -p agent-session-grep-provider-codex `
+            --all-targets -- --nocapture 2>&1 |
+            Tee-Object -FilePath 'evidence/ci/provider-evidence-tests.txt'
+
+      - name: Open-source gate benchmark
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $binary = Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}'
+          python -m unittest scripts/evidence/test_open_source_gate_benchmark.py
+          python scripts/evidence/open_source_gate_benchmark.py run `
+            --profile '${{ matrix.id }}' `
+            --workspace . `
+            --output-dir 'evidence/ci/open-source-gate' `
+            --binary $binary
+          python scripts/evidence/open_source_gate_benchmark.py validate-report `
+            "evidence/ci/open-source-gate/gate-manifest-${{ matrix.id }}.json"
+
+      - name: Storage feasibility spikes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Push-Location 'spikes/data-root-locking'
+          try {
+            $lockingOutput = cargo run --locked --release --target '${{ matrix.target }}' 2>&1 |
+              Tee-Object -FilePath '../../evidence/ci/data-root-locking-spike.txt'
+            if ($lockingOutput -match '\[FAIL\]') {
+              throw 'data-root-locking spike reported a failed assertion'
+            }
+          } finally {
+            Pop-Location
+          }
+          Push-Location 'spikes/sqlite-snapshot-wal'
+          try {
+            $walOutput = cargo run --locked --release --target '${{ matrix.target }}' 2>&1 |
+              Tee-Object -FilePath '../../evidence/ci/sqlite-snapshot-wal-spike.txt'
+            if ($walOutput -match '\[FAIL\]') {
+              throw 'sqlite-snapshot-wal spike reported a failed assertion'
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: SQLite source identity spikes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Push-Location 'spikes/sqlite-source-identity'
+          try {
+            foreach ($bin in @('sqlite-source-identity-spike', 'phase2')) {
+              $out = cargo run --locked --release --target '${{ matrix.target }}' --bin $bin 2>&1 |
+                Tee-Object -FilePath "../../evidence/ci/sqlite-source-identity-$bin.txt"
+              if ($out -match '\[FAIL\]') {
+                throw "sqlite-source-identity $bin reported a failed assertion"
+              }
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Write environment and binary hash report
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $binary = Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}'
+          $item = Get-Item $binary
+          $report = [ordered]@{
+            artifact_kind = 'ci_run_evidence'
+            accounting_status_before_review = 'ci_configured_only'
+            workflow = 'core-beta-evidence'
+            run_url = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            runner_label = '${{ matrix.runner }}'
+            runner_os = '${{ runner.os }}'
+            runner_arch = '${{ runner.arch }}'
+            os_description = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+            os_architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            process_architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            target = '${{ matrix.target }}'
+            source_commit = '${{ github.sha }}'
+            rustc = (rustc --version --verbose | Out-String).Trim()
+            cargo = (cargo --version | Out-String).Trim()
+            binary_name = '${{ matrix.binary }}'
+            binary_size_bytes = $item.Length
+            binary_sha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+            unsigned = $true
+            limitations = @(
+              'Workflow configuration is not proof that a GitHub-hosted run passed.',
+              'Artifacts are unsigned and are not release certification.',
+              'Production process tests exercise SqliteStore APIs but do not constitute release certification or minimum-OS evidence.',
+              'The Ubuntu 22.04 runner does not certify the proposed glibc 2.31 floor.',
+              'No signing or macOS notarization is performed.'
+            )
+          }
+          $report | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM -Path 'evidence/ci/environment.json'
+
+      - name: Upload unsigned evidence artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-beta-${{ matrix.id }}-${{ github.run_id }}
+          path: |
+            evidence/ci/
+            target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,73 @@
+{
+  "committed": 5,
+  "fixture_blake3": "a7f85a455dd1986dcd6c81feed5aad02c830ed2b26a4e8f70fc03009a70232ef",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "grok-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 140,
+        "start": 0
+      },
+      "text": "hello world",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "grok-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 449,
+        "start": 281
+      },
+      "text": "part1\npart2",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "grok-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": {
+        "end": 717,
+        "start": 605
+      },
+      "text": "next question",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "grok-msg-3",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 3,
+      "span": {
+        "end": 1027,
+        "start": 913
+      },
+      "text": "第三轮问题",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "grok-msg-4",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 4,
+      "span": {
+        "end": 1140,
+        "start": 1028
+      },
+      "text": "final answer",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": "p1",
+  "skipped": 1
+}

@@ -1,0 +1,60 @@
+{
+  "committed": 4,
+  "fixture_blake3": "2e21aa04438333b7f3968f816a5357439afe521fe2df501573334b066fa2e605",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 143,
+        "start": 0
+      },
+      "text": "build the project",
+      "timestamp": "2026-07-03T13:22:14Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "2",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 447,
+        "start": 286
+      },
+      "text": "plan accepted",
+      "timestamp": "2026-07-03T13:22:16Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "3",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 2,
+      "span": {
+        "end": 598,
+        "start": 448
+      },
+      "text": "internal reasoning only",
+      "timestamp": "2026-07-03T13:22:16.5Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "4",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 3,
+      "span": {
+        "end": 738,
+        "start": 599
+      },
+      "text": "修复中文路径",
+      "timestamp": null
+    }
+  ],
+  "session_native_id": null,
+  "skipped": 1
+}

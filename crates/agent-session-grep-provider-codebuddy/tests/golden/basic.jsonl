@@ -1,0 +1,7 @@
+{"type":"message","role":"user","content":"code","sessionId":"sess-1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"message","role":"user","content":"hello world","sessionId":"sess-1"}
+{"type":"message","role":"assistant","content":[{"type":"text","text":"part1"},{"type":"text","text":"part2"}],"sessionId":"sess-1"}
+{"type":"meta","sessionId":"sess-1","cwd":"/work"}
+{"type":"message","role":"system","content":"system prompt","sessionId":"sess-1"}
+not json at all
+{"type":"message","role":"user","content":"中文问题","sessionId":"sess-1","timestamp":"2026-01-01T00:05:00Z"}

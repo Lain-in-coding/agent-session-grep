@@ -1,0 +1,68 @@
+{
+  "committed": 6,
+  "fixture_blake3": "26556f79bc187baa0169ca383fd411e086bdad2438301a40a4a8f15e4d857ab9",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-0",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": null,
+      "text": "hello",
+      "timestamp": "101"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-1",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": null,
+      "text": "hi there",
+      "timestamp": "102"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-2",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 2,
+      "span": null,
+      "text": "raw only",
+      "timestamp": "150"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-3",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 3,
+      "span": null,
+      "text": "q1",
+      "timestamp": "200"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-4",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 4,
+      "span": null,
+      "text": "a1",
+      "timestamp": "200"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "cursor-msg-5",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 5,
+      "span": null,
+      "text": "q2",
+      "timestamp": "201"
+    }
+  ],
+  "session_native_id": "tab-1",
+  "skipped": 0
+}

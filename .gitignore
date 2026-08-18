@@ -1,0 +1,52 @@
+# Rust build artifacts (所有层级，含 spikes/*/target)
+target/
+# Isolated --target-dir outputs used for parallel/worktree verification runs
+target-*/
+**/*.rs.bk
+
+# Local clones of third-party reference projects (never part of this project)
+/*_src/
+
+# Local scratch databases + SQLite 侧车文件
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Golden SQLite fixtures are committed test data (BLAKE3-pinned bytes),
+# not scratch databases — re-include them from the `*.db` rule above.
+!crates/*/tests/golden/*.db
+
+# Generated local benchmark evidence (reports may contain machine details)
+/evidence-output/
+# Generated gate/install manifests (reproducible by re-running the harnesses;
+# may contain local machine details). Keeps scripts/evidence/out/README.md tracked.
+/scripts/evidence/out/*.json
+
+# Secrets / credentials (绝不入库)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+.mcp.json
+
+# Local agent / editor configuration
+.claude/
+.codegraph/
+.idea/
+.vscode/
+
+# Generated language caches
+**/__pycache__/
+**/*.pyc
+
+# Local research material (not part of the shared repository)
+/AI-Agent历史会话检索-借鉴项目清单.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

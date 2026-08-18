@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-session-grep.dev/schemas/robot/v1.1/envelope.schema.json",
+  "title": "agent-session-grep Robot Protocol Envelope v1.1",
+  "description": "A complete agent-session-grep JSON or JSONL protocol frame. Additive evolution of the frozen v1 envelope: searchHit gains occurrences and resume_available; searchData gains an optional facets echo.",
+  "oneOf": [
+    { "$ref": "#/$defs/success" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/progress" },
+    { "$ref": "#/$defs/diagnostic" }
+  ],
+  "$defs": {
+    "searchHit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "score", "session_id", "text", "resume_available"],
+      "properties": {
+        "id": { "type": "string" },
+        "score": { "type": "number" },
+        "session_id": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "why_matched": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 8,
+          "description": "Deterministic literal-term evidence derived from the query against the hit's full text."
+        },
+        "suggested_next_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 2,
+          "description": "Suggested follow-up commands using only real identifiers present on the hit."
+        },
+        "occurrences": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-session collapse count under group_by_session; always 1 on the default path, where the key is omitted to keep legacy output byte-compatible."
+        },
+        "resume_available": {
+          "type": "boolean",
+          "description": "Whether Resume Metadata is available for the hit's session (ADR-0009). false only means no resumable provider metadata exists; the history stays searchable."
+        }
+      }
+    },
+    "truncation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truncated", "reason"],
+      "properties": {
+        "truncated": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "searchData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hits", "generation", "truncation"],
+      "properties": {
+        "hits": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/searchHit" }
+        },
+        "generation": { "type": "integer", "minimum": 0 },
+        "truncation": { "$ref": "#/$defs/truncation" },
+        "facets": { "$ref": "#/$defs/searchFacets" }
+      }
+    },
+    "searchFacets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Structured facet filters echoed back as applied. The key is omitted entirely when every facet holds its default (sidechain=include, no tool filters), keeping default output byte-compatible.",
+      "properties": {
+        "sidechain": { "enum": ["include", "main_only", "subagent_only"] },
+        "tool_kind": {
+          "enum": ["file", "command", "web", "query", "unknown", null],
+          "description": "Closed tool-activity kind set; null means no tool_kind filter was applied."
+        },
+        "tool_name": {
+          "type": ["string", "null"],
+          "description": "Verbatim tool name filter; null means no tool_name filter was applied."
+        }
+      }
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["next_cursor", "has_more"],
+      "properties": {
+        "next_cursor": { "type": ["string", "null"] },
+        "has_more": { "type": "boolean" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_ms", "generation"],
+      "properties": {
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "generation": { "type": ["integer", "string", "null"] }
+      }
+    },
+    "errorBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable", "details"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_request",
+            "not_found",
+            "source_io",
+            "source_changed",
+            "snapshot_failed",
+            "catalog_error",
+            "provider_error",
+            "capability_not_supported",
+            "writer_busy",
+            "schema_incompatible",
+            "cursor_invalid",
+            "cursor_expired",
+            "generation_mismatch",
+            "internal"
+          ]
+        },
+        "message": { "type": "string", "maxLength": 4096 },
+        "retryable": { "type": "boolean" },
+        "details": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": true
+        }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "frame_type",
+        "command",
+        "request_id",
+        "ok",
+        "outcome",
+        "data",
+        "retrieval_mode",
+        "redaction",
+        "warnings",
+        "page",
+        "meta"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.1" },
+        "frame_type": { "const": "response" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "ok": { "const": true },
+        "outcome": { "enum": ["success", "partial"] },
+        "data": true,
+        "retrieval_mode": {
+          "enum": ["lexical", "semantic", "hybrid", "lexical_fallback"]
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "status", "ruleset_version", "redacted_count"],
+          "properties": {
+            "mode": { "enum": ["default", "revealed"] },
+            "status": { "enum": ["applied", "none", "partial"] },
+            "ruleset_version": { "type": "string", "maxLength": 64 },
+            "redacted_count": { "type": "integer", "minimum": 0 },
+            "audit_id": { "type": ["string", "null"], "maxLength": 128 }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 4096 }
+        },
+        "page": { "$ref": "#/$defs/page" },
+        "meta": { "$ref": "#/$defs/meta" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "command": { "const": "search" } },
+            "required": ["command"]
+          },
+          "then": {
+            "properties": {
+              "data": { "$ref": "#/$defs/searchData" }
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "frame_type",
+        "command",
+        "request_id",
+        "ok",
+        "outcome",
+        "error",
+        "warnings",
+        "page",
+        "meta"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.1" },
+        "frame_type": { "const": "error" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "ok": { "const": false },
+        "outcome": { "const": "failure" },
+        "error": { "$ref": "#/$defs/errorBody" },
+        "warnings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 4096 }
+        },
+        "page": { "$ref": "#/$defs/page" },
+        "meta": { "$ref": "#/$defs/meta" }
+      }
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "frame_type",
+        "command",
+        "request_id",
+        "message"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.1" },
+        "frame_type": { "const": "progress" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "message": { "type": "string", "maxLength": 4096 }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "frame_type",
+        "command",
+        "request_id",
+        "message"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.1" },
+        "frame_type": { "const": "diagnostic" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "message": { "type": "string", "maxLength": 4096 }
+      }
+    }
+  }
+}
