@@ -31,7 +31,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
- "tokenizers",
+ "tokenizers 0.23.1",
 ]
 
 [[package]]
@@ -395,7 +395,7 @@ dependencies = [
  "rayon",
  "safetensors 0.7.0",
  "thiserror 2.0.19",
- "tokenizers",
+ "tokenizers 0.22.2",
  "yoke",
  "zip",
 ]
@@ -574,6 +574,12 @@ name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
+name = "daachorse"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
 
 [[package]]
 name = "darling"
@@ -1871,6 +1877,39 @@ dependencies = [
  "ahash",
  "aho-corasick",
  "compact_str 0.9.1",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.3.4",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.19",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokenizers"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44e5bea67576e04b6ff8564c5d9e09c2ef0cf476502245f2f120e497769d3112"
+dependencies = [
+ "ahash",
+ "compact_str 0.9.1",
+ "daachorse",
  "dary_heap",
  "derive_builder",
  "esaxx-rs",

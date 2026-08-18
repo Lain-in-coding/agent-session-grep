@@ -22,7 +22,7 @@ crossterm = "0.28"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 safetensors = "0.4.5"
 
 # Release profile rationale (2026-08-15, task 08-15 open-source-product-roadmap).
