@@ -19,7 +19,7 @@ crossterm = "0.28"
 # Optional local semantic stack (feature semantic-candle). Pinned to versions
 # already present in the local cargo registry so offline builds stay hermetic.
 # No hf-hub / reqwest / tokio: model weights are imported from a local bundle only.
-candle-core = "0.10.2"
+candle-core = "0.11.0"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
