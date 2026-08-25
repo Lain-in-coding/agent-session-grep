@@ -15,7 +15,7 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 # Optional local semantic stack (feature semantic-candle). Pinned to versions
 # already present in the local cargo registry so offline builds stay hermetic.
 # No hf-hub / reqwest / tokio: model weights are imported from a local bundle only.
