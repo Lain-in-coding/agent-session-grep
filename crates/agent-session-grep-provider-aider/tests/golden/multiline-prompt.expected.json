@@ -1,0 +1,38 @@
+{
+  "fixture_blake3": "7eaf31bd75f56ac8f293be43764f00470be1c5b9c137d603a655856f0bcf8e7b",
+  "session_native_id": "2026-01-02 09:00:00",
+  "committed": 3,
+  "skipped": 0,
+  "messages": [
+    {
+      "seq": 0,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "user",
+      "text": "please refactor the parser\nand keep the spans byte exact\n第三行（多字节：🚀）",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 45, "end": 133 }
+    },
+    {
+      "seq": 1,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "I will do that.",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 150, "end": 165 }
+    },
+    {
+      "seq": 2,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "Applied edit to src/placeholder.rs\n\nApplied edit to src/placeholder_two.rs",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 173, "end": 247 }
+    }
+  ]
+}

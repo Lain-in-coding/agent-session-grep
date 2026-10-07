@@ -90,19 +90,45 @@ as a purported checksum of the evolving canonical tree. Snapshots describe
 They remain immutable; future development follows the public contribution
 contract, not continuous re-export or manifest regeneration.
 
-Only the exact, freshly generated profile/exclusion metadata is omitted from
-its byte-checked manifest during the exporter's scan (it necessarily declares
-excluded roots). Profile drift is rejected; all other manifest fields are
-scanned, including extra fields supplied by a caller. Historical manifests and
-all source content are scanned with the unchanged public rules. A source that
-already contains v2 snapshots and no root v1 manifest keeps those snapshot bytes
-unchanged as ordinary inventory entries; their policy metadata can also fail
-the scan. Re-exporting does not grant historical metadata a new exemption.
-In particular, an old v1 `excluded_prefixes` field can contain an internal
-marker and fail the scan after archival. Preserve that evidence and request a
-separately reviewed resolution; do not rewrite the provenance, broaden the
-allowlist, or report a failed scan as success. Export success is not a
-credential/history audit or permission to publish.
+The trusted scanner has exactly two reviewed historical policy-metadata pins.
+Each binds the **complete raw SHA-256**, exact archived path and schema before
+omitting only the following top-level fields from its in-memory scan input:
+
+- v1: `docs/operations/imports/public-tree-v1-e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af.json`
+  - SHA-256: `e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af`
+  - Schema: `agent-session-grep.public-tree/v1`; omit only `excluded_prefixes`.
+- v2: `docs/operations/imports/public-tree-v2-f587c73332158342330a63874fabdc8f565624ec.json`
+  - SHA-256: `121e09c2ab6f7e5922a0862ea095fae3ae343913847cc3efa62546cf71585ead`
+  - Schema: `agent-session-grep.public-tree/v2`; omit only `excluded_prefixes`
+    and `profile`.
+
+Every other field, nested value and inventory entry remains scanned under the
+unchanged rules. These are not whole-file, directory, schema or credential
+exemptions. The registry lives in reviewed scanner code, never candidate data
+or caller-supplied configuration. A self-declared digest grants no trust.
+Known-path byte/hash/schema mismatch and unregistered historical snapshots are
+non-success even without privacy-pattern hits. No legacy root-path alias is
+registered: the original root manifest and existing formal history still need
+the separate history/credential audit.
+
+Both standalone tracked-file scanning and export-directory scanning use the
+same byte/content policy. `docs/operations/imports/public-tree-*.json -text`
+keeps snapshot bytes exact on checkout with either `core.autocrlf` setting.
+Do not normalize, reserialize or rewrite a snapshot to make a hash match.
+Preserve a failed candidate and request a separately reviewed resolution.
+
+For a **freshly generated** v2 output only, the exporter checks the complete
+bytes, exact schema, current tool hash and exact profile/exclusion metadata.
+It grants the shared scanner a single path-and-raw-hash-bound authorization to
+omit only `profile` and `excluded_prefixes`. Extra fields still get scanned.
+That grant cannot override a historical pin, survive to a later file, or
+become standalone authorization for a subsequent historical snapshot. Existing
+v2 snapshots remain byte-exact inventory entries on re-export, but unregistered
+ones fail closed. Profile/tool drift is a non-success result, not a waiver.
+
+CLI diagnostics report only controlled rule identifiers, not private matches,
+source excerpts or candidate paths. Export success is not a credential/history
+audit, proof that all content is public, or permission to publish.
 
 ### Explicit Git index modes, including Windows
 
@@ -372,12 +398,13 @@ server no longer retains old refs.
   `--sensitive-data-removal`):
   <https://github.com/newren/git-filter-repo/blob/main/Documentation/git-filter-repo.txt>
 
-## Executable export contract
+## Executable export and privacy contract
 
 ### Scope and trigger
 
 This contract applies when exporting a fixed source commit or checking/applying
-Git modes in an independently staged export. It does not authorize publishing,
+Git modes in an independently staged export, and when scanning a tracked tree
+or export directory under the named repo/public profile. It does not authorize publishing,
 history rewriting or applying a raw-source snapshot to a reconciled working tree.
 
 ### Signatures
@@ -386,6 +413,10 @@ history rewriting or applying a raw-source snapshot to a reconciled working tree
 export_public_tree.py --repo <source> --commit <ref> --destination <empty-dir>
 export_public_tree.py --destination <export> --manifest <relative-v2-path> --index-modes check
 export_public_tree.py --destination <export> --manifest <relative-v2-path> --index-modes apply
+privacy_scan.py --repo <tracked-tree> --profile repo|public
+scan_content(path: str, data: bytes, profile="repo", *, _generated_snapshot=None) -> list[Finding]
+scan_repo(repo: Path, profile="repo") -> list[Finding]
+scan_export(repo: Path, destination: Path, manifest=None) -> int
 ```
 
 ### Inputs, outputs and environment
@@ -396,12 +427,34 @@ evidence. Index operations accept that exact snapshot and staged inventory,
 not arbitrary partial path lists. Tool/scanner/profile bytes determine provenance;
 ambient Git directory/index/object overrides are rejected, not silently trusted.
 
+The shared `scan_content` scans the relative filename once, even for binary
+payloads, before applying the same selected profile to decoded content. Both
+entry points delegate to it; export does not repeat the filename scan. Binary
+payload bytes are not decoded or certified clean. `Finding` carries path, line,
+rule, match and excerpt for internal use; CLI diagnostics expose rule ids only.
+Filename findings use line1; projected JSON line numbers describe scan input,
+not necessarily the original archived lines.
+
+The two read-only historical pins above bind exact path, raw SHA256, schema and
+fixed top-level fields: v1 omits only `excluded_prefixes`; v2 omits only
+`excluded_prefixes` and `profile`. Every other field/nested value is scanned.
+There is no caller registry, root alias or whole-file exemption. Only the
+trusted exporter supplies the private `_generated_snapshot=(path, raw_sha256)`
+grant after validating exact generated bytes, v2 schema, current exporter hash,
+current profile and exclusions. It is reset per file, cannot override a
+historical pin, and never enters standalone scanning. Candidate declarations
+are data, not authorization. Snapshot `-text` attributes preserve approved raw
+bytes across checkout policies; scans never rewrite bytes to obtain a match.
+
 ### Validation and error matrix
 
 | Case | Result | Mutation boundary |
 | --- | --- | --- |
 | Valid export or matching index check | Exit 0 | Export writes only its isolated destination; check preserves index content |
-| Public-rule finding | Exit 1 | Export is not approved for publication; evidence is retained |
+| Filename/content rule finding | Exit 1 | Both scanner CLIs retain failed evidence; neither approves publication |
+| Known snapshot hash/schema mismatch (`snapshot-integrity`) or unknown historical snapshot (`unregistered-snapshot`) | Exit 1 | Reject even without regex hits; no policy omission or byte rewrite |
+| Missing/unreadable tracked file or failed tracked inventory | Standalone CLI exit 2 | No missing-file skip; helper raises I/O/Git error |
+| Exact registered snapshot or verified fresh output | Exit 0 only if remaining path/content scan is clean | Omit only fixed top-level fields in memory; no credential/history clearance |
 | Invalid source, path, manifest, destination, index or Git operation | Exit 2 | Export prevalidation writes nothing; rejected index transaction preserves the real index |
 | Mode mismatch in check mode | Exit 2 | Explicit review/apply is required; no automatic mode repair |
 | Existing index lock or incompatible environment | Exit 2 | Another writer's lock/state is not removed or overridden |
@@ -409,20 +462,27 @@ ambient Git directory/index/object overrides are rejected, not silently trusted.
 ### Good, base and bad cases
 
 - Good: two fresh destinations from identical source/tool/profile bytes have
-  identical snapshot bytes and verified payload hashes/modes.
+  identical snapshot bytes and verified payload hashes/modes. Registered archive
+  bytes survive both checkout policies and both scanner entry points agree.
 - Base: Windows stages a Unix script as100644. Check rejects; explicit apply
   changes only its recorded mode to100755 with the blob unchanged.
 - Bad: a source subdirectory hides an output inside the actual source root;
   a path collides on Windows; a malformed manifest uses a non-string path or
   boolean count; an unmerged/extra/drifted index entry appears. Reject rather
-  than guessing, following a link or updating a partial inventory.
+  than guessing, following a link or updating a partial inventory. A filename-only
+  finding fails both scanners even when its bytes are benign or binary; edited
+  or unknown pattern-free snapshots fail without consulting candidate policy.
 
 ### Required tests and assertion points
 
 The exporter suite must assert deterministic objects/projection under both
 checkout newline policies, NUL-safe portable paths, untouched sources on
-rejection, v1 byte preservation, non-exempt historical snapshots, and scanning
-of non-profile metadata. Transaction tests compare real index bytes and blob
+rejection, v1 byte preservation, exact registered policy projection, rejection
+of changed/unregistered snapshots, and scanning of every non-policy field.
+Require registry/schema/path/hash/encoding mutations, injected inventory/free
+text, candidate-registry refusal, and private fresh-grant isolation. Filename-
+only text/JSON/binary cases must fail both scanners with one finding per name,
+not a duplicated export finding; repo/public profile distinctions stay intact. Transaction tests compare real index bytes and blob
 IDs on success/failure and preserve other writers' lock ownership. CLI tests
 assert exit codes, absent traceback/path disclosure and no destination creation
 for invalid inputs. Use synthetic fixtures, never real session data.
@@ -436,3 +496,6 @@ for invalid inputs. Use synthetic fixtures, never real session data.
 | Validate, then update using stale staged OIDs | Lock first, validate a private candidate, recheck, then atomically publish |
 | Blanket-stage a directory or waive the whole manifest scan | Stage reviewed literal inventory paths; exempt only exact tool-owned metadata |
 | Treat a failed historical-content scan as successful migration | Keep the failure/evidence and resolve it through the reviewed integration |
+| Scan names only in export, or skip binary filenames | Use the shared filename-and-content policy once in both entry points |
+| Trust a snapshot schema, self-declared digest or candidate registry | Require the trusted exact raw pin/schema or the one-file validated fresh grant |
+| Extend a fresh grant to the next historical file | Reset per file and give historical pins precedence |

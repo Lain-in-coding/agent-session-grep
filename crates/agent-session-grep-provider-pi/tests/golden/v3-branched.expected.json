@@ -1,0 +1,60 @@
+{
+  "committed": 4,
+  "fixture_blake3": "fc8c0db990ad43f00944393bcddae07ac2df48a8f454a230e2363c1a089cecd5",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 0,
+      "span": {
+        "end": 399,
+        "start": 256
+      },
+      "text": "root question",
+      "timestamp": "2026-01-01T00:00:02Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 1,
+      "span": {
+        "end": 596,
+        "start": 400
+      },
+      "text": "kept\nanswer",
+      "timestamp": "2026-01-01T00:00:03Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "seq": 2,
+      "span": {
+        "end": 755,
+        "start": 597
+      },
+      "text": "abandoned branch answer",
+      "timestamp": "2026-01-01T00:00:04Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "user",
+      "seq": 3,
+      "span": {
+        "end": 919,
+        "start": 756
+      },
+      "text": "被放弃分支上的中文追问",
+      "timestamp": "2026-01-01T00:00:05Z"
+    }
+  ],
+  "session_native_id": "sess-v3",
+  "skipped": 0
+}

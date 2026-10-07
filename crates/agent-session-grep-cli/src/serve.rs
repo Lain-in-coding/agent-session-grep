@@ -83,8 +83,16 @@ pub fn run(
     let local_addr = listener
         .local_addr()
         .map_err(|e| crate::CliError::usage(format!("serve: local address unavailable: {e}")))?;
+    // Token goes in the URL **fragment**, not the query string. A fragment is
+    // never sent to the server, so it cannot land in a request log, an access
+    // log, or a `Referer` header on any later navigation — whereas
+    // `?token=<secret>` reaches every one of those. The page reads it from
+    // `location.hash` and sends it as `Authorization: Bearer`, then strips it
+    // from the visible URL so it does not persist in browser history.
+    // Idea from cc-sessions-viewer's `web-server-mode.md` (no LICENSE file in
+    // that repository — spec-level idea only, no code borrowed).
     eprintln!(
-        "asg serve: open http://{local_addr}/?token={}",
+        "asg serve: open http://{local_addr}/#token={}",
         session.token()
     );
     eprintln!("asg serve: loopback-only; LAN mode is capability_not_supported");
@@ -203,6 +211,12 @@ fn worker_loop(
             }
         };
         let mut stream = stream;
+        // Windows 的 `accept` 会继承 listener 的非阻塞属性（`set_nonblocking(true)`
+        // 在 serve_listener 里是为了让 accept 轮询不阻塞事件循环）。不显式还原为
+        // 阻塞，SO_RCVTIMEO/SO_SNDTIMEO 就整体失效：请求字节晚到几百微秒即
+        // WouldBlock → 立刻回 408（实测 140 次合法请求误判 2 次），而半关闭的
+        // 客户端还会被随后的 RST 抹掉已经收到的响应（0 字节 + ConnectionAborted）。
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(limits.read_timeout));
         let _ = stream.set_write_timeout(Some(limits.write_timeout));
         let request = parse_request(&mut stream);
@@ -303,9 +317,19 @@ impl HttpRequest {
     /// requests made by the embedded UI carry no Origin header; a present
     /// Origin must exactly match the loopback Host authority (Q27).
     pub fn check_origin_loopback(&self) -> bool {
-        let Some(origin) = self.header("origin") else {
+        let mut origins = self
+            .headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("origin"))
+            .map(|(_, value)| value.as_str());
+        let Some(origin) = origins.next() else {
             return true;
         };
+        // 重复 Origin 不是"没有 Origin"：`header` 对重复取值返回 None，沿用它会
+        // 把两个 Origin 头当成同源放行（fail open）。在场即校验，歧义即拒绝。
+        if origins.next().is_some() {
+            return false;
+        }
         let Some((scheme, authority)) = parse_http_origin(origin) else {
             return false;
         };
@@ -341,6 +365,27 @@ impl HttpRequest {
             }
         }
         None
+    }
+
+    fn query_pairs(&self) -> Result<Vec<(String, String)>, HttpResponse> {
+        let Some((_, query)) = self.path.split_once('?') else {
+            return Ok(Vec::new());
+        };
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                match (percent_decode(key), percent_decode(value)) {
+                    (Some(key), Some(value)) => Ok((key, value)),
+                    _ => Err(fixed_error(
+                        400,
+                        "invalid_request",
+                        "invalid query parameter encoding",
+                    )),
+                }
+            })
+            .collect()
     }
 }
 
@@ -524,14 +569,17 @@ pub fn parse_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     let mut headers = Vec::new();
     let mut header_bytes = 0usize;
     loop {
-        if headers.len() >= MAX_HEADER_COUNT {
-            return Err(invalid_data("too many request headers"));
-        }
         let mut line = String::new();
         let n = read_bounded_line(&mut reader, &mut line, MAX_HEADER_BYTES - header_bytes)?;
         header_bytes += n;
         if n == 0 || line.trim().is_empty() {
             break;
+        }
+        // 计数放在"确认这一行是 header"之后：守卫在循环开头时，终止空行也要占
+        // 一次迭代，于是恰好 MAX_HEADER_COUNT 条 header 的合法请求被判 400
+        // （实际上限只有 99）。上限的含义是"接受这么多条 header"。
+        if headers.len() >= MAX_HEADER_COUNT {
+            return Err(invalid_data("too many request headers"));
         }
         let Some(idx) = line.find(':') else {
             return Err(invalid_data("malformed request header"));
@@ -654,9 +702,15 @@ pub fn route_request(
             "direct loopback connection required",
         );
     }
+    // The UI page itself is static HTML with no secrets and no data; it may be
+    // fetched without a token so the fragment-based flow can boot at all — a
+    // fragment is never sent to the server, so the page-load request carries
+    // no credential by design (the query-string form keeps its historical
+    // bootstrap path too). Every data route below still requires the bearer.
+    let is_ui_page = req.method == "GET" && path_only(req.path.as_str()) == "/";
     let bootstrap_token =
         path_only(req.path.as_str()) == "/" && req.query_param("token").as_deref() == Some(token);
-    if !req.check_token(token) && !bootstrap_token {
+    if !is_ui_page && !req.check_token(token) && !bootstrap_token {
         return fixed_error(401, "unauthorized", "valid bearer token required");
     }
 
@@ -712,19 +766,31 @@ pub fn route_request(
         );
     }
     if let Some(id) = path.strip_prefix("/api/show/") {
+        if let Err(response) = check_argv_value("id", id) {
+            return response;
+        }
         args = vec!["show".to_string(), id.to_string()];
     } else if path == "/api/show" {
         let Some(id) = req.query_param("id").filter(|value| !value.is_empty()) else {
             return fixed_error(400, "invalid_request", "missing id parameter");
         };
+        if let Err(response) = check_argv_value("id", &id) {
+            return response;
+        }
         args = vec!["show".to_string(), id];
     }
     if let Some(session_id) = path.strip_prefix("/api/resume/") {
+        if let Err(response) = check_argv_value("session", session_id) {
+            return response;
+        }
         args = vec!["resume".to_string(), session_id.to_string()];
     } else if path == "/api/resume" {
         let Some(session_id) = req.query_param("session").filter(|value| !value.is_empty()) else {
             return fixed_error(400, "invalid_request", "missing session parameter");
         };
+        if let Err(response) = check_argv_value("session", &session_id) {
+            return response;
+        }
         args = vec!["resume".to_string(), session_id];
     }
     if !matches!(
@@ -752,7 +818,19 @@ pub fn route_request(
         None,
         offline,
     ) {
-        Ok((command, outcome, data, page, warnings)) => {
+        Ok((command, outcome, mut data, page, warnings)) => {
+            if command == "status"
+                && let Some(data) = data.as_object_mut()
+            {
+                data.insert("web_capabilities".into(), serde_json::json!({
+                    "search_parameters": WEB_SEARCH_PARAMETERS,
+                    "repeated_parameters": ["provider"],
+                    "provider_values": agent_session_grep_ports::capability::search_provider_filter_values(),
+                    "retrieval_modes": ["lexical", "semantic", "hybrid"],
+                    "limit_sets_max_items": true,
+                    "mutation_and_execution": false,
+                }));
+            }
             let outcome = match outcome {
                 crate::protocol::Outcome::Success => "success",
                 crate::protocol::Outcome::Partial => "partial",
@@ -775,33 +853,101 @@ pub fn route_request(
     }
 }
 
+const WEB_SEARCH_PARAMETERS: &[&str] = &[
+    "q",
+    "mode",
+    "limit",
+    "max_bytes",
+    "cursor",
+    "provider",
+    "since",
+    "until",
+    "repo",
+    "include_system",
+    "group_by_session",
+    "sidechain",
+    "tool_kind",
+    "tool_name",
+];
+
 fn request_args(req: &HttpRequest) -> Result<Vec<String>, HttpResponse> {
     let path = path_only(req.path.as_str());
-    let value = |name: &str| req.query_param(name).filter(|value| !value.is_empty());
+    let value = |name: &str| -> Result<Option<String>, HttpResponse> {
+        let Some(value) = req.query_param(name).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        check_argv_value(name, &value)?;
+        Ok(Some(value))
+    };
     match path {
         "/" | "/health" | "/api/providers" => Ok(Vec::new()),
         "/api/status" => Ok(vec!["status".to_string()]),
         "/api/search" | "/api/projection/search" => {
-            let Some(query) = value("q") else {
+            let parameters = req.query_pairs()?;
+            let mut seen = std::collections::BTreeSet::new();
+            for (name, parameter) in &parameters {
+                if !WEB_SEARCH_PARAMETERS.contains(&name.as_str())
+                    || (name != "provider" && !seen.insert(name.as_str()))
+                    || parameter.trim().is_empty()
+                {
+                    return Err(fixed_error(
+                        400,
+                        "invalid_request",
+                        "unknown, duplicate or empty search parameter",
+                    ));
+                }
+                check_argv_value(name, parameter)?;
+            }
+            let Some(query) = value("q")? else {
                 return Err(fixed_error(400, "invalid_request", "missing q parameter"));
             };
             let mut args = vec!["search".to_string(), query];
-            append_value_flag(&mut args, "--mode", value("mode"));
-            append_value_flag(&mut args, "--max-items", value("limit"));
-            append_value_flag(&mut args, "--cursor", value("cursor"));
-            append_value_flag(&mut args, "--provider", value("provider"));
-            append_value_flag(&mut args, "--since", value("since"));
-            append_value_flag(&mut args, "--until", value("until"));
-            if value("include_system").as_deref() == Some("true") {
-                args.push("--include-system".to_string());
+            append_value_flag(&mut args, "--mode", value("mode")?);
+            append_value_flag(&mut args, "--max-items", value("limit")?);
+            append_value_flag(&mut args, "--max-bytes", value("max_bytes")?);
+            append_value_flag(&mut args, "--cursor", value("cursor")?);
+            for (_, provider) in parameters.iter().filter(|(name, _)| name == "provider") {
+                append_value_flag(&mut args, "--provider", Some(provider.clone()));
             }
-            if value("group_by_session").as_deref() == Some("true") {
-                args.push("--group-by-session".to_string());
+            append_value_flag(&mut args, "--since", value("since")?);
+            append_value_flag(&mut args, "--until", value("until")?);
+            // repo（schema v16）：与 CLI `--repo` / MCP `repo` 同一维度，Web 面
+            // 不得少一个过滤轴（五入口一致性）。空取值被 `value` 过滤掉 = 无过滤。
+            append_value_flag(&mut args, "--repo", value("repo")?);
+            append_value_flag(&mut args, "--tool-kind", value("tool_kind")?);
+            append_value_flag(&mut args, "--tool-name", value("tool_name")?);
+            match value("sidechain")?.as_deref() {
+                None | Some("include") => {}
+                Some("main_only") => args.push("--main-only".into()),
+                Some("subagent_only") => args.push("--subagent-only".into()),
+                Some(_) => {
+                    return Err(fixed_error(
+                        400,
+                        "invalid_request",
+                        "invalid sidechain parameter",
+                    ));
+                }
+            }
+            for (name, flag) in [
+                ("include_system", "--include-system"),
+                ("group_by_session", "--group-by-session"),
+            ] {
+                match value(name)?.as_deref() {
+                    Some("true") => args.push(flag.into()),
+                    None | Some("false") => {}
+                    Some(_) => {
+                        return Err(fixed_error(
+                            400,
+                            "invalid_request",
+                            "search boolean must be true or false",
+                        ));
+                    }
+                }
             }
             Ok(args)
         }
         "/api/context" => {
-            let Some(session) = value("session") else {
+            let Some(session) = value("session")? else {
                 return Err(fixed_error(
                     400,
                     "invalid_request",
@@ -809,24 +955,76 @@ fn request_args(req: &HttpRequest) -> Result<Vec<String>, HttpResponse> {
                 ));
             };
             let mut args = vec!["context".to_string(), session];
-            append_value_flag(&mut args, "--policy", value("policy"));
-            append_value_flag(&mut args, "--level", value("level"));
-            append_value_flag(&mut args, "--max-messages", value("max_messages"));
+            append_value_flag(&mut args, "--policy", value("policy")?);
+            append_value_flag(&mut args, "--level", value("level")?);
+            append_value_flag(&mut args, "--max-messages", value("max_messages")?);
             Ok(args)
         }
         "/api/handoff" => {
-            let Some(query) = value("q") else {
+            let Some(query) = value("q")? else {
                 return Err(fixed_error(400, "invalid_request", "missing q parameter"));
             };
             let mut args = vec!["handoff".to_string(), query];
-            append_value_flag(&mut args, "--provider", value("provider"));
-            append_value_flag(&mut args, "--since", value("since"));
-            append_value_flag(&mut args, "--until", value("until"));
-            append_value_flag(&mut args, "--max-evidence", value("max_evidence"));
+            append_value_flag(&mut args, "--provider", value("provider")?);
+            append_value_flag(&mut args, "--since", value("since")?);
+            append_value_flag(&mut args, "--until", value("until")?);
+            append_value_flag(&mut args, "--max-evidence", value("max_evidence")?);
             Ok(args)
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Flag tokens this surface itself puts into the argv it hands `dispatch`.
+/// [`crate::is_known_flag_name`] covers the prefix-position vocabulary but not
+/// the per-subcommand flags marshalled here, so the two lists together are the
+/// full set of tokens the parser can compare a value against.
+const SERVE_ARGV_FLAGS: &[&str] = &[
+    "--mode",
+    "--max-items",
+    "--max-bytes",
+    "--tool-kind",
+    "--tool-name",
+    "--main-only",
+    "--subagent-only",
+    "--include-sidechain",
+    "--cursor",
+    "--provider",
+    "--since",
+    "--until",
+    "--repo",
+    "--include-system",
+    "--group-by-session",
+    "--policy",
+    "--level",
+    "--max-messages",
+    "--max-evidence",
+];
+
+/// Every request value that reaches [`crate::dispatch`] travels as an argv
+/// token, and the parser matches flag names by whole-token equality wherever
+/// they sit. A value that *equals* a flag name therefore changed what actually
+/// ran: `?q=--repo&repo=needle` searched `needle` filtered by repo `--repo` and
+/// answered 200 for a query nobody asked, while `?q=--include-system` was eaten
+/// as a boolean flag and answered a 400 claiming `q` was missing. Same doctrine
+/// as the `--db <path>` flag-shaped-value guard (R8.1/R8.2): ambiguity is an
+/// explicit usage error, never a silent reinterpretation.
+///
+/// The test is equality against the flag vocabulary, not a `-` prefix, because
+/// equality is exactly what the parser does. `q` is a free-text search term and
+/// coding transcripts are full of flag-*shaped* strings (`--no-verify`, `-Wall`,
+/// `-D warnings`); rejecting those would drop real coverage without closing any
+/// ambiguity, since the parser never compares against them.
+fn check_argv_value(name: &str, value: &str) -> Result<(), HttpResponse> {
+    if crate::is_known_flag_name(value) || SERVE_ARGV_FLAGS.contains(&value) {
+        // 只回显参数名（调用点全是字面量），绝不回显取值——它可能是检索词。
+        return Err(fixed_error(
+            400,
+            "invalid_request",
+            &format!("parameter {name} must not be a CLI flag name"),
+        ));
+    }
+    Ok(())
 }
 
 fn append_value_flag(args: &mut Vec<String>, flag: &str, value: Option<String>) {
@@ -902,7 +1100,6 @@ mod tests {
     use super::*;
     use std::net::{Shutdown, SocketAddr};
     use std::sync::{Arc, Barrier};
-    use std::time::Instant;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -1018,6 +1215,31 @@ mod tests {
         assert!(!proxied.check_direct_client());
     }
 
+    /// `header` returns `None` for a duplicated value, and a *missing* Origin is
+    /// deliberately treated as same-origin — so reusing it here let two Origin
+    /// headers walk through the cross-origin gate: one bad Origin answered 403,
+    /// the same bad Origin sent twice answered 200. Ambiguity must fail closed,
+    /// the way a duplicated Host and Authorization already do.
+    #[test]
+    fn duplicate_origin_header_cannot_bypass_the_cross_origin_guard() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let mut duplicated = authorized("GET", "/api/status");
+        duplicated
+            .headers
+            .push(("Origin".into(), "http://evil.test".into()));
+        duplicated
+            .headers
+            .push(("Origin".into(), "http://evil.test".into()));
+        assert!(!duplicated.check_origin_loopback());
+        let response = route_request(&duplicated, TEST_TOKEN, "test.db", false, &store);
+        assert_eq!(response.status, 403, "{}", response.body);
+        assert!(
+            response.body.contains("forbidden_origin"),
+            "{}",
+            response.body
+        );
+    }
+
     #[test]
     fn percent_decode_handles_unicode_and_rejects_bad_escape() {
         assert_eq!(percent_decode("hello+world"), Some("hello world".into()));
@@ -1058,7 +1280,7 @@ mod tests {
         );
         let response = route_request(&bootstrap, TEST_TOKEN, "test.db", false, &store);
         assert_eq!(response.status, 200);
-        assert!(response.body.contains("local session observatory"));
+        assert!(response.body.contains("data-shell=\"asg-web\""));
 
         let api_query_token = request(
             "GET",
@@ -1069,6 +1291,16 @@ mod tests {
             route_request(&api_query_token, TEST_TOKEN, "test.db", false, &store).status,
             401
         );
+
+        // The fragment-based flow loads the page with NO credential at all —
+        // a fragment is never sent to the server, so `GET /` arrives bare.
+        // The static page must still load (the UI reads the token from
+        // `location.hash` and puts it in the Authorization header itself);
+        // data routes must not.
+        let bare_page = request("GET", "/", vec![("Host".into(), "127.0.0.1:8080".into())]);
+        let response = route_request(&bare_page, TEST_TOKEN, "test.db", false, &store);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("data-shell=\"asg-web\""));
     }
 
     #[test]
@@ -1078,6 +1310,7 @@ mod tests {
             "/api/status",
             "/api/providers",
             "/api/search?q=needle&mode=lexical&limit=20",
+            "/api/search?q=needle&repo=github.com/synthetic-owner/synthetic-repo",
             "/api/handoff?q=needle",
         ] {
             let response = route_request(
@@ -1103,6 +1336,213 @@ mod tests {
         assert_eq!(invalid.status, 400);
         assert!(!invalid.body.contains("C:/Users"));
         assert!(!invalid.body.contains("secret.jsonl"));
+    }
+
+    /// Request values travel to `dispatch` as argv tokens, and the parser
+    /// matches flag names by whole-token equality wherever they sit. Before the
+    /// guard, `?q=--repo&repo=needle` really searched `needle` filtered by repo
+    /// `--repo` and answered **200 for a query nobody asked**, while
+    /// `?q=--include-system` was eaten as a boolean flag and answered a 400
+    /// claiming the caller had omitted `q`. Both must be one explicit
+    /// `invalid_request` naming the parameter.
+    #[test]
+    fn flag_shaped_request_values_are_rejected_instead_of_reparsed() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        for path in [
+            "/api/search?q=--repo&repo=needle",
+            "/api/search?q=--include-system",
+            "/api/search?q=needle&mode=-x",
+            "/api/search?q=needle&repo=--repo",
+            "/api/projection/search?q=--cursor&cursor=needle",
+            "/api/handoff?q=--provider&provider=codex",
+            "/api/context?session=--policy&policy=recent",
+            "/api/show?id=--yes",
+            "/api/show/--yes",
+            "/api/resume?session=--yes",
+            "/api/resume/--yes",
+        ] {
+            let response = route_request(
+                &authorized("GET", path),
+                TEST_TOKEN,
+                "test.db",
+                false,
+                &store,
+            );
+            assert_eq!(response.status, 400, "{path}: {}", response.body);
+            assert!(
+                response.body.contains("invalid_request"),
+                "{path}: {}",
+                response.body
+            );
+        }
+
+        // 取值本身绝不回显（可能是用户的检索词），只说参数名。
+        let named = route_request(
+            &authorized("GET", "/api/search?q=--repo&repo=needle"),
+            TEST_TOKEN,
+            "test.db",
+            false,
+            &store,
+        );
+        assert!(!named.body.contains("needle"), "{}", named.body);
+        assert!(named.body.contains("parameter q"), "{}", named.body);
+    }
+
+    /// The guard tests equality against the flag vocabulary, not a `-` prefix:
+    /// `q` is a free-text search term and coding transcripts are full of
+    /// flag-shaped strings the parser never compares against. Rejecting those
+    /// would make `--no-verify` or `-D warnings` unsearchable from the Web UI
+    /// while closing no ambiguity at all.
+    #[test]
+    fn search_terms_that_merely_look_like_flags_stay_searchable() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        for query in ["--no-verify", "-Wall", "-D%20warnings", "-1", "--repo%3Dx"] {
+            let response = route_request(
+                &authorized("GET", &format!("/api/search?q={query}")),
+                TEST_TOKEN,
+                "test.db",
+                false,
+                &store,
+            );
+            assert_eq!(response.status, 200, "q={query}: {}", response.body);
+        }
+    }
+
+    /// Structural half of the guard: every flag name this surface marshals into
+    /// argv must be one the guard refuses as a value. Adding a value-taking flag
+    /// to `request_args` without registering it turns the next query that
+    /// happens to equal that flag name back into a silently rewritten request,
+    /// so the omission has to fail here instead.
+    #[test]
+    fn every_flag_serve_marshals_is_refused_as_a_value() {
+        let populated = [
+            "/api/search?q=needle&mode=lexical&limit=5&cursor=c&provider=codex\
+             &since=1d&until=1h&repo=r&include_system=true&group_by_session=true",
+            "/api/context?session=s&policy=recent&level=full&max_messages=5",
+            "/api/handoff?q=needle&provider=codex&since=1d&until=1h&max_evidence=3",
+        ];
+        let mut seen = 0usize;
+        for path in populated {
+            let Ok(args) = request_args(&authorized("GET", path)) else {
+                panic!("{path}: a fully populated request must be accepted");
+            };
+            for flag in args.iter().filter(|arg| arg.starts_with("--")) {
+                assert!(
+                    check_argv_value("q", flag).is_err(),
+                    "{path}: serve emits {flag} but the guard accepts it as a value"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(
+            seen, 16,
+            "the populated routes emit a known number of flags; update this with them"
+        );
+    }
+
+    #[test]
+    fn search_routes_forward_the_repo_filter_like_the_cli_flag() {
+        // 五入口一致性：Web 的检索路由必须携带与 CLI `--repo`/MCP `repo` 同一
+        // 过滤轴。缺省 = 不过滤；空取值与 CLI/MCP 一样明确报错。
+        for path in ["/api/search", "/api/projection/search"] {
+            let Ok(with_repo) = request_args(&authorized(
+                "GET",
+                &format!("{path}?q=needle&repo=github.com/synthetic-owner/synthetic-repo"),
+            )) else {
+                panic!("{path}: repo 取值必须映射为 --repo 而不是请求错误");
+            };
+            assert!(
+                with_repo.windows(2).any(|pair| pair[0] == "--repo"
+                    && pair[1] == "github.com/synthetic-owner/synthetic-repo"),
+                "{path}: {with_repo:?}"
+            );
+            let Ok(args) = request_args(&authorized("GET", &format!("{path}?q=needle"))) else {
+                panic!("{path}: 缺省 repo 必须是合法请求");
+            };
+            assert!(!args.iter().any(|arg| arg == "--repo"), "{path}: {args:?}");
+            assert!(request_args(&authorized("GET", &format!("{path}?q=needle&repo="))).is_err());
+        }
+    }
+
+    #[test]
+    fn search_forwards_budget_facets_and_every_provider_value() {
+        let request = authorized(
+            "GET",
+            "/api/search?q=needle&max_bytes=4096&provider=claude&provider=grok-build&sidechain=subagent_only&tool_kind=command&tool_name=Bash",
+        );
+        let args = request_args(&request).unwrap_or_else(|response| panic!("{}", response.body));
+        for expected in [
+            ["--max-bytes", "4096"],
+            ["--provider", "claude"],
+            ["--provider", "grok-build"],
+            ["--tool-kind", "command"],
+            ["--tool-name", "Bash"],
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == expected[0] && pair[1] == expected[1]),
+                "{args:?}"
+            );
+        }
+        assert!(args.iter().any(|arg| arg == "--subagent-only"));
+        for query in [
+            "q=x&max_bytes=",
+            "q=x&mode=lexical&mode=semantic",
+            "q=x&tool_name=%FF",
+            "q=x&sidechain=other",
+            "q=x&include_system=1",
+            "q=x&unexpected=true",
+        ] {
+            assert!(
+                request_args(&authorized("GET", &format!("/api/search?{query}"))).is_err(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_applies_provider_union_and_reports_its_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let source = dir.path().join("grok.jsonl");
+        std::fs::write(&source, r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"needle web"},"_meta":{"promptIndex":0}}}"#).unwrap();
+        crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+        crate::build_embeddings(&store).unwrap();
+        for mode in ["lexical", "semantic", "hybrid"] {
+            let response = route_request(
+                &authorized(
+                    "GET",
+                    &format!(
+                        "/api/search?q=needle&provider=claude&provider=grok-build&mode={mode}&max_bytes=4096&sidechain=main_only"
+                    ),
+                ),
+                TEST_TOKEN,
+                "test.db",
+                true,
+                &store,
+            );
+            assert_eq!(response.status, 200, "{}", response.body);
+            let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            assert_eq!(body["data"]["retrieval_mode"], mode);
+            assert_eq!(body["data"]["hits"].as_array().unwrap().len(), 1, "{body}");
+            assert_eq!(body["data"]["hits"][0]["text"], "needle web");
+        }
+        let status = route_request(
+            &authorized("GET", "/api/status"),
+            TEST_TOKEN,
+            "test.db",
+            true,
+            &store,
+        );
+        let body: serde_json::Value = serde_json::from_str(&status.body).unwrap();
+        assert_eq!(
+            body["data"]["web_capabilities"]["search_parameters"],
+            serde_json::json!(WEB_SEARCH_PARAMETERS)
+        );
+        assert_eq!(
+            body["data"]["web_capabilities"]["mutation_and_execution"],
+            false
+        );
     }
 
     #[test]
@@ -1173,24 +1613,103 @@ mod tests {
         server.join().expect("server join");
     }
 
+    /// Windows' `accept` hands back a socket that inherited the listener's
+    /// non-blocking flag (`set_nonblocking(true)` is what keeps the accept poll
+    /// off the event loop). Without restoring blocking mode the read deadline is
+    /// inert: a request whose bytes land a moment after `accept` makes
+    /// `parse_request` return `WouldBlock`, which the server reports as 408 — 2
+    /// of 140 valid requests were answered that way against the real catalog,
+    /// and a half-closing client lost the response entirely to the RST that
+    /// followed. Delay the request past any accept-time read to pin it.
+    #[test]
+    fn integration_delayed_request_is_served_not_timed_out() {
+        let (address, token, server) = start_test_server(1, Duration::from_secs(5));
+        let mut stream = TcpStream::connect(address).expect("connect test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set client timeout");
+        std::thread::sleep(Duration::from_millis(200));
+        stream
+            .write_all(get_request(address, &token, "/api/status").as_bytes())
+            .expect("write request");
+        stream.shutdown(Shutdown::Write).expect("finish request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        server.join().expect("server join");
+    }
+
+    /// The limit means "this many headers are accepted": counting at the top of
+    /// the loop spent one iteration on the terminating blank line, so a
+    /// well-formed request carrying exactly `MAX_HEADER_COUNT` headers was
+    /// rejected 400 and the real ceiling was 99. Pin both sides of the boundary.
+    #[test]
+    fn integration_accepts_exactly_max_header_count_headers() {
+        let (address, token, server) = start_test_server(2, Duration::from_secs(3));
+        let required = format!("Host: {address}\r\nAuthorization: Bearer {token}\r\n");
+        let pad = |count: usize| {
+            (0..count)
+                .map(|index| format!("X-Pad-{index}: v\r\n"))
+                .collect::<String>()
+        };
+        let at_limit = raw_http(
+            address,
+            &format!(
+                "GET /api/status HTTP/1.1\r\n{required}{}\r\n",
+                pad(MAX_HEADER_COUNT - 2)
+            ),
+        );
+        assert!(at_limit.starts_with("HTTP/1.1 200"), "{at_limit}");
+        let over_limit = raw_http(
+            address,
+            &format!(
+                "GET /api/status HTTP/1.1\r\n{required}{}\r\n",
+                pad(MAX_HEADER_COUNT - 1)
+            ),
+        );
+        assert!(over_limit.starts_with("HTTP/1.1 400"), "{over_limit}");
+        server.join().expect("server join");
+    }
+
+    /// Slowloris isolation is a **structural** property, not a latency budget.
+    /// The read timeout here is long enough that the parked connection provably
+    /// cannot be reaped first, so a 200 can only mean the fast request was
+    /// served alongside it; a server that serialised would stall past
+    /// `raw_http`'s own client read timeout and fail loudly. An absolute
+    /// wall-clock assertion instead measured how loaded the host was — it
+    /// flaked in a full `--workspace` run while passing in isolation.
     #[test]
     fn integration_slowloris_does_not_block_a_fast_get() {
-        let (address, token, server) = start_test_server(2, Duration::from_millis(300));
+        let (address, token, server) = start_test_server(2, Duration::from_secs(30));
         let mut slow = TcpStream::connect(address).expect("connect slow client");
-        slow.set_read_timeout(Some(Duration::from_secs(2)))
+        slow.write_all(b"GET /api/status HTTP/1.1\r\nHost:")
+            .expect("write partial request");
+
+        let fast = raw_http(address, &get_request(address, &token, "/api/status"));
+        assert!(fast.starts_with("HTTP/1.1 200"), "{fast}");
+
+        // Release the parked connection so the second slot completes and
+        // `stop_after` is reached without waiting out the 30s read timeout.
+        drop(slow);
+        server.join().expect("server join");
+    }
+
+    /// The reaping half of the same guard, with no timing assertion: a client
+    /// that never finishes its headers is answered 408 once the server's own
+    /// read timeout expires, whenever that happens to be.
+    #[test]
+    fn integration_stalled_headers_are_answered_408() {
+        let (address, _token, server) = start_test_server(1, Duration::from_millis(300));
+        let mut slow = TcpStream::connect(address).expect("connect slow client");
+        slow.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("slow read timeout");
         slow.write_all(b"GET /api/status HTTP/1.1\r\nHost:")
             .expect("write partial request");
 
-        let started = Instant::now();
-        let fast = raw_http(address, &get_request(address, &token, "/api/status"));
-        assert!(fast.starts_with("HTTP/1.1 200"));
-        assert!(started.elapsed() < Duration::from_millis(250));
-
         let mut slow_response = String::new();
         slow.read_to_string(&mut slow_response)
             .expect("read timeout response");
-        assert!(slow_response.starts_with("HTTP/1.1 408"));
+        assert!(slow_response.starts_with("HTTP/1.1 408"), "{slow_response}");
         server.join().expect("server join");
     }
 
@@ -1240,7 +1759,7 @@ mod tests {
         assert!(!WEB_UI_HTML.contains("https://"));
         assert!(!WEB_UI_HTML.contains("innerHTML"));
         for endpoint in [
-            "/health",
+            "/api/status",
             "/api/providers",
             "/api/search",
             "/api/show",
@@ -1250,6 +1769,243 @@ mod tests {
         ] {
             assert!(WEB_UI_HTML.contains(endpoint), "missing {endpoint}");
         }
+    }
+
+    /// The UI hides regions with the `hidden` attribute, but `[hidden]` is only
+    /// a UA-stylesheet `display: none`: any author `display` rule on the same
+    /// element wins and the region stays visible. `.gate` sets `display: grid`
+    /// and `.shell` sets `display: flex`, so without an author-level
+    /// `[hidden] { display: none !important }` the token gate and the app shell
+    /// render on top of each other and the gate's button looks dead. Pin both
+    /// the rule and every element that depends on it.
+    #[test]
+    fn embedded_ui_enforces_the_hidden_attribute_over_author_display_rules() {
+        assert!(
+            WEB_UI_HTML.contains("[hidden] { display: none !important; }"),
+            "author-level [hidden] override is required: `.gate`/`.shell` set display"
+        );
+        for id in [
+            "gate",
+            "shell",
+            "contextPanel",
+            "detailEmpty",
+            "previewOutput",
+        ] {
+            assert!(
+                WEB_UI_HTML.contains(&format!("id=\"{id}\"")),
+                "missing element #{id} that the hidden-attribute contract covers"
+            );
+        }
+    }
+
+    /// Every `data-i18n` key the markup asks for must exist in **both**
+    /// dictionaries, or the toggle silently blanks that control (an empty
+    /// button is indistinguishable from a broken one). Both directions are
+    /// checked: a key added to the markup without a translation, and a key
+    /// present in one language only.
+    #[test]
+    fn embedded_ui_translates_every_referenced_i18n_key() {
+        let keys: Vec<&str> = WEB_UI_HTML
+            .match_indices("data-i18n=\"")
+            .map(|(index, marker)| {
+                let rest = &WEB_UI_HTML[index + marker.len()..];
+                &rest[..rest.find('"').expect("unterminated data-i18n value")]
+            })
+            .collect();
+        assert!(keys.len() >= 10, "expected the markup to use i18n keys");
+
+        let zh_start = WEB_UI_HTML.find("  zh: {").expect("zh dictionary");
+        let en_start = WEB_UI_HTML.find("  en: {").expect("en dictionary");
+        assert!(zh_start < en_start, "dictionary order assumption changed");
+        let zh = &WEB_UI_HTML[zh_start..en_start];
+        let en_end = WEB_UI_HTML[en_start..]
+            .find("\n};")
+            .expect("dictionary terminator");
+        let en = &WEB_UI_HTML[en_start..en_start + en_end];
+
+        for key in keys {
+            assert!(zh.contains(&format!("{key}:")), "zh missing i18n key {key}");
+            assert!(en.contains(&format!("{key}:")), "en missing i18n key {key}");
+        }
+    }
+
+    /// The source text between `anchor` and the first following `terminator`.
+    /// Pins a behaviour to the handler that has to implement it: a bare
+    /// whole-file `contains` passes when the required call sits anywhere at all,
+    /// which is how a defect in one handler hides behind another's code.
+    fn ui_slice(anchor: &str, terminator: &str) -> &'static str {
+        let start = WEB_UI_HTML
+            .find(anchor)
+            .unwrap_or_else(|| panic!("web UI no longer contains `{anchor}`"));
+        let rest = &WEB_UI_HTML[start..];
+        let end = rest
+            .find(terminator)
+            .unwrap_or_else(|| panic!("`{anchor}` is not terminated by `{terminator}`"));
+        &rest[..end + terminator.len()]
+    }
+
+    /// A URL that differs from the current one only in its fragment is a
+    /// same-document navigation: the script does not re-run. So pasting the
+    /// fresh `#token=…` line into the tab that is already open — exactly what
+    /// the gate's rejection text instructs after serve rotates the token — left
+    /// the gate sitting there unchanged, with the dead token still in storage.
+    /// The fragment read has to be reachable again from `hashchange`.
+    #[test]
+    fn embedded_ui_reads_the_token_again_when_only_the_fragment_changes() {
+        assert!(
+            WEB_UI_HTML.contains("function readUrlToken()"),
+            "the fragment read must be a function, not inline boot-only code"
+        );
+        let handler = ui_slice("window.addEventListener('hashchange'", "\n});");
+        assert!(
+            handler.contains("readUrlToken()"),
+            "hashchange must re-read the fragment: {handler}"
+        );
+        assert!(
+            handler.contains("acceptToken("),
+            "a token found on hashchange must authenticate: {handler}"
+        );
+    }
+
+    /// A preview belongs to the session it was opened from. `closeContext` hid
+    /// it but `loadContext` did not, so opening session B while session A's
+    /// resume preview was on screen left A's `--resume` command under B's
+    /// header — a command that resumes the wrong session if copied.
+    #[test]
+    fn embedded_ui_scopes_the_preview_pane_to_the_open_session() {
+        let load_context = ui_slice("async function loadContext(", "\n}");
+        assert!(
+            load_context.contains("previewOutput"),
+            "opening a session must reset the preview pane: {load_context}"
+        );
+        assert!(
+            load_context.contains("hidden = true"),
+            "the preview pane must be hidden, not just emptied: {load_context}"
+        );
+    }
+
+    /// `applyI18n()` only rewrites `[data-i18n]` markup and the select options.
+    /// Everything else on screen came from `t()` at render time, so the toggle
+    /// used to leave the status line, every hit card's session line, the session
+    /// title and each `show` button in the previous language — an English UI
+    /// reading "已连接 · 第 4 代 · 38 条记录". The toggle must re-run those
+    /// renderers.
+    #[test]
+    fn embedded_ui_rerenders_dynamic_strings_when_the_language_changes() {
+        let toggle = ui_slice("getElementById('langToggle').addEventListener", "\n});");
+        for call in ["applyI18n()", "renderHits(", "loadContext(", "init()"] {
+            assert!(
+                toggle.contains(call),
+                "language toggle must re-render via `{call}`: {toggle}"
+            );
+        }
+    }
+
+    /// The counter beside the "Hits" heading reported the last page's length,
+    /// not what is on screen: paging 2 at a time through 18 hits left it reading
+    /// "lexical · 2" under an 18-row list.
+    #[test]
+    fn embedded_ui_counts_every_loaded_page_in_the_hit_meta() {
+        let meta = ui_slice("async function doSearch(", "\n}");
+        assert!(
+            meta.contains("lastHits.length"),
+            "the hit meta must count all loaded pages: {meta}"
+        );
+    }
+
+    /// Closing the context reset `activeHit` but left the `.active` class on the
+    /// card, so the sidebar kept showing a selected hit with nothing open.
+    #[test]
+    fn embedded_ui_clears_the_hit_highlight_when_the_context_closes() {
+        let close = ui_slice("function closeContext()", "\n}");
+        assert!(
+            close.contains("classList.remove('active')"),
+            "closing the context must drop the hit highlight: {close}"
+        );
+    }
+
+    /// `white-space: pre-wrap` breaks at soft opportunities only, and transcript
+    /// text is full of runs with none (absolute paths, URLs, base64, hashes). A
+    /// single 400-character run measured 3233px inside a 990px pane, giving the
+    /// message list a horizontal scrollbar. Both text surfaces need a break rule.
+    #[test]
+    fn embedded_ui_wraps_unbreakable_runs_in_message_and_preview_text() {
+        for anchor in [".msg-body {", "pre.preview {"] {
+            let rule = ui_slice(anchor, "}");
+            assert!(
+                rule.contains("white-space: pre-wrap") && rule.contains("overflow-wrap:"),
+                "`{anchor}` wraps pre-formatted text and needs overflow-wrap: {rule}"
+            );
+        }
+    }
+
+    /// `frame-ancestors` is defined to be ignored in a meta-delivered policy and
+    /// the browser logs a CSP error for it on every page load. The directive is
+    /// only real on the HTTP response, so the meta tag must not carry it while
+    /// the served header still must.
+    #[test]
+    fn embedded_ui_meta_csp_omits_the_directive_only_a_header_can_carry() {
+        let meta = ui_slice("<meta http-equiv=\"Content-Security-Policy\"", ">");
+        assert!(
+            !meta.contains("frame-ancestors"),
+            "meta CSP must not declare frame-ancestors: {meta}"
+        );
+
+        let store = SqliteStore::open_in_memory().expect("store");
+        let page = route_request(
+            &authorized("GET", "/"),
+            TEST_TOKEN,
+            "test.db",
+            false,
+            &store,
+        );
+        let csp = page
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "Content-Security-Policy")
+            .map(|(_, value)| *value)
+            .expect("the UI page must send a CSP header");
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "the header keeps the framing protection the meta tag cannot: {csp}"
+        );
+    }
+
+    /// With no icon declared the browser probes `/favicon.ico` on its own. That
+    /// path is not the UI page, so it needs a bearer token the probe never
+    /// carries — a 401 in the console on every load. An inline `data:` icon
+    /// stops the request; `img-src ... data:` already permits it.
+    #[test]
+    fn embedded_ui_declares_an_inline_icon_so_no_favicon_probe_is_made() {
+        assert!(
+            WEB_UI_HTML.contains("rel=\"icon\"") && WEB_UI_HTML.contains("href=\"data:"),
+            "the page must declare an inline icon"
+        );
+    }
+
+    /// A credential the server refused must not be replayed: keeping it made
+    /// every later load paint the authenticated shell, wait out a `/health`
+    /// round-trip, and only then fall back to the gate.
+    #[test]
+    fn embedded_ui_forgets_a_rejected_token() {
+        let show_gate = ui_slice("function showGate(", "\n}");
+        assert!(
+            show_gate.contains("removeItem(TOKEN_KEY)"),
+            "a rejected token must be dropped from storage: {show_gate}"
+        );
+    }
+
+    /// `.ctl-row label` sets `flex: none` and beats `.ctl-row > *` on
+    /// specificity, so the filter controls could not shrink to the 248px
+    /// sidebar: they needed 308px and the page-size input was cut in half at the
+    /// sidebar edge. The row must be allowed to wrap.
+    #[test]
+    fn embedded_ui_lets_the_filter_row_wrap_inside_the_sidebar() {
+        let rule = ui_slice(".ctl-row {", "}");
+        assert!(
+            rule.contains("flex-wrap: wrap"),
+            "unshrinkable filter labels overflow the sidebar without wrapping: {rule}"
+        );
     }
 
     #[test]

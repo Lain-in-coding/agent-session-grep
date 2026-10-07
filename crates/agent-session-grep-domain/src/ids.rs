@@ -24,6 +24,7 @@
 //! * [`Stability::Unstable`] — best-effort id derived from facts that may shift
 //!   between runs. Callers must not persist cross-run references to these.
 
+use crate::error::{DomainError, DomainResult};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -101,7 +102,8 @@ pub struct SessionIdentityNamespace<'a> {
 /// The wire form is `<prefix><hex-blake3-digest>` for derived ids, or
 /// `<prefix><adopted>` for native ids where `<adopted>` is a sanitized copy of
 /// the provider's own id. Construct via [`StableId::native`] or
-/// [`StableId::derive`]; never hand-assemble the string.
+/// [`StableId::derive`]; use [`StableId::native_checked`] for new provider input.
+/// Never hand-assemble the string.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StableId {
     kind: IdKind,
@@ -119,11 +121,8 @@ const PLACEMENT_ID_PREFIX: &str = "plc_v1_";
 
 /// Maximum length (in chars) of the adopted suffix of a native id.
 ///
-/// Provider-native ids are trusted-but-unbounded strings; an extreme value
-/// would pollute logs and JSON responses. Every known provider id is far
-/// shorter (Claude Code uuids are 36 chars, Codex session ids shorter), so
-/// the clamp never truncates a legitimate id and the lossless round-trip
-/// contract holds for all real inputs.
+/// New provider input above this limit is rejected by `native_checked`;
+/// the legacy `native` constructor clamps only for compatibility.
 const NATIVE_SUFFIX_MAX_CHARS: usize = 256;
 
 impl StableId {
@@ -140,6 +139,8 @@ impl StableId {
     /// clamped to [`NATIVE_SUFFIX_MAX_CHARS`]) so that hostile or pathological
     /// ids cannot break logs or JSON output; within those bounds the id is
     /// preserved so that round-tripping back to the provider is lossless.
+    /// This legacy normalization is not injective: new provider input must use
+    /// [`StableId::native_checked`] to avoid merging distinct identities.
     pub fn native(kind: IdKind, raw: &str) -> Self {
         let sanitized: String = raw
             .trim()
@@ -152,6 +153,36 @@ impl StableId {
             stability: Stability::Native,
             value: format!("{}{sanitized}", kind.prefix()),
         }
+    }
+
+    /// Adopt a provider-native id only when it can identify exactly one entity.
+    ///
+    /// This is the checked path for provider-controlled identity at ingest:
+    /// control characters, whitespace, an empty value, or a suffix longer than
+    /// [`NATIVE_SUFFIX_MAX_CHARS`] are rejected instead of being normalized into
+    /// a potentially colliding legacy wire id. The unchecked [`StableId::native`]
+    /// remains for compatibility with already-persisted identities.
+    pub fn native_checked(kind: IdKind, raw: &str) -> DomainResult<Self> {
+        if raw.is_empty() {
+            return Err(DomainError::InvalidRequest(
+                "provider-native id must not be empty".into(),
+            ));
+        }
+        if raw.chars().take(NATIVE_SUFFIX_MAX_CHARS + 1).count() > NATIVE_SUFFIX_MAX_CHARS {
+            return Err(DomainError::InvalidRequest(
+                "provider-native id exceeds the native identity length limit".into(),
+            ));
+        }
+        if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(DomainError::InvalidRequest(
+                "provider-native id must not contain control or whitespace characters".into(),
+            ));
+        }
+        Ok(StableId {
+            kind,
+            stability: Stability::Native,
+            value: format!("{}{raw}", kind.prefix()),
+        })
     }
 
     /// Derive a deterministic id by hashing intrinsic identity facts.
@@ -372,6 +403,36 @@ mod tests {
             "msg_v1_".len() + NATIVE_SUFFIX_MAX_CHARS
         );
         assert!(oversized.validate());
+    }
+
+    #[test]
+    fn native_checked_rejects_non_injective_inputs() {
+        assert!(
+            StableId::native_checked(IdKind::Message, "a\0b")
+                .unwrap_err()
+                .to_string()
+                .contains("control or whitespace")
+        );
+        assert!(StableId::native_checked(IdKind::Message, " a").is_err());
+        assert!(StableId::native_checked(IdKind::Message, "a b").is_err());
+        assert!(StableId::native_checked(IdKind::Message, "").is_err());
+        assert!(StableId::native_checked(IdKind::Message, &"x".repeat(257)).is_err());
+
+        let valid = StableId::native_checked(IdKind::Message, "message-1").unwrap();
+        assert_eq!(valid.as_str(), "msg_v1_message-1");
+        assert_eq!(valid.stability(), Stability::Native);
+    }
+
+    #[test]
+    fn native_checked_preserves_distinct_valid_unicode_ids_verbatim() {
+        let raw = "中".repeat(NATIVE_SUFFIX_MAX_CHARS);
+        let id = StableId::native_checked(IdKind::Message, &raw).unwrap();
+        assert_eq!(id.as_str(), format!("msg_v1_{raw}"));
+        assert!(StableId::native_checked(IdKind::Message, &format!("{raw}中")).is_err());
+        let composed = StableId::native_checked(IdKind::Message, "é").unwrap();
+        let decomposed = StableId::native_checked(IdKind::Message, "e\u{301}").unwrap();
+        assert_ne!(composed, decomposed);
+        assert!(StableId::native_checked(IdKind::Message, "a\u{a0}b").is_err());
     }
 
     #[test]
@@ -625,7 +686,7 @@ mod tests {
     /// provider data-root marker) plus the Windows path-case normalization
     /// the migration adds (`windows` lowercases the whole key; non-Windows
     /// keeps the spelling). Production `installation_namespace` in
-    /// `crates/agent-session-grep-cli/src/main.rs` lacks the normalization
+    /// `crates/agent-session-grep-cli/src/lib.rs` lacks the normalization
     /// today — that is the known debt this mirror fixes ahead of time.
     fn namespace_key(path: &str, provider_id: &str, windows: bool) -> String {
         let folded = path.replace('\\', "/");

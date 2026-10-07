@@ -12,10 +12,10 @@
 //!   成功 JSON-RPC response，result 携 `isError: true` + canonical error 结构。
 
 use crate::protocol::{self, CanonicalCode, Outcome, ProtocolError};
-use crate::{CliError, canonical_search_provider, provider_registry, render, store_ref};
+use crate::{CliError, canonical_search_provider, provider_registry, render, resume_app_with_repo};
 use agent_session_grep_adapters_sqlite::SqliteStore;
 use agent_session_grep_application::{
-    App, AppRequest, AppResponse, ContextLevel, ResponseBudget,
+    AppRequest, AppResponse, ContextLevel, ResponseBudget,
     handoff_pack::{HandoffInput, resolve_source_locations},
     parse_search_instant,
 };
@@ -26,6 +26,7 @@ use agent_session_grep_ports::{
     handoff::HandoffFilters,
 };
 use serde_json::{Map, Value, json};
+use std::io::BufRead;
 
 /// 支持的 MCP 协议版本（新→旧）。协商绝不谎报支持：请求版本在列才回显。
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -42,27 +43,69 @@ const INVALID_PARAMS: i64 = -32602;
 /// 截断处以 "..." 标记——超长输入不得放大错误帧。
 const ECHO_CAP: usize = 128;
 
+/// Schema and runtime share the capability registry's canonical IDs and aliases.
+fn provider_filter_values() -> Vec<&'static str> {
+    agent_session_grep_ports::capability::search_provider_filter_values()
+}
+
+/// `tool_name` 过滤值的字符上界（schema `maxLength`）：provider 工具名
+/// （`Bash` / `Read` / `shell` / `mcp__server__tool`）远短于此，更长只可能是
+/// 错误输入；该值会原样回显进 `data.facets.tool_name`，无界就等于让调用方
+/// 自行放大响应。
+const TOOL_NAME_MAX_CHARS: usize = 128;
+
 /// 在已打开的只读 store 上服务 MCP，直到 stdin EOF（→ 干净停机）。
 ///
 /// 空行跳过；stdin 读错误归 `source_io`。stdout 写失败/EPIPE 的退出语义由
 /// [`protocol::write_stdout_line`] 统一执行（design §0.8）。
-pub(crate) fn serve(store: &SqliteStore) -> Result<Outcome, CliError> {
+pub(crate) fn serve(store: &SqliteStore, offline: bool) -> Result<Outcome, CliError> {
     let mut server = McpServer {
         store,
+        offline,
         initialized: false,
         initialize_seen: false,
     };
-    for line in std::io::stdin().lines() {
-        let line = line.map_err(|error| {
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        // 按字节读行，不用 `BufRead::lines()`：后者在非 UTF-8 输入上返回 Err，
+        // 会把"某一行有坏字节"升级成整个连接的 IO 故障——待答请求与其后所有
+        // 请求全部无声丢弃，客户端只能等到超时。坏字节是坏 frame，不是 IO
+        // 故障：按 JSON-RPC 回 -32700 并继续服务。
+        let read = reader.read_until(b'\n', &mut raw).map_err(|error| {
             ProtocolError::new(
                 CanonicalCode::SourceIo,
                 format!("cannot read stdin: {error}"),
             )
         })?;
+        if read == 0 {
+            break;
+        }
+        // 与 `BufRead::lines()` 同一行界定：去掉行尾 "\n"，再去掉其前的 "\r"。
+        if raw.last() == Some(&b'\n') {
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+        }
+        let line = match std::str::from_utf8(&raw) {
+            Ok(line) => line,
+            Err(_) => {
+                protocol::write_stdout_line(&error_frame(
+                    Value::Null,
+                    PARSE_ERROR,
+                    "parse error: line is not valid UTF-8",
+                    None,
+                ));
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(frame) = server.handle_line(&line) {
+        if let Some(frame) = server.handle_line(line) {
             protocol::write_stdout_line(&frame);
         }
     }
@@ -72,6 +115,8 @@ pub(crate) fn serve(store: &SqliteStore) -> Result<Outcome, CliError> {
 /// 单连接 MCP 服务状态：注入的只读 store + initialize 门闩。
 struct McpServer<'a> {
     store: &'a SqliteStore,
+    /// 全局 `--offline` 意图（design D5）：`doctor` 工具如实回显，与 CLI 同源。
+    offline: bool,
     /// `notifications/initialized` 之前只放行 initialize/ping（design §0.7）。
     initialized: bool,
     /// 是否收到过成功 initialize 握手：门闩只在握手之后打开，未握手先发
@@ -318,7 +363,16 @@ impl McpServer<'_> {
         match self.call_tool(name, arguments) {
             Ok(payload) => {
                 // ADR-0009: MCP is a cross-boundary output → redact by default.
-                let (redacted_payload, _redaction) = crate::redaction::redact_value(payload);
+                let (mut redacted_payload, redaction) = crate::redaction::redact_value(payload);
+                // ADR-0009：脱敏状态必须随帧上报：
+                // 与 Robot envelope 同一 `redaction` 块。少了它，调用方无法区分
+                // "服务端涂红了这个值"与"原文逐字就是 [redacted:...]"，也拿不到
+                // redacted_count——AI 客户端会把涂红标记当成真实历史内容推理。
+                // 状态在脱敏之后插入：块内是计数与静态标识，不参与二次扫描。
+                redacted_payload
+                    .as_object_mut()
+                    .expect("tool payload is a JSON object")
+                    .insert("redaction".into(), protocol::redaction_block(&redaction));
                 // content.text 与 structuredContent 是同一 payload 的两种载体
                 // （2025-06-18 字段；老客户端忽略未知字段，design §0.2）。
                 let text = redacted_payload.to_string();
@@ -378,6 +432,7 @@ impl McpServer<'_> {
                 "providers",
                 "since",
                 "until",
+                "repo",
                 "include_system",
                 "group_by_session",
                 "sidechain",
@@ -440,63 +495,8 @@ impl McpServer<'_> {
             tool_kind,
             tool_name,
         };
-        // 语义/混合查询向量：与 CLI search 同一策略——有已导入且验证过的
-        // 本地 Candle E5 bundle 时用真实模型（进程内缓存，MCP 长连接下后续
-        // 查询零加载成本），否则回退 bigram-hash。向量索引未就绪时 Application
-        // 显式 lexical_fallback。
-        let query_embedding = if mode == RetrievalMode::Lexical {
-            None
-        } else {
-            use agent_session_grep_application::embedding::BigramHashModel;
-            use agent_session_grep_ports::EmbeddingModel;
-            let (model_id, embedding) = {
-                #[cfg(feature = "semantic-candle")]
-                {
-                    let cache = crate::platform_paths_for_mcp().ok().and_then(|v| {
-                        v.get("cache")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string())
-                    });
-                    if let Some(cache) = cache {
-                        let dir =
-                            agent_session_grep_application::candle_embedding::default_model_dir(
-                                std::path::Path::new(&cache),
-                            );
-                        if let Ok(model) =
-                            agent_session_grep_application::candle_embedding::CandleE5Model::load_cached(
-                                &dir,
-                            )
-                        {
-                            let emb =
-                                model.embed(&query, true).map_err(|error| ToolError::Business(error.into()))?;
-                            (model.manifest().model_id.clone(), Some(emb))
-                        } else {
-                            let model = BigramHashModel::new();
-                            let emb = model
-                                .embed(&query, true)
-                                .map_err(|error| ToolError::Business(error.into()))?;
-                            (model.manifest().model_id.clone(), Some(emb))
-                        }
-                    } else {
-                        let model = BigramHashModel::new();
-                        let emb = model
-                            .embed(&query, true)
-                            .map_err(|error| ToolError::Business(error.into()))?;
-                        (model.manifest().model_id.clone(), Some(emb))
-                    }
-                }
-                #[cfg(not(feature = "semantic-candle"))]
-                {
-                    let model = BigramHashModel::new();
-                    let emb = model
-                        .embed(&query, true)
-                        .map_err(|error| ToolError::Business(error.into()))?;
-                    (model.manifest().model_id.clone(), Some(emb))
-                }
-            };
-            self.store.set_semantic_model(&model_id);
-            embedding
-        };
+        let query_embedding =
+            crate::prepare_search_embedding(self.store, mode, &query).map_err(business)?;
         let mut payload = self.run_app(AppRequest::Search {
             query,
             filters,
@@ -692,11 +692,7 @@ impl McpServer<'_> {
         reject_below_floor(max_bytes.into(), "max_bytes", 4096)?;
         let filters = opt_filters(args)?;
         let search_limit = limit.unwrap_or(50);
-        let app = App::with_resume(
-            store_ref(self.store),
-            store_ref(self.store),
-            store_ref(self.store),
-        );
+        let app = resume_app_with_repo(self.store, crate::current_repo_slug());
         // 检索作为装配源：宽松 fetch-all 预算 + 全文级 snippet；pack 预算由
         // 包构建器单一执行（与 CLI handoff 同一约定）。
         let response = app.handle(AppRequest::Search {
@@ -789,25 +785,14 @@ impl McpServer<'_> {
         ))
     }
 
-    /// doctor 不经 App：直接读 store 只读事实，data 形状与 CLI doctor 对齐。
+    /// doctor 不经 App：直接读 store 只读事实。data 由 [`crate::doctor_store_data`]
+    /// 投影——与 CLI `doctor --db` 同一份代码，不再各写一份 `json!`（曾因此漏报
+    /// offline / semantic_feature / *_storage / orphaned_usage_* 六个字段）。
     fn tool_doctor(&self) -> Result<Value, ToolError> {
-        let schema = self.store.schema_version().map_err(business)?;
-        let generation = self.store.active_generation().map_err(business)?;
-        let interrupted = self.store.interrupted_batch_count().map_err(business)?;
-        let (orphaned_tool_activities, orphaned_activity_memberships) =
-            self.store.orphaned_activity_counts().map_err(business)?;
+        let data = crate::doctor_store_data(self.store, self.offline).map_err(business)?;
         Ok(success_payload(
             Outcome::Success,
-            json!({
-                "tool": env!("CARGO_PKG_NAME"),
-                "version": env!("CARGO_PKG_VERSION"),
-                "db": "ok",
-                "schema": schema,
-                "generation": generation,
-                "interrupted_batches": interrupted,
-                "orphaned_tool_activities": orphaned_tool_activities,
-                "orphaned_activity_memberships": orphaned_activity_memberships,
-            }),
+            data,
             &protocol::Page::default(),
             &[],
         ))
@@ -816,11 +801,12 @@ impl McpServer<'_> {
     /// 良构请求进 Application，成功走 CLI 同一个 [`render`] 投影；
     /// 失败即业务错误——此后不再产生 `-32602`（design §2 note）。
     fn run_app(&self, request: AppRequest) -> Result<Value, ToolError> {
-        let app = App::with_resume(
-            store_ref(self.store),
-            store_ref(self.store),
-            store_ref(self.store),
-        );
+        // repo boost 只在 Search 路径被消费：仅搜索请求解析一次当前仓库，
+        // 其余 MCP 请求零 git 探测；长生命周期服务不做跨请求缓存。
+        let repo = matches!(request, AppRequest::Search { .. })
+            .then(crate::current_repo_slug)
+            .flatten();
+        let app = crate::resume_semantic_app_with_repo(self.store, repo);
         match app.handle(request) {
             Ok(response) => {
                 let (outcome, data, page, warnings) = render(response);
@@ -884,8 +870,8 @@ fn tool_catalog() -> Value {
                     },
                     "providers": {
                         "type": "array",
-                        "maxItems": 2,
-                        "items": { "type": "string", "enum": ["claude", "claude-code", "codex"] },
+                        "maxItems": provider_filter_values().len(),
+                        "items": { "type": "string", "enum": provider_filter_values() },
                         "description": "Restrict hits to these providers (OR). Omitted matches all providers."
                     },
                     "since": {
@@ -900,6 +886,15 @@ fn tool_catalog() -> Value {
                         "maxLength": 64,
                         "description": "Exclusive upper time bound; same syntax as since. \
                             Interval is half-open [since, until)."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "maxLength": 255,
+                        "description": "Restrict hits to sessions of this repository, \
+                            given as the privacy-safe three-segment slug \
+                            host/owner/name (verbatim equality; the same values \
+                            get_status reports under repos). Sessions without a repo \
+                            identity are excluded. Same semantics as the CLI --repo."
                     },
                     "include_system": {
                         "type": "boolean",
@@ -926,6 +921,7 @@ fn tool_catalog() -> Value {
                     },
                     "tool_name": {
                         "type": "string",
+                        "maxLength": TOOL_NAME_MAX_CHARS,
                         "description": "Keep only messages carrying a tool activity with \
                             this exact tool name (e.g. Bash, Read, shell)."
                     },
@@ -1041,7 +1037,12 @@ fn tool_catalog() -> Value {
             "name": "list_sessions",
             "description": "Page Session entities (ses_v1_) in stable wire-id order. \
                 Documents and messages are not returned (competitor-borrowings R1.3); \
-                only session entities are listed.",
+                only session entities are listed. Each entry carries a peek object \
+                (first_user_text / last_user_text, <= 200 chars each, <= 1 KiB serialized \
+                per session; null when the session has no user message) for cheap triage \
+                without a full show. When a title can be derived (custom title, then \
+                AI summary, then the first valid user message, <= 80 chars), the entry \
+                also carries a title string; it is omitted when no candidate exists.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1107,8 +1108,8 @@ fn tool_catalog() -> Value {
                     },
                     "providers": {
                         "type": "array",
-                        "maxItems": 2,
-                        "items": { "type": "string", "enum": ["claude", "claude-code", "codex"] },
+                        "maxItems": provider_filter_values().len(),
+                        "items": { "type": "string", "enum": provider_filter_values() },
                         "description": "Restrict hits to these providers (OR). Omitted matches all providers."
                     },
                     "since": {
@@ -1159,6 +1160,8 @@ fn tool_catalog() -> Value {
 }
 
 /// 成功工具 payload（9 个工具同形，design §2）：outcome/data/warnings/page。
+/// 跨边界脱敏状态（`redaction`）由 [`McpServer::handle_tools_call`] 在脱敏之后
+/// 追加——本函数在脱敏之前构造，拿不到计数。
 fn success_payload(
     outcome: Outcome,
     data: Value,
@@ -1302,6 +1305,10 @@ fn validate_string_length(key: &str, value: &str) -> Result<(), ToolError> {
         "cursor" => 512,
         "since" | "until" => 64,
         "session_id" | "message_id" => 128,
+        "tool_name" => TOOL_NAME_MAX_CHARS,
+        // repo slug 上界与派生侧一致（`repo_identity::REPO_SLUG_MAX_CHARS`）：
+        // 派生出的 slug 不可能超过该长度，更长的取值只可能是错误输入。
+        "repo" => crate::repo_identity::REPO_SLUG_MAX_CHARS,
         _ => return Ok(()),
     };
     if value.chars().count() > max {
@@ -1312,8 +1319,9 @@ fn validate_string_length(key: &str, value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// 检索过滤参数（design §3）：providers 别名数组（OR 语义）+ 绝对 ISO-8601
-/// 的 since/until（半开区间 [since, until)，边界比较由 Application 统一执行）。
+/// 检索过滤参数（design §3）：providers 别名数组（OR 语义）、绝对 ISO-8601
+/// 的 since/until（半开区间 [since, until)，边界比较由 Application 统一执行）、
+/// repo 三段 slug（逐字等值）。
 /// provider 值经 [`crate::canonical_search_provider`] 归一（canonical id 与
 /// 历史别名），与 CLI `--provider` 同一套取值。
 /// MCP 只接受绝对时间：紧凑相对量（"1h"）没有声明的时钟基准，属非法参数。
@@ -1323,6 +1331,14 @@ fn opt_filters(args: &Map<String, Value>) -> Result<SearchFilters, ToolError> {
         let Value::Array(entries) = value else {
             return Err(ToolError::Params("providers must be an array".into()));
         };
+        // schema `maxItems` 的代码侧强制（与 additionalProperties 同理）。
+        if entries.len() > provider_filter_values().len() {
+            return Err(ToolError::Params(format!(
+                "providers must contain at most {} entries, got {}",
+                provider_filter_values().len(),
+                entries.len()
+            )));
+        }
         for entry in entries {
             let Some(provider) = entry.as_str() else {
                 return Err(ToolError::Params(
@@ -1333,14 +1349,23 @@ fn opt_filters(args: &Map<String, Value>) -> Result<SearchFilters, ToolError> {
                 .providers
                 .push(canonical_search_provider(provider).ok_or_else(|| {
                     ToolError::Params(format!(
-                        "providers must contain only claude|claude-code|codex, got {}",
-                        bounded(provider)
+                        "providers must contain only {}",
+                        crate::provider_value_hint()
                     ))
                 })?);
         }
     }
     filters.since = opt_instant(args, "since")?;
     filters.until = opt_instant(args, "until")?;
+    // repo slug（schema v16）：与 CLI `--repo` 同语义——三段 slug 逐字等值，
+    // 形状不校验（未命中即诚实空页）。空串/纯空白是请求错误：拼写错误伪装成
+    // "无过滤"比报错更糟，绝不静默降级为全库检索。
+    filters.repo = match opt_str(args, "repo")? {
+        Some(raw) if raw.trim().is_empty() => {
+            return Err(ToolError::Params("repo must not be empty".into()));
+        }
+        other => other,
+    };
     Ok(filters)
 }
 
@@ -1447,7 +1472,8 @@ fn budget_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_session_grep_domain::{IdKind, Stability};
+    use agent_session_grep_adapters_sqlite::SourceBatch;
+    use agent_session_grep_domain::{EvidenceSpan, IdKind, MessagePlacement, Stability};
     use agent_session_grep_ports::SearchProvider;
 
     fn open_store(dir: &tempfile::TempDir) -> SqliteStore {
@@ -1480,6 +1506,7 @@ mod tests {
     fn fresh(store: &SqliteStore) -> McpServer<'_> {
         McpServer {
             store,
+            offline: false,
             initialized: false,
             initialize_seen: false,
         }
@@ -1488,6 +1515,7 @@ mod tests {
     fn ready(store: &SqliteStore) -> McpServer<'_> {
         McpServer {
             store,
+            offline: false,
             initialized: true,
             initialize_seen: true,
         }
@@ -1892,6 +1920,59 @@ mod tests {
         assert_eq!(v["error"]["code"], -32601);
     }
 
+    /// CONTRACT 原文：MCP 工具集的公开声明来源。
+    const CONTRACT_SOURCE: &str =
+        include_str!("../../../docs/contracts/CONTRACT-cli-robot-mcp-draft.md");
+
+    /// 从 CONTRACT §8 的 `tools: a / b / c` 行解析出被声明的工具名。
+    fn contract_declared_tools() -> Vec<String> {
+        CONTRACT_SOURCE
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tools:"))
+            .map(|rest| {
+                rest.split('/')
+                    .map(|name| name.trim().trim_matches('`').to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn contract_declared_mcp_tools_match_the_real_catalog() {
+        // `tools_list_exposes_exactly_the_nine_contract_tools` 把真实 catalog 钉在
+        // 一份手抄数组上——改 CONTRACT 文档不会让任何测试失败，改代码也不会迫使
+        // 文档同步。这与 handoff/incremental 少报同一类缺口：一致性只存在于人的
+        // 记忆里。这里把文档本身作为输入解析，双向对齐真实注册表。
+        let declared = contract_declared_tools();
+        assert_eq!(
+            declared.len(),
+            9,
+            "CONTRACT §8 的 tools 行解析出 {} 个工具名，解析逻辑或文档格式可能变了：{declared:?}",
+            declared.len()
+        );
+
+        let catalog = tool_catalog();
+        let mut real: Vec<String> = catalog
+            .as_array()
+            .expect("tool catalog must be an array")
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .expect("tool name must be a string")
+                    .to_string()
+            })
+            .collect();
+        let mut documented = declared;
+        real.sort();
+        documented.sort();
+        assert_eq!(
+            documented, real,
+            "CONTRACT §8 声明的 MCP 工具集与真实注册表漂移——两侧必须同时改"
+        );
+    }
+
     #[test]
     fn tools_list_exposes_exactly_the_nine_contract_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2099,6 +2180,91 @@ mod tests {
     }
 
     #[test]
+    fn declared_schema_bounds_are_enforced_at_runtime() {
+        // schema 里声明的每个约束都必须在运行时成立，否则就是对调用方谎报：
+        // `providers` 的 maxItems 曾只是装饰（5 个条目照常成功，而声明的 2 本身
+        // 也比合法取值数还紧），`tool_name` 则连 maxLength 都没声明、运行时也
+        // 不设界（100 KB 值被接受并原样回显进 data.facets）。声明与校验现在共用
+        // 同一常量，无法再分叉。
+        let catalog = tool_catalog();
+        let tools = catalog.as_array().expect("tools");
+        for name in ["search_sessions", "generate_handoff"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let providers = &tool["inputSchema"]["properties"]["providers"];
+            assert_eq!(
+                providers["maxItems"],
+                json!(provider_filter_values().len()),
+                "{name}"
+            );
+            assert_eq!(
+                providers["items"]["enum"],
+                json!(provider_filter_values()),
+                "{name}"
+            );
+        }
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_sessions")
+            .expect("search_sessions");
+        assert_eq!(
+            search["inputSchema"]["properties"]["tool_name"]["maxLength"],
+            json!(TOOL_NAME_MAX_CHARS)
+        );
+        // 声明的每个 enum 取值都必须真被运行时接受（反向也不能谎报）。
+        for value in provider_filter_values() {
+            assert!(
+                canonical_search_provider(value).is_some(),
+                "schema 声明了运行时不接受的 provider: {value}"
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = seeded_store(&dir);
+        let mut server = ready(&store);
+        let over_providers: Vec<Value> =
+            std::iter::repeat_n(json!("claude"), provider_filter_values().len() + 1).collect();
+        for (tool, arguments) in [
+            (
+                "search_sessions",
+                json!({ "query": "hello", "providers": over_providers }),
+            ),
+            (
+                "generate_handoff",
+                json!({ "query": "hello", "providers": over_providers }),
+            ),
+            (
+                "search_sessions",
+                json!({
+                    "query": "hello",
+                    "tool_name": "b".repeat(TOOL_NAME_MAX_CHARS + 1)
+                }),
+            ),
+        ] {
+            let v = call(&mut server, tool, arguments.clone());
+            assert_eq!(v["error"]["code"], -32602, "{tool} {arguments}");
+            assert_eq!(
+                v["error"]["data"]["canonical_code"], "invalid_request",
+                "{tool} {arguments}"
+            );
+            assert!(v["result"].is_null(), "{tool} {arguments}");
+        }
+        // 恰好在界上的取值照常放行：三个合法拼写全给出 + 上限长度的 tool_name。
+        let v = call(
+            &mut server,
+            "search_sessions",
+            json!({
+                "query": "hello",
+                "providers": provider_filter_values(),
+                "tool_name": "b".repeat(TOOL_NAME_MAX_CHARS)
+            }),
+        );
+        assert_eq!(v["result"]["isError"], false, "{v}");
+    }
+
+    #[test]
     fn search_filter_schema_and_runtime_validation_stay_aligned() {
         let catalog = tool_catalog();
         let search = catalog
@@ -2108,15 +2274,22 @@ mod tests {
         let properties = &search["inputSchema"]["properties"];
         assert_eq!(
             properties["providers"]["items"]["enum"],
-            json!(["claude", "claude-code", "codex"])
+            json!(provider_filter_values())
         );
         assert_eq!(properties["since"]["type"], "string");
         assert_eq!(properties["until"]["type"], "string");
+        // repo（schema v16）：与 CLI `--repo` 同一维度，声明与运行时同步。
+        assert_eq!(properties["repo"]["type"], "string");
+        assert_eq!(
+            properties["repo"]["maxLength"],
+            json!(crate::repo_identity::REPO_SLUG_MAX_CHARS)
+        );
 
         let valid = json!({
             "providers": ["codex", "claude", "claude-code"],
             "since": "2026-08-01T00:00:00Z",
-            "until": "2026-08-02T00:00:00+00:00"
+            "until": "2026-08-02T00:00:00+00:00",
+            "repo": "github.com/synthetic-owner/synthetic-repo"
         });
         let filters = opt_filters(valid.as_object().expect("filter object"))
             .expect("declared filter values must parse");
@@ -2131,6 +2304,19 @@ mod tests {
         assert!(filters.since.is_some());
         assert!(filters.until.is_some());
         assert!(filters.since < filters.until);
+        // 逐字进 filters.repo（形状不校验——未命中即诚实空页，与 CLI 一致）。
+        assert_eq!(
+            filters.repo.as_deref(),
+            Some("github.com/synthetic-owner/synthetic-repo")
+        );
+        // 缺省 = 无 repo 限制。
+        let no_repo = json!({ "since": "2026-08-01T00:00:00Z" });
+        assert!(
+            opt_filters(no_repo.as_object().expect("filter object"))
+                .expect("filters parse")
+                .repo
+                .is_none()
+        );
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_store(&dir);
@@ -2141,6 +2327,14 @@ mod tests {
             json!({ "query": "x", "providers": [1] }),
             json!({ "query": "x", "since": "1h" }),
             json!({ "query": "x", "until": "2026-08-01" }),
+            // repo：非字符串、空串、纯空白、超长一律 -32602（绝不静默变成无过滤）。
+            json!({ "query": "x", "repo": 5 }),
+            json!({ "query": "x", "repo": "" }),
+            json!({ "query": "x", "repo": "   " }),
+            json!({
+                "query": "x",
+                "repo": "o".repeat(crate::repo_identity::REPO_SLUG_MAX_CHARS + 1)
+            }),
         ] {
             let v = call(&mut server, "search_sessions", arguments.clone());
             assert_eq!(v["error"]["code"], -32602, "{arguments}");
@@ -2150,6 +2344,42 @@ mod tests {
             );
             assert!(v["result"].is_null(), "{arguments}");
         }
+    }
+
+    #[test]
+    fn search_repo_filter_reaches_the_store_like_the_cli_flag() {
+        // 参数不能只被解析后丢掉：同一 query 在无 repo 限制时有命中，加上一个
+        // 库内不存在的 slug 后必须是诚实的空页（success + 无 hits），而不是
+        // 静默忽略过滤返回全部命中。seeded_store 只提交消息、无会话 repo 身份，
+        // 故任何 slug 都不该匹配（"无行 = 未知"，未知不匹配）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = seeded_store(&dir);
+        let mut server = ready(&store);
+        let unfiltered = call(&mut server, "search_sessions", json!({ "query": "hello" }));
+        assert_eq!(unfiltered["result"]["isError"], false, "{unfiltered}");
+        assert_eq!(
+            unfiltered["result"]["structuredContent"]["data"]["hits"]
+                .as_array()
+                .expect("hits")
+                .len(),
+            2
+        );
+
+        let filtered = call(
+            &mut server,
+            "search_sessions",
+            json!({ "query": "hello", "repo": "github.com/synthetic-owner/synthetic-repo" }),
+        );
+        assert_eq!(filtered["result"]["isError"], false, "{filtered}");
+        let data = &filtered["result"]["structuredContent"]["data"];
+        assert!(
+            data["hits"].as_array().expect("hits").is_empty(),
+            "repo 过滤未生效（参数被忽略）：{data}"
+        );
+        assert_eq!(
+            filtered["result"]["structuredContent"]["page"]["has_more"], false,
+            "{filtered}"
+        );
     }
 
     #[test]
@@ -2259,6 +2489,240 @@ mod tests {
         // 合法下限（1）不受影响：仍走正常业务帧。
         let v = call(&mut server, "list_sessions", json!({ "limit": 1 }));
         assert_eq!(v["result"]["isError"], false);
+    }
+
+    /// 提交一个含成员消息的会话实体（peek 用例的种子）。
+    fn seed_session(store: &SqliteStore, tag: &[u8], messages: &[(StableId, Vec<u8>)]) -> StableId {
+        let session = StableId::derive(IdKind::Session, Stability::Reconstructed, &[tag]);
+        let mut entries: Vec<(StableId, Vec<u8>, String)> = messages
+            .iter()
+            .map(|(id, payload)| (id.clone(), payload.clone(), String::new()))
+            .collect();
+        entries.push((
+            session.clone(),
+            serde_json::json!({
+                "documents": [],
+                "messages": messages.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            })
+            .to_string()
+            .into_bytes(),
+            String::new(),
+        ));
+        store
+            .commit_batch(&entries)
+            .expect("seed session with members");
+        session
+    }
+
+    fn user_payload(text: &str) -> Vec<u8> {
+        serde_json::json!({ "role": "user", "text": text })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn list_entries(v: &Value) -> &Vec<Value> {
+        v["result"]["structuredContent"]["data"]["entries"]
+            .as_array()
+            .expect("list entries array")
+    }
+
+    #[test]
+    fn list_sessions_entries_carry_peek_with_first_and_last_user_text() {
+        // Peek Bundle 借用（#7，hstry）：每条会话条目附 1 KiB 级分诊预览，
+        // 首/尾用户消息按 member 顺序抽取；结构化输出与 content.text 同源。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        let first = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-m1"]);
+        let middle = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-m2"]);
+        let last = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-m3"]);
+        seed_session(
+            &store,
+            b"peek-ses",
+            &[
+                (first, user_payload("first hello")),
+                (middle, br#"{"role":"assistant","text":"answer"}"#.to_vec()),
+                (last, user_payload("last hello")),
+            ],
+        );
+        let mut server = ready(&store);
+        let v = call(&mut server, "list_sessions", json!({ "limit": 10 }));
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        let entries = list_entries(&v);
+        assert_eq!(entries.len(), 1);
+        let peek = &entries[0]["peek"];
+        assert_eq!(peek["first_user_text"], "first hello", "{peek}");
+        assert_eq!(peek["last_user_text"], "last hello", "{peek}");
+    }
+
+    #[test]
+    fn list_sessions_peek_stays_within_char_and_byte_budget() {
+        // 预算常量（PEEK_FIELD_MAX_CHARS / PEEK_MAX_BYTES）在协议边界成立：
+        // 宽字符（4 字节/字符）下字符上限会让字节超支，字节闸必须继续截断。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        let msg = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-fat-m"]);
+        seed_session(
+            &store,
+            b"peek-fat-ses",
+            &[(msg, user_payload(&"🦀".repeat(1000)))],
+        );
+        let mut server = ready(&store);
+        let v = call(&mut server, "list_sessions", json!({ "limit": 10 }));
+        let entries = list_entries(&v);
+        let peek = &entries[0]["peek"];
+        for field in ["first_user_text", "last_user_text"] {
+            let text = peek[field].as_str().expect("peek field is text");
+            assert!(text.chars().count() <= 200, "{field} over char cap");
+        }
+        let serialized = serde_json::to_string(peek).expect("peek serializes");
+        assert!(
+            serialized.len() <= 1024,
+            "peek serialized {serialized} bytes"
+        );
+        // 宽字符把字段压到字符上限之下——字节闸确实生效而非摆设。
+        let first_chars = peek["first_user_text"]
+            .as_str()
+            .expect("text")
+            .chars()
+            .count();
+        assert!(first_chars < 200, "byte gate should cut below the char cap");
+    }
+
+    #[test]
+    fn list_sessions_peek_fields_are_null_when_no_user_message() {
+        // 只有 assistant/tool 消息的会话：peek 键恒在，字段为 null——
+        // 调用方可以区分"没有用户消息"与"没有 peek 键"。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        let a = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-na-m1"]);
+        let b = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-na-m2"]);
+        seed_session(
+            &store,
+            b"peek-na-ses",
+            &[
+                (a, br#"{"role":"assistant","text":"answer"}"#.to_vec()),
+                (b, br#"{"role":"tool","text":"output"}"#.to_vec()),
+            ],
+        );
+        let mut server = ready(&store);
+        let v = call(&mut server, "list_sessions", json!({ "limit": 10 }));
+        let entries = list_entries(&v);
+        assert_eq!(entries.len(), 1);
+        let peek = &entries[0]["peek"];
+        assert!(peek.is_object(), "peek key must be present: {entries:?}");
+        assert!(peek["first_user_text"].is_null(), "{peek}");
+        assert!(peek["last_user_text"].is_null(), "{peek}");
+    }
+
+    /// 提交一个带 placement 成员消息的会话（标题派生链用例的种子）。
+    fn seed_titled_session(
+        store: &SqliteStore,
+        tag: &[u8],
+        user_texts: &[&str],
+        session_extra: Option<(&str, &str)>,
+    ) -> StableId {
+        let session = StableId::derive(IdKind::Session, Stability::Reconstructed, &[tag]);
+        let document = StableId::derive(IdKind::Document, Stability::Reconstructed, &[tag]);
+        let mut entries: Vec<(StableId, Vec<u8>, String)> = Vec::new();
+        let mut placements: Vec<MessagePlacement> = Vec::new();
+        let mut member_ids: Vec<String> = Vec::new();
+        for (index, text) in user_texts.iter().enumerate() {
+            let message = StableId::derive(
+                IdKind::Message,
+                Stability::Reconstructed,
+                &[tag, &(index as u32).to_le_bytes()],
+            );
+            member_ids.push(message.as_str().to_string());
+            entries.push((message.clone(), user_payload(text), String::new()));
+            placements.push(MessagePlacement::new(
+                session.clone(),
+                document.clone(),
+                message,
+                index as u32,
+                false,
+                Some(EvidenceSpan { start: 0, end: 1 }),
+            ));
+        }
+        let mut session_value = serde_json::json!({ "messages": member_ids });
+        if let Some((key, value)) = session_extra {
+            session_value[key] = serde_json::json!(value);
+        }
+        entries.push((
+            session.clone(),
+            session_value.to_string().into_bytes(),
+            String::new(),
+        ));
+        entries.push((
+            document.clone(),
+            serde_json::json!({
+                "provider": "synthetic",
+                "variant": "synthetic/jsonl-v1",
+                "fingerprint": "0123456789abcdef",
+                "len": 128,
+            })
+            .to_string()
+            .into_bytes(),
+            String::new(),
+        ));
+        store
+            .commit_source_batches_if_changed(&[SourceBatch {
+                source_path: format!("title-seed-{}.jsonl", String::from_utf8_lossy(tag)),
+                entries,
+                placements,
+                edges: Vec::new(),
+                activities: Vec::new(),
+                usage_events: Vec::new(),
+                relation_complete: true,
+                len_bytes: None,
+                fingerprint: None,
+                provider_id: None,
+                resume_claims: Vec::new(),
+            }])
+            .expect("seed titled session");
+        session
+    }
+
+    #[test]
+    fn list_sessions_entries_carry_title_from_derivation_chain() {
+        // 标题派生链（#6）：custom-title（session payload `title`）>
+        // ai-title（`summary`）> 首条有效 user 消息；展示在条目 title 字段
+        // （peek 旁边）；派生链无候选时 title 键缺席。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        let custom = seed_titled_session(
+            &store,
+            b"t-custom",
+            &["fallback body"],
+            Some(("title", "自定义标题")),
+        );
+        let ai = seed_titled_session(
+            &store,
+            b"t-ai",
+            &["fallback body"],
+            Some(("summary", "AI 摘要标题")),
+        );
+        let plain = seed_titled_session(&store, b"t-plain", &["第一条有效用户消息"], None);
+        let empty = seed_titled_session(&store, b"t-empty", &[], None);
+        let mut server = ready(&store);
+        let v = call(&mut server, "list_sessions", json!({ "limit": 10 }));
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        let entries = list_entries(&v);
+        assert_eq!(entries.len(), 4);
+        let title_of = |session: &StableId| {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == session.as_str())
+                .and_then(|entry| entry.get("title"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(title_of(&custom).as_deref(), Some("自定义标题"));
+        assert_eq!(title_of(&ai).as_deref(), Some("AI 摘要标题"));
+        assert_eq!(title_of(&plain).as_deref(), Some("第一条有效用户消息"));
+        assert!(
+            title_of(&empty).is_none(),
+            "无候选的会话必须省略 title 键: {entries:?}"
+        );
     }
 
     #[test]
@@ -2388,6 +2852,29 @@ mod tests {
     }
 
     #[test]
+    fn business_error_frames_mask_provider_io_source_paths() {
+        // ProviderError::Io 的 OS 文本可能含真实绝对 transcript 路径；归一成
+        // ProtocolError 时已掩码（R4.3）。MCP 业务错误帧与 -32602 协议帧再叠加
+        // 跨边界脱敏，路径与密钥形状值都不得出现在任何错误帧里。
+        let error: ProtocolError = agent_session_grep_ports::ProviderError::Io(
+            "cannot open C:/Users/secret/transcript.jsonl (os error 2)".into(),
+        )
+        .into();
+        let frame = business_error_result(&error);
+        let text = frame.to_string();
+        assert_eq!(
+            frame["structuredContent"]["error"]["canonical_code"], "provider_error",
+            "{frame}"
+        );
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!text.contains("transcript.jsonl"), "{text}");
+
+        let frame = error_frame(Value::Null, INVALID_PARAMS, &error.message, None);
+        assert!(!frame.contains("secret"), "{frame}");
+        assert!(!frame.contains("transcript.jsonl"), "{frame}");
+    }
+
+    #[test]
     fn tool_schemas_bound_unbounded_strings_and_arrays() {
         // R5：无界 string 参数加 maxLength、无界 array 参数加 maxItems。
         let tools = tool_catalog().as_array().expect("tools").clone();
@@ -2404,7 +2891,18 @@ mod tests {
         assert_eq!(properties["cursor"]["maxLength"], 512);
         assert_eq!(properties["since"]["maxLength"], 64);
         assert_eq!(properties["until"]["maxLength"], 64);
-        assert_eq!(properties["providers"]["maxItems"], 2);
+        assert_eq!(
+            properties["repo"]["maxLength"],
+            json!(crate::repo_identity::REPO_SLUG_MAX_CHARS)
+        );
+        assert_eq!(
+            properties["providers"]["maxItems"],
+            json!(provider_filter_values().len())
+        );
+        assert_eq!(
+            properties["tool_name"]["maxLength"],
+            json!(TOOL_NAME_MAX_CHARS)
+        );
         let context = tool("get_session_context");
         assert_eq!(
             context["inputSchema"]["properties"]["session_id"]["maxLength"],
@@ -2666,6 +3164,93 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_report_redaction_status_like_the_robot_envelope() {
+        // ADR-0009：MCP 工具结果必须随帧
+        // 上报 `redaction` 块。曾经这里只做脱敏、丢弃状态——调用方拿到
+        // "[redacted:api_key]" 却无法区分"服务端涂红"与"原文逐字如此"，也拿不到
+        // redacted_count。形状与 Robot envelope 单源（protocol::redaction_block）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        store
+            .commit_batch(&[(
+                StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"secret"]),
+                // 合成密钥形状（与 ports::redact 测试同一约定），非真实凭据。
+                br#"{"role":"user","text":"leaky sk-ant-api03-1234567890abcdef here"}"#.to_vec(),
+                "leaky sk-ant-api03-1234567890abcdef here".to_string(),
+            )])
+            .expect("commit searchable row");
+        let mut server = ready(&store);
+
+        let v = call(&mut server, "search_sessions", json!({ "query": "leaky" }));
+        let payload = &v["result"]["structuredContent"];
+        let hits = payload["data"]["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{payload}");
+        assert_eq!(
+            hits[0]["text"], "leaky [redacted:api_key] here",
+            "{payload}"
+        );
+        let redaction = &payload["redaction"];
+        assert_eq!(redaction["status"], "applied", "{payload}");
+        assert_eq!(redaction["mode"], "default", "{payload}");
+        assert!(
+            redaction["redacted_count"].as_u64().is_some_and(|n| n >= 1),
+            "{payload}"
+        );
+        assert_eq!(
+            redaction["ruleset_version"],
+            crate::redaction::RULESET_VERSION,
+            "{payload}"
+        );
+        assert!(redaction["audit_id"].is_null(), "{payload}");
+        // 双载体仍严格同形（脱敏状态进 text，不只进 structuredContent）。
+        let text = v["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert_eq!(parse(text), *payload);
+
+        // 无密钥的响应如实报 status=none / count=0——不得省略键（调用方靠它
+        // 判定"未脱敏"，缺键与 none 不是一回事）。
+        let v = call(&mut server, "get_status", json!({}));
+        let redaction = &v["result"]["structuredContent"]["redaction"];
+        assert_eq!(redaction["status"], "none", "{v}");
+        assert_eq!(redaction["redacted_count"], 0, "{v}");
+    }
+
+    #[test]
+    fn every_tool_result_carries_the_redaction_block() {
+        // 9 个工具同形（design §2）：任何成功工具结果都带 redaction 块，
+        // 不允许只在 search 上实现。这里覆盖 catalog-only 夹具即可成功的 6 个；
+        // 需要关系行的另外 3 个（context/message/handoff）由 mcp_e2e.rs 的
+        // `all_tool_results_carry_the_redaction_block` 在真实夹具上覆盖。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = seeded_store(&dir);
+        let mut server = ready(&store);
+        let cases = [
+            ("doctor", json!({})),
+            ("get_status", json!({})),
+            ("list_providers", json!({})),
+            ("search_sessions", json!({ "query": "hello" })),
+            ("list_sessions", json!({ "limit": 5 })),
+            (
+                "get_session_resume",
+                json!({ "session_id": "ses_v1_ccdd1234-5678-4abc-8def-001122334455" }),
+            ),
+        ];
+        for (tool, arguments) in cases {
+            let v = call(&mut server, tool, arguments.clone());
+            assert_eq!(v["result"]["isError"], false, "{tool}: {v}");
+            let redaction = &v["result"]["structuredContent"]["redaction"];
+            assert!(
+                redaction.is_object(),
+                "{tool} 缺少 redaction 块: {}",
+                v["result"]["structuredContent"]
+            );
+            assert!(redaction["status"].is_string(), "{tool}: {redaction}");
+            assert!(redaction["redacted_count"].is_u64(), "{tool}: {redaction}");
+        }
+    }
+
+    #[test]
     fn search_round_trip_projects_the_shared_render_payload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
@@ -2703,6 +3288,76 @@ mod tests {
         assert_eq!(result["content"][0]["type"], "text");
         let text = result["content"][0]["text"].as_str().expect("text content");
         assert_eq!(parse(text), *payload);
+    }
+
+    #[test]
+    fn semantic_and_provider_search_match_cli_with_real_ingested_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let claude = dir.path().join("claude.jsonl");
+        let grok = dir.path().join("grok.jsonl");
+        std::fs::write(&claude, r#"{"type":"user","uuid":"filter-claude","sessionId":"filter-session","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"needle claude"}}"#).unwrap();
+        std::fs::write(&grok, r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"needle grok"},"_meta":{"promptIndex":0}}}"#).unwrap();
+        for source in [&claude, &grok] {
+            crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+        }
+        let (built, _) = crate::build_embeddings(&store).unwrap();
+        assert_eq!(built["indexed"], 2);
+        let mut server = ready(&store);
+        for mode in ["lexical", "semantic", "hybrid"] {
+            let all = call(
+                &mut server,
+                "search_sessions",
+                json!({"query":"needle", "mode":mode}),
+            );
+            assert_eq!(
+                all["result"]["structuredContent"]["data"]["hits"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2,
+                "{all}"
+            );
+            let filtered = call(
+                &mut server,
+                "search_sessions",
+                json!({"query":"needle", "mode":mode,"providers":["grok-build"]}),
+            );
+            let data = &filtered["result"]["structuredContent"]["data"];
+            assert_eq!(data["retrieval_mode"], mode, "{filtered}");
+            assert_eq!(data["hits"].as_array().unwrap().len(), 1, "{filtered}");
+            assert_eq!(data["hits"][0]["text"], "needle grok");
+            let args: Vec<String> = [
+                "search",
+                "needle",
+                "--mode",
+                mode,
+                "--provider",
+                "grok-build",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let (_, _, cli, _, _) = crate::dispatch(
+                &store,
+                "test.db",
+                &args,
+                protocol::OutputMode::Json,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(data["hits"], cli["hits"]);
+            let future = call(
+                &mut server,
+                "search_sessions",
+                json!({"query":"needle", "mode":mode,"since":"2050-01-01T00:00:00Z"}),
+            );
+            assert_eq!(
+                future["result"]["structuredContent"]["data"]["hits"],
+                json!([])
+            );
+        }
     }
 
     #[test]
@@ -2765,6 +3420,34 @@ mod tests {
         assert_eq!(data["interrupted_batches"], 0);
         assert_eq!(data["orphaned_tool_activities"], 0);
         assert_eq!(data["orphaned_activity_memberships"], 0);
+    }
+
+    #[test]
+    fn doctor_tool_data_is_the_same_projection_as_the_cli_doctor() {
+        // MCP doctor 曾自己写一份 json!，比 CLI `doctor --db` 少 6 个字段
+        // （offline / semantic_feature / tool_activity_storage / usage_storage /
+        // orphaned_usage_events / orphaned_usage_memberships）——同一个诊断问题
+        // 经 MCP 问会得到严格更弱的答案。两侧现在共用 crate::doctor_store_data；
+        // 本测试直接与那个单源比对，任何一侧再分叉都会红。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&dir);
+        let mut server = ready(&store);
+        let v = call(&mut server, "doctor", json!({}));
+        let data = &v["result"]["structuredContent"]["data"];
+        let cli = crate::doctor_store_data(&store, false).expect("cli doctor projection");
+        assert_eq!(data, &cli, "MCP doctor 与 CLI doctor 投影漂移");
+        // offline 意图如实回显（design D5）：MCP 服务由 `--offline mcp` 启动时为 true。
+        let mut offline_server = McpServer {
+            store: &store,
+            offline: true,
+            initialized: true,
+            initialize_seen: true,
+        };
+        let v = call(&mut offline_server, "doctor", json!({}));
+        assert_eq!(
+            v["result"]["structuredContent"]["data"]["offline"], true,
+            "{v}"
+        );
     }
 
     #[test]

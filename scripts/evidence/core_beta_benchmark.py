@@ -177,7 +177,10 @@ def run_process(
 
 
 def parse_frame(output: str) -> dict[str, Any]:
-    line = output.splitlines()[0] if output.splitlines() else ""
+    # 按 "\n" 切，不用 str.splitlines()：后者还在 U+2028/U+2029/U+0085 等
+    # Unicode 行边界处断开，而 JSON 允许这些码点未转义地出现在字符串里。
+    # 真实 transcript 含这类字符时，splitlines 会把单行 envelope 切成碎片。
+    line = output.split("\n")[0] if output else ""
     frame = json.loads(line)
     if not isinstance(frame, dict) or frame.get("ok") is not True:
         raise RuntimeError(f"CLI did not return a successful Robot frame: {line}")

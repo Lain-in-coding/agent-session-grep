@@ -240,7 +240,7 @@ The server prints the effective loopback URL with a per-session bearer token
 to stderr:
 
 ```text
-asg serve: open http://127.0.0.1:<port>/?token=<32-hex>
+asg serve: open http://127.0.0.1:<port>/#token=<32-hex>
 ```
 
 Walk through with the token (`Authorization: Bearer <token>`, loopback Host

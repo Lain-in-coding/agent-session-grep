@@ -217,7 +217,7 @@ Message: Provider 原生 Message/Event ID
 ## 7. 开放问题（R0 必须裁决）
 
 1. **ContentBlob 三层是否为真实需求**（阻断级）：需在 R0 用真实脱敏 fixture 证明"同一内容跨多个 Source 重复引用"确实发生。有证据 → 三层进 v1.0；无证据 → 仅 `ContentBlob.content_hash` 单层去重，Occurrence/Membership 降级 post-1.0。决策记入 `docs/adr/`。
-2. **`id_alias` 保留周期**：relocation 后旧 ID 别名保留多久，需明确上限，不能无期限隐式兼容。
+2. **Relocation alias 保留周期（2026-09-27 已裁决）**：首版只维护指向安装 namespace 的平面目录别名，默认 90 天，显式可设 1–365 天。迁移不重写 canonical ID，因此不需要旧/新 Session-ID rewrite alias；原 canonical lookup 不到期。目录别名到期也不得复用旧 namespace 来合并独立安装。
 3. **规范化指纹算法**：重建身份所用的"规范化内容/结构指纹"的确切归一化规则（空白、Unicode、字段顺序）需冻结并版本化。
 4. **`completeness` 取值域**：Session/Message 的完整度枚举需定义（如 `complete | truncated_head | truncated_tail | partial`）。
 

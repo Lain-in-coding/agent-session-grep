@@ -9,8 +9,9 @@
 > - approver: 项目最终验收人
 > - due_milestone: 0.3 Integration Beta / Provider Promotion Train
 > - evidence_path: `docs/architecture/RFC-0002-provider-adapter-contract.md` §6；
->   `crates/agent-session-grep-ports/src/capability.rs`；
->   `crates/agent-session-grep-cli/src/main.rs`、`src/human.rs`、`src/mcp.rs`；
+>   `crates/agent-session-grep-ports/src/capability.rs`、`src/manifest.rs`；
+>   `crates/agent-session-grep-cli/src/lib.rs`、`src/human.rs`、`src/mcp.rs`；
+>   `crates/agent-session-grep-cli/tests/provider_matrix.rs`（`CAPABILITY_BEHAVIOR_GUARDS`）；
 >   `docs/product/PROVIDER-MATURITY-MATRIX.md`
 > - governance: 本 ADR 当前仅为 Proposed。未经 owner/approver 记录
 >   `accepted_at`、approver、实现证据与通过的跨边界测试，不得宣称 Accepted；
@@ -26,12 +27,12 @@ RFC-0002 §6 要求 `fixture + 共享 contract + 跨 target + 回滚策略`，�
 
 | RFC-0002 要求 | 可验证证据 | 当前状态 |
 |---|---|---|
-| 合成 fixture 与 golden | `crates/agent-session-grep-provider-claude/tests/golden.rs`、`crates/agent-session-grep-provider-codex/tests/golden.rs` 及各自 fixture；golden 锁定 canonical 输出漂移 | Claude/Codex 有直接路径；其余 provider 必须补同等可复核证据后才能按该项晋级 |
-| 确定性 property/contract | `crates/agent-session-grep-provider-claude/tests/properties.rs`、`crates/agent-session-grep-provider-codex/tests/properties.rs`；共享 `ProviderAdapter` / `CanonicalEventSink` 见 `crates/agent-session-grep-ports/src/lib.rs` | Claude/Codex 有直接 property 路径；共享 contract 在代码中可验证；逐 provider 证据仍须按 promotion 记录 |
-| 只读、原子 staging、source span 与增量不变量 | `crates/agent-session-grep-ports/src/lib.rs` 的 parse/sink 合同；`crates/agent-session-grep-application/src/lib.rs` 的 staging；CLI/provider e2e 测试与 `docs/evidence/integration-beta/real-data-regression.md` | 机制与部分实测证据存在；不能把通用机制自动等同于每个 provider 的晋级证据 |
-| 跨正式 target | `.github/workflows/ci.yml` 的 `test (${{ matrix.os }})` job（ubuntu-latest、windows-latest、macos-latest）执行 `cargo test --workspace`；`docs/operations/core-beta-evidence-matrix.md` 的 CI 记录规则要求具体成功 run | workflow 已配置；在记录具体成功 run 前仍是待验证证据，不得宣称跨 target 已认证 |
-| 回滚策略 | 本 ADR §2–§4；入口机制为 CLI `providers`（`ProviderCapabilityMatrix::current()`）与 MCP `list_providers` maturity 投影 | 文档与入口机制已落地；本 ADR 仍 Proposed，须 owner/approver 明确 accepted_at |
-| AdapterManifest 声明 | RFC-0002 §6 的要求；当前 `ProviderAdapter` 最低 trait 位于 `crates/agent-session-grep-ports/src/lib.rs` | 结构化 `AdapterManifest`/fixture revision/最后认证 target 尚待独立 contract 工作落地；不能以本 ADR 代替 |
+| 合成 fixture 与 golden | 14 个已实现 provider crate 各自的 `tests/golden.rs` 与脱敏 fixture，均带 `PROVENANCE.md`（`fixture_revision=1`）；`pinned_golden_table_covers_exactly_the_implemented_providers`（`crates/agent-session-grep-cli/tests/provider_matrix.rs`）保证钉住的 golden 集合与已实现集合逐一对应 | 14 个 provider 均有 golden 证据，不再只有 Claude/Codex；但 golden 是漂移锁，不是 owner 的晋级决定 |
+| 确定性 property/contract | 共享 `ProviderAdapter` / `CanonicalEventSink` 见 `crates/agent-session-grep-ports/src/lib.rs`；各 provider crate 的 `tests/properties.rs` 为逐 provider seeded 随机化 property 套件（2026-08-25 起覆盖全部 14 个已实现 provider，此前仅 claude-code/codex）；`capability_probe_claim_matches_real_probe_on_own_golden`、`capability_parse_claim_matches_real_parse_on_own_golden` 对全部 14 个 adapter 跑真实 probe/parse 并核对声明 | 共享 contract 与全 provider 的 probe/parse 行为核对已闭合；逐 provider seeded 随机化 property 套件已覆盖全部 14 个已实现 provider（2026-08-25 wave，由 `beta_readiness_property_column_matches_properties_test_existence` 双向守护 ledger property 列与套件文件存在一致）；测试绿色仍不等于 owner 的晋级决定 |
+| 只读、原子 staging、source span 与增量不变量 | `crates/agent-session-grep-ports/src/lib.rs` 的 parse/sink 合同；`crates/agent-session-grep-application/src/lib.rs` 的 staging；`CAPABILITY_BEHAVIOR_GUARDS`（`crates/agent-session-grep-cli/tests/provider_matrix.rs`）为能力矩阵的每一列登记一个行为守卫，`every_capability_column_has_a_behavior_guard` 阻止新增列只有声明没有守卫；真实数据回归见 `docs/evidence/integration-beta/real-data-regression.md` | 机制、逐列行为守卫与真实数据回归均已入库；仍不得把通用机制自动等同于每个 provider 的晋级决定 |
+| 跨正式 target | `.github/workflows/ci.yml` 的 `test (${{ matrix.os }})` job（ubuntu-latest、windows-latest、macos-latest）执行 `cargo test --workspace`；`docs/operations/core-beta-evidence-matrix.md` 的 CI 记录规则要求具体成功 run | workflow 已配置；在记录具体成功 run 前仍是待验证证据，不得宣称跨 target 已认证。这是本 ADR 之外的独立 blocker（见 `docs/product/PROVIDER-MATURITY-MATRIX.md` 缺口第 5 条） |
+| 回滚策略 | 本 ADR §2–§4；入口机制为 CLI `providers`（`ProviderCapabilityMatrix::current()`）与 MCP `list_providers` maturity 投影；`capability.rs` 之外的生产代码不含任何 maturity 字面量（仅比较枚举），投影一致性由 `provider_output_has_every_current_matrix_row_and_enum_maturity` 与 `readme_provider_table_matches_capability_matrix_maturity` 守卫 | 文档、入口机制与单源不变量的守卫均已落地；本 ADR 仍 Proposed，须 owner/approver 明确 accepted_at |
+| AdapterManifest 声明 | `crates/agent-session-grep-ports/src/manifest.rs` 的 `AdapterManifest` 与 `manifest_for()`（从矩阵行投影 provider/variant/maturity/能力，adapter 只补矩阵外证据）；14 个 adapter 均实现 `manifest()` 并声明非空 `known_limitations`、`fixture_revision=1`、空 `last_certified_targets`、有界的 `streaming_support` 与配套上限；由 `beta_readiness_manifests_match_ledger_evidence_columns` 与 `implemented_manifests_match_authoritative_capability_rows` 守卫 | 结构化 manifest 已实现并被守卫；`last_certified_targets` 为空，等待具名成功的跨 target run 后填写 |
 
 ### 2. 必须降级/回滚的触发条件
 
@@ -65,4 +66,5 @@ owner 决定是否晋级、维持或降级；成熟度不会因某个 adapter �
 - Provider 的公开 maturity 有明确的降级路径，且 CLI/Robot/MCP 能在降级后看到同一事实。
 - 晋级证据与治理接受分离：测试绿色不等于 owner 晋级，workflow 配置不等于跨 target 认证，文档存在不等于 Accepted。
 - 降级不会破坏历史可检索性；用户仍可搜索已有 Canonical 数据，并能看到 provider 当前受限状态。
-- 结构化 `AdapterManifest` 仍是独立 contract 缺口，本 ADR 不替代该实现。
+- 结构化 `AdapterManifest` 已在 `crates/agent-session-grep-ports/src/manifest.rs` 落地，
+  从矩阵行投影 maturity，因此降级会同时反映到 manifest；本 ADR 不因此变为 Accepted。

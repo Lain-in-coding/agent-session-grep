@@ -709,6 +709,26 @@ def validate_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def gate_failure_reason(manifest: dict[str, Any]) -> str | None:
+    """Return why the gate failed, or None when it passed.
+
+    ``run_gate`` records the verdict inside the manifest, but CI reads the exit
+    code, not the artifact: a command that stays green while ``gate.pass`` is
+    false cannot fail for the thing it measures. Every thresholded metric here
+    is a deterministic function of the synthetic corpus (recall, parse loss,
+    discovery coverage, resume/handoff success), so a false verdict is a real
+    regression rather than runner noise. Latency is measured without a
+    threshold and never reaches this verdict.
+    """
+    gate = manifest.get("gate", {})
+    if gate.get("pass") is True:
+        return None
+    failures = gate.get("failures") or []
+    if failures:
+        return "gate metrics below threshold: " + ", ".join(failures)
+    return f"gate.pass is {gate.get('pass')!r}, not true"
+
+
 def parser() -> argparse.ArgumentParser:
     root = Path(__file__).resolve().parents[2]
     result = argparse.ArgumentParser(description=__doc__)
@@ -730,7 +750,12 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "run":
-            run_gate(args)
+            manifest_path = run_gate(args)
+            reason = gate_failure_reason(
+                json.loads(manifest_path.read_text(encoding="utf-8"))
+            )
+            if reason is not None:
+                raise RuntimeError(reason)
         else:
             validate_manifest(Path(args.report).expanduser().resolve())
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

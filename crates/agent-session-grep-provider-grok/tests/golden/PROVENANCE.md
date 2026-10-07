@@ -6,6 +6,7 @@
 ## fixture_revision
 
 - `basic.jsonl` — revision 1（2026-08-16 引入）。
+- `object-content.jsonl` — revision 1（2026-08-29 引入，见下"对象 content fixture"）。
 - 格式修复必须新增 fixture 而非只改 parser（政策 §Provider fixture 要求）。
 
 ## 构造方式
@@ -56,3 +57,23 @@
 行式 JSONL：每个 span 覆盖"某一整行去掉行尾符"，golden 测试
 `golden_spans_slice_back_to_exact_source_lines` 逐字节校验切片并核对 chunk 种类
 与消息角色一致。
+
+## 对象 content fixture（`object-content.jsonl`）
+
+`basic.jsonl` 只覆盖裸字符串与 block 数组 content，未覆盖参考实现中使用的单对象
+形态：`{"type":"text","text":"…"}`。因此 adapter 的 `grok_content_text` 对
+真实对象形态返回空串，随后 `user_message_chunk` / `agent_message_chunk` 的
+`continue` 将用户与助手正文一起静默丢弃；这一缺陷不改变任何既有 golden 输出。
+
+`object-content.jsonl` 同为逐行人工手写的合成数据，UTF-8（无 BOM）、LF 行尾、371
+字节，BLAKE3 pin 在 `object-content.expected.json`
+（`5f6ad4805ecca9d437fcfa058bea1bc49544c2ce7ad0bc35ca8d8fd8ede7a41b`）。
+
+| 行 | 内容 | 覆盖点 |
+|----|------|--------|
+| 1 | `user_message_chunk`，content 为 `{"type":"text","text":…}` 对象 | 对象形态用户 chunk 必须进索引 |
+| 2 | `agent_message_chunk`，content 为同形对象 | 对象形态助手 chunk 必须进索引 |
+
+形状证据：fast-resume（MIT）`src/adapters/grok.rs` 测试
+（`content: {"type":"text","text":…}`）与 Recall `src/adapters/grok.rs` 测试
+（同形 `session/update` 记录）。**未复制任何真实内容**。

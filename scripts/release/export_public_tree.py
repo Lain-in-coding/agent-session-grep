@@ -286,25 +286,27 @@ def export_tree(repo: Path, destination: Path, commit: str) -> dict[str, object]
 def scan_export(repo: Path, destination: Path, manifest: dict | None = None) -> int:
     # `repo` is retained for callers of the v1 API, but is NEVER a tool source.
     scanner, profile, _ = tool_context()
-    rules = scanner.PROFILES["public"]
     findings = []
     for path in destination_files(destination):
         relative = path.relative_to(destination).as_posix()
         data = path.read_bytes()
+        generated_snapshot = None
         if manifest is not None and relative == manifest_path(manifest["source_commit"]):
             if data != json_bytes(manifest):
                 raise ValueError("generated manifest changed before scan")
-            if (manifest.get("profile") != profile
+            if (manifest.get("schema") != SCHEMA
+                    or manifest.get("tool") != {
+                        "path": "scripts/release/export_public_tree.py", "version": "2",
+                        "sha256": sha256(Path(__file__)),
+                    }
+                    or manifest.get("profile") != profile
                     or manifest.get("excluded_prefixes") != list(EXCLUDED_PREFIXES)):
                 raise ValueError("tool profile changed before scan")
-            # Omit only exact tool-owned policy metadata, never arbitrary
-            # caller-supplied manifest fields. Historical files get no omission.
-            data = json_bytes({key: value for key, value in manifest.items()
-                               if key not in ("profile", "excluded_prefixes")})
-        findings.extend(scanner.scan_lines(relative, [relative], rules=rules))
-        text = scanner.decode_text(data)
-        if text is not None:
-            findings.extend(scanner.scan_lines(relative, text.splitlines(), rules=rules))
+            # A one-file grant, bound to the complete checked bytes. It cannot
+            # authorize any later historical file or replace an archive pin.
+            generated_snapshot = (relative, hashlib.sha256(data).hexdigest())
+        findings.extend(scanner.scan_content(relative, data, "public",
+                                             _generated_snapshot=generated_snapshot))
     if findings:
         for finding in findings:
             # Do not print the matching private value or raw source excerpt.

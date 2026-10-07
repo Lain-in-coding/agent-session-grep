@@ -153,6 +153,10 @@ fn key_input(event: Event) -> Option<KeyInput> {
         };
     }
     match key.code {
+        // 控制字符不是文本：某些终端把 DEL/ESC 之类当 `Char` 上报，打进输入框
+        // 后会随查询串一起渲染进终端（见 core.rs `fold_controls`）。这里就地丢弃，
+        // 与上面 Ctrl 组合的处理同一条规则。
+        KeyCode::Char(c) if c.is_control() => None,
         KeyCode::Char(c) => Some(KeyInput::Char(c)),
         KeyCode::Enter => Some(KeyInput::Enter),
         KeyCode::Esc => Some(KeyInput::Esc),
@@ -217,6 +221,8 @@ fn search_msg(response: AppResponse) -> Msg {
                     score: hit.score,
                     session_id: hit.session_id,
                     resume_available: hit.resume_available,
+                    // Application 已按 ADR-0008 装配好摘要；这里只透传。
+                    snippet: hit.text.unwrap_or_default(),
                 })
                 .collect();
             Msg::SearchLoaded(SearchPage {
@@ -412,7 +418,11 @@ fn draw(frame: &mut Frame, model: &Model) {
             let resume = Paragraph::new(resume_lines(model).join("\n"));
             frame.render_widget(resume, resume_area);
             let body = context_lines(model).join("\n");
-            let scroll = u16::try_from(model.scroll).unwrap_or(u16::MAX);
+            // ratatui 的 Paragraph 内部算 `area.height + scroll`（u16 加法）：
+            // 把越界滚动饱和到 u16::MAX 会让它在 debug build 里溢出 panic。
+            // 按可视高度留出余量后再夹取，越界滚动退化为"停在最底"。
+            let ceiling = u16::MAX - body_area.height;
+            let scroll = u16::try_from(model.scroll).unwrap_or(ceiling).min(ceiling);
             let paragraph = Paragraph::new(body).scroll((scroll, 0));
             frame.render_widget(paragraph, body_area);
             frame.render_widget(status, status_area);
@@ -465,6 +475,8 @@ mod tests {
         assert_eq!(page.hits.len(), 1);
         assert!(page.hits[0].resume_available);
         assert!(page.hits[0].session_id.is_some());
+        // Application 装配的摘要必须到达列表投影，否则 Results 屏只剩 UUID+score。
+        assert_eq!(page.hits[0].snippet, "preview");
     }
 
     #[test]
@@ -538,11 +550,12 @@ mod tests {
             placements,
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         }
     }
 
@@ -597,6 +610,159 @@ mod tests {
             matches!(result, Msg::EffectFailed(message) if message.contains("2 sessions")),
             "distinct Sessions must remain explicitly ambiguous"
         );
+    }
+
+    /// Render `draw` through ratatui's `TestBackend` and hand back the cell
+    /// buffer. This is the only way to exercise the real layout/widget math
+    /// without a terminal — the reducer tests cannot catch a panic that lives
+    /// in the render half.
+    fn rendered(model: &Model, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, model))
+            .expect("draw must not fail");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Hostile-but-real content: CJK/emoji (unicode width != byte length), an
+    /// ANSI escape sequence and raw control bytes (transcripts carry shell
+    /// output verbatim — `msg_v1_2cf77e63-…` in the local catalog starts with
+    /// `\x1b[31;1m   Compiling krates v0.21.2\x1b[0m`), a very long single
+    /// line, and empty strings.
+    fn hostile_model(screen: Screen) -> Model {
+        let nasty = "\u{1b}[31m红色\u{7}\r\tCJK 中文 emoji 👨‍👩‍👧‍👦 \u{0}end";
+        Model {
+            screen,
+            // 输入框只可能拿到 key_input 放行的可打印字符（见
+            // `key_input_rejects_control_characters`），所以这里放宽字符而非控制符。
+            input: "中文 emoji 👨‍👩‍👧‍👦 query".to_string(),
+            query: nasty.to_string(),
+            hits: vec![
+                SearchHitView {
+                    id: nasty.to_string(),
+                    score: f32::NAN,
+                    session_id: Some("中文会话\u{1b}[0m".to_string()),
+                    resume_available: true,
+                    snippet: format!("{nasty} {}", "x".repeat(10_000)),
+                },
+                SearchHitView {
+                    id: String::new(),
+                    score: 0.0,
+                    session_id: None,
+                    resume_available: false,
+                    snippet: String::new(),
+                },
+            ],
+            selected: 1,
+            context: Some(ContextView {
+                session_id: nasty.to_string(),
+                lines: vec![
+                    ContextMessage {
+                        role: nasty.to_string(),
+                        text: "x".repeat(10_000),
+                        precision: String::new(),
+                    },
+                    ContextMessage {
+                        role: String::new(),
+                        text: String::new(),
+                        precision: nasty.to_string(),
+                    },
+                ],
+                truncated: true,
+                truncation_reason: Some(nasty.to_string()),
+                warnings: vec![nasty.to_string()],
+                generation: u64::MAX,
+            }),
+            resume: Some(ResumeMetadataView {
+                session_id: nasty.to_string(),
+                provider_id: Some(nasty.to_string()),
+                resume_available: true,
+                provider_session_id: Some(String::new()),
+                original_working_directory: Some("C:/中文/路径 👩‍💻".to_string()),
+                unavailable_reason: None,
+            }),
+            scroll: 1,
+            status: Some(nasty.to_string()),
+            warnings: vec![nasty.to_string()],
+            ..Model::default()
+        }
+    }
+
+    #[test]
+    fn draw_survives_hostile_content_at_degenerate_terminal_sizes() {
+        for screen in [Screen::Search, Screen::Results, Screen::Context] {
+            let model = hostile_model(screen);
+            // 1x1 / 10x3 / 3-row are the sizes where the fixed-Length rows
+            // (title + input/resume + status) do not fit at all.
+            for (width, height) in [(1, 1), (10, 3), (3, 40), (80, 24), (200, 2)] {
+                let buffer = rendered(&model, width, height);
+                for (index, cell) in buffer.content.iter().enumerate() {
+                    assert!(
+                        !cell.symbol().chars().any(char::is_control),
+                        "control character {:?} at cell {index} ({width}x{height}, {screen:?})",
+                        cell.symbol()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_clamps_out_of_range_scroll() {
+        // ratatui 的 Paragraph 内部算 `area.height + scroll`（u16 加法）：把越界
+        // 滚动饱和到 u16::MAX 会在 debug build 里溢出 panic，而不是停在最底行。
+        let model = Model {
+            screen: Screen::Context,
+            context: Some(ContextView {
+                session_id: "ses_v1_scroll".to_string(),
+                lines: vec![ContextMessage {
+                    role: "user".to_string(),
+                    text: "only line".to_string(),
+                    precision: "byte".to_string(),
+                }],
+                truncated: false,
+                truncation_reason: None,
+                warnings: Vec::new(),
+                generation: 1,
+            }),
+            scroll: usize::MAX,
+            ..Model::default()
+        };
+
+        rendered(&model, 40, 12);
+        rendered(&model, 1, 1);
+    }
+
+    #[test]
+    fn key_input_rejects_control_characters() {
+        let press = |code: KeyCode| {
+            key_input(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))
+        };
+        for control in ['\u{1b}', '\u{7f}', '\u{0}', '\r', '\n', '\t'] {
+            assert_eq!(
+                press(KeyCode::Char(control)),
+                None,
+                "control char {control:?} must not reach the input box"
+            );
+        }
+        assert_eq!(press(KeyCode::Char('中')), Some(KeyInput::Char('中')));
+        assert_eq!(press(KeyCode::Enter), Some(KeyInput::Enter));
+    }
+
+    #[test]
+    fn draw_renders_empty_model_without_panicking() {
+        for screen in [Screen::Search, Screen::Results, Screen::Context] {
+            let model = Model {
+                screen,
+                ..Model::default()
+            };
+            rendered(&model, 80, 24);
+            rendered(&model, 1, 1);
+        }
     }
 
     #[test]

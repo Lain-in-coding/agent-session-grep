@@ -1,9 +1,34 @@
 # Install and upgrade (from source)
 
-Scope: building `agent-session-grep` from a checkout of this repository and placing
-both the canonical command and the `asg` alias in a user-level directory. There
-is no released, signed, or published artifact — see
-[What this does not give you](#what-this-does-not-give-you).
+Scope: building `agent-session-grep` from this repository and installing both
+`agent-session-grep` and the `asg` alias in a user-level directory. The existing
+`0.1.0` release is source-only; no signed binary distribution is claimed here.
+
+## Historical installer evidence and current verification
+
+A development-side report dated 2026-10-06 described a Windows install, first
+run, in-place upgrade with a synthetic successor version, uninstall, and
+idempotent second uninstall. Both command names were reported byte-identical.
+That report was a single-machine run with a preinstalled Rust toolchain, not
+clean-machine certification or compatibility with a second released version.
+Its private raw logs and local Git coordinates are not public evidence and are
+not imported here. Reproduce the procedure with `scripts/install/smoke.ps1`
+and the build/install commands below, recording the canonical tested SHA.
+
+The current workflow definitions are:
+
+- `ci.yml`: three-OS fmt/clippy/test and installer/uninstaller/surface smoke.
+- `release.yml`: tag-driven, four-target unsigned packaging and publication;
+  running it requires separate owner authorization. Existing release assets
+  must not be replaced. Workflow-integrity changes are still pending review.
+- `release-verify.yml`: non-publishing, locked/no-default-features/target-bound
+  builds, synthetic smoke, packaging, and checksum verification on three OS
+  families. Its 30-day Actions artifacts are not release assets.
+
+These definitions are `ci_configured_only` for this reconciliation until named
+canonical runs for the tested SHA exist. Historical CI records are described
+with their scope in [the evidence matrix](core-beta-evidence-matrix.md); they
+must not be reused as certification of this candidate or a clean machine.
 
 ## What the installer does
 
@@ -128,12 +153,19 @@ agent-session-grep --version
 asg --version
 ```
 
+Measured 2026-10-06 (see the evidence table above): re-running the installer
+over an existing install replaced both managed files in place and the version
+output followed the new artifact. There is still no second released version to
+upgrade across, so this proves the replacement mechanics, not compatibility
+between two real releases.
+
 An upgraded binary may need to migrate an existing data root on first open.
-Migration is automatic and transactional; the latest v11 → v12 step adds the
-`tool_activities` projection (the v5 → v6 and v6 → v7 steps in
-`migration-v5-to-v6.md` and `migration-v6-to-v7.md` are historical). An
-older binary refuses to open a newer store with `schema_incompatible` (exit
-9) rather than downgrading it.
+Migration is automatic, transactional, and stepwise; the current store schema
+is v17, whose last step records the store-level index-projection version. The
+per-step list is not restated here — `rebuild-and-migration-runbook.md` owns it,
+and the v5 → v6 and v6 → v7 steps in `migration-v5-to-v6.md` and
+`migration-v6-to-v7.md` are historical. An older binary refuses to open a newer
+store with `schema_incompatible` (exit 9) rather than downgrading it.
 
 ## Uninstall
 

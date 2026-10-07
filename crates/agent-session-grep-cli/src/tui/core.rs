@@ -9,6 +9,9 @@
 use agent_session_grep_domain::ContextPolicy;
 use agent_session_grep_ports::{SearchFacets, SidechainFacet};
 
+/// 命中列表里正文预览的最大字符数（与 human 渲染器的 `SNIPPET_PREVIEW_CHARS` 一致）。
+const HIT_SNIPPET_CHARS: usize = 120;
+
 /// 三屏状态机（PRD R2）：Search（输入）→ Results(命中列表) → Context（消息链）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Screen {
@@ -118,6 +121,9 @@ pub(crate) struct SearchHitView {
     pub score: f32,
     pub session_id: Option<String>,
     pub resume_available: bool,
+    /// Application 装配的命中正文摘要（ADR-0008，已按 max_snippet_chars 截断）。
+    /// 缺失为空串——core 不回读 payload 自己造摘要。
+    pub snippet: String,
 }
 
 /// 一页检索结果的平数据投影（glue 从 `AppResponse::Search` 构造）。
@@ -191,7 +197,8 @@ pub(crate) struct Model {
     pub tool_kind: ToolKindMode,
     /// 最近一次错误或提示（如 `no hits`）；渲染进状态行，不弹窗、不退出。
     pub status: Option<String>,
-    /// 最近一次加载的截断事实（PARTIAL 渲染依据），来自 App 响应。
+    /// 最近一次**检索页**的截断事实（PARTIAL 渲染依据），来自 App 响应。
+    /// Context 装配的截断/警告留在 [`ContextView`]，不共用这组字段。
     pub truncated: bool,
     pub truncation_reason: Option<String>,
     pub warnings: Vec<String>,
@@ -496,8 +503,12 @@ fn search_loaded(mut model: Model, page: SearchPage) -> (Model, Option<Effect>) 
     (model, None)
 }
 
-/// 上下文加载：截断/警告事实提升到 Model（状态行渲染源），滚动复位；
-/// Session 改变时清空旧 metadata，并通过 Application Effect 读取固定 Resume 契约。
+/// 上下文加载：滚动复位；Session 改变时清空旧 metadata，并通过 Application
+/// Effect 读取固定 Resume 契约。
+///
+/// 截断/警告事实**留在** [`ContextView`] 里，不上提到 Model：Model 上那组字段
+/// 属于检索页，覆盖掉会让 Esc 回到 Results 后把完整命中列表谎报成 `PARTIAL`
+/// （状态行由 [`status_line`] 按当前屏选源）。
 fn context_loaded(mut model: Model, view: ContextView) -> (Model, Option<Effect>) {
     let session_id = view.session_id.clone();
     let metadata_is_current = model
@@ -508,9 +519,6 @@ fn context_loaded(mut model: Model, view: ContextView) -> (Model, Option<Effect>
         model.resume = None;
     }
     model.generation = view.generation;
-    model.truncated = view.truncated;
-    model.truncation_reason = view.truncation_reason.clone();
-    model.warnings = view.warnings.clone();
     model.context = Some(view);
     model.scroll = 0;
     model.status = None;
@@ -558,8 +566,9 @@ fn max_scroll(model: &Model) -> usize {
         .unwrap_or(0)
 }
 
-/// 命中列表行：选中行前缀 `> `，其余两空格对齐；Session 与 Resume
-/// 可用性只展示 Application 已返回的结构化事实。
+/// 命中列表项：首行 `> <id>  score  session  resume`（选中行前缀 `> `，其余两
+/// 空格对齐），有摘要时追加一条缩进的正文预览行。返回的每个元素是一个列表项
+/// （可能两行），Session 与 Resume 可用性只展示 Application 已返回的结构化事实。
 pub(crate) fn hit_lines(model: &Model) -> Vec<String> {
     model
         .hits
@@ -567,12 +576,32 @@ pub(crate) fn hit_lines(model: &Model) -> Vec<String> {
         .enumerate()
         .map(|(i, hit)| {
             let prefix = if i == model.selected { "> " } else { "  " };
-            let session = hit.session_id.as_deref().unwrap_or("—");
+            let id = fold_controls(&hit.id);
+            let session = hit
+                .session_id
+                .as_deref()
+                .map(fold_controls)
+                .unwrap_or_else(|| "—".to_string());
             let resume = if hit.resume_available { "yes" } else { "no" };
-            format!(
-                "{prefix}{}  score {:.3}  session {session}  resume {resume}",
-                hit.id, hit.score
-            )
+            let mut item = format!(
+                "{prefix}{id}  score {:.3}  session {session}  resume {resume}",
+                hit.score
+            );
+            // 只有 UUID + score 的命中列表无从判断哪条有用（human 渲染器已按
+            // 同一理由补了正文预览，见 human.rs `render_search`）。空白折叠成
+            // 单空格，整段按字符（非字节）截断。
+            let snippet: String = fold_controls(&hit.snippet)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(HIT_SNIPPET_CHARS)
+                .collect();
+            if !snippet.is_empty() {
+                item.push_str("\n    ");
+                item.push_str(&snippet);
+            }
+            item
         })
         .collect()
 }
@@ -615,6 +644,15 @@ fn display_field(value: Option<&str>) -> String {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return "—".to_string();
     };
+    fold_controls(value)
+}
+
+/// 控制字符折叠为空格。ratatui 不会替我们做这件事：`unicode-width` 把 ESC 记为
+/// 宽度 1，于是 `Paragraph`/`List` 会把它当普通字符写进单元格，后端再原样打印
+/// ——真实 transcript 里的终端输出（`\x1b[31;1m   Compiling ...\x1b[0m`）就会被
+/// 终端执行，改颜色、移光标、清屏，把整帧 TUI 冲掉。所有非字面量文本（消息
+/// 正文/角色、id、错误与警告文本）渲染前必须过这里。
+fn fold_controls(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -636,25 +674,50 @@ pub(crate) fn context_lines(model: &Model) -> Vec<String> {
             .iter()
             .map(|message| {
                 let first = message.text.lines().next().unwrap_or("");
-                format!("{}: {} [{}]", message.role, first, message.precision)
+                format!(
+                    "{}: {} [{}]",
+                    fold_controls(&message.role),
+                    fold_controls(first),
+                    fold_controls(&message.precision)
+                )
             })
             .collect(),
     }
 }
 
 /// 状态行：generation + 截断（`PARTIAL: <预算旋钮>`）+ 首条警告 + 最近错误/提示。
-/// 诚实渲染是硬要求（PRD R3）：截断与降级绝不吞掉。
+/// 诚实渲染是硬要求（PRD R3）：截断与降级绝不吞掉——但也绝不把另一屏的截断
+/// 事实挂到当前屏上，所以截断/警告按当前屏选源（Context 屏取 [`ContextView`]，
+/// 其余屏取检索页留在 Model 上的那组字段）。
 pub(crate) fn status_line(model: &Model) -> String {
     let mut parts = vec![format!("gen {}", model.generation)];
-    if model.truncated {
-        let reason = model.truncation_reason.as_deref().unwrap_or("unspecified");
-        parts.push(format!("PARTIAL: {reason}"));
+    let context = model
+        .context
+        .as_ref()
+        .filter(|_| model.screen == Screen::Context);
+    let (truncated, reason, warnings) = match context {
+        Some(view) => (
+            view.truncated,
+            view.truncation_reason.as_deref(),
+            view.warnings.as_slice(),
+        ),
+        None => (
+            model.truncated,
+            model.truncation_reason.as_deref(),
+            model.warnings.as_slice(),
+        ),
+    };
+    if truncated {
+        parts.push(format!(
+            "PARTIAL: {}",
+            fold_controls(reason.unwrap_or("unspecified"))
+        ));
     }
-    if let Some(warning) = model.warnings.first() {
-        parts.push(format!("warning: {warning}"));
+    if let Some(warning) = warnings.first() {
+        parts.push(format!("warning: {}", fold_controls(warning)));
     }
     if let Some(status) = &model.status {
-        parts.push(status.clone());
+        parts.push(fold_controls(status));
     }
     parts.join(" | ")
 }
@@ -689,8 +752,8 @@ pub(crate) fn title_line(model: &Model) -> String {
             let session = model
                 .context
                 .as_ref()
-                .map(|view| view.session_id.as_str())
-                .unwrap_or("-");
+                .map(|view| fold_controls(&view.session_id))
+                .unwrap_or_else(|| "-".to_string());
             format!("Context {session} - policy {policy}  f: toggle, Esc: back, q: quit")
         }
     }
@@ -721,6 +784,7 @@ mod tests {
             score,
             session_id: None,
             resume_available: false,
+            snippet: String::new(),
         }
     }
 
@@ -853,6 +917,7 @@ mod tests {
             score: 2.0,
             session_id: Some("ses_v1_resumable".to_string()),
             resume_available: true,
+            snippet: String::new(),
         }];
 
         let (model, effect) = update(submitted("rust"), Msg::SearchLoaded(loaded));
@@ -1081,6 +1146,7 @@ mod tests {
                 score: 1.0,
                 session_id: Some("ses_v1_s".into()),
                 resume_available: false,
+                snippet: String::new(),
             }],
             ..Model::default()
         };
@@ -1221,21 +1287,54 @@ mod tests {
     }
 
     #[test]
-    fn hit_lines_render_session_and_resume_availability() {
+    fn hit_lines_render_session_resume_availability_and_snippet() {
+        // 只有 UUID + score 的列表无从判断哪条有用；摘要与 human 渲染器同源，
+        // 空白折叠、按字符截断，控制字符不外泄。
         let mut model = results(&[], None);
         model.hits = vec![SearchHitView {
             id: "msg_v1_a".to_string(),
             score: 2.0,
             session_id: Some("ses_v1_a".to_string()),
             resume_available: true,
+            snippet: "  \u{1b}[31mfix the\n\tparser  bug 中文 ".to_string(),
         }];
 
         let lines = hit_lines(&model);
 
         assert_eq!(
             lines,
+            vec![
+                "> msg_v1_a  score 2.000  session ses_v1_a  resume yes\n    [31mfix the parser bug 中文"
+            ]
+        );
+
+        // 无摘要的命中不追加空行。
+        model.hits[0].snippet = "   ".to_string();
+        assert_eq!(
+            hit_lines(&model),
             vec!["> msg_v1_a  score 2.000  session ses_v1_a  resume yes"]
         );
+    }
+
+    #[test]
+    fn hit_lines_truncate_snippet_by_characters_not_bytes() {
+        let mut model = results(&[], None);
+        model.hits = vec![SearchHitView {
+            id: "msg_v1_wide".to_string(),
+            score: 1.0,
+            session_id: None,
+            resume_available: false,
+            snippet: "中".repeat(400),
+        }];
+
+        let preview = hit_lines(&model)[0]
+            .split_once("\n    ")
+            .expect("snippet row")
+            .1
+            .to_string();
+
+        assert_eq!(preview.chars().count(), HIT_SNIPPET_CHARS);
+        assert!(preview.chars().all(|c| c == '中'));
     }
 
     #[test]
@@ -1289,6 +1388,99 @@ mod tests {
         // 只取文本首行；unknown 精度如实渲染 [unknown]。
         assert_eq!(lines[0], "user: hello [byte]");
         assert_eq!(lines[1], "assistant: hi [unknown]");
+    }
+
+    #[test]
+    fn view_models_fold_control_characters_from_provider_content() {
+        // 真实 transcript 会原样保存终端输出：本地 catalog 里的
+        // msg_v1_2cf77e63-… 首行就是 `\x1b[31;1m   Compiling krates v0.21.2\x1b[0m`。
+        // ratatui 不过滤 ESC（unicode-width 记宽度 1），所以折叠必须发生在这里，
+        // 否则转义序列会被终端执行、把整帧冲掉。
+        let nasty = "\u{1b}[31;1m   Compiling\u{1b}[0m\u{7}\r\ttail";
+        let model = Model {
+            screen: Screen::Context,
+            hits: vec![SearchHitView {
+                id: nasty.to_string(),
+                score: 1.0,
+                session_id: Some(nasty.to_string()),
+                resume_available: true,
+                snippet: nasty.to_string(),
+            }],
+            context: Some(ContextView {
+                session_id: nasty.to_string(),
+                lines: vec![ContextMessage {
+                    role: nasty.to_string(),
+                    text: nasty.to_string(),
+                    precision: nasty.to_string(),
+                }],
+                truncated: true,
+                truncation_reason: Some(nasty.to_string()),
+                warnings: vec![nasty.to_string()],
+                generation: 7,
+            }),
+            truncated: true,
+            truncation_reason: Some(nasty.to_string()),
+            warnings: vec![nasty.to_string()],
+            status: Some(nasty.to_string()),
+            ..Model::default()
+        };
+
+        // 逐行检查：`hit_lines` 的项内换行是版式结构（首行 + 缩进摘要行），
+        // 内容里的控制字符才是缺陷。
+        let rows: Vec<String> = [
+            hit_lines(&model),
+            context_lines(&model),
+            vec![status_line(&model), title_line(&model)],
+            resume_lines(&model),
+        ]
+        .concat()
+        .iter()
+        .flat_map(|item| item.split('\n').map(str::to_string).collect::<Vec<_>>())
+        .collect();
+
+        for row in &rows {
+            assert!(
+                !row.chars().any(char::is_control),
+                "view models must not emit control characters: {row:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("Compiling")),
+            "text itself is preserved"
+        );
+    }
+
+    #[test]
+    fn status_line_reports_truncation_per_screen() {
+        // Results 屏的状态行只能描述当前那页命中；Context 装配的截断/警告
+        // 属于另一屏的数据。Esc 返回 Results 后若还挂着 `PARTIAL: max_messages`，
+        // 完整的命中列表就被谎报成不完整（PRD R3 诚实渲染反例）。
+        let mut truncated_context = view("ses_v1_s", 2);
+        truncated_context.truncated = true;
+        truncated_context.truncation_reason = Some("max_messages".to_string());
+        truncated_context.warnings =
+            vec!["1 of 2 evidence spans have unknown precision".to_string()];
+        let model = update(
+            results(&[("msg_v1_a", 2.0)], None),
+            Msg::ContextLoaded(truncated_context),
+        )
+        .0;
+
+        let on_context = status_line(&model);
+        assert!(on_context.contains("PARTIAL: max_messages"), "{on_context}");
+        assert!(on_context.contains("warning: 1 of 2"), "{on_context}");
+
+        let (model, _) = key(model, KeyInput::Esc);
+        assert_eq!(model.screen, Screen::Results);
+        let on_results = status_line(&model);
+        assert!(
+            !on_results.contains("PARTIAL"),
+            "the search page was complete: {on_results}"
+        );
+        assert!(
+            !on_results.contains("warning:"),
+            "context warnings belong to the Context screen: {on_results}"
+        );
     }
 
     #[test]

@@ -1,0 +1,28 @@
+{
+  "fixture_blake3": "5f6ad4805ecca9d437fcfa058bea1bc49544c2ce7ad0bc35ca8d8fd8ede7a41b",
+  "session_native_id": "object-prompt-1",
+  "committed": 2,
+  "skipped": 0,
+  "messages": [
+    {
+      "seq": 0,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "user",
+      "text": "object-shaped user",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 0, "end": 175 }
+    },
+    {
+      "seq": 1,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "object-shaped assistant",
+      "timestamp": null,
+      "is_sidechain": false,
+      "span": { "start": 176, "end": 370 }
+    }
+  ]
+}

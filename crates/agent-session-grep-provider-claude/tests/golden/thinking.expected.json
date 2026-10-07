@@ -1,0 +1,48 @@
+{
+  "fixture_blake3": "f8ccc46ee3a92fc8f666fc393f80034e53ec6f502c5336ad75f164c30812225a",
+  "session_native_id": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+  "committed": 4,
+  "skipped": 0,
+  "messages": [
+    {
+      "seq": 0,
+      "native_id": "00000000-0000-4000-8000-0000000000a1",
+      "parent_native_id": null,
+      "role": "user",
+      "text": "thinking golden 根消息：ask for extended reasoning.",
+      "timestamp": "2026-01-02T00:00:00.000Z",
+      "is_sidechain": false,
+      "span": { "start": 0, "end": 356 }
+    },
+    {
+      "seq": 1,
+      "native_id": "00000000-0000-4000-8000-0000000000a2",
+      "parent_native_id": "00000000-0000-4000-8000-0000000000a1",
+      "role": "assistant",
+      "text": "合成推理正文：先看 README，再决定改哪一行。",
+      "timestamp": "2026-01-02T00:00:05.000Z",
+      "is_sidechain": false,
+      "span": { "start": 357, "end": 762 }
+    },
+    {
+      "seq": 2,
+      "native_id": "00000000-0000-4000-8000-0000000000a3",
+      "parent_native_id": "00000000-0000-4000-8000-0000000000a2",
+      "role": "assistant",
+      "text": "第二段合成推理（emoji：🧠）。\n回答正文跟在推理之后。\nRead(C:\\placeholder\\project\\README.md)",
+      "timestamp": "2026-01-02T00:00:07.000Z",
+      "is_sidechain": false,
+      "span": { "start": 763, "end": 1330 }
+    },
+    {
+      "seq": 3,
+      "native_id": "00000000-0000-4000-8000-0000000000a4",
+      "parent_native_id": "00000000-0000-4000-8000-0000000000a3",
+      "role": "assistant",
+      "text": "空白 thinking 与 redacted_thinking 都不进正文。",
+      "timestamp": "2026-01-02T00:00:09.000Z",
+      "is_sidechain": false,
+      "span": { "start": 1331, "end": 1827 }
+    }
+  ]
+}

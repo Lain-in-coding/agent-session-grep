@@ -31,6 +31,26 @@ from pathlib import Path
 from typing import Any
 
 
+def _force_utf8_output() -> None:
+    """Keep the verdict printable on any host code page.
+
+    ``sys.stdout`` uses the platform encoding with ``errors="strict"``, and a
+    captured CI step's stdout is a pipe rather than a console, so on a Windows
+    runner it is the ANSI code page (cp1252). Printing the ✓/✗ status marks
+    there raises UnicodeEncodeError and the release gate dies with a traceback
+    instead of a verdict. Force UTF-8 (CI logs are UTF-8) and degrade an
+    unencodable character rather than aborting the run. ``sys.stderr`` already
+    defaults to ``backslashreplace``; it is included so both streams agree.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_output()
+
+
 class VerificationError(Exception):
     pass
 
@@ -43,6 +63,36 @@ def parse_first_json_line(output: str) -> dict[str, Any]:
     raise VerificationError("expected a JSON frame on stdout")
 
 
+def run_asg_raw(
+    asg_bin: str,
+    data_root: str,
+    args: list[str],
+    *,
+    stdin: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run asg with --output json and return the raw completed process.
+
+    原样返回 stdout/stderr 是有意为之：hook 的契约是默认一个字节都不写 stdout，
+    只有拿到原始结果才能断言这一点（run_asg 会把非 JSON 输出判成错误）。
+    """
+    env = os.environ.copy()
+    env["ASG_DATA_ROOT"] = data_root
+    db = str(Path(data_root) / "asg.db")
+    return subprocess.run(
+        [asg_bin, "--db", db, "--output", "json"] + args,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        # CLI 的 robot 输出是 UTF-8；Windows runner 的 locale 是 ANSI 代码页，
+        # 不显式指定编码会让 text=True 用 charmap 解码非 ASCII 字节而抛
+        # UnicodeDecodeError（WiX/中文夹具下实测 0x8d）。
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=30,
+    )
+
+
 def run_asg(
     asg_bin: str,
     data_root: str,
@@ -51,17 +101,7 @@ def run_asg(
     stdin: str | None = None,
 ) -> dict[str, Any]:
     """Run asg with --output json and return the first parsed frame."""
-    env = os.environ.copy()
-    env["ASG_DATA_ROOT"] = data_root
-    db = str(Path(data_root) / "asg.db")
-    result = subprocess.run(
-        [asg_bin, "--db", db, "--output", "json"] + args,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=30,
-    )
+    result = run_asg_raw(asg_bin, data_root, args, stdin=stdin)
     if result.returncode != 0:
         raise VerificationError(
             f"command {' '.join(args)} exited {result.returncode}: "
@@ -208,17 +248,29 @@ def verify_semantic(asg_bin: str, data_root: str) -> bool:
 
 
 def verify_hook(asg_bin: str, data_root: str) -> bool:
-    disabled = run_asg(
+    """不加 --enable 时 hook 必须完全不写 stdout（不注入历史），运行事实走 stderr。
+
+    CLI 自身的契约（help 文本）：`不加 --enable 时 stdout 一个字节都不写；运行事实走
+    stderr`。所以这里断言 exit 0 + stdout 为空 + stderr 记录 enabled=false，
+    **不能**再期望 stdout 上的 hookSpecificOutput JSON 帧。
+    """
+    result = run_asg_raw(
         asg_bin,
         data_root,
         ["hook", "user-prompt-submit"],
         stdin='{"prompt":"retry"}',
-    )["data"]
-    ok = (
-        disabled.get("enabled") is False
-        and disabled.get("hookSpecificOutput", {}).get("additionalContext") == ""
     )
-    return step("hook off by default", ok, f"enabled={disabled.get('enabled')}")
+    ok = (
+        result.returncode == 0
+        and result.stdout == ""
+        and "enabled=false" in result.stderr
+    )
+    return step(
+        "hook off by default",
+        ok,
+        f"exit={result.returncode} stdout={len(result.stdout)}B "
+        f"stderr={result.stderr.strip()!r}",
+    )
 
 
 def verify_providers(asg_bin: str, data_root: str) -> bool:

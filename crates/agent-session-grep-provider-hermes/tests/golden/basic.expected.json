@@ -4,7 +4,7 @@
   "messages": [
     {
       "is_sidechain": false,
-      "native_id": "hermes-msg-1",
+      "native_id": "",
       "parent_native_id": null,
       "role": "user",
       "seq": 0,
@@ -14,7 +14,7 @@
     },
     {
       "is_sidechain": false,
-      "native_id": "hermes-msg-3",
+      "native_id": "",
       "parent_native_id": null,
       "role": "assistant",
       "seq": 1,
@@ -24,7 +24,7 @@
     },
     {
       "is_sidechain": false,
-      "native_id": "hermes-msg-5",
+      "native_id": "",
       "parent_native_id": null,
       "role": "user",
       "seq": 2,

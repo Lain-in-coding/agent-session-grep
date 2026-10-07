@@ -2,7 +2,8 @@
 # core.autocrlf would otherwise rewrite LF to CRLF on checkout and silently
 # shift every pinned byte span. `-text` opts these paths out of eol handling.
 crates/*/tests/golden/*.jsonl -text
-crates/*/tests/golden/*.json -text
+# CRLF is fixture data, not trailing whitespace; retain all normal space checks.
+crates/*/tests/golden/*.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
 crates/*/tests/golden/*.md -text
 crates/*/tests/golden/*.expected.json -text
 # SQLite fixtures are binary; git must never touch their bytes or diff them.
@@ -15,3 +16,6 @@ crates/*/tests/golden/*.db binary
 
 # Public projection hashes must not depend on checkout newline conversion.
 scripts/release/public_AGENTS.md text eol=lf
+
+# Immutable import snapshot pins bind raw bytes, independent of core.autocrlf.
+docs/operations/imports/public-tree-*.json -text

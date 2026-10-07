@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import stat
@@ -591,6 +592,170 @@ class PublicTreeIntegrityTests(unittest.TestCase):
         self.assertEqual(index.read_bytes(), published[0])
         record = export_public_tree.git_bytes(self.destination, "ls-files", "--stage", "--", "run.sh")
         self.assertTrue(record.startswith(b"100755 "), record)
+
+    def test_pinned_snapshot_bytes_survive_both_clone_newline_settings(self) -> None:
+        scanner, _, _ = export_public_tree.tool_context()
+        entries = {path: ("100644", (SCRIPT.parents[2] / path).read_bytes())
+                   for path in scanner.HISTORICAL_SNAPSHOTS}
+        entries[".gitattributes"] = ("100644", (SCRIPT.parents[2] / ".gitattributes").read_bytes())
+        entries["ordinary.txt"] = ("100644", b"ordinary text\n")
+        commit = self.commit(entries)
+        self.git("update-ref", "refs/heads/snapshots", commit)
+        for autocrlf in ("true", "false"):
+            with self.subTest(autocrlf=autocrlf):
+                clone = self.root / ("clone-" + autocrlf)
+                subprocess.run(["git", "clone", "--no-local", "-q", "--branch", "snapshots",
+                                "--config", "core.autocrlf=" + autocrlf,
+                                str(self.repo), str(clone)], check=True, capture_output=True)
+                for path, (digest, _, _) in scanner.HISTORICAL_SNAPSHOTS.items():
+                    self.assertEqual((clone / path).read_bytes(), entries[path][1])
+                    self.assertEqual(hashlib.sha256((clone / path).read_bytes()).hexdigest(), digest)
+                    self.assertEqual(export_public_tree.git_bytes(clone, "show", "HEAD:" + path),
+                                     entries[path][1])
+                self.assertEqual((clone / "ordinary.txt").read_bytes(),
+                                 b"ordinary text\r\n" if autocrlf == "true" else b"ordinary text\n")
+                self.assertEqual(scanner.scan_repo(clone, "public"), [])
+                destination = self.root / ("export-" + autocrlf)
+                manifest = export_public_tree.export_tree(clone, destination, commit)
+                self.assertEqual(export_public_tree.scan_export(clone, destination, manifest), 0)
+                for path in scanner.HISTORICAL_SNAPSHOTS:
+                    self.assertEqual((destination / path).read_bytes(), entries[path][1])
+
+    def test_historical_scans_agree_without_rule_hits_and_do_not_trust_candidate_registry(self) -> None:
+        scanner, _, _ = export_public_tree.tool_context()
+        cases = []
+        for path in scanner.HISTORICAL_SNAPSHOTS:
+            raw = (SCRIPT.parents[2] / path).read_bytes()
+            cases.extend([(path, raw, 0), (path, b"{}", 1), (path, raw + b" ", 1),
+                          ("renamed.json", raw, 1)])
+        cases.extend([
+            ("docs/operations/imports/public-tree-v2-unknown.json", b"{}", 1),
+            ("ordinary.json", b'{"profile":"public","excluded_prefixes":[]}', 0),
+            ("ordinary.md", ("." + TRACKER + "/private").encode(), 1),
+        ])
+        for index, (relative, raw, status) in enumerate(cases):
+            with self.subTest(case=index):
+                destination = self.root / ("candidate-" + str(index))
+                target = destination / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(raw)
+                # Candidate data is never imported as policy or executable code.
+                (destination / "registry.json").write_text(
+                    json.dumps({relative: {"sha256": hashlib.sha256(raw).hexdigest(),
+                                          "fields": ["profile", "excluded_prefixes", "files"]}}),
+                    encoding="utf-8")
+                indexed = self.root / ("indexed-" + str(index))
+                (indexed / relative).parent.mkdir(parents=True)
+                (indexed / relative).write_bytes(raw)
+                (indexed / "registry.json").write_bytes((destination / "registry.json").read_bytes())
+                subprocess.run(["git", "init", "-q", str(indexed)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(indexed), "-c", "core.autocrlf=false", "add",
+                                "--", relative, "registry.json"], check=True, capture_output=True)
+                self.assertEqual(bool(scanner.scan_repo(indexed, "public")), bool(status))
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    self.assertEqual(export_public_tree.scan_export(self.repo, destination), status)
+                if status:
+                    self.assertIn("public-tree privacy finding:", stderr.getvalue())
+                    self.assertNotIn(relative, stderr.getvalue())
+                    self.assertNotIn(TRACKER, stderr.getvalue())
+
+    def test_filename_only_findings_agree_and_are_not_duplicated(self) -> None:
+        scanner, _, _ = export_public_tree.tool_context()
+        for index, raw in enumerate((b"ordinary text", b"{}", b"\x00")):
+            with self.subTest(binary=b"\x00" in raw):
+                relative = "docs/" + "08-15-" + "synthetic-check.txt"
+                destination = self.root / ("path-export-" + str(index))
+                target = destination / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(raw)
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    self.assertEqual(export_public_tree.scan_export(self.repo, destination), 1)
+                self.assertEqual(stderr.getvalue().count("[internal-task-id]"), 1)
+                self.assertNotIn(relative, stderr.getvalue())
+                indexed = self.root / ("path-indexed-" + str(index))
+                target = indexed / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(raw)
+                subprocess.run(["git", "init", "-q", str(indexed)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(indexed), "add", "--", relative],
+                               check=True, capture_output=True)
+                self.assertEqual([f.rule for f in scanner.scan_repo(indexed, "public")],
+                                 ["internal-task-id"])
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    self.assertEqual(scanner.main(["--repo", str(indexed), "--profile", "public"]), 1)
+                self.assertEqual(stderr.getvalue().count("[internal-task-id]"), 1)
+                self.assertNotIn(relative, stderr.getvalue())
+
+    def test_fresh_authorization_cannot_flow_to_unknown_historical_snapshot(self) -> None:
+        _, manifest = self.export({"a": ("100644", b"a")})
+        self.assertEqual(export_public_tree.scan_export(self.repo, self.destination, manifest), 0)
+        unknown = self.destination / "docs/operations/imports/public-tree-v2-unknown.json"
+        unknown.write_bytes(b"{}")
+        self.assertEqual(export_public_tree.scan_export(self.repo, self.destination, manifest), 1)
+        # Without this invocation's verified generated manifest, its snapshot
+        # is historical too. Profile/schema resemblance alone grants nothing.
+        self.assertEqual(export_public_tree.scan_export(self.repo, self.destination), 1)
+
+    def test_generated_grant_cannot_override_a_historical_pin(self) -> None:
+        _, manifest = self.export({"a": ("100644", b"a")})
+        # Same current tool/profile as a fresh output, but an approved historical
+        # path can NEVER be repurposed to accept different bytes.
+        manifest["source_commit"] = "f587c73332158342330a63874fabdc8f565624ec"
+        destination = self.root / "override-candidate"
+        snapshot = destination / export_public_tree.manifest_path(manifest["source_commit"])
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_bytes(export_public_tree.json_bytes(manifest))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(export_public_tree.scan_export(self.repo, destination, manifest), 1)
+        self.assertIn("snapshot-integrity", stderr.getvalue())
+
+    def test_generated_schema_tool_and_policy_fields_remain_exact(self) -> None:
+        commit, manifest = self.export({"a": ("100644", b"a")})
+        snapshot = self.destination / export_public_tree.manifest_path(commit)
+        for key, value in (("schema", "agent-session-grep.public-tree/v1"),
+                           ("tool", {"path": "untrusted.py", "sha256": "0" * 64}),
+                           ("profile", {}), ("excluded_prefixes", [])):
+            with self.subTest(field=key):
+                modified = {**manifest, key: value}
+                snapshot.write_bytes(export_public_tree.json_bytes(modified))
+                with self.assertRaises(ValueError):
+                    export_public_tree.scan_export(self.repo, self.destination, modified)
+
+    def test_byte_exact_golden_json_whitespace(self) -> None:
+        self.git("config", "core.autocrlf", "false")
+        self.git("config", "core.whitespace", "trailing-space,space-before-tab")
+        attributes = SCRIPT.parents[2] / ".gitattributes"
+        (self.repo / ".gitattributes").write_bytes(attributes.read_bytes())
+        relative = "crates/example/tests/golden/basic.expected.json"
+        fixture = self.repo / relative
+        fixture.parent.mkdir(parents=True)
+        fixture.write_bytes(b'{"value":0}\r\n')
+        other = self.repo / "other.json"
+        other.write_bytes(b'{"value":0}\n')
+        self.git("add", "--", ".gitattributes", relative, "other.json")
+        self.git("commit", "-qm", "synthetic whitespace baseline")
+
+        def stage_and_check(content: bytes) -> int:
+            fixture.write_bytes(content)
+            self.git("add", "--", relative)
+            self.assertEqual(self.git("show", ":" + relative), content)
+            return subprocess.run(
+                ["git", "-C", str(self.repo), "diff", "--cached", "--check"],
+                capture_output=True,
+            ).returncode
+
+        self.assertEqual(stage_and_check(b'{"value":1}\r\n'), 0)
+        for malformed in (b'{"value":1} \r\n', b'{"value":1}\r\n\r\n',
+                          b' \t{"value":1}\r\n'):
+            with self.subTest(content=malformed):
+                self.assertNotEqual(stage_and_check(malformed), 0)
+        self.assertEqual(stage_and_check(b'{"value":1}\r\n'), 0)
+        other.write_bytes(b'{"value":1}\r\n')
+        self.git("add", "--", "other.json")
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", str(self.repo), "diff", "--cached", "--check"],
+            capture_output=True,
+        ).returncode, 0)
 
     def test_existing_index_lock_is_never_removed(self) -> None:
         commit, _ = self.export({"run.sh": ("100755", b"#!/bin/sh\n")})

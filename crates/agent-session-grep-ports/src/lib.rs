@@ -5,11 +5,13 @@
 //!
 //! 分层依赖不变量：domain ← ports ← application ← adapters。
 
+pub mod maintenance;
 pub mod redact;
+pub mod relocation;
 
 use agent_session_grep_domain::{
     DomainError, DomainResult, PlacementId, SessionContextGraph, StableId, ToolActivity,
-    ToolActivityKind,
+    ToolActivityKind, UsageObservation,
 };
 use std::io::{BufRead, Read};
 
@@ -19,6 +21,13 @@ use std::io::{BufRead, Read};
 /// Application 层负责把 PortError 归一为对外协议错误。
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
+    /// Invalid caller input or a relocation plan that cannot authorize this request.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// The catalog changed after the caller obtained its plan.
+    #[error("catalog generation mismatch: {0}")]
+    GenerationMismatch(String),
     /// 底层存储/IO 故障。
     #[error("backend failure: {0}")]
     Backend(String),
@@ -54,11 +63,12 @@ pub type PortResult<T> = Result<T, PortError>;
 pub struct SourceSnapshot {
     /// 源在存储中的规范路径（相对 data-root 或绝对，由 adapter 定义）。
     pub path: String,
-    /// 字节长度。
+    /// Captured byte length (logical backup length for SQLite sources).
     pub len: u64,
     /// 修改时间（Unix 毫秒）。
     pub mtime_ms: i64,
-    /// 内容指纹（BLAKE3 十六进制），用于识别等长改写。
+    /// Opaque content fingerprint. Files use BLAKE3 hex; SQLite logical
+    /// snapshots use `sqlite:` followed by the backup's BLAKE3 hex.
     pub fingerprint: String,
 }
 
@@ -108,11 +118,48 @@ pub trait CatalogStore {
     /// 的结果并让 cursor 错位（competitor-borrowings R1.3）。
     fn list_sessions(&self, limit: usize) -> PortResult<Vec<CatalogEntry>>;
 
+    /// 批量读取会话标题投影（schema v13 `session_titles`）：与 `session_ids`
+    /// 同序的 `Option<String>`，`None` 表示该会话没有可派生标题（无候选或
+    /// 存储无此投影）。实现必须批量读取（分块 IN），不得逐条查询（N+1）。
+    ///
+    /// 默认空实现：无标题投影的存储对每个 id 返回 `None`，保持与条目数
+    /// 对齐的契约不变。
+    fn session_titles(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        Ok(session_ids.iter().map(|_| None).collect())
+    }
+
+    /// 批量读取会话 repo 身份投影（schema v16 `session_repo_slugs`）：与
+    /// `session_ids` 同序的 `Option<String>`，值为三段 slug `host/owner/name`。
+    /// `None` 表示该会话没有 repo 身份（检测失败/非 git 目录/存储无此投影）——
+    /// "无行 = 未知"，未知绝不等于匹配。实现必须批量读取（分块 IN），不得逐条
+    /// 查询（N+1）。
+    ///
+    /// 默认空实现：无 repo 投影的存储对每个 id 返回 `None`，保持与条目数对齐。
+    fn session_repo_slugs(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        Ok(session_ids.iter().map(|_| None).collect())
+    }
+
     /// Catalog 当前实体总数（status/doctor 使用）。
     fn count(&self) -> PortResult<u64>;
 
+    /// 全库 token 用量聚合（usage 维度只读投影）。`None` = 存储无 usage
+    /// 投影（legacy schema 未迁移或后端未实现）；`Some(totals)` 且
+    /// `totals.sessions == 0` = 有投影但没有任何 usage 事实（未知 ≠ 零）。
+    /// 默认空实现：无 usage 投影的存储返回 `None`。
+    fn usage_totals(&self) -> PortResult<Option<UsageTotals>> {
+        Ok(None)
+    }
+
     /// 当前对外可见的不可变 generation。`0` 表示尚未激活任何写批次。
     fn active_generation(&self) -> PortResult<u64>;
+
+    /// 全库 repo 身份聚合（schema v16 只读投影；status 展示用）。
+    ///
+    /// 返回 `(repo_slug, sessions)` 列表；无 repo 投影的存储返回空列表
+    /// （未知 ≠ 零）。默认空实现。
+    fn repo_totals(&self) -> PortResult<Vec<RepoTotals>> {
+        Ok(Vec::new())
+    }
 }
 
 /// One distinct Session that contains placements for a stable Message.
@@ -141,6 +188,33 @@ pub struct SourcePlacement {
 pub struct ContextStats {
     pub placements: u64,
     pub source_placement_claims: u64,
+}
+
+/// 全库 token 用量聚合（status 展示用；只读投影）。
+///
+/// 覆盖标记原则（agentsview has_*_tokens 同义）：`sessions == 0` 表示库中
+/// **没有任何** usage 事实（未知），而不是"用量为零"——真 0 与未知必须可区分。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    /// 至少挂有一条 usage 事件的会话数。
+    pub sessions: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// 事件数按来源分列（observed = provider 逐事件给出，derived = 累计量派生）。
+    pub observed_events: u64,
+    pub derived_events: u64,
+}
+
+/// 单仓库会话聚合（schema v16 `session_repo_slugs` 只读投影；status 展示用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTotals {
+    /// 三段 repo slug（`host/owner/name`）——投影只存 slug，绝不落绝对路径。
+    pub repo_slug: String,
+    /// 派生到该 slug 的会话数。
+    pub sessions: u64,
 }
 
 /// Backend-independent read capability for contextual Message relations.
@@ -197,18 +271,23 @@ pub trait ContextGraphStore {
 
 /// A provider whose authoritative source-document metadata may constrain search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SearchProvider {
-    Claude,
-    Codex,
-}
+pub struct SearchProvider(&'static str);
 
 impl SearchProvider {
+    // Preserve the original public constructor spellings while making the
+    // capability matrix authoritative for every additional provider.
+    #[allow(non_upper_case_globals)]
+    pub const Claude: Self = Self("claude-code");
+    #[allow(non_upper_case_globals)]
+    pub const Codex: Self = Self("codex");
+
+    pub fn parse(value: &str) -> Option<Self> {
+        capability::canonical_search_provider_id(value).map(Self)
+    }
+
     /// Canonical provider id stored in SourceDocument payloads.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude-code",
-            Self::Codex => "codex",
-        }
+        self.0
     }
 }
 
@@ -241,12 +320,15 @@ impl SearchInstant {
 ///
 /// `providers` is a canonical sorted set at the Application boundary. Provider
 /// entries are ORed; provider and time dimensions are ANDed. Time is a
-/// half-open UTC interval `[since, until)`.
+/// half-open UTC interval `[since, until)`. `repo` (schema v16) is an exact
+/// match on the privacy-safe `host/owner/name` repo slug derived from the
+/// session's pair-observed working directory; `None` = no repo restriction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
     pub providers: Vec<SearchProvider>,
     pub since: Option<SearchInstant>,
     pub until: Option<SearchInstant>,
+    pub repo: Option<String>,
 }
 
 impl SearchFilters {
@@ -254,10 +336,14 @@ impl SearchFilters {
         providers: Vec::new(),
         since: None,
         until: None,
+        repo: None,
     };
 
     pub fn is_empty(&self) -> bool {
-        self.providers.is_empty() && self.since.is_none() && self.until.is_none()
+        self.providers.is_empty()
+            && self.since.is_none()
+            && self.until.is_none()
+            && self.repo.is_none()
     }
 }
 
@@ -280,11 +366,19 @@ pub struct SearchHit {
     /// 任何 placement（无归属会话）。
     pub session_id: Option<String>,
     /// 命中实体正文的摘要，由 Application 检索装配时填充（保序批量取 payload
-    /// 后截取 `text` 字段，按 `max_snippet_chars` 截前缀）。`None` 表示该实体
-    /// 没有可展示正文。
+    /// 的规范 `text` 字段后构建显示窗口）。`None` 表示该实体没有可展示正文。
+    ///
+    /// 摘要字符数 ≤ `max_snippet_chars`，且始终是原文的连续切片：存在可证明的
+    /// 字面命中（与 `why_matched` 同源词元）时，以最早命中为中心按 2 右 : 1 左
+    /// 交替扩展；锚点自身超过上限时取锚点起始的 `max_snippet_chars` 个字符；
+    /// 无字面证据（含语义-only 命中）时回退为正文前缀。不插入省略号、高亮或
+    /// 任何合成字符；大小写不敏感匹配把逐字符小写展开回映到原字符边界（如
+    /// `İ`），只保证 Unicode 标量边界、不保证字素簇完整。摘要字节经既有
+    /// 命中级字节估算计入 `max_response_bytes`（不分入口另行计费）。
     ///
     /// robot/json/jsonl 序列化器输出为命中对象的 `text` 字段；人类渲染器打印
-    /// 同一摘要作为 snippet 行（R4.3：human 输出不变）。
+    /// 同一摘要的片段行（human 预览会再按 `why_matched` 词元居中，见 CLI
+    /// `render_search`）。
     pub text: Option<String>,
     /// 确定性字面量命中证据（search-match-guidance）：由 Application 用与索引侧
     /// 同一 CJK/plain-text 词元分析对用户**字面查询**派生，逐词断言在命中完整正文
@@ -434,20 +528,75 @@ impl SearchFacets {
     }
 }
 
+/// 工具活动 target 的存储/投影上限（字符数）：显式截断；真实 transcript 的
+/// 路径与命令可能很长，但活动只承载检索面事实，不需要全文。
+///
+/// 单一来源：SQLite 落库前按本上限截断（`StoredActivity` 派生 activity id 前的
+/// 归一化点），provider-claude 把 `tool_use` 摘要并入可检索正文时用同一上限——
+/// 两侧同值，正文里看到的 target 与库里存的 target 才逐字一致。
+pub const TOOL_ACTIVITY_TARGET_MAX_CHARS: usize = 512;
+
+/// 工具名 → [`ToolActivityKind`] 的闭集（设计 R2）。名字**逐字**匹配 provider
+/// 记录的工具名，大小写敏感；不在表内 → `Unknown`（fail-closed，绝不猜）。
+///
+/// 闭集里每个名字都有真实语料证据（普查口径：本机真实 transcript 的结构统计，
+/// 只取「记录类型 / 工具名 / 参数键名」，不取任何内容字节）：
+///
+/// - Claude Code JSONL，`message.content[]` 的 `tool_use` block `name` 字段：
+///   `PowerShell`（Windows 形态下最高频）、`Read`、`Edit`、`Grep`、`Agent`
+///   （subagent 派发工具的现名，`Task` 为旧名）、`Bash`、`Write`、`Glob`、
+///   `WebFetch`、`WebSearch`。
+/// - Codex rollout，`response_item/function_call` 的 `name`（参数在 JSON 字符串
+///   `arguments` 里）：`shell_command`（最高频）、`exec_command`、`web_fetch`、
+///   `web_search`、`view_image`、`spawn_agent`。
+/// - Codex rollout，`response_item/custom_tool_call` 的 `name`（参数在字符串
+///   `input` 里）：`exec`、`apply_patch`。
+///
+/// 刻意**不**收入闭集：`mcp__*`（语义由 MCP server 定义）、`update_plan` /
+/// `get_goal` / `wait` / `wait_agent` / `close_agent` / `send_message` /
+/// `write_stdin` / `js` 等编排控制面工具（不属 file/command/web/query 任一类），
+/// 以及用户自定义插件工具（`CronList` 等）。它们如实记 `Unknown`。
+const COMMAND_TOOL_NAMES: [&str; 6] = [
+    "Bash",
+    "PowerShell",
+    "shell",
+    "shell_command",
+    "exec",
+    "exec_command",
+];
+/// 见 [`COMMAND_TOOL_NAMES`] 的证据说明。
+const FILE_TOOL_NAMES: [&str; 8] = [
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "ApplyPatch",
+    "apply_patch",
+    "view_image",
+];
+/// 见 [`COMMAND_TOOL_NAMES`] 的证据说明。
+const QUERY_TOOL_NAMES: [&str; 5] = ["Glob", "Grep", "Task", "Agent", "spawn_agent"];
+/// 见 [`COMMAND_TOOL_NAMES`] 的证据说明。
+const WEB_TOOL_NAMES: [&str; 4] = ["WebFetch", "WebSearch", "web_fetch", "web_search"];
+
 /// 工具活动 kind 推断规则（设计 R2）：按 provider 记录的**工具名**判定，
 /// 顺序匹配、首个命中生效；不在已知闭集内 → [`ToolActivityKind::Unknown`]
 /// （fail-closed，绝不猜）。
 pub fn infer_tool_activity_kind(name: &str) -> ToolActivityKind {
-    match name {
-        "Bash" | "shell" | "exec" => ToolActivityKind::Command,
-        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "ApplyPatch" => {
-            ToolActivityKind::File
-        }
-        "Glob" | "Grep" => ToolActivityKind::Query,
-        "WebFetch" | "WebSearch" => ToolActivityKind::Web,
-        "Task" => ToolActivityKind::Query,
-        _ => ToolActivityKind::Unknown,
+    if COMMAND_TOOL_NAMES.contains(&name) {
+        return ToolActivityKind::Command;
     }
+    if FILE_TOOL_NAMES.contains(&name) {
+        return ToolActivityKind::File;
+    }
+    if QUERY_TOOL_NAMES.contains(&name) {
+        return ToolActivityKind::Query;
+    }
+    if WEB_TOOL_NAMES.contains(&name) {
+        return ToolActivityKind::Web;
+    }
+    ToolActivityKind::Unknown
 }
 
 /// 把 provider 记录的调用事实构造成规范活动（设计 R1/R2/R4 的单一落点）。
@@ -485,6 +634,14 @@ pub fn build_tool_activity(
 /// （本项目 Web 工具的 input 只有 url），末尾追加 `description`（Task 类工具）。
 /// 与 Recall 的差异：只接受字符串值（数组形态的 `bash -c …` 参数在 Claude/Codex
 /// 记录中不出现，fail-closed 不猜），键匹配区分大小写（provider 记录的确切字段名）。
+///
+/// **字符串形态的 input**（不是对象）同样受理：Codex rollout 的
+/// `response_item/custom_tool_call` 把整段参数放在字符串 `input` 里（真实语料
+/// 1503/1503 条如此），此时整条字符串就是 provider 记录的 target。其中
+/// `apply_patch` 的 input 是补丁封套（真实语料 549/549 条首行恰为
+/// `*** Begin Patch`），按封套语法取首个 `*** {Add,Update,Delete} File:` 的路径
+/// ——比拿整段补丁当 target 有用得多；封套内没有 File 头时回退整段原文，绝不
+/// 编造路径。
 pub fn extract_tool_activity_target(input: &serde_json::Value) -> Option<String> {
     const PRIORITY: [&str; 13] = [
         "path",
@@ -501,12 +658,44 @@ pub fn extract_tool_activity_target(input: &serde_json::Value) -> Option<String>
         "regex",
         "description",
     ];
+    if let Some(raw) = input.as_str() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(apply_patch_target(trimmed).unwrap_or(trimmed).to_string());
+    }
     let object = input.as_object()?;
     for key in PRIORITY {
         if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Codex `apply_patch` 封套里的首个受影响文件路径。
+///
+/// 只在**首行恰为** `*** Begin Patch` 时解析（fail-closed：真实语料里有把补丁
+/// 文本嵌进 shell 命令的 `exec` 调用，那类命令必须整条保留，不能被当补丁解析）。
+/// 返回 `None` 表示「不是补丁封套 / 封套内无 File 头」，由调用方回退原文。
+fn apply_patch_target(input: &str) -> Option<&str> {
+    const ENVELOPE_HEADER: &str = "*** Begin Patch";
+    const FILE_HEADERS: [&str; 3] = ["*** Update File: ", "*** Add File: ", "*** Delete File: "];
+    let mut lines = input.lines();
+    if lines.next()?.trim() != ENVELOPE_HEADER {
+        return None;
+    }
+    for line in lines {
+        for header in FILE_HEADERS {
+            if let Some(path) = line.trim_start().strip_prefix(header) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    return Some(path);
+                }
             }
         }
     }
@@ -536,7 +725,7 @@ pub trait SearchIndex {
 
     /// 带 facet 过滤的查询（additive）：`facets` 为默认值时语义与
     /// [`Self::query_filtered`] 完全一致（实现可短路）。命中仍按钉住排序
-    /// （bm25 + id tiebreak）。
+    /// （rank fusion + id tiebreak）。
     fn query_faceted(
         &self,
         query: SearchQuery<'_>,
@@ -545,6 +734,19 @@ pub trait SearchIndex {
     ) -> PortResult<Vec<SearchHit>> {
         let _ = facets;
         self.query_filtered(query, limit)
+    }
+
+    /// Apply visibility before the backend limit. Legacy implementations may
+    /// leave visibility to Application; storage adapters should push it down.
+    fn query_with_policy(
+        &self,
+        query: SearchQuery<'_>,
+        limit: usize,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
+        let _ = include_system;
+        self.query_faceted(query, limit, facets)
     }
 }
 
@@ -563,11 +765,33 @@ pub trait SemanticIndex {
     /// 执行语义查询：返回与 query embedding 最相似的 top-k 消息。
     ///
     /// 结果按余弦相似度降序。`limit` 是最大返回数。
-    fn query_semantic(&self, query_embedding: &[f32], limit: usize) -> PortResult<Vec<SearchHit>>;
+    fn query_semantic(&self, query_embedding: &[f32], limit: usize) -> PortResult<Vec<SearchHit>> {
+        self.query_semantic_filtered(
+            query_embedding,
+            limit,
+            &SearchFilters::EMPTY,
+            &SearchFacets::default(),
+            true,
+        )
+    }
+
+    /// Apply the same metadata/facet/visibility predicates as lexical search
+    /// before selecting top-k. Non-finite vectors or scores are errors.
+    fn query_semantic_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        filters: &SearchFilters,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>>;
 
     /// 语义索引是否就绪（模型已加载、向量索引已建）。
-    /// 未就绪时 Application 应回退到 lexical。
-    fn is_ready(&self) -> bool;
+    /// Only `Ok(false)` permits lexical fallback; backend errors propagate.
+    fn is_ready(&self) -> PortResult<bool>;
+
+    /// Current model identity for cursor binding; errors must not be hidden.
+    fn semantic_model_id(&self) -> PortResult<Option<String>>;
 }
 
 /// 未提供语义索引实现时的占位（对应 `App<.., NoSemanticIndex>`）：语义/
@@ -581,16 +805,23 @@ impl SemanticIndex for NoSemanticIndex {
         Ok(())
     }
 
-    fn query_semantic(
+    fn query_semantic_filtered(
         &self,
         _query_embedding: &[f32],
         _limit: usize,
+        _filters: &SearchFilters,
+        _facets: &SearchFacets,
+        _include_system: bool,
     ) -> PortResult<Vec<SearchHit>> {
         Ok(Vec::new())
     }
 
-    fn is_ready(&self) -> bool {
-        false
+    fn is_ready(&self) -> PortResult<bool> {
+        Ok(false)
+    }
+
+    fn semantic_model_id(&self) -> PortResult<Option<String>> {
+        Ok(None)
     }
 }
 
@@ -644,8 +875,20 @@ impl<T: CatalogStore + ?Sized> CatalogStore for &T {
     fn list_sessions(&self, limit: usize) -> PortResult<Vec<CatalogEntry>> {
         (**self).list_sessions(limit)
     }
+    fn session_titles(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        (**self).session_titles(session_ids)
+    }
+    fn session_repo_slugs(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        (**self).session_repo_slugs(session_ids)
+    }
     fn count(&self) -> PortResult<u64> {
         (**self).count()
+    }
+    fn usage_totals(&self) -> PortResult<Option<UsageTotals>> {
+        (**self).usage_totals()
+    }
+    fn repo_totals(&self) -> PortResult<Vec<RepoTotals>> {
+        (**self).repo_totals()
     }
     fn active_generation(&self) -> PortResult<u64> {
         (**self).active_generation()
@@ -702,6 +945,16 @@ impl<T: SearchIndex + ?Sized> SearchIndex for &T {
     ) -> PortResult<Vec<SearchHit>> {
         (**self).query_faceted(query, limit, facets)
     }
+
+    fn query_with_policy(
+        &self,
+        query: SearchQuery<'_>,
+        limit: usize,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
+        (**self).query_with_policy(query, limit, facets, include_system)
+    }
 }
 
 /// 读取并校验一个源快照，把端口错误归一为领域语义，并返回校验过的字节——
@@ -742,6 +995,8 @@ fn port_error_kind(error: &PortError) -> &'static str {
         PortError::NotFound(_) => "not_found",
         PortError::SnapshotChanged(_) => "snapshot_changed",
         PortError::WriterBusy(_) => "writer_busy",
+        PortError::InvalidRequest(_) => "invalid_request",
+        PortError::GenerationMismatch(_) => "generation_mismatch",
     }
 }
 
@@ -963,8 +1218,23 @@ impl<T: SemanticIndex + ?Sized> SemanticIndex for &T {
         (**self).query_semantic(query_embedding, limit)
     }
 
-    fn is_ready(&self) -> bool {
+    fn query_semantic_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        filters: &SearchFilters,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
+        (**self).query_semantic_filtered(query_embedding, limit, filters, facets, include_system)
+    }
+
+    fn is_ready(&self) -> PortResult<bool> {
         (**self).is_ready()
+    }
+
+    fn semantic_model_id(&self) -> PortResult<Option<String>> {
+        (**self).semantic_model_id()
     }
 }
 
@@ -975,10 +1245,19 @@ impl<T: SemanticIndex + ?Sized> SemanticIndex for &T {
 /// 由 sink 侧决定如何映射到 domain 类型（未知角色、id 稳定性策略归 sink）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEvent<'a> {
-    /// 会话内单调序号，从 0 起（只对成功产出的对话消息递增）。
+    /// Explicit session membership for a multi-session source. None retains
+    /// the report-level single-session contract.
+    pub session: Option<&'a ProviderSessionIdentity>,
+    /// Source-local ordinal, starting at zero and increasing for emitted messages.
     pub seq: u32,
     /// provider-native 消息 id（如 Claude Code 的 `uuid`）。空串表示 provider 未提供，
-    /// 此时 sink 应回退到 reconstructed 派生（path+seq）。
+    /// 此时 sink 必须自行派生，且不得声称 `Stability::Native`。
+    ///
+    /// 空串是显式契约而非疏漏：provider 绝不编造形如 `<provider>-msg-{seq}` 的
+    /// 假 id——那会把纯序号伪装成持久身份。composition root 的回退用
+    /// document-scoped path-free facts（provider、variant、document id、seq）派生
+    /// `Stability::Unstable`，因为 seq 会随 provider 记录过滤规则变化而漂移，
+    /// 不能承诺跨运行稳定。
     pub native_id: &'a str,
     /// 父消息的 native id（threading 边）。`None` 表示根消息或 provider 未提供。
     pub parent_native_id: Option<&'a str>,
@@ -998,6 +1277,15 @@ pub struct MessageEvent<'a> {
     pub span: Option<(u64, u64)>,
 }
 
+/// A provider's source-local session boundary, with independently observed
+/// resume metadata. `source_key` is not a native ID and must never be exposed
+/// as one; it distinguishes sessions whose provider omitted a durable ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionIdentity {
+    pub source_key: String,
+    pub observation: ProviderSessionObservation,
+}
+
 /// 一条规范化的工具活动观察（RFC-0002 §2 扩展）：provider 把 `tool_use` /
 /// `tool_result`（或 Codex `custom_tool_call` / `function_call_output`）配对后
 /// 连同锚定消息一起推入 sink。
@@ -1011,6 +1299,21 @@ pub struct ToolActivityEvent<'a> {
     pub message_native_id: &'a str,
     /// 提取出的完整活动事实（owned：provider 必须分配 target 字符串）。
     pub activity: ToolActivity,
+}
+
+/// 一条规范化的 token 用量观察（RFC-0002 §2 扩展，usage 维度）。
+///
+/// 只承载 provider 格式**明确给出**的数字（Observed），或由累计量经单调校验
+/// 确定性派生的增量（Derived）——绝不按文本长度等代理估算。锚定规则：
+/// `message_native_id` 非空时挂在该消息上（如 Claude Code 的 `message.usage`
+/// 锚在 assistant 记录）；空串表示 **session 级观察**（如 Codex 的
+/// `token_count` 累计事件没有消息关联），由组合根挂到该源的会话上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEvent<'a> {
+    /// 锚定消息的 provider-native id；空串 = session 级观察，绝不臆造锚点。
+    pub message_native_id: &'a str,
+    /// 提取出的完整用量事实。
+    pub usage: UsageObservation,
 }
 
 /// Canonical 事件接收端（RFC-0002 §2）：parse 流式产出，绝不整体加载。
@@ -1030,6 +1333,14 @@ pub trait CanonicalEventSink {
     /// 活动附着在 `event.message_native_id` 指向的消息上；sink 负责把 native id
     /// 解析为稳定消息身份，解析失败的活动必须丢弃（绝不臆造锚点）。
     fn emit_activity(&mut self, _event: ToolActivityEvent<'_>) -> PortResult<()> {
+        Ok(())
+    }
+
+    /// 接收一条 token 用量观察（additive：默认实现为 no-op，既有 sink 不受影响）。
+    ///
+    /// `event.message_native_id` 非空时用量挂在该消息上；空串是 session 级观察。
+    /// sink 负责解析锚点；解析失败必须丢弃（绝不臆造锚点）。
+    fn emit_usage(&mut self, _event: UsageEvent<'_>) -> PortResult<()> {
         Ok(())
     }
 }
@@ -1411,6 +1722,129 @@ mod tests {
     }
 
     #[test]
+    fn tool_activity_kind_covers_the_names_real_transcripts_record() {
+        use agent_session_grep_domain::ToolActivityKind as K;
+        // 名字取自真实语料普查（见 `TOOL_NAME_EVIDENCE`）。此前这些名字全部落
+        // Unknown，且 Unknown 连 target 也一起丢弃（fail-closed 双保险），于是
+        // 真实语料里最高频的工具活动反而信息最少——这正是 "richer extraction"
+        // 要补的洞。
+        let cases = [
+            // Claude Code（Windows 形态的 shell 工具）。
+            ("PowerShell", K::Command),
+            // Claude Code：subagent 派发工具的现名（`Task` 是旧名，两者同工具）。
+            ("Agent", K::Query),
+            // Codex `function_call`：命令执行两代工具名。
+            ("shell_command", K::Command),
+            ("exec_command", K::Command),
+            // Codex `custom_tool_call`：补丁工具的真实名（小写下划线）。
+            ("apply_patch", K::File),
+            // Codex `function_call`：网页检索/抓取。
+            ("web_search", K::Web),
+            ("web_fetch", K::Web),
+            // Codex `function_call`：读图（按路径取文件内容）。
+            ("view_image", K::File),
+            // Codex `function_call`：子 agent 派发，与 Claude `Agent`/`Task` 同类。
+            ("spawn_agent", K::Query),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(infer_tool_activity_kind(name), expected, "name: {name:?}");
+        }
+
+        // 反向：用户自定义 / MCP / 编排控制面工具不进闭集（语义由 server 或
+        // 会话编排定义，按名字猜 kind 就是编造）。
+        for name in [
+            "mcp__some-server__web_search",
+            "update_plan",
+            "get_goal",
+            "wait",
+            "wait_agent",
+            "close_agent",
+            "send_message",
+            "write_stdin",
+            "js",
+            "TodoWrite",
+            "CronList",
+        ] {
+            assert_eq!(
+                infer_tool_activity_kind(name),
+                K::Unknown,
+                "name: {name:?} 必须留在 Unknown（不按名字猜语义）"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_activity_target_accepts_string_shaped_tool_input() {
+        use serde_json::json;
+        // 证据：Codex rollout 的 `response_item/custom_tool_call` 把参数放在
+        // **字符串** `input` 里（不是 `arguments` 对象），真实语料 1503/1503 条
+        // 皆如此。此前只接受对象 → 这些调用 target 恒为 None。
+        assert_eq!(
+            extract_tool_activity_target(&json!("cargo test --workspace")).as_deref(),
+            Some("cargo test --workspace")
+        );
+        // trim 后为空 → None（不把空白当 target）。
+        assert_eq!(extract_tool_activity_target(&json!("   ")), None);
+        assert_eq!(extract_tool_activity_target(&json!("")), None);
+        // 前后空白 trim，与对象形态同规。
+        assert_eq!(
+            extract_tool_activity_target(&json!("  git status  ")).as_deref(),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn tool_activity_target_reads_the_apply_patch_envelope_file_header() {
+        use serde_json::json;
+        // 证据：Codex `custom_tool_call` name=`apply_patch` 的 `input` 是补丁
+        // 封套，真实语料 549/549 条首行恰为 `*** Begin Patch`，其后按
+        // `*** Update File: ` / `*** Add File: ` / `*** Delete File: ` 声明路径。
+        // 取首个 File 头的路径，比拿整段补丁文本当 target 有用得多。
+        let patch =
+            "*** Begin Patch\n*** Update File: crates/a/src/lib.rs\n@@\n-old\n+new\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(patch)).as_deref(),
+            Some("crates/a/src/lib.rs")
+        );
+        let added = "*** Begin Patch\n*** Add File: docs/new.md\n+hello\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(added)).as_deref(),
+            Some("docs/new.md")
+        );
+        let deleted = "*** Begin Patch\n*** Delete File: tmp/gone.txt\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(deleted)).as_deref(),
+            Some("tmp/gone.txt")
+        );
+        // 多个 File 头 → 取首个（确定性；活动只承载检索面事实）。
+        let multi =
+            "*** Begin Patch\n*** Update File: first.rs\n*** Add File: second.rs\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(multi)).as_deref(),
+            Some("first.rs")
+        );
+        // 封套但无 File 头 → 回退整段（trim 后的原文），绝不编路径。
+        let headerless = "*** Begin Patch\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(headerless)).as_deref(),
+            Some(headerless)
+        );
+        // 首行不是 `*** Begin Patch` 的字符串（真实语料里有 3 条 exec 命令内嵌
+        // 补丁文本）→ 不当补丁解析，保持整条命令。
+        let heredoc = "bash -lc 'apply_patch <<EOF\n*** Update File: a.rs\nEOF'";
+        assert_eq!(
+            extract_tool_activity_target(&json!(heredoc)).as_deref(),
+            Some(heredoc)
+        );
+        // File 头存在但路径为空白 → 继续找下一个头；都没有则回退整段。
+        let blank = "*** Begin Patch\n*** Update File:   \n*** Add File: real.rs\n*** End Patch";
+        assert_eq!(
+            extract_tool_activity_target(&json!(blank)).as_deref(),
+            Some("real.rs")
+        );
+    }
+
+    #[test]
     fn tool_activity_target_priority_chain_first_present_wins() {
         use serde_json::json;
         // 优先级（借用 Recall events.rs::target_from_value 的键序）：
@@ -1471,7 +1905,13 @@ mod tests {
             None
         );
         assert_eq!(extract_tool_activity_target(&json!(null)), None);
-        assert_eq!(extract_tool_activity_target(&json!("not an object")), None);
+        // 字符串形态的 input 不再是"非对象 → None"：Codex custom_tool_call 把
+        // 整段参数记在字符串 `input` 里，那就是 provider 记录的 target。
+        // 见 `tool_activity_target_accepts_string_shaped_tool_input`。
+        assert_eq!(
+            extract_tool_activity_target(&json!("not an object")).as_deref(),
+            Some("not an object")
+        );
         // 数组值（Recall 的 bash -c 形态）在本项目 fail-closed：不猜。
         assert_eq!(
             extract_tool_activity_target(&json!({"command": ["bash", "-c", "ls"]})),
@@ -1482,6 +1922,51 @@ mod tests {
             extract_tool_activity_target(&json!({"command": "  git status  "})).as_deref(),
             Some("git status")
         );
+    }
+
+    #[test]
+    fn build_tool_activity_keeps_the_fail_closed_double_guarantee() {
+        use agent_session_grep_domain::{
+            ToolActivityActor, ToolActivityKind as K, ToolActivityStatus,
+        };
+        use serde_json::json;
+        // 闭集扩张后这条不变量更重要：未知名 → kind=Unknown **且** target=None，
+        // 即使 input 带着形似命令/路径的字段（也包括字符串形态的 input）。
+        let unknown_object = build_tool_activity(
+            "mcp__some-server__run",
+            ToolActivityActor::Main,
+            &json!({"command": "rm -rf /"}),
+            ToolActivityStatus::Success,
+        );
+        assert_eq!(unknown_object.kind, K::Unknown);
+        assert_eq!(unknown_object.target, None);
+        let unknown_string = build_tool_activity(
+            "update_plan",
+            ToolActivityActor::Main,
+            &json!("cargo test"),
+            ToolActivityStatus::Unknown,
+        );
+        assert_eq!(unknown_string.kind, K::Unknown);
+        assert_eq!(unknown_string.target, None);
+        // 已知名 + 无可用字段 → kind 保留、target=None。
+        let known_without_target = build_tool_activity(
+            "Read",
+            ToolActivityActor::Subagent,
+            &json!({"limit": 20}),
+            ToolActivityStatus::Success,
+        );
+        assert_eq!(known_without_target.kind, K::File);
+        assert_eq!(known_without_target.target, None);
+        assert_eq!(known_without_target.actor, ToolActivityActor::Subagent);
+        // 已知名 + 字符串 input（Codex custom_tool_call 形态）→ target 取整条。
+        let known_string = build_tool_activity(
+            "exec",
+            ToolActivityActor::Main,
+            &json!("cargo fmt --all"),
+            ToolActivityStatus::Success,
+        );
+        assert_eq!(known_string.kind, K::Command);
+        assert_eq!(known_string.target.as_deref(), Some("cargo fmt --all"));
     }
 
     #[test]
@@ -1606,6 +2091,11 @@ mod tests {
             ..SearchFilters::default()
         };
         assert!(!until_only.is_empty());
+        let repo_only = SearchFilters {
+            repo: Some("github.com/owner/name".into()),
+            ..SearchFilters::default()
+        };
+        assert!(!repo_only.is_empty());
     }
 
     struct FakeContextStore {
@@ -1852,5 +2342,68 @@ mod tests {
 
         let ok = read_bounded_source(&source, 10).unwrap();
         assert_eq!(ok, b"0123456789");
+    }
+
+    /// RFC-0002 原文：provider adapter 契约的权威规范。
+    const RFC_0002: &str =
+        include_str!("../../../docs/architecture/RFC-0002-provider-adapter-contract.md");
+
+    /// RFC-0002 §5 错误矩阵里的标签 → 对应的 `ProviderError` 变体名。
+    ///
+    /// 契约文档用 snake_case 标签描述错误类，代码用 Pascal 变体实现。两侧此前
+    /// 没有任何联系：重命名一个变体、或在文档里写一个不存在的标签，都不会有测试
+    /// 失败，而 `PROVIDER-ADAPTER-CONTRIBUTOR-GUIDE.md` 让贡献者按这些标签实现
+    /// adapter——标签失效等于把规范变成传说。
+    ///
+    /// 只登记"确实是错误类型"的标签：`record_recoverable` 与 `incomplete_tail`
+    /// 是处理策略（分别落在 `ParseReport.skipped` 与"不提交半截"的调用方行为上），
+    /// 不是 `ProviderError` 变体，故不在此表。
+    const RFC_0002_ERROR_LABELS: &[(&str, &str)] = &[
+        ("source_changed_during_read", "SourceChangedDuringRead"),
+        ("structural_fatal", "StructuralFatal"),
+        ("ambiguous_variant", "AmbiguousVariant"),
+    ];
+
+    #[test]
+    fn rfc_0002_error_vocabulary_maps_to_real_provider_error_variants() {
+        let source = include_str!("lib.rs");
+        // 只在生产区找变体定义，避免测试里的字符串自证。
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+
+        for (label, variant) in RFC_0002_ERROR_LABELS {
+            assert!(
+                RFC_0002.contains(&format!("`{label}`")),
+                "RFC-0002 不再提及错误标签 `{label}`——本表必须同步删除该行，\
+                 否则守护会声称文档有一条它其实没有的规范"
+            );
+            assert!(
+                production.contains(&format!("{variant}(")),
+                "RFC-0002 §5 的错误标签 `{label}` 对应的 `ProviderError::{variant}` \
+                 在生产代码里找不到——契约词汇与实现已脱节，必须同时修文档与代码"
+            );
+        }
+
+        // §6 的字段能力词汇必须与 `CapabilityLevel` 的对外字符串一致：文档写
+        // `native | derived | partial | unsupported | unknown`，代码经 serde
+        // (`rename_all = "snake_case"`) 把同一组值输出给 CLI/MCP/Web。任一侧
+        // 改名而不同步，对外文档即失真。取值走 serde 而不是手抄常量。
+        for level in [
+            crate::capability::CapabilityLevel::Native,
+            crate::capability::CapabilityLevel::Derived,
+            crate::capability::CapabilityLevel::Partial,
+            crate::capability::CapabilityLevel::Unsupported,
+            crate::capability::CapabilityLevel::Unknown,
+        ] {
+            let wire = serde_json::to_string(&level).expect("CapabilityLevel 必须可序列化");
+            let name = wire.trim_matches('"');
+            assert!(
+                RFC_0002.contains(&format!("`{name}")) || RFC_0002.contains(&format!("{name} |")),
+                "RFC-0002 §6 的字段能力词汇缺少 `{name}`——\
+                 CapabilityLevel 有该档位，契约文档不得漏档"
+            );
+        }
     }
 }

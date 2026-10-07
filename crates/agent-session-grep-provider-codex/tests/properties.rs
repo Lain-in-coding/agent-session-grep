@@ -479,3 +479,76 @@ fn properties_hold_for_fixed_seed_corpus() {
          session={saw_session} no_session={saw_no_session} messages={saw_messages}"
     );
 }
+
+/// 属性 7（生命周期 append，B5）：在已封口快照末尾追加一条合法
+/// `response_item/message` 后，既有消息的 seq/native_id/text/span（含
+/// occurrence-local 时间戳规则）必须逐字段不变，新消息追加在末尾——
+/// 增量 sync 的"前缀稳定"前提。
+#[test]
+fn prop_append_keeps_prefix_byte_stable() {
+    let adapter = CodexAdapter::new();
+    for (i, seed) in fixed_seeds().iter().copied().enumerate() {
+        let case = build_case(seed, i == 0);
+
+        let mut extended = case.bytes.clone();
+        // 未封口的末行先补行尾，否则追加会与残余字节拼成一行。
+        if extended.last().is_some_and(|b| *b != b'\n') {
+            extended.push(b'\n');
+        }
+        let appended = json!({
+            "timestamp": "2026-07-26T10:00:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": format!("msg-p{seed:016x}-appended"),
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "appended lifecycle record"}],
+            },
+        })
+        .to_string();
+        let append_start = extended.len() as u64;
+        extended.extend_from_slice(appended.as_bytes());
+        extended.push(b'\n');
+
+        let mut base_sink = CollectingSink::default();
+        let base_report = adapter
+            .parse(&case.bytes, &mut base_sink)
+            .unwrap_or_else(|e| panic!("seed={seed}: 基准快照解析不应失败: {e}"));
+        let mut ext_sink = CollectingSink::default();
+        let ext_report = adapter
+            .parse(&extended, &mut ext_sink)
+            .unwrap_or_else(|e| panic!("seed={seed}: 追加后快照解析不应失败: {e}"));
+
+        assert_eq!(
+            ext_sink.messages.len(),
+            base_sink.messages.len() + 1,
+            "seed={seed}: 追加一条合法记录只新增一条消息"
+        );
+        assert_eq!(
+            ext_sink.messages[..base_sink.messages.len()],
+            base_sink.messages[..],
+            "seed={seed}: 追加不得移动既有消息的任何字段（含 span）"
+        );
+        let last = &ext_sink.messages[base_sink.messages.len()];
+        assert_eq!(
+            last.native_id,
+            format!("msg-p{seed:016x}-appended"),
+            "seed={seed}: 追加消息 native id 必须原样透传"
+        );
+        assert_eq!(last.timestamp, None, "seed={seed}: 外层时间戳不进稳定字段");
+        assert_eq!(
+            last.span,
+            Some((append_start, append_start + appended.len() as u64)),
+            "seed={seed}: 追加消息 span 必须覆盖追加行（不含行尾）"
+        );
+        assert_eq!(
+            ext_report.committed,
+            base_report.committed + 1,
+            "seed={seed}: committed 只新增一"
+        );
+        assert_eq!(
+            ext_report.skipped, base_report.skipped,
+            "seed={seed}: 追加不得改变既有 skipped 计数"
+        );
+    }
+}

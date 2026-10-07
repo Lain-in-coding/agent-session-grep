@@ -12,6 +12,13 @@ use std::process::{Command, Output, Stdio};
 /// 刚构建出的 `agent-session-grep` 二进制的绝对路径（由 Cargo 在编译期注入）。
 const BIN: &str = env!("CARGO_BIN_EXE_agent-session-grep");
 
+/// 固定应用时钟（`ASG_CLOCK_MS`，2026-08-25T00:00:00Z 的 Unix 毫秒）：rank
+/// signals 的时效衰减随注入时钟确定，e2e 子进程全部注入该值——同 query 同
+/// clock 结果逐字节可复现，杜绝真实时钟造成的排序/得分漂移（含 handoff
+/// pack 字节确定性）。夹具时间戳都在 2026-08-10 之前，相对时间谓词断言
+/// （`--since 1d/1w` 等）在该时钟下语义不变。
+const E2E_CLOCK_MS: &str = "1787616000000";
+
 /// 在给定 db 上以 robot 协议模式跑一次 CLI，返回完整输出。
 /// 功能性测试统一断言稳定 JSON envelope；human 版式走 [`run_human`]。
 fn run(db: &str, args: &[&str]) -> Output {
@@ -20,6 +27,7 @@ fn run(db: &str, args: &[&str]) -> Output {
         .arg(db)
         .arg("--robot")
         .args(args)
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
         .output()
         .expect("failed to spawn agent-session-grep binary")
 }
@@ -30,6 +38,7 @@ fn run_human(db: &str, args: &[&str]) -> Output {
         .arg("--db")
         .arg(db)
         .args(args)
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
         .output()
         .expect("failed to spawn agent-session-grep binary")
 }
@@ -107,7 +116,32 @@ fn temp_db(tag: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(format!("{tag}.db"));
     let s = path.to_string_lossy().into_owned();
+    // Read-only CLI commands require an existing catalog. Initialize the empty
+    // fixture explicitly so tests do not rely on read opens creating/migrating it.
+    let store = agent_session_grep_adapters_sqlite::SqliteStore::open_for_write(&s)
+        .expect("initialize empty catalog fixture under writer lease");
+    drop(store);
     (dir, s)
+}
+
+/// Match the CLI's source locator spelling when seeding historical scan rows.
+fn v6_fixture_source_locator(path: &Path) -> String {
+    let locator = path
+        .to_str()
+        .expect("fixture source path is Unicode")
+        .to_owned();
+    #[cfg(windows)]
+    {
+        let mut locator = locator.replace('\\', "/");
+        if locator.as_bytes().get(1) == Some(&b':') {
+            locator[..1].make_ascii_lowercase();
+        }
+        locator
+    }
+    #[cfg(not(windows))]
+    {
+        locator
+    }
 }
 
 fn create_v6_catalog(
@@ -271,13 +305,77 @@ fn index_search_get_roundtrip() {
     assert!(out.status.success());
     assert!(stdout(&out).contains("the quick brown fox jumps"));
 }
+/// B4：语义证据门的显式注入通道（`ASG_SEMANTIC_SIMILARITY_FLOOR`）。
+/// - 门高于任何实际相似度（1.0）→ semantic 返回空（候选在融合前被拒绝）；
+/// - 门开到 -1.0 → 同一候选恢复（证明上一步的拒绝来自证据门）；
+/// - 非法值 → invalid_request（exit 2），绝不静默改用别的阈值。
+#[test]
+fn semantic_evidence_floor_env_override_is_explicit_and_validated() {
+    let (dir, db) = temp_db("semantic-floor");
+    let fixture = dir.path().join("floor.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"user","uuid":"90000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"floor-session","timestamp":"2026-08-01T12:00:00.000Z","message":{"role":"user","content":"floorprobe matcher body"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write floor fixture");
+    let ingested = run(&db, &["ingest", fixture.to_str().unwrap()]);
+    assert!(ingested.status.success(), "{}", stdout(&ingested));
+    let indexed = run(&db, &["index", "embeddings"]);
+    assert!(indexed.status.success(), "{}", stdout(&indexed));
+    assert_eq!(parse_first_line(&indexed)["data"]["indexed"], 1);
+
+    let run_env = |value: &str| {
+        Command::new(BIN)
+            .arg("--db")
+            .arg(&db)
+            .arg("--robot")
+            .args(["search", "floorprobe", "--mode", "semantic"])
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("ASG_SEMANTIC_SIMILARITY_FLOOR", value)
+            .output()
+            .expect("failed to spawn agent-session-grep binary")
+    };
+
+    // 1.0：query 前缀与 passage 前缀不同，任何存库向量都取不到 1.0。
+    let closed = run_env("1.0");
+    assert!(closed.status.success(), "{}", stdout(&closed));
+    let frame = parse_first_line(&closed);
+    assert_eq!(
+        frame["data"]["hits"].as_array().unwrap().len(),
+        0,
+        "{frame}"
+    );
+
+    // -1.0：门全开，同一候选恢复。
+    let open = run_env("-1.0");
+    assert!(open.status.success(), "{}", stdout(&open));
+    let frame = parse_first_line(&open);
+    assert_eq!(
+        frame["data"]["hits"].as_array().unwrap().len(),
+        1,
+        "{frame}"
+    );
+
+    // 非法值：显式失败，绝不静默使用别的阈值。
+    let invalid = run_env("not-a-number");
+    assert_eq!(invalid.status.code(), Some(2), "{}", stdout(&invalid));
+    let frame = parse_first_line(&invalid);
+    assert_eq!(frame["error"]["code"], "invalid_request", "{frame}");
+}
 
 #[test]
 fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() {
-    let (dir, db) = temp_db("migrated-v6-reingest");
+    let dir = tempfile::tempdir().expect("v6 fixture directory");
+    let db = dir
+        .path()
+        .join("migrated-v6-reingest.db")
+        .to_string_lossy()
+        .into_owned();
     let session_native = "66111111-1111-4111-8111-111111111111";
     let message_native = "66222222-2222-4222-8222-222222222222";
-    let legacy_session_wire = format!("ses_v1_{session_native}");
     let message_wire = format!("msg_v1_{message_native}");
     let legacy_document_wire = "doc_v1_legacy-v6-document";
     let message_text = "legacy catalog survives migration";
@@ -288,7 +386,22 @@ fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() 
          \"message\":{{\"role\":\"user\",\"content\":\"{message_text}\"}}}}\n"
     );
     std::fs::write(&source, &source_content).expect("write v6 re-ingest fixture");
-    let source_path = source.to_string_lossy().into_owned();
+    let source_path = v6_fixture_source_locator(&source);
+    // Reproduce the historical namespace and CLI locator spelling. A complete
+    // re-ingest must prove and preserve this Session, never allocate a new one.
+    let namespace = agent_session_grep_application::relocation::legacy_installation_namespace(
+        &source_path,
+        "claude-code",
+    );
+    let legacy_session_wire = agent_session_grep_domain::StableId::native_session_scoped(
+        &agent_session_grep_domain::SessionIdentityNamespace {
+            provider_id: "claude-code",
+            installation_namespace: &namespace,
+        },
+        session_native,
+    )
+    .as_str()
+    .to_owned();
     create_v6_catalog(
         &db,
         &source_path,
@@ -297,6 +410,12 @@ fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() 
         legacy_document_wire,
         message_text,
     );
+    {
+        // Schema migration is a writer operation; exercise it under the same
+        // explicit lease used by production maintenance/write entrypoints.
+        let _store = agent_session_grep_adapters_sqlite::SqliteStore::open_for_write(&db)
+            .expect("migrate v6 catalog under writer lease");
+    }
 
     let get = run(&db, &["get", &message_wire]);
     assert!(get.status.success(), "get failed: {}", stdout(&get));
@@ -357,7 +476,7 @@ fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() 
     );
     assert_eq!(parse_first_line(&ingest)["data"]["skipped"], 0);
     let session_wire = session_wire_for_message(&db, &message_wire);
-    assert_ne!(session_wire, legacy_session_wire);
+    assert_eq!(session_wire, legacy_session_wire);
 
     let context = run(&db, &["context", &session_wire]);
     assert!(
@@ -395,6 +514,103 @@ fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() 
             stdout(&output)
         );
     }
+}
+
+fn assert_v6_reingest_rejects_unproven_session(raw_locator: bool) {
+    let (dir, home) = discover_env();
+    let db = dir
+        .path()
+        .join("unproven-v6.db")
+        .to_string_lossy()
+        .into_owned();
+    let source = dir.path().join(".claude/projects/legacy-source.jsonl");
+    let source_content = serde_json::json!({
+        "type": "user",
+        "uuid": "c0000000-0000-4000-8000-000000000001",
+        "parentUuid": null,
+        "sessionId": "ccdd1234-5678-4abc-8def-001122334455",
+        "timestamp": "2026-07-28T00:00:00.000Z",
+        "message": { "role": "user", "content": "resume smoke root" },
+    });
+    std::fs::write(&source, format!("{source_content}\n")).expect("write unproven legacy source");
+    let input_path = source.to_string_lossy().into_owned();
+    let message_wire = "msg_v1_c0000000-0000-4000-8000-000000000001";
+    let source_path = if raw_locator {
+        input_path.clone()
+    } else {
+        v6_fixture_source_locator(Path::new(&input_path))
+    };
+    create_v6_catalog(
+        &db,
+        &source_path,
+        "ses_v1_ccdd1234-5678-4abc-8def-001122334455",
+        message_wire,
+        "doc_v1_unproven-v6-document",
+        "resume smoke root",
+    );
+    let store = agent_session_grep_adapters_sqlite::SqliteStore::open_for_write(&db)
+        .expect("migrate unproven v6 catalog under writer lease");
+    drop(store);
+    let before = relocation_rows(&db, None);
+    let generation_before: i64 = Connection::open(&db)
+        .expect("open legacy generation")
+        .query_row("SELECT active_generation FROM store_metadata", [], |row| {
+            row.get(0)
+        })
+        .expect("read legacy generation");
+
+    // Both explicit entrypoints normalize their input; discovery constructs
+    // its own locators. All routes must reach the shared storage guard.
+    let normalized_input = v6_fixture_source_locator(Path::new(&input_path));
+    let mut commands = vec![
+        vec!["ingest", input_path.as_str()],
+        vec!["sync", input_path.as_str()],
+    ];
+    if normalized_input != input_path {
+        commands.push(vec!["ingest", normalized_input.as_str()]);
+        commands.push(vec!["sync", normalized_input.as_str()]);
+    }
+    commands.push(vec!["sync", "--discover"]);
+    for args in commands {
+        let ingest = run_with_home(&db, &home, &args);
+        assert_eq!(
+            ingest.status.code(),
+            Some(2),
+            "{} must not replace an unproven legacy Session: {}",
+            args[0],
+            stdout(&ingest)
+        );
+        assert_eq!(
+            parse_first_line(&ingest)["error"]["code"],
+            "invalid_request"
+        );
+        assert_relocation_rows(&db, None, &before);
+        let generation_after: i64 = Connection::open(&db)
+            .expect("open unchanged generation")
+            .query_row("SELECT active_generation FROM store_metadata", [], |row| {
+                row.get(0)
+            })
+            .expect("read unchanged generation");
+        assert_eq!(generation_after, generation_before);
+        // The relocation snapshot compares path keys; also preserve the exact
+        // historical spelling so a rejected ingest cannot normalize it silently.
+        let stored_source_path: String = Connection::open(&db)
+            .expect("open unchanged source locator")
+            .query_row("SELECT source_path FROM source_scans", [], |row| row.get(0))
+            .expect("read unchanged source locator");
+        assert_eq!(stored_source_path, source_path);
+    }
+}
+
+#[test]
+fn migrated_v6_catalog_rejects_unproven_session_identity() {
+    assert_v6_reingest_rejects_unproven_session(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn migrated_v6_catalog_rejects_unproven_session_at_raw_windows_locator() {
+    assert_v6_reingest_rejects_unproven_session(true);
 }
 
 #[test]
@@ -1128,7 +1344,22 @@ fn machine_mode_version_emits_single_success_envelope() {
 
 #[test]
 fn level_value_before_robot_flag_still_emits_robot_error_envelope() {
-    let out = run_bare(&["--level", "talks", "--robot", "context", "not-a-session-id"]);
+    // 缺失 --db 不再是用法错误（B3：数据命令默认用平台默认库），因此这里显式
+    // 给一个已初始化的夹具库，让断言仍然落在"参数错误（无效 session id）→
+    // exit 2"这一原意上，而不是缺库的 catalog_error。
+    let (_dir, db) = temp_db("level-before-robot");
+    let out = Command::new(BIN)
+        .args([
+            "--db",
+            &db,
+            "--level",
+            "talks",
+            "--robot",
+            "context",
+            "not-a-session-id",
+        ])
+        .output()
+        .expect("failed to spawn agent-session-grep binary");
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
     let frame = parse_first_line(&out);
     assert_envelope_shape(&frame, false);
@@ -1203,6 +1434,106 @@ fn doctor_reports_ok_without_db() {
         s.contains("\"db\":\"not-checked\""),
         "无 --db 时应标记未校验: {s}"
     );
+}
+
+#[test]
+fn stale_index_projection_is_reported_refused_then_healed_by_sync_and_rebuild() {
+    // 实测缺陷的端到端固化：由旧二进制建立的库（FTS 词元流是纯 bigram）在
+    // 新二进制下中文查询静默 0 命中、ASCII 照常命中。修复后三条线都必须成立：
+    // doctor 如实报告失配、搜索 fail-closed（绝不返回错误命中集）、写路径自愈。
+    let (dir, db) = temp_db("stale-projection");
+    let fixture = dir.path().join("cjk.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"请帮我做配置备份 clippy"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+    let path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["sync", &path]);
+    assert!(out.status.success(), "sync failed: {}", stdout(&out));
+    assert!(
+        stdout(&run(&db, &["search", "配置备份"])).contains("msg_v1_"),
+        "健康库中文必须可检索"
+    );
+    let frame = parse_first_line(&run(&db, &["doctor"]));
+    assert_eq!(frame["data"]["index_projection_version"], 1);
+    assert_eq!(frame["data"]["index_projection_expected"], 1);
+    assert_eq!(frame["data"]["index_projection_stale"], false);
+
+    // 改写成旧二进制留下的状态：FTS 正文回落为**纯 bigram** 词元流（单字词元
+    // 加入之前的形态），版本戳落到 0——v17 迁移给"投影非空的旧库"留的哨兵值。
+    let downgrade = |db: &str| {
+        let conn = Connection::open(db).expect("open catalog");
+        let updated = conn
+            .execute("UPDATE fts SET text = '配置 置备 备份 clippy'", [])
+            .expect("rewrite fts with the legacy projection");
+        assert_eq!(updated, 1, "夹具应恰有一条消息 FTS 行");
+        conn.execute(
+            "UPDATE store_metadata SET index_projection_version = 0 WHERE singleton = 1",
+            [],
+        )
+        .expect("downgrade projection stamp");
+    };
+    downgrade(&db);
+
+    let frame = parse_first_line(&run(&db, &["doctor"]));
+    assert_eq!(frame["data"]["index_projection_version"], 0);
+    assert_eq!(frame["data"]["index_projection_stale"], true);
+
+    // 搜索 fail-closed：中文与 ASCII 一律报错，绝不静默返回 0 命中或半个结果集。
+    for query in ["配置备份", "备份", "clippy"] {
+        let out = run(&db, &["search", query]);
+        assert_eq!(
+            out.status.code(),
+            Some(9),
+            "query {query} 必须 exit 9（schema_incompatible）: {}",
+            stdout(&out)
+        );
+        let frame = parse_first_line(&out);
+        assert_envelope_shape(&frame, false);
+        assert_eq!(frame["error"]["code"], "schema_incompatible");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("index rebuild"),
+            "错误消息必须给出确切修复命令: {}",
+            stdout(&out)
+        );
+    }
+
+    // 写路径自愈：源字节未变（本应 no-op 的 sync）打开库时自动重投影。
+    let out = run(&db, &["sync", &path]);
+    assert!(
+        out.status.success(),
+        "healing sync failed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&run(&db, &["doctor"]));
+    assert_eq!(frame["data"]["index_projection_stale"], false);
+    assert!(stdout(&run(&db, &["search", "配置备份"])).contains("msg_v1_"));
+    assert!(stdout(&run(&db, &["search", "备份"])).contains("msg_v1_"));
+
+    // 文档给出的手动修复命令同样收敛。
+    downgrade(&db);
+    let out = run(&db, &["index", "rebuild"]);
+    assert!(out.status.success(), "rebuild failed: {}", stdout(&out));
+    let frame = parse_first_line(&run(&db, &["doctor"]));
+    assert_eq!(frame["data"]["index_projection_stale"], false);
+    assert!(stdout(&run(&db, &["search", "配置备份"])).contains("msg_v1_"));
+}
+
+#[test]
+fn doctor_without_db_reports_expected_projection_version_and_no_guess() {
+    // 无 --db：期望版本是构建事实，可报告；库侧事实无从得知 → 显式 null，不猜。
+    let frame = parse_first_line(&run_bare(&["--robot", "doctor"]));
+    assert_eq!(frame["data"]["index_projection_expected"], 1);
+    assert!(frame["data"]["index_projection_version"].is_null());
+    assert!(frame["data"]["index_projection_stale"].is_null());
 }
 
 #[test]
@@ -1379,13 +1710,19 @@ fn list_and_status_report_catalog_contents() {
 }
 
 fn codex_incremental_fixture(session_id: &str, messages: &[(&str, &str, &str)]) -> String {
+    codex_fixture_with_cwd(session_id, "/workspace/synthetic-codex-fixture", messages)
+}
+
+/// 与 [`codex_incremental_fixture`] 同构，但 cwd 由调用方指定——repo identity
+/// 测试把 session_meta 的 cwd 指向真实临时 git 仓库，驱动 sync 期的 git 检测。
+fn codex_fixture_with_cwd(session_id: &str, cwd: &str, messages: &[(&str, &str, &str)]) -> String {
     let mut lines = vec![
         serde_json::json!({
             "timestamp": "2026-08-15T03:00:00.000Z",
             "type": "session_meta",
             "payload": {
                 "session_id": session_id,
-                "cwd": "/workspace/synthetic-codex-fixture",
+                "cwd": cwd,
             },
         })
         .to_string(),
@@ -1411,6 +1748,27 @@ fn codex_incremental_fixture(session_id: &str, messages: &[(&str, &str, &str)]) 
         );
     }
     format!("{}\n", lines.join("\n"))
+}
+
+/// 在临时目录里建一个带 origin 远端的最小 git 仓库（repo identity e2e 用）。
+/// 空仓库无需提交，`rev-parse --show-toplevel` 与 `remote get-url origin`
+/// 即可生效；路径在运行时生成，永不进入 tracked 文本。
+fn init_git_repo_with_origin(dir: &Path, name: &str, url: &str) -> std::path::PathBuf {
+    let repo = dir.join(name);
+    std::fs::create_dir_all(&repo).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .expect("spawn git init");
+    assert!(init.success(), "git init failed");
+    let add = Command::new("git")
+        .args(["remote", "add", "origin", url])
+        .current_dir(&repo)
+        .status()
+        .expect("spawn git remote add");
+    assert!(add.success(), "git remote add failed");
+    repo
 }
 
 #[test]
@@ -1580,6 +1938,130 @@ fn search_by_working_directory_returns_session() {
     assert!(
         !stdout(&out).contains("msg_v1_"),
         "source path must never be searchable: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn search_repo_filter_returns_only_matching_sessions() {
+    // repo identity（schema v16）：sync 期对本机 git 仓库检测派生的
+    // host/owner/name slug，--repo 逐字等值过滤；无仓库身份的会话与其它
+    // slug 诚实排除（不猜）。
+    let (dir, db) = temp_db("repo-filter");
+    let repo = init_git_repo_with_origin(
+        dir.path(),
+        "repo-app",
+        "https://github.com/synthetic-owner/synthetic-repo.git",
+    );
+    let fixture = dir.path().join("rollout-repo-filter.jsonl");
+    std::fs::write(
+        &fixture,
+        codex_fixture_with_cwd(
+            "repo-filter-session",
+            &repo.to_string_lossy(),
+            &[("repo_user_message", "user", "repo filter body")],
+        ),
+    )
+    .expect("write codex fixture");
+    let path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["sync", &path]);
+    assert!(out.status.success(), "sync failed: {}", stdout(&out));
+
+    // 命中：slug 相等返回该会话消息，且不泄漏绝对路径。
+    let out = run(
+        &db,
+        &[
+            "search",
+            "--repo",
+            "github.com/synthetic-owner/synthetic-repo",
+            "filter",
+        ],
+    );
+    assert!(out.status.success(), "search failed: {}", stdout(&out));
+    let s = stdout(&out);
+    assert!(
+        s.contains("msg_v1_"),
+        "repo filter should match the synced session: {s}"
+    );
+    assert!(
+        !s.contains(repo.to_string_lossy().as_ref()),
+        "absolute repo path must never leak into output: {s}"
+    );
+
+    // 不命中：其它 slug 诚实空页。
+    let out = run(
+        &db,
+        &["search", "--repo", "github.com/other/other", "filter"],
+    );
+    assert!(out.status.success(), "search failed: {}", stdout(&out));
+    assert!(
+        !stdout(&out).contains("msg_v1_"),
+        "other slug must not match: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn status_reports_repo_aggregation() {
+    // status 按 repo 聚合（会话数降序、slug 升序 tiebreak）。
+    let (dir, db) = temp_db("repo-status");
+    let repo_a = init_git_repo_with_origin(dir.path(), "repo-a", "https://github.com/o/alpha.git");
+    let repo_b = init_git_repo_with_origin(dir.path(), "repo-b", "https://github.com/o/beta.git");
+    let fixture_a = dir.path().join("rollout-repo-status-a.jsonl");
+    std::fs::write(
+        &fixture_a,
+        codex_fixture_with_cwd(
+            "repo-status-session-a",
+            &repo_a.to_string_lossy(),
+            &[("repo_status_a", "user", "repo status alpha body")],
+        ),
+    )
+    .expect("write codex fixture a");
+    let out = run(&db, &["sync", &fixture_a.to_string_lossy()]);
+    assert!(out.status.success(), "sync a failed: {}", stdout(&out));
+    let fixture_b = dir.path().join("rollout-repo-status-b.jsonl");
+    std::fs::write(
+        &fixture_b,
+        codex_fixture_with_cwd(
+            "repo-status-session-b",
+            &repo_b.to_string_lossy(),
+            &[("repo_status_b", "user", "repo status beta body")],
+        ),
+    )
+    .expect("write codex fixture b");
+    let out = run(&db, &["sync", &fixture_b.to_string_lossy()]);
+    assert!(out.status.success(), "sync b failed: {}", stdout(&out));
+
+    let out = run(&db, &["status"]);
+    assert!(out.status.success(), "status failed: {}", stdout(&out));
+    let first = parse_first_line(&out);
+    let repos = first["data"]["repos"]
+        .as_array()
+        .expect("repos must be an array");
+    assert_eq!(repos.len(), 2, "{first}");
+    let slugs: Vec<&str> = repos
+        .iter()
+        .map(|r| r["repo_slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        slugs,
+        vec!["github.com/o/alpha", "github.com/o/beta"],
+        "same session count must tiebreak by slug asc: {first}"
+    );
+    for repo in repos {
+        assert_eq!(repo["sessions"].as_u64(), Some(1), "{first}");
+    }
+}
+
+#[test]
+fn search_repo_flag_requires_value() {
+    let (_dir, db) = temp_db("repo-flag-value");
+    let out = run(&db, &["search", "anything", "--repo"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing --repo value must be a usage error: {}",
         stdout(&out)
     );
 }
@@ -2002,11 +2484,459 @@ fn sync_new_truncated_source_parses_valid_prefix_recoverably() {
     assert_eq!(frame["data"]["messages"], 1, "有效前缀应解析: {frame}");
     assert_eq!(frame["data"]["committed"], 1, "有效前缀应提交: {frame}");
     assert_eq!(frame["data"]["skipped"], 1, "截断行应计 skipped: {frame}");
-    assert_eq!(frame["data"]["diagnostics"], 1, "{frame}");
+    assert_eq!(frame["data"]["diagnostics"], 2, "{frame}");
+    let warnings = frame["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 2, "{frame}");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("line 2") && text.contains("invalid JSON"))),
+        "original truncated-line diagnostic must remain visible: {frame}"
+    );
+    let retention = warnings[0].as_str().expect("retention warning");
+    assert!(
+        retention.starts_with("partial source scan:")
+            && retention.contains("history is retained")
+            && retention.contains("may temporarily coexist")
+            && retention.contains("complete rescan")
+            && retention.chars().count() <= 512,
+        "bounded retention/coexistence warning must be first: {frame}"
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.starts_with("partial source scan:")))
+            .count(),
+        1,
+        "one retention warning per response: {frame}"
+    );
     let out = run(&db, &["search", "complete"]);
+
     assert!(stdout(&out).contains("msg_v1_"), "search={}", stdout(&out));
 }
 
+/// A source that has always been empty carries no provider/variant evidence.
+/// The first sighting must be a warned no-op: no fake provider, installation
+/// binding, scan row or placeholder entity may be persisted. Content arriving
+/// later establishes the real provider through the ordinary path.
+#[test]
+fn first_empty_standalone_source_is_a_warned_noop_until_content_exists() {
+    let (dir, db) = temp_db("first-empty-noop");
+    let fixture = dir.path().join("empty-later.jsonl");
+    std::fs::write(&fixture, b"").expect("write empty fixture");
+    let path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["sync", &path]);
+    assert!(
+        out.status.success(),
+        "empty sync must succeed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["data"]["committed"], 0, "{frame}");
+    assert_eq!(frame["data"]["generation"], 0, "{frame}");
+    let warnings = frame["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("empty source"))),
+        "first-empty no-op must be visible: {frame}"
+    );
+
+    // Nothing may be persisted for a source that never had content: no binding,
+    // no scan row, and no provider="empty" namespace.
+    let conn = Connection::open(&db).expect("open catalog");
+    let bindings: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_installations", [], |r| {
+            r.get(0)
+        })
+        .expect("count bindings");
+    let scans: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_scans", [], |r| r.get(0))
+        .expect("count scans");
+    let empty_namespaces: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installation_namespaces WHERE provider_id='empty'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count empty namespaces");
+    assert_eq!(
+        (bindings, scans, empty_namespaces),
+        (0, 0, 0),
+        "first-empty sighting must not persist identity"
+    );
+    drop(conn);
+
+    std::fs::write(
+        &fixture,
+        claude_fixture(r#""first empty source recovered""#),
+    )
+    .expect("write content");
+    let out = run(&db, &["sync", &path]);
+    assert!(
+        out.status.success(),
+        "content sync failed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["data"]["committed"], 1, "{frame}");
+    assert_eq!(frame["data"]["generation"], 1, "{frame}");
+    let conn = Connection::open(&db).expect("open catalog");
+    let provider: String = conn
+        .query_row(
+            "SELECT n.provider_id FROM source_installations si
+             JOIN installation_namespaces n USING(namespace_id)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("provider binding");
+    assert_eq!(provider, "claude-code");
+    drop(conn);
+    let out = run(&db, &["search", "recovered"]);
+    assert!(stdout(&out).contains("msg_v1_"), "search={}", stdout(&out));
+}
+
+/// The ingest entry point must treat an emptied known source exactly like sync:
+/// an honest empty replacement that keeps the proven installation binding and
+/// tombstones the previous messages, instead of failing with a provider clash.
+#[test]
+fn ingest_empty_replacement_keeps_proven_provider_and_tombstones_messages() {
+    let (dir, db) = temp_db("ingest-empty");
+    let fixture = dir.path().join("ingest-empty.jsonl");
+    std::fs::write(&fixture, claude_fixture(r#""ingest emptied content""#)).expect("write fixture");
+    let path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["ingest", &path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["data"]["generation"], 1);
+    let out = run(&db, &["search", "emptied"]);
+    assert!(stdout(&out).contains("msg_v1_"), "search={}", stdout(&out));
+
+    std::fs::write(&fixture, b"").expect("truncate fixture");
+    let out = run(&db, &["ingest", &path]);
+    assert!(
+        out.status.success(),
+        "emptied ingest must succeed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["data"]["committed"], 0, "{frame}");
+    assert_eq!(frame["data"]["generation"], 2, "{frame}");
+    let out = run(&db, &["search", "emptied"]);
+    assert!(
+        !stdout(&out).contains("msg_v1_"),
+        "emptied source must tombstone its messages: {}",
+        stdout(&out)
+    );
+}
+
+/// The historical first-empty path persisted an `empty` provider binding. Such
+/// a binding may be replaced exactly once, and only when the source provably
+/// holds no real facts; anything with a real claim stays a hard conflict.
+#[test]
+fn empty_placeholder_binding_is_repaired_only_with_proof() {
+    const EMPTY_FINGERPRINT: &str =
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let (dir, db) = temp_db("empty-placeholder-repair");
+
+    // Seed the exact durable shape the old first-empty path wrote: an
+    // allocated-v1 `empty` namespace with one current location, the source
+    // binding, and a zero-byte scan row.
+    let seed = |fixture: &Path, forged_message: bool| {
+        // The CLI records the canonical locator spelling; seed the same one.
+        let path = v6_fixture_source_locator(fixture);
+        let key = agent_session_grep_application::relocation::normalize_absolute_path(&path)
+            .expect("normalize fixture path");
+        let root = v6_fixture_source_locator(fixture.parent().expect("fixture parent"));
+        let tag = fixture
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("fixture stem");
+        let namespace_id = format!("ins_v1_{tag}");
+        let namespace_input = format!("installation-v1:{tag}");
+        let conn = Connection::open(&db).expect("open catalog");
+        conn.execute(
+            "INSERT INTO installation_namespaces(
+                 namespace_id, provider_id, namespace_input, origin, created_at_ms)
+             VALUES(?1, 'empty', ?2, 'allocated-v1', 1)",
+            rusqlite::params![&namespace_id, &namespace_input],
+        )
+        .expect("seed namespace");
+        conn.execute(
+            "INSERT INTO installation_locations(
+                 provider_id, root_key, root_locator, namespace_id, state, retired_until_ms)
+             VALUES('empty', ?1, ?2, ?3, 'current', NULL)",
+            rusqlite::params![&root, &root, &namespace_id],
+        )
+        .expect("seed location");
+        conn.execute(
+            "INSERT INTO source_installations(source_path, source_key, namespace_id)
+             VALUES(?1, ?2, ?3)",
+            rusqlite::params![&path, &key, &namespace_id],
+        )
+        .expect("seed binding");
+        conn.execute(
+            "INSERT INTO source_scans(
+                 source_path, scanned_at_ms, len_bytes, fingerprint, provider_id, parser_version)
+             VALUES(?1, 1, 0, ?2, NULL, 2)",
+            rusqlite::params![&path, EMPTY_FINGERPRINT],
+        )
+        .expect("seed scan");
+        let document = "doc_v1_9d688f0b845e2b6f7adb7a9eda35c150";
+        let session = "ses_v1_bf6e9effacfd4419e7a57dd0d881f0c6";
+        for (wire, kind, payload) in [
+            (
+                document,
+                "Document",
+                serde_json::json!({
+                    "provider": "empty", "variant": "empty", "len": 0,
+                    "fingerprint": EMPTY_FINGERPRINT,
+                }),
+            ),
+            (
+                session,
+                "Session",
+                serde_json::json!({
+                    "document": document, "documents": [document], "messages": [],
+                }),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO catalog(id, payload) VALUES(?1, ?2)",
+                rusqlite::params![wire, serde_json::to_vec(&payload).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fts_ids(wire_id, id_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    wire,
+                    serde_json::json!({"kind": kind, "stability": "Reconstructed", "value": wire})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO source_membership(source_path, message_id, document_id) VALUES(?1, ?2, ?3)", rusqlite::params![path, wire, document]).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO source_relation_scans(source_path, relation_schema_version) VALUES(?1, 7)",
+            [&path],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM catalog WHERE id=?1",
+                [document],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "the repair assertion must start with a real placeholder"
+        );
+        if forged_message {
+            conn.execute(
+                "INSERT INTO catalog(id, payload) VALUES('msg_v1_forged',
+                     '{\"role\":\"user\",\"text\":\"forged\",\
+                       \"timestamp\":\"2026-01-01T00:00:00Z\"}')",
+                [],
+            )
+            .expect("seed forged catalog row");
+            conn.execute(
+                "INSERT INTO source_membership(source_path, message_id, document_id)
+                 VALUES(?1, 'msg_v1_forged', NULL)",
+                [&path],
+            )
+            .expect("seed forged claim");
+        }
+        drop(conn);
+    };
+
+    let fixture = dir.path().join("legacy-empty.jsonl");
+    std::fs::write(&fixture, b"").expect("write empty fixture");
+    seed(&fixture, false);
+    std::fs::write(&fixture, claude_fixture(r#""legacy placeholder repaired""#))
+        .expect("write content");
+    let locator = v6_fixture_source_locator(&fixture);
+    let out = run(&db, &["sync", &fixture.to_string_lossy()]);
+    assert!(out.status.success(), "repair sync failed: {}", stdout(&out));
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["data"]["committed"], 1, "{frame}");
+    let conn = Connection::open(&db).expect("open catalog");
+    let provider: String = conn
+        .query_row(
+            "SELECT n.provider_id FROM source_installations si
+             JOIN installation_namespaces n USING(namespace_id)
+             WHERE si.source_path = ?1",
+            [&locator],
+            |r| r.get(0),
+        )
+        .expect("repaired binding");
+    assert_eq!(provider, "claude-code");
+    let placeholders: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM catalog WHERE id LIKE 'doc_v1_9d688f0b%'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count legacy placeholders");
+    assert_eq!(
+        placeholders, 0,
+        "repaired batch must retire the old placeholders"
+    );
+    drop(conn);
+    let out = run(&db, &["search", "placeholder repaired"]);
+    assert!(stdout(&out).contains("msg_v1_"), "search={}", stdout(&out));
+
+    // Negative control: any real claim makes the binding non-repairable. The
+    // fixture lives in its own directory: installation locations are keyed by
+    // (provider_id, root_key) and both seeds share the `empty` provider.
+    let forged_dir = dir.path().join("forged");
+    std::fs::create_dir_all(&forged_dir).expect("create forged dir");
+    let forged = forged_dir.join("forged-empty.jsonl");
+    std::fs::write(&forged, b"").expect("write empty fixture");
+    seed(&forged, true);
+    std::fs::write(&forged, claude_fixture(r#""forged must not rebind""#)).expect("write content");
+    let forged_locator = v6_fixture_source_locator(&forged);
+    let out = run(&db, &["sync", &forged.to_string_lossy()]);
+    assert!(!out.status.success(), "real claims must block the rebind");
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["error"]["code"], "invalid_request", "{frame}");
+    let conn = Connection::open(&db).expect("open catalog");
+    let provider: String = conn
+        .query_row(
+            "SELECT n.provider_id FROM source_installations si
+             JOIN installation_namespaces n USING(namespace_id)
+             WHERE si.source_path = ?1",
+            [&forged_locator],
+            |r| r.get(0),
+        )
+        .expect("binding must survive the refusal");
+    assert_eq!(provider, "empty");
+}
+
+#[test]
+fn empty_lifecycle_matrix_preserves_provider_identity_and_refills() {
+    for command in ["ingest", "sync"] {
+        for canonical in [false, true] {
+            for (native_session, native_message) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let (dir, db) = temp_db("empty-lifecycle-matrix");
+                let source = dir.path().join(if canonical {
+                    ".claude/projects/synthetic/session.jsonl"
+                } else {
+                    "standalone.jsonl"
+                });
+                std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+                let path = source.to_string_lossy().into_owned();
+                let context = format!("{command}/{canonical}/{native_session}/{native_message}");
+                let invoke = || {
+                    let output = run(&db, &[command, &path]);
+                    assert!(output.status.success(), "{context}: {}", stdout(&output));
+                    parse_first_line(&output)
+                };
+                std::fs::write(&source, b"").unwrap();
+                let first_empty = invoke();
+                assert_eq!(first_empty["data"]["committed"], 0, "{context}");
+                assert_eq!(first_empty["data"]["generation"], 0, "{context}");
+                assert!(
+                    first_empty["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|warning| warning.as_str().unwrap().contains("empty source"))
+                );
+                let conn = Connection::open(&db).unwrap();
+                for table in [
+                    "catalog",
+                    "source_scans",
+                    "source_installations",
+                    "installation_namespaces",
+                    "installation_locations",
+                ] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0,
+                        "{context}/{table}"
+                    );
+                }
+                drop(conn);
+                let mut record: serde_json::Value =
+                    serde_json::from_str(&claude_fixture(r#""lifecyclevisible body""#)).unwrap();
+                if !native_session {
+                    record.as_object_mut().unwrap().remove("sessionId");
+                }
+                if !native_message {
+                    record.as_object_mut().unwrap().remove("uuid");
+                }
+                let bytes = serde_json::to_vec(&record).unwrap();
+                std::fs::write(&source, &bytes).unwrap();
+                assert_eq!(invoke()["data"]["generation"], 1, "{context}");
+                let conn = Connection::open(&db).unwrap();
+                let binding: (String, String) = conn
+                    .query_row(
+                        "SELECT si.namespace_id, n.provider_id FROM source_installations si
+                     JOIN installation_namespaces n USING(namespace_id)",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(binding.1, "claude-code");
+                let identities: Vec<(String, String)> = conn
+                    .prepare("SELECT wire_id, id_json FROM fts_ids ORDER BY wire_id")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                drop(conn);
+                std::fs::write(&source, b"").unwrap();
+                assert_eq!(invoke()["data"]["generation"], 2, "{context}");
+                let repeated_empty = invoke();
+                assert_eq!(repeated_empty["data"]["generation"], 2, "{context}");
+                assert_eq!(repeated_empty["data"]["committed"], 0, "{context}");
+                let empty_search = parse_first_line(&run(&db, &["search", "lifecyclevisible"]));
+                assert!(
+                    empty_search["data"]["hits"].as_array().unwrap().is_empty(),
+                    "{context}"
+                );
+                std::fs::write(&source, &bytes).unwrap();
+                assert_eq!(invoke()["data"]["generation"], 3, "{context}");
+                assert_eq!(invoke()["data"]["generation"], 3, "{context}");
+                let conn = Connection::open(&db).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT namespace_id FROM source_installations", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                    binding.0
+                );
+                let restored: Vec<(String, String)> = conn
+                    .prepare("SELECT wire_id, id_json FROM fts_ids ORDER BY wire_id")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(
+                    restored, identities,
+                    "{context}: refill must restore exact identities"
+                );
+                assert_eq!(
+                    conn.query_row("SELECT provider_id FROM source_scans", [], |row| row
+                        .get::<_, Option<String>>(0))
+                        .unwrap(),
+                    None,
+                    "explicit inputs are not discovery ownership"
+                );
+            }
+        }
+    }
+}
 #[test]
 fn sync_partial_scan_never_tombstones_unseen_messages() {
     // 不完整扫描（坏行 + 消息被移除）：relation_complete=false → store 层只并集
@@ -2223,13 +3153,16 @@ fn providers_robot_output_is_a_stable_matrix_envelope() {
     let semantic = &frame["data"]["semantic"];
     assert_eq!(
         semantic.as_object().unwrap().len(),
-        3,
+        5,
         "semantic 键集稳定: {semantic}"
     );
     assert_eq!(
         semantic["default_model"],
         agent_session_grep_application::embedding::BIGRAM_HASH_MODEL_ID
     );
+    // B4 正名（additive）：默认向量化器 = fuzzy lexical vector。
+    assert_eq!(semantic["model_kind"], "fuzzy_lexical_hash");
+    assert_eq!(semantic["model_label"], "fuzzy lexical vector");
     if cfg!(feature = "semantic-candle") {
         assert_eq!(semantic["feature"], "semantic-candle");
         assert_eq!(semantic["runtime"], "candle-e5-local");
@@ -2257,6 +3190,7 @@ fn providers_robot_output_is_a_stable_matrix_envelope() {
         "search",
         "source_span",
         "tool_activity",
+        "usage",
         "variant_id",
     ]
     .into_iter()
@@ -2366,25 +3300,19 @@ fn run_with_path(
         .expect("failed to spawn agent-session-grep binary")
 }
 
-/// cwd 文本比较：忽略尾部分隔符；Windows 大小写不敏感。
-fn same_cwd(recorded: &str, expected: &str) -> bool {
-    let recorded = recorded.trim().trim_end_matches(['/', '\\']);
-    let expected = expected.trim().trim_end_matches(['/', '\\']);
-    #[cfg(windows)]
-    {
-        recorded.eq_ignore_ascii_case(expected)
-    }
-    #[cfg(not(windows))]
-    {
-        recorded == expected
-    }
-}
-
 #[test]
 fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
     let (dir, db) = temp_db("resume-spawn");
     let workdir = dir.path().join("original-workspace");
     std::fs::create_dir_all(&workdir).expect("create workspace");
+    // Exercise logical and physical cwd spellings even when the host's temp
+    // directory is not itself a symlink (as /var is on macOS).
+    #[cfg(unix)]
+    let workdir = {
+        let alias = dir.path().join("workspace-link");
+        std::os::unix::fs::symlink(&workdir, &alias).expect("link original workspace");
+        alias
+    };
     let workdir_str = workdir.to_string_lossy().into_owned();
     let (fixture_path, anchor_message) = write_claude_resume_fixture(dir.path(), &workdir_str);
     let out = run(&db, &["ingest", &fixture_path]);
@@ -2447,8 +3375,9 @@ fn resume_yes_first_run_forced_preview_then_spawns_in_original_cwd() {
         "second run must not report first-run: {frame}"
     );
     let recorded_cwd = std::fs::read_to_string(&cwd_out).expect("read recorded cwd");
-    assert!(
-        same_cwd(&recorded_cwd, &workdir_str),
+    assert_eq!(
+        std::fs::canonicalize(&recorded_cwd).expect("resolve spawned cwd"),
+        workdir.canonicalize().expect("resolve original workspace"),
         "spawned cwd {recorded_cwd:?} != expected {workdir_str:?}"
     );
     let recorded_args = std::fs::read_to_string(&args_out).expect("read recorded args");
@@ -2529,6 +3458,27 @@ fn resume_yes_missing_provider_binary_returns_structured_error() {
             .is_some_and(|m| m.contains("install")),
         "error message must hint installation: {frame}"
     );
+}
+
+#[test]
+fn robot_error_envelope_redacts_echoed_secrets() {
+    // 错误 envelope 与成功 envelope 同一脱敏纪律（ADR-0009）：--since 的非法值
+    // 被回显进错误 message，跨边界输出前必须脱敏——Robot 调用方把密钥形状的
+    // token 误贴进 flag 值是最常见的泄漏形态。
+    let (_dir, db) = temp_db("error-envelope-redaction");
+    // Fresh synthetic Stripe-shaped value; reuse it for the non-echo assertion.
+    let synthetic = format!("sk_live_{}X", "TestOnly9".repeat(2));
+    let out = run(&db, &["search", "--since", &synthetic, "q"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    let frame = parse_first_line(&out);
+    assert_envelope_shape(&frame, false);
+    assert_eq!(frame["error"]["code"], "invalid_request", "{frame}");
+    let text = stdout(&out);
+    assert!(
+        !text.contains(synthetic.as_str()),
+        "echoed secret must be redacted: {text}"
+    );
+    assert!(text.contains("[redacted:stripe_key]"), "{text}");
 }
 
 #[test]
@@ -3934,6 +4884,56 @@ fn error_envelope_command_points_at_the_failing_token() {
 }
 
 #[test]
+fn unknown_subcommand_hint_lists_every_command_the_help_promises() {
+    // `--help` 的 COMMANDS 段与 `unknown subcommand` 的"可用命令"提示是两处
+    // 手写清单，历史上已漂移（handoff/resume/hook/serve/providers/model 存在
+    // 于帮助却被提示否认）。新手把提示当权威，会得出"这个命令不存在"的错误
+    // 结论。此测试把两者钉在一起：帮助里列出的每个命令都必须出现在提示里。
+    let help = run_bare(&["--help"]);
+    assert!(help.status.success(), "help failed: {}", stdout(&help));
+    let help_text = stdout(&help);
+    let commands_block = help_text
+        .split("COMMANDS:")
+        .nth(1)
+        .expect("help must have a COMMANDS block")
+        .split("\nPAGINATION")
+        .next()
+        .expect("COMMANDS block must be delimited");
+    // COMMANDS 行形如 `    <name>[ <sub>|<args>]   <说明>`；取首个 token 即命令名。
+    let mut promised: Vec<String> = commands_block
+        .lines()
+        .filter_map(|line| line.strip_prefix("    "))
+        .filter(|line| !line.starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+    promised.sort();
+    promised.dedup();
+    assert!(
+        promised.len() >= 20,
+        "COMMANDS 解析出的命令数异常（{}）：{promised:?}",
+        promised.len()
+    );
+
+    let (_dir, db) = temp_db("unknown-subcommand");
+    let out = run(&db, &["definitely-not-a-command"]);
+    assert_eq!(out.status.code(), Some(2), "stdout={}", stdout(&out));
+    let frame = parse_first_line(&out);
+    assert_envelope_shape(&frame, false);
+    assert_eq!(frame["error"]["code"], "invalid_request", "{frame}");
+    let hint = frame["error"]["message"]
+        .as_str()
+        .expect("message is a string")
+        .to_string();
+    for command in &promised {
+        assert!(
+            hint.contains(command.as_str()),
+            "帮助承诺的命令 {command} 未出现在 unknown subcommand 提示里: {hint}"
+        );
+    }
+}
+
+#[test]
 fn sync_directory_rejection_is_path_free_and_platform_neutral() {
     // R2.2：sync 传目录 → invalid_request（exit 2）；消息不含路径，展开示例
     // 平台中立（不给 PowerShell-only 的 Get-ChildItem 例子）。robot envelope
@@ -4126,6 +5126,58 @@ fn snippet_renders_in_human_search_but_is_stripped_in_machine_modes() {
 }
 
 #[test]
+fn human_search_next_step_commands_are_runnable_wire_ids() {
+    // 2026-08-29 审计：human `search` 只渲染冻结的五列会话表，表里的 Session ID
+    // 是 **provider 原生** id —— `context <它>` 直接 exit 2 `not a valid session
+    // id`，而 `--help` 承诺 search → show <msg_id> → context <ses_id>。表后的
+    // 下一步提示必须给真正能跑的 wire id，且这里逐条真跑一次来证明。
+    let (dir, db) = temp_db("next-step");
+    let fixture = dir.path().join("next-step.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"user","uuid":"a0000000-0000-4000-8000-000000000001","sessionId":"a0000000-0000-4000-8000-000000000002","cwd":"C:\\placeholder\\project","timestamp":"2026-07-26T01:00:00.000Z","message":{"role":"user","content":"nextstepprobe body text"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+    let fixture_path = fixture.to_string_lossy().into_owned();
+    let out = run(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+
+    let out = run_human(&db, &["search", "nextstepprobe"]);
+    assert!(out.status.success(), "search failed: {}", stdout(&out));
+    let human = stdout(&out);
+    assert!(
+        human.contains("会话标题"),
+        "冻结的五列表头必须保留: {human}"
+    );
+
+    // 提示行形如 `  context ses_v1_...` / `  show msg_v1_...`：逐条真跑。
+    let mut ran = 0usize;
+    for line in human.lines() {
+        let Some(rest) = line.strip_prefix("  ") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let (Some(command), Some(id)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !matches!(command, "context" | "show") {
+            continue;
+        }
+        let out = run(&db, &[command, id]);
+        assert!(
+            out.status.success(),
+            "提示给出的命令必须真的能跑: {command} {id} → {}",
+            stdout(&out)
+        );
+        ran += 1;
+    }
+    assert_eq!(ran, 2, "提示必须同时给出 context 与 show 两条命令: {human}");
+}
+
+#[test]
 fn golden_broken_line_syncs_with_visible_diagnostic() {
     // R2.3：仓库固定的 Claude golden fixture 内含一条故意截断行。真实 sync
     // 必须成功，并把 parser 的行号诊断通过公开 warnings 通道带给调用方。
@@ -4142,13 +5194,33 @@ fn golden_broken_line_syncs_with_visible_diagnostic() {
     let frame = parse_first_line(&out);
     assert_envelope_shape(&frame, true);
     assert_eq!(frame["data"]["skipped"], 1, "{frame}");
-    assert_eq!(frame["data"]["diagnostics"], 1, "{frame}");
+    assert_eq!(frame["data"]["diagnostics"], 2, "{frame}");
     let warnings = frame["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 2, "{frame}");
     assert!(
         warnings.iter().any(|warning| warning
             .as_str()
             .is_some_and(|text| text.contains("line 5") && text.contains("invalid JSON"))),
         "broken-line diagnostic must be visible: {frame}"
+    );
+    let retention = warnings[0].as_str().expect("retention warning");
+    assert!(
+        retention.starts_with("partial source scan:")
+            && retention.contains("history is retained")
+            && retention.contains("may temporarily coexist")
+            && retention.contains("complete rescan")
+            && retention.chars().count() <= 512,
+        "bounded retention/coexistence warning must be first: {frame}"
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.starts_with("partial source scan:")))
+            .count(),
+        1,
+        "one retention warning per response: {frame}"
     );
 }
 
@@ -4189,9 +5261,8 @@ fn fatal_source_rejection_reports_line_numbers_and_repair_direction() {
 }
 
 #[test]
-fn multi_session_file_emits_visible_session_diagnostic() {
-    // R3.1：provider 已检测同文件多 sessionId；CLI 必须实际公开数量和 ID，
-    // 不能只把 diagnostics 数量从 0 改成 1 后仍让用户看不到原因。
+fn multi_session_file_without_message_identities_is_rejected_atomically() {
+    // A report-level warning cannot make assigning all messages to one session safe.
     let (dir, db) = temp_db("multi-session-warning");
     let fixture = dir.path().join("multi-session.jsonl");
     let first = serde_json::json!({
@@ -4209,19 +5280,74 @@ fn multi_session_file_emits_visible_session_diagnostic() {
     std::fs::write(&fixture, format!("{first}\n{second}\n")).expect("write fixture");
     let fixture_path = fixture.to_string_lossy().into_owned();
     let out = run(&db, &["ingest", &fixture_path]);
-    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
     let frame = parse_first_line(&out);
-    assert_envelope_shape(&frame, true);
-    assert_eq!(frame["data"]["diagnostics"], 1, "{frame}");
-    let warnings = frame["warnings"].as_array().expect("warnings");
-    let diagnostic = warnings
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .find(|warning| warning.contains("2 个不同 sessionId"))
-        .unwrap_or_else(|| panic!("multi-session diagnostic missing: {frame}"));
-    assert!(diagnostic.contains("multi-session-first"), "{diagnostic}");
-    assert!(diagnostic.contains("multi-session-second"), "{diagnostic}");
-    assert!(diagnostic.contains("归属首个会话"), "{diagnostic}");
+    assert_envelope_shape(&frame, false);
+    assert_eq!(frame["error"]["code"], "invalid_request");
+    let message = frame["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("per-message session identities"),
+        "{frame}"
+    );
+    assert!(!message.contains("multi-session-first"), "{frame}");
+    assert!(!message.contains("multi-session-second"), "{frame}");
+    let listed = run(&db, &["list", "10"]);
+    assert!(listed.status.success(), "{}", stdout(&listed));
+    assert!(
+        parse_first_line(&listed)["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn unsafe_native_message_and_parent_ids_leave_the_catalog_unchanged() {
+    let (dir, db) = temp_db("unsafe-native-ids");
+    let fixture = dir.path().join("native-ids.jsonl");
+    let fixture_path = fixture.to_string_lossy().into_owned();
+    let safe_record = serde_json::json!({
+        "type": "user", "uuid": "safe-original", "sessionId": "safe-session",
+        "message": {"role": "user", "content": "original indexed text"}
+    });
+    std::fs::write(&fixture, format!("{safe_record}\n")).unwrap();
+    let initial = run(&db, &["ingest", &fixture_path]);
+    assert!(initial.status.success(), "{}", stdout(&initial));
+    let initial_generation = parse_first_line(&initial)["meta"]["generation"].clone();
+    let original = parse_first_line(&run(&db, &["get", "msg_v1_safe-original"]));
+    assert_envelope_shape(&original, true);
+
+    for invalid in [
+        "a\0b".to_string(),
+        " a".to_string(),
+        "a b".to_string(),
+        "x".repeat(257),
+    ] {
+        for field in ["uuid", "parentUuid"] {
+            let mut record = safe_record.clone();
+            record[field] = serde_json::Value::String(invalid.clone());
+            std::fs::write(&fixture, format!("{record}\n")).unwrap();
+            let out = run(&db, &["ingest", &fixture_path]);
+            assert_eq!(out.status.code(), Some(2), "{field}: {}", stdout(&out));
+            let frame = parse_first_line(&out);
+            assert_envelope_shape(&frame, false);
+            assert_eq!(frame["error"]["code"], "invalid_request", "{frame}");
+            assert!(
+                !frame["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&invalid)
+            );
+            let retained = parse_first_line(&run(&db, &["get", "msg_v1_safe-original"]));
+            assert_envelope_shape(&retained, true);
+            assert_eq!(retained["data"], original["data"]);
+            let store = agent_session_grep_adapters_sqlite::SqliteStore::open(&db).unwrap();
+            assert_eq!(
+                serde_json::json!(store.active_generation().unwrap()),
+                initial_generation
+            );
+        }
+    }
 }
 
 // ─── R4/ADR-0008：search 命中携带 session_id 与 text 摘要 ───────────────────
@@ -4621,6 +5747,67 @@ fn compact_relative_duration_uses_application_clock() {
     );
 }
 
+// ─── rank signals（competitor-borrowings #1）：lexical 时效衰减 + sidechain 惩罚 ──
+
+/// 合成夹具：两条同正文、不同时间戳的主线消息（时效差 236 天），加一对
+/// 同正文、一主线一侧链的消息（无时间戳）。正文逐字节相同 → bm25 全等，
+/// 排序必须由 rank signals 决定，而非 FTS 分差。
+const RANK_FIXTURE: &str = r#"{"type":"user","uuid":"rk-1","parentUuid":null,"sessionId":"sess-rank","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"rank probe needle"}}
+{"type":"user","uuid":"rk-2","parentUuid":"rk-1","sessionId":"sess-rank","timestamp":"2026-08-24T00:00:00.000Z","message":{"role":"user","content":"rank probe needle"}}
+{"type":"assistant","uuid":"rk-3","parentUuid":"rk-2","sessionId":"sess-rank","isSidechain":true,"message":{"role":"assistant","content":"side probe needle"}}
+{"type":"assistant","uuid":"rk-4","parentUuid":"rk-2","sessionId":"sess-rank","message":{"role":"assistant","content":"side probe needle"}}"#;
+
+#[test]
+fn search_ranks_newer_first_and_demotes_sidechain_deterministically() {
+    let (dir, db) = temp_db("rank-signals");
+    let fixture = dir.path().join("rank.jsonl");
+    std::fs::write(&fixture, format!("{RANK_FIXTURE}\n")).expect("write rank fixture");
+    let out = run(&db, &["ingest", fixture.to_str().expect("utf-8 path")]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+
+    // 时效衰减：同 bm25 下新消息排前（E2E_CLOCK_MS=2026-08-25 固定）。
+    let out = run(&db, &["search", "rank probe needle"]);
+    assert!(out.status.success(), "search failed: {}", stdout(&out));
+    let frame = parse_first_line(&out);
+    let hits = frame["data"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2, "{frame}");
+    assert_eq!(
+        hits[0]["id"],
+        native_msg_wire("rk-2"),
+        "newer must rank first: {frame}"
+    );
+    assert_eq!(hits[1]["id"], native_msg_wire("rk-1"), "{frame}");
+
+    // 同 clock 同 query 两次调用结果一致（无真实时钟漂移）：envelope 的
+    // request_id（每次运行随机）与 meta.duration_ms（计时）天生逐次不同，
+    // 剥掉这两个运行特有字段后其余字节必须完全一致。
+    let again = run(&db, &["search", "rank probe needle"]);
+    assert!(again.status.success(), "search failed: {}", stdout(&again));
+    let mut first = parse_first_line(&out);
+    let mut second = parse_first_line(&again);
+    for frame in [&mut first, &mut second] {
+        frame
+            .as_object_mut()
+            .expect("frame object")
+            .remove("request_id");
+        frame.as_object_mut().expect("frame object").remove("meta");
+    }
+    assert_eq!(first, second, "same clock + query must rank identically");
+
+    // sidechain 惩罚：同 bm25 下主线消息排前。
+    let out = run(&db, &["search", "side probe needle"]);
+    assert!(out.status.success(), "search failed: {}", stdout(&out));
+    let frame = parse_first_line(&out);
+    let hits = frame["data"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2, "{frame}");
+    assert_eq!(
+        hits[0]["id"],
+        native_msg_wire("rk-4"),
+        "mainline must rank before equal-relevance sidechain: {frame}"
+    );
+    assert_eq!(hits[1]["id"], native_msg_wire("rk-3"), "{frame}");
+}
+
 #[test]
 fn cursor_reissued_under_mutated_filters_is_rejected() {
     let (_dir, db) = filter_db("filter-cursor");
@@ -4689,6 +5876,7 @@ fn mcp_frames(db: &str, inputs: &[serde_json::Value]) -> Vec<serde_json::Value> 
         .arg("--db")
         .arg(db)
         .arg("mcp")
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4724,7 +5912,7 @@ fn mcp_frames(db: &str, inputs: &[serde_json::Value]) -> Vec<serde_json::Value> 
 fn discover_env() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir for discover home");
     let home = dir.path().to_string_lossy().into_owned();
-    // provider_data_root 读 HOME（Unix）/ USERPROFILE（Windows）。
+    // provider_discovery_target 读 HOME（Unix）/ USERPROFILE（Windows）。
     std::fs::create_dir_all(dir.path().join(".claude").join("projects"))
         .expect("create claude projects root");
     std::fs::create_dir_all(dir.path().join(".codex").join("sessions"))
@@ -4736,9 +5924,10 @@ fn discover_env() -> (tempfile::TempDir, String) {
 fn run_with_home(db: &str, home: &str, args: &[&str]) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.arg("--db").arg(db).arg("--robot").args(args);
-    // 两个变量都设，避免平台/继承差异导致 provider_data_root 解析到真实 home。
+    // 两个变量都设，避免平台/继承差异导致 provider_discovery_target 解析到真实 home。
     cmd.env("HOME", home);
     cmd.env("USERPROFILE", home);
+    cmd.env("ASG_CLOCK_MS", E2E_CLOCK_MS);
     cmd.output()
         .expect("failed to spawn agent-session-grep binary")
 }
@@ -4826,6 +6015,573 @@ fn sync_discover_finds_and_syncs_provider_sources() {
     assert!(
         stdout(&out).contains("msg_v1_"),
         "codex search: {}",
+        stdout(&out)
+    );
+}
+
+/// 写一个最小 OpenCode `opencode.db`（session/message/part 三表），布局与
+/// provider adapter 的 probe/parse 期望一致。
+fn write_opencode_db(path: &std::path::Path, text: &str) {
+    let conn = Connection::open(path).expect("create opencode fixture db");
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);
+         INSERT INTO session VALUES ('ses_disc', 'discover', '/work', 1, 2);
+         INSERT INTO message VALUES ('msg_disc', 'ses_disc', '{\"role\":\"user\"}', 1);",
+    )
+    .expect("create opencode fixture schema");
+    conn.execute(
+        "INSERT INTO part VALUES ('part_disc', 'msg_disc', json_object('type', 'text', 'text', ?1), 1)",
+        rusqlite::params![text],
+    )
+    .expect("insert opencode fixture part");
+    conn.close().expect("close opencode fixture db");
+}
+
+#[test]
+fn sqlite_multi_session_wal_sources_keep_context_and_resume_metadata_separate() {
+    for provider in ["opencode", "cursor"] {
+        let (dir, db) = temp_db("sqlite-session-isolation");
+        let source = dir.path().join("source.db");
+        let source_path = source.to_string_lossy().into_owned();
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        if provider == "opencode" {
+            conn.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);"
+            ).unwrap();
+            for (index, label) in ["alpha", "beta"].iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO session VALUES (?1, ?2)",
+                    rusqlite::params![format!("session-{label}"), format!("/synthetic/{label}")],
+                )
+                .unwrap();
+                for (ordinal, role) in ["user", "assistant"].iter().enumerate() {
+                    let id = format!("{label}-{ordinal}");
+                    let time = (index * 2 + ordinal) as i64;
+                    conn.execute(
+                        "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            id,
+                            format!("session-{label}"),
+                            serde_json::json!({"role":role}).to_string(),
+                            time
+                        ],
+                    )
+                    .unwrap();
+                    conn.execute("INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![format!("part-{id}"), id, serde_json::json!({"type":"text", "text":format!("syntheticisolation {label} {ordinal}")}).to_string(), time]).unwrap();
+                }
+            }
+        } else {
+            conn.execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);")
+                .unwrap();
+            let tabs: Vec<_> = ["alpha", "beta"]
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    serde_json::json!({
+                        "id": format!("session-{label}"), "createdAt": index,
+                        "bubbles": [
+                            {"type":"user", "text":format!("syntheticisolation {label} 0")},
+                            {"type":"assistant", "text":format!("syntheticisolation {label} 1")}
+                        ]
+                    })
+                })
+                .collect();
+            conn.execute(
+                "INSERT INTO ItemTable VALUES (?1, ?2)",
+                rusqlite::params![
+                    "workbench.panel.aichat.view.aichat.chatdata",
+                    serde_json::json!({"tabs":tabs}).to_string()
+                ],
+            )
+            .unwrap();
+        }
+        assert!(Path::new(&format!("{source_path}-wal")).exists());
+        let main_before = std::fs::read(&source).unwrap();
+        let ingest = run(&db, &["ingest", &source_path]);
+        assert!(ingest.status.success(), "{provider}: {}", stdout(&ingest));
+        assert_eq!(parse_first_line(&ingest)["data"]["committed"], 4);
+        assert_eq!(
+            main_before,
+            std::fs::read(&source).unwrap(),
+            "ingest must not checkpoint the source"
+        );
+
+        let search = run(
+            &db,
+            &["search", "syntheticisolation", "--provider", provider],
+        );
+        assert!(search.status.success(), "{provider}: {}", stdout(&search));
+        let search = parse_first_line(&search);
+        let hits = search["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 4, "{search}");
+        let mut sessions = std::collections::BTreeSet::new();
+        for label in ["alpha", "beta"] {
+            let label_hits: Vec<_> = hits
+                .iter()
+                .filter(|hit| hit["text"].as_str().unwrap().contains(label))
+                .collect();
+            assert_eq!(label_hits.len(), 2);
+            let session = label_hits[0]["session_id"].as_str().unwrap();
+            assert!(
+                sessions.insert(session.to_string()),
+                "sessions must not merge"
+            );
+            assert!(label_hits.iter().all(|hit| hit["session_id"] == session));
+            for hit in label_hits {
+                let message = run(&db, &["get", hit["id"].as_str().unwrap()]);
+                assert!(message.status.success(), "{}", stdout(&message));
+                let message = parse_first_line(&message);
+                let payload: serde_json::Value =
+                    serde_json::from_str(message["data"]["payload"].as_str().unwrap()).unwrap();
+                assert_eq!(payload["session"], session);
+                assert_eq!(payload["sessions"], serde_json::json!([session]));
+            }
+            let context = run(&db, &["context", session, "--policy", "full"]);
+            assert!(context.status.success(), "{}", stdout(&context));
+            let context = parse_first_line(&context);
+            let messages = context["data"]["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "{context}");
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message["payload"].to_string().contains(label)),
+                "{context}"
+            );
+            let metadata = run(&db, &["get-session-resume", session]);
+            assert!(metadata.status.success(), "{}", stdout(&metadata));
+            let metadata = parse_first_line(&metadata);
+            assert_eq!(metadata["data"]["session_id"], session);
+            assert_eq!(metadata["data"]["provider_id"], provider);
+            assert_eq!(
+                metadata["data"]["provider_session_id"],
+                format!("session-{label}")
+            );
+            if provider == "opencode" {
+                assert_eq!(
+                    metadata["data"]["original_working_directory"],
+                    format!("/synthetic/{label}")
+                );
+            }
+        }
+        let again = run(&db, &["ingest", &source_path]);
+        assert!(again.status.success(), "{}", stdout(&again));
+        let again = parse_first_line(&again);
+        assert_eq!(again["data"]["committed"], 0);
+        assert_eq!(again["data"]["unchanged"], 4);
+        assert_eq!(
+            again["meta"]["generation"],
+            parse_first_line(&ingest)["meta"]["generation"]
+        );
+    }
+}
+
+#[test]
+fn sync_discover_finds_sqlite_sourced_opencode() {
+    // 回归：发现曾硬编码只收 `.jsonl`，opencode 的源是单个 SQLite
+    // `opencode.db`，于是扫描永远零命中——有 root 却永不可发现。扩展名现在是
+    // per-provider 列，这个测试从 CLI 外部端到端锁定：真 SQLite 源被发现、索引、
+    // 可检索，且 `-wal`/`-shm` 旁文件不被当成源（它们的 extension 是
+    // `db-wal`/`db-shm`，精确匹配天然排除）。
+    let (home_dir, home) = discover_env();
+    let (_db_dir, db) = temp_db("discover-opencode");
+    let opencode_root = home_dir
+        .path()
+        .join(".local")
+        .join("share")
+        .join("opencode");
+    std::fs::create_dir_all(&opencode_root).expect("create opencode root");
+    write_opencode_db(
+        &opencode_root.join("opencode.db"),
+        "discover opencode hello",
+    );
+    // 旁文件用非 SQLite 内容：若被误当成源，probe 会失败并让 provider 报错，
+    // 断言 found == 1 就会挂。
+    std::fs::write(opencode_root.join("opencode.db-wal"), b"not a database")
+        .expect("write wal sidecar");
+    std::fs::write(opencode_root.join("opencode.db-shm"), b"not a database")
+        .expect("write shm sidecar");
+
+    let out = run_with_home(&db, &home, &["sync", "--discover"]);
+    assert!(
+        out.status.success(),
+        "sync --discover failed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    let opencode = frame["data"]["discovery"]["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["id"] == "opencode")
+        .expect("opencode in discovery");
+    assert_eq!(
+        opencode["found"], 1,
+        "只应发现 opencode.db 自身，不含 -wal/-shm: {frame}"
+    );
+    assert_eq!(opencode["complete"], true, "{frame}");
+
+    let out = run_with_home(&db, &home, &["search", "opencode"]);
+    assert!(
+        stdout(&out).contains("msg_v1_"),
+        "discovered opencode source must be searchable: {}",
+        stdout(&out)
+    );
+}
+
+/// R1 回归：整档源（SQLite / 整档 JSON / Markdown）的字节不是记录流。
+///
+/// 旧的截断尾启发式对所有源做逐行 JSON 健康检查：改写后的整档源会被判成
+/// `Invalid` 并 Retain 旧索引，于是源更新永远不可见。这里对每个整档 provider
+/// 用 pinned golden 源实测：首次 sync 可见 → 改写源 → resync 必须提交新内容
+/// 并 tombstone 被替换的旧内容。
+#[test]
+fn whole_source_updates_become_visible_after_rewrite() {
+    struct Case {
+        provider: &'static str,
+        golden: &'static str,
+        /// SQLite 源的 (表, 列) 改写目标；`None` 表示文本源。
+        sqlite: Option<(&'static str, &'static str)>,
+        from: &'static str,
+        to: &'static str,
+        old_token: &'static str,
+        new_token: &'static str,
+    }
+
+    let cases = [
+        Case {
+            provider: "cline",
+            golden: "../agent-session-grep-provider-cline/tests/golden/basic.json",
+            sqlite: None,
+            from: "hello world",
+            to: "rewrittencline corpus",
+            old_token: "world",
+            new_token: "rewrittencline",
+        },
+        Case {
+            provider: "hermes",
+            golden: "../agent-session-grep-provider-hermes/tests/golden/basic.json",
+            sqlite: None,
+            from: "hello world",
+            to: "rewrittenhermes corpus",
+            old_token: "world",
+            new_token: "rewrittenhermes",
+        },
+        Case {
+            provider: "aider",
+            golden: "../agent-session-grep-provider-aider/tests/golden/basic.md",
+            sqlite: None,
+            from: "Rust is a systems programming language.",
+            to: "Rust is a rewrittenaider corpus.",
+            old_token: "systems",
+            new_token: "rewrittenaider",
+        },
+        Case {
+            provider: "cursor",
+            golden: "../agent-session-grep-provider-cursor/tests/golden/basic.db",
+            sqlite: Some(("ItemTable", "value")),
+            from: "hello",
+            to: "rewrittencursor",
+            old_token: "hello",
+            new_token: "rewrittencursor",
+        },
+        Case {
+            provider: "opencode",
+            golden: "../agent-session-grep-provider-opencode/tests/golden/basic.db",
+            sqlite: Some(("part", "data")),
+            from: "hello world",
+            to: "rewrittenopencode",
+            old_token: "world",
+            new_token: "rewrittenopencode",
+        },
+    ];
+
+    for case in cases {
+        let (dir, db) = temp_db(&format!("whole-source-{}", case.provider));
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(case.golden);
+        let file_name = golden.file_name().expect("golden file name");
+        let source = dir.path().join(file_name);
+        std::fs::copy(&golden, &source).expect("copy golden source");
+        let path = source.to_string_lossy().into_owned();
+
+        let out = run(&db, &["sync", &path]);
+        assert!(
+            out.status.success(),
+            "{}: 首次 sync 失败: {}",
+            case.provider,
+            stdout(&out)
+        );
+        let before = run(&db, &["search", case.old_token]);
+        assert!(
+            stdout(&before).contains("msg_v1_"),
+            "{}: 改写前必须能检索到旧内容: {}",
+            case.provider,
+            stdout(&before)
+        );
+
+        // 改写整档源：文本源整体替换，SQLite 源原地 UPDATE。
+        match case.sqlite {
+            Some((table, column)) => {
+                let conn = Connection::open(&source).expect("open fixture db");
+                conn.execute(
+                    &format!("UPDATE {table} SET {column} = replace({column}, ?1, ?2)"),
+                    rusqlite::params![case.from, case.to],
+                )
+                .expect("rewrite sqlite source");
+                conn.close().expect("close rewritten source");
+            }
+            None => {
+                let text = std::fs::read_to_string(&source).expect("read text source");
+                std::fs::write(&source, text.replace(case.from, case.to))
+                    .expect("rewrite text source");
+            }
+        }
+
+        let out = run(&db, &["sync", &path]);
+        assert!(
+            out.status.success(),
+            "{}: resync 失败: {}",
+            case.provider,
+            stdout(&out)
+        );
+        let frame = parse_first_line(&out);
+        assert!(
+            frame["data"]["committed"].as_u64().unwrap_or(0) > 0,
+            "{}: 改写后的整档源必须重新解析并提交: {frame}",
+            case.provider
+        );
+
+        let after = run(&db, &["search", case.new_token]);
+        assert!(
+            stdout(&after).contains("msg_v1_"),
+            "{}: 改写后的内容必须可见: {}",
+            case.provider,
+            stdout(&after)
+        );
+        let stale = run(&db, &["search", case.old_token]);
+        assert!(
+            !stdout(&stale).contains("msg_v1_"),
+            "{}: 被替换的旧内容必须 tombstone: {}",
+            case.provider,
+            stdout(&stale)
+        );
+    }
+}
+fn pi_fixture(text: &str) -> String {
+    // Pi 的 session JSONL：`type:"session"` 头行携带身份，`type:"message"` 携带
+    // 嵌套 `message.role`（见 provider-pi 的 golden `basic.jsonl`）。
+    format!(
+        "{}\n{}\n",
+        r#"{"type":"session","id":"sess-discover-pi","cwd":"/work","timestamp":"2026-08-14T03:00:00Z"}"#,
+        format_args!(
+            r#"{{"type":"message","message":{{"role":"user","content":{}}}}}"#,
+            serde_json::Value::String(text.to_string())
+        )
+    )
+}
+
+#[test]
+fn sync_discover_finds_pi_sessions_under_encoded_cwd_dirs() {
+    // pi 的 transcript 落在 `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`——比
+    // claude/codex 多一层按 cwd 编码的目录。发现是递归的，所以这一层不需要特殊
+    // 处理；本测试端到端锁定该嵌套确实被走到，避免日后有人把遍历改成单层。
+    let (home_dir, home) = discover_env();
+    let (_db_dir, db) = temp_db("discover-pi");
+    let encoded_cwd = home_dir
+        .path()
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join("--work--proj--");
+    std::fs::create_dir_all(&encoded_cwd).expect("create pi sessions root");
+    std::fs::write(
+        encoded_cwd.join("20260814T030000_sess-discover-pi.jsonl"),
+        pi_fixture("discover pi hello"),
+    )
+    .expect("write pi fixture");
+
+    let out = run_with_home(&db, &home, &["sync", "--discover"]);
+    assert!(
+        out.status.success(),
+        "sync --discover failed: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    let pi = frame["data"]["discovery"]["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["id"] == "pi")
+        .expect("pi in discovery");
+    assert_eq!(pi["found"], 1, "{frame}");
+    assert_eq!(pi["complete"], true, "{frame}");
+
+    let out = run_with_home(&db, &home, &["search", "pi"]);
+    assert!(
+        stdout(&out).contains("msg_v1_"),
+        "discovered pi source must be searchable: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn sync_discover_separates_pi_and_openclaw_by_canonical_root() {
+    // 回归（真缺陷）：pi 与 openclaw 的 transcript 是**同一种** v3 JSONL——
+    // `{type:session,...}` 头 + `{type:message,message:{role,content}}`。两个
+    // adapter 的 probe 对同一段字节都返回 `Confirmed`，内容里没有任何判别位，
+    // 于是全 registry probe 必然命中 `select_and_stage_source` 的 tie 分支，
+    // 整个源被 `ambiguous provider selection` 拒绝：修复前 `~/.pi` 与
+    // `~/.openclaw` 下的源一律无法索引（pi 自带 golden fixture 亦然）。
+    //
+    // 现在 `sync --discover` 把规范根派生的 provider 作为 hint 传给 staging，
+    // 候选集收缩到该 provider 的 adapter。本测试把这条不变量钉在最强的形式上：
+    // **同一份字节**分别落在两个根下，必须各归其主，且都能被索引。
+    let (home_dir, home) = discover_env();
+    let (_db_dir, db) = temp_db("discover-pi-openclaw");
+    let shared_bytes = pi_fixture("ambiguous shape marker");
+
+    let pi_dir = home_dir
+        .path()
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join("--work--");
+    std::fs::create_dir_all(&pi_dir).expect("create pi sessions root");
+    std::fs::write(pi_dir.join("pi-one.jsonl"), &shared_bytes).expect("write pi fixture");
+
+    let openclaw_dir = home_dir
+        .path()
+        .join(".openclaw")
+        .join("agents")
+        .join("main")
+        .join("sessions");
+    std::fs::create_dir_all(&openclaw_dir).expect("create openclaw sessions root");
+    std::fs::write(openclaw_dir.join("claw-one.jsonl"), &shared_bytes)
+        .expect("write openclaw fixture");
+
+    let out = run_with_home(&db, &home, &["sync", "--discover"]);
+    assert!(
+        out.status.success(),
+        "identical bytes under two roots must both index: {}",
+        stdout(&out)
+    );
+    let frame = parse_first_line(&out);
+    let providers = frame["data"]["discovery"]["providers"]
+        .as_array()
+        .expect("providers");
+    for id in ["pi", "openclaw"] {
+        let row = providers
+            .iter()
+            .find(|provider| provider["id"] == id)
+            .unwrap_or_else(|| panic!("{id} in discovery: {frame}"));
+        assert_eq!(row["found"], 1, "{id} must find its own source: {frame}");
+        assert_eq!(row["complete"], true, "{id}: {frame}");
+    }
+
+    // 两个源都进了索引，且是两条独立消息：id 回退事实含 provider，所以同一段
+    // 字节在两个 provider 下派生出不同 stable id（不会互相塌缩成一条）。修复前
+    // 这里是 0 条——两个源都被 ambiguous 拒绝。
+    // `run_with_home` 已带 --robot；再加 --output 会被拒为重复输出标志。
+    let out = run_with_home(&db, &home, &["search", "ambiguous"]);
+    let frame = parse_first_line(&out);
+    let hits = frame["data"]["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("search must succeed with hits: {frame}"));
+    assert_eq!(
+        hits.len(),
+        2,
+        "同字节的两个源必须各自入索引（pi + openclaw 各一条）: {frame}"
+    );
+    let ids: std::collections::BTreeSet<&str> =
+        hits.iter().filter_map(|hit| hit["id"].as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "两条消息的 stable id 必须不同（派生事实含 provider）: {frame}"
+    );
+    let sessions: std::collections::BTreeSet<&str> = hits
+        .iter()
+        .filter_map(|hit| hit["session_id"].as_str())
+        .collect();
+    assert_eq!(sessions.len(), 2, "两个源必须分属不同会话: {frame}");
+}
+
+#[test]
+fn explicit_sync_resolves_pi_and_openclaw_by_canonical_root() {
+    // 同一缺陷的第二条入口。`sync --discover` 的 hint 来自逐根扫描，显式
+    // `sync <file>` 没有扫描结果，修复前 hint 恒为 None → 全 registry probe →
+    // pi/openclaw 必然 tie → 用户点名同步自己的 pi transcript 时被整源拒绝，
+    // 且错误信息（"ambiguous provider selection"）无法自助解决。
+    //
+    // 现在两条入口共用同一张 root 表（正向 provider→root 供 discover，反向
+    // path→provider 供显式 sync），因此对同一个文件得到同一个 provider。
+    let (home_dir, home) = discover_env();
+    let (_db_dir, db) = temp_db("explicit-sync-twins");
+    let shared_bytes = pi_fixture("explicit twin marker");
+
+    let pi_dir = home_dir
+        .path()
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join("--work--");
+    std::fs::create_dir_all(&pi_dir).expect("create pi sessions root");
+    let pi_file = pi_dir.join("pi-explicit.jsonl");
+    std::fs::write(&pi_file, &shared_bytes).expect("write pi fixture");
+
+    let openclaw_dir = home_dir
+        .path()
+        .join(".openclaw")
+        .join("agents")
+        .join("main")
+        .join("sessions");
+    std::fs::create_dir_all(&openclaw_dir).expect("create openclaw sessions root");
+    let claw_file = openclaw_dir.join("claw-explicit.jsonl");
+    std::fs::write(&claw_file, &shared_bytes).expect("write openclaw fixture");
+
+    // 逐个显式同步：两者都必须成功（修复前均为 exit 2 invalid_request）。
+    for path in [&pi_file, &claw_file] {
+        let out = run_with_home(&db, &home, &["sync", &path.to_string_lossy()]);
+        assert!(
+            out.status.success(),
+            "explicit sync of a canonical-root source must succeed: {}",
+            stdout(&out)
+        );
+    }
+
+    // 两个源各归其主、各自成会话——与 discover 路径的结论一致。
+    let out = run_with_home(&db, &home, &["search", "explicit"]);
+    let frame = parse_first_line(&out);
+    let hits = frame["data"]["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("search must succeed with hits: {frame}"));
+    assert_eq!(hits.len(), 2, "两个显式同步的源必须都入索引: {frame}");
+    let sessions: std::collections::BTreeSet<&str> = hits
+        .iter()
+        .filter_map(|hit| hit["session_id"].as_str())
+        .collect();
+    assert_eq!(sessions.len(), 2, "两个源必须分属不同会话: {frame}");
+
+    // 反面：同一段字节放在任何登记根之外时没有路径事实可依，tie 拒绝必须保留
+    // ——那是诚实行为，不得靠猜测绕过（此断言防止将来有人给 hint 加"猜第一个
+    // 匹配的 adapter"式兜底）。
+    let loose = home_dir.path().join("exported-copy.jsonl");
+    std::fs::write(&loose, &shared_bytes).expect("write loose copy");
+    let out = run_with_home(&db, &home, &["sync", &loose.to_string_lossy()]);
+    assert!(
+        !out.status.success(),
+        "登记根之外的歧义源必须仍被拒绝，不得猜 provider: {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("ambiguous provider selection"),
+        "拒绝原因必须仍是 ambiguous provider selection: {}",
         stdout(&out)
     );
 }
@@ -5279,4 +7035,1511 @@ fn search_facet_flag_validation_is_explicit() {
         "{}",
         stdout(&out)
     );
+}
+
+// ---- `incremental` 能力列 ↔ 真实 resync 行为 防漂移 ----
+
+/// 每个已实现 provider 的 pinned golden 源文件（相对本 crate 目录）。
+///
+/// 与 `provider_matrix.rs` 的 `PINNED_GOLDEN`（expected.json）互补：这里要的是
+/// **输入字节**，因为增量判定的对象是源文件本身。
+const GOLDEN_SOURCES: &[(&str, &str)] = &[
+    (
+        "aider",
+        "../agent-session-grep-provider-aider/tests/golden/basic.md",
+    ),
+    (
+        "antigravity",
+        "../agent-session-grep-provider-antigravity/tests/golden/basic.jsonl",
+    ),
+    (
+        "claude-code",
+        "../agent-session-grep-provider-claude/tests/golden/basic.jsonl",
+    ),
+    (
+        "cline",
+        "../agent-session-grep-provider-cline/tests/golden/basic.json",
+    ),
+    (
+        "codex",
+        "../agent-session-grep-provider-codex/tests/golden/basic.jsonl",
+    ),
+    (
+        "cursor",
+        "../agent-session-grep-provider-cursor/tests/golden/basic.db",
+    ),
+    (
+        "grok-build",
+        "../agent-session-grep-provider-grok/tests/golden/basic.jsonl",
+    ),
+    (
+        "hermes",
+        "../agent-session-grep-provider-hermes/tests/golden/basic.json",
+    ),
+    (
+        "kimi-code",
+        "../agent-session-grep-provider-kimi/tests/golden/basic.jsonl",
+    ),
+    (
+        "openclaw",
+        "../agent-session-grep-provider-openclaw/tests/golden/basic.jsonl",
+    ),
+    (
+        "opencode",
+        "../agent-session-grep-provider-opencode/tests/golden/basic.db",
+    ),
+    (
+        "pi",
+        "../agent-session-grep-provider-pi/tests/golden/basic.jsonl",
+    ),
+    (
+        "qoder",
+        "../agent-session-grep-provider-qoder/tests/golden/basic.jsonl",
+    ),
+    (
+        "tencent-codebuddy",
+        "../agent-session-grep-provider-codebuddy/tests/golden/basic.jsonl",
+    ),
+];
+
+/// `incremental` 声明必须与真实 resync 行为一致（逐 provider 用其 pinned golden
+/// 源实测）。
+///
+/// 起因：capability.rs 曾只给 claude-code / codex 声明 `incremental: Native`，
+/// 其余 12 个已实现 provider 一律 `Unsupported`，而增量判定完全在
+/// composition root + store 层：`sync` 先读 `source_scans` 的
+/// `(len_bytes, fingerprint)` 缓存，与当次快照的 BLAKE3 指纹比对，相同则**跳过
+/// parse**（`unchanged` 上报已存消息数），再由
+/// `commit_source_batches_if_changed` 做内容级 no-op 判定、不推进 generation。
+/// 这条链上没有任何 per-provider 分支，adapter 也不参与——`incremental` 因此
+/// 只取决于"源是否有稳定字节身份"，对全部 14 个已实现 provider 一致成立。
+/// 此前的 `Unsupported` 是少报，本测试把它钉成可执行断言。
+///
+/// 断言形态与既有 `sync_commits_then_reports_unchanged_on_resync`（claude）/
+/// `..._codex` 同构，只是覆盖全部 14 个 provider 的真实 golden 源：
+/// 首次 sync 提交 N 条并推进 generation，二次 sync `committed=0` /
+/// `unchanged=N` / generation 不变。
+#[test]
+fn capability_incremental_claim_matches_real_resync_for_every_provider() {
+    use agent_session_grep_ports::capability::{
+        CapabilityLevel, ProviderCapabilityMatrix, ProviderMaturity,
+    };
+
+    let matrix = ProviderCapabilityMatrix::current();
+    let implemented: Vec<_> = matrix
+        .providers
+        .iter()
+        .filter(|p| p.maturity != ProviderMaturity::Unsupported)
+        .collect();
+    assert_eq!(implemented.len(), 14, "已实现 provider 应为 14 个");
+    let mut covered: Vec<&str> = GOLDEN_SOURCES.iter().map(|(id, _)| *id).collect();
+    let mut expected: Vec<&str> = implemented.iter().map(|p| p.provider_id.as_str()).collect();
+    covered.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        covered, expected,
+        "GOLDEN_SOURCES 必须恰好覆盖 capability.rs 的 14 个已实现 provider"
+    );
+
+    for cap in implemented {
+        let relative = GOLDEN_SOURCES
+            .iter()
+            .find(|(id, _)| *id == cap.provider_id)
+            .expect("covered above")
+            .1;
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let provider_id = cap.provider_id.as_str();
+
+        // 每个 provider 独立 db + 独立源副本：pi/openclaw 是同格式孪生，必须
+        // 放在各自的登记根下才能定身份（见
+        // `explicit_sync_resolves_twin_formats_by_registered_root`）。这里用
+        // `<tmp>/<home-relative-root>/basic.<ext>` 复刻该布局。
+        let (dir, db) = temp_db(&format!("incr-{provider_id}"));
+        let root_relative = match provider_id {
+            "pi" => Some(".pi/agent/sessions"),
+            "openclaw" => Some(".openclaw/agents"),
+            _ => None,
+        };
+        let staged = match root_relative {
+            Some(root) => dir.path().join(root),
+            None => dir.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(&staged).expect("create staging root");
+        let file_name = golden.file_name().expect("golden file name");
+        let source = staged.join(file_name);
+        std::fs::copy(&golden, &source).expect("copy golden source");
+        let path = source.to_string_lossy().into_owned();
+
+        // 首次 sync：提交 N 条消息，generation 推进到 1。
+        let out = run(&db, &["sync", &path]);
+        assert!(
+            out.status.success(),
+            "{provider_id}: 首次 sync 必须成功: {}",
+            stdout(&out)
+        );
+        let first = parse_first_line(&out);
+        let committed = first["data"]["committed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{provider_id}: committed 必须是数字: {first}"));
+        assert!(
+            committed > 0,
+            "{provider_id}: 首次 sync 必须提交消息（golden 源非空）: {first}"
+        );
+        let generation = first["data"]["generation"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{provider_id}: generation 必须是数字: {first}"));
+
+        // 二次 sync 同一字节：指纹命中 → 跳过 parse → 内容级 no-op。
+        let out = run(&db, &["sync", &path]);
+        assert!(
+            out.status.success(),
+            "{provider_id}: resync 必须成功: {}",
+            stdout(&out)
+        );
+        let second = parse_first_line(&out);
+        let resync_committed = second["data"]["committed"].as_u64();
+        let unchanged = second["data"]["unchanged"].as_u64();
+        let resync_generation = second["data"]["generation"].as_u64();
+
+        match cap.incremental {
+            CapabilityLevel::Native | CapabilityLevel::Derived | CapabilityLevel::Partial => {
+                assert_eq!(
+                    resync_committed,
+                    Some(0),
+                    "{provider_id}: capability.rs 声明 incremental={:?}，但未变化的 resync \
+                     仍提交了消息（虚报）: {second}",
+                    cap.incremental
+                );
+                assert_eq!(
+                    unchanged,
+                    Some(committed),
+                    "{provider_id}: resync 必须把已存消息如实计入 unchanged: {second}"
+                );
+                assert_eq!(
+                    resync_generation,
+                    Some(generation),
+                    "{provider_id}: 未变化的 resync 不得推进 generation: {second}"
+                );
+            }
+            CapabilityLevel::Unsupported => {
+                assert_ne!(
+                    resync_committed,
+                    Some(0),
+                    "{provider_id}: capability.rs 声明 incremental=Unsupported，但未变化的 \
+                     resync 实测是 committed=0 的 no-op（少报，增量其实可用）: {second}"
+                );
+            }
+            CapabilityLevel::Unknown => {
+                panic!("{provider_id}: 已实现 provider 的 incremental 不得为 Unknown")
+            }
+        }
+    }
+}
+
+// ---- `search` 能力列 ↔ 真实检索行为 防漂移 ----
+
+/// `search` 声明必须与真实检索行为一致（逐 provider 用其 pinned golden 源实测）。
+///
+/// 起因：`search` 对全部 14 个已实现 provider 声明 `Native`，但此前只有
+/// doc↔`capability.rs` 一致性守护，没有任何测试把"某 provider 的正文真的能被检索
+/// 到"钉成断言。这是能力列里风险最实的一种漏检：`parse` 落库与 `search` 可检索之
+/// 间还隔着 FTS 索引写入与查询投影，任一环节对某种正文（CJK、emoji、超长行、
+/// markdown 折叠文本）失效，都不会被 golden 的 expected.json 比对发现——那份基线
+/// 记录的是 adapter 发出的 `StagedMessage`，不是索引后的可检索性。
+///
+/// 断言形态：sync 该 provider 的真实 golden 源 → 从**它自己的** golden 正文里取一
+/// 个词做 query → 要求命中非空、命中正文确实包含该词、且命中 id 是 `msg_v1_`
+/// 形态。query 取自 golden 自身而非固定单词，因为 14 个 fixture 的语言不同
+/// （codex 是中文 + emoji、claude-code 混中英），固定英文词会在非英文 fixture 上
+/// 假失败——那是 harness 缺陷而非能力缺陷。
+#[test]
+fn capability_search_claim_matches_real_retrieval_for_every_provider() {
+    use agent_session_grep_ports::capability::{
+        CapabilityLevel, ProviderCapabilityMatrix, ProviderMaturity,
+    };
+
+    let matrix = ProviderCapabilityMatrix::current();
+    let implemented: Vec<_> = matrix
+        .providers
+        .iter()
+        .filter(|p| p.maturity != ProviderMaturity::Unsupported)
+        .collect();
+    assert_eq!(implemented.len(), 14, "已实现 provider 应为 14 个");
+
+    for cap in implemented {
+        let provider_id = cap.provider_id.as_str();
+        let relative = GOLDEN_SOURCES
+            .iter()
+            .find(|(id, _)| *id == provider_id)
+            .unwrap_or_else(|| panic!("{provider_id}: GOLDEN_SOURCES 缺少条目"))
+            .1;
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+
+        // 与 incremental 守护同一布局：pi/openclaw 是同格式孪生，身份来自登记根。
+        let (dir, db) = temp_db(&format!("search-{provider_id}"));
+        let root_relative = match provider_id {
+            "pi" => Some(".pi/agent/sessions"),
+            "openclaw" => Some(".openclaw/agents"),
+            _ => None,
+        };
+        let staged = match root_relative {
+            Some(root) => dir.path().join(root),
+            None => dir.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(&staged).expect("create staging root");
+        let file_name = golden.file_name().expect("golden file name");
+        let source = staged.join(file_name);
+        std::fs::copy(&golden, &source).expect("copy golden source");
+        let path = source.to_string_lossy().into_owned();
+
+        let out = run(&db, &["sync", &path]);
+        assert!(
+            out.status.success(),
+            "{provider_id}: sync 必须成功: {}",
+            stdout(&out)
+        );
+        let synced = parse_first_line(&out);
+        let committed = synced["data"]["committed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{provider_id}: committed 必须是数字: {synced}"));
+        assert!(
+            committed > 0,
+            "{provider_id}: golden 源必须落库消息: {synced}"
+        );
+
+        // 从该 provider 自己的 pinned 基线正文里取一个可查询词：≥3 字符的
+        // ASCII 字母 token（FTS5 默认 unicode61 分词器对 ASCII 词的切分稳定，
+        // 对 CJK 逐字切分，故只取 ASCII token 以保证 query 语义确定）。
+        let expected_relative = relative
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/basic.expected.json"))
+            .unwrap_or_else(|| panic!("{provider_id}: golden 路径应含目录: {relative}"));
+        let expected_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&expected_relative);
+        let expected_raw = std::fs::read_to_string(&expected_path)
+            .unwrap_or_else(|e| panic!("{provider_id}: 读取 {expected_relative} 失败: {e}"));
+        let expected: serde_json::Value = serde_json::from_str(&expected_raw)
+            .unwrap_or_else(|e| panic!("{provider_id}: expected.json 非合法 JSON: {e}"));
+        let bodies: Vec<String> = expected["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{provider_id}: expected.json 缺少 messages 数组"))
+            .iter()
+            .filter_map(|m| m["text"].as_str().map(str::to_owned))
+            .collect();
+        let query = bodies
+            .iter()
+            .flat_map(|body| {
+                body.split(|c: char| !c.is_ascii_alphanumeric())
+                    .filter(|token| {
+                        token.len() >= 3 && token.chars().all(|c| c.is_ascii_alphabetic())
+                    })
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .unwrap_or_else(|| {
+                panic!("{provider_id}: pinned golden 正文里找不到可查询的 ASCII 词，无法实测检索")
+            });
+
+        let out = run(&db, &["search", &query]);
+        match cap.search {
+            CapabilityLevel::Native | CapabilityLevel::Derived | CapabilityLevel::Partial => {
+                assert!(
+                    out.status.success(),
+                    "{provider_id}: capability.rs 声明 search={:?}，但检索命令失败: {}",
+                    cap.search,
+                    stdout(&out)
+                );
+                let frame = parse_first_line(&out);
+                assert_envelope_shape(&frame, true);
+                let hits = frame["data"]["hits"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{provider_id}: 响应缺少 hits 数组: {frame}"));
+                assert!(
+                    !hits.is_empty(),
+                    "{provider_id}: capability.rs 声明 search={:?}，但用它自己 golden 正文里的词 \
+                     `{query}` 检索到 0 条（落库 {committed} 条却检索不到，虚报）: {frame}",
+                    cap.search
+                );
+                for hit in hits {
+                    let id = hit["id"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{provider_id}: 命中缺少 id: {hit}"));
+                    assert!(
+                        id.starts_with("msg_v1_"),
+                        "{provider_id}: 命中 id 必须是 msg_v1_ 形态: {hit}"
+                    );
+                    let text = hit["text"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{provider_id}: 命中缺少 text: {hit}"));
+                    assert!(
+                        text.to_lowercase().contains(&query),
+                        "{provider_id}: 命中正文不含查询词 `{query}`（索引与投影不同源）: {hit}"
+                    );
+                }
+            }
+            CapabilityLevel::Unsupported => {
+                let frame = parse_first_line(&out);
+                let hits = frame["data"]["hits"].as_array().map(Vec::len).unwrap_or(0);
+                assert_eq!(
+                    hits, 0,
+                    "{provider_id}: capability.rs 声明 search=Unsupported，但用 `{query}` \
+                     实测检索到 {hits} 条（少报）: {frame}"
+                );
+            }
+            CapabilityLevel::Unknown => {
+                panic!("{provider_id}: 已实现 provider 的 search 不得为 Unknown")
+            }
+        }
+    }
+}
+
+// ---- usage 维度端到端：ingest → status（schema v15 投影）----
+
+#[test]
+fn ingest_claude_usage_flows_into_status_totals() {
+    let (dir, db) = temp_db("usage-e2e-claude");
+    // 合成 claude JSONL：两条 assistant 各带 message.usage（合成数字，非真实数据）。
+    let fixture = dir.path().join("usage-claude.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"user","uuid":"55111111-1111-4111-8111-111111111111","sessionId":"usage-aaaa-bbbb-cccc-dddd","message":{"role":"user","content":"how many tokens?"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"55222222-2222-4222-8222-222222222222","sessionId":"usage-aaaa-bbbb-cccc-dddd","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":30,"cache_creation_input_tokens":20}}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"55333333-3333-4333-8333-333333333333","sessionId":"usage-aaaa-bbbb-cccc-dddd","message":{"role":"user","content":"again?"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"55444444-4444-4444-8444-444444444444","sessionId":"usage-aaaa-bbbb-cccc-dddd","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}],"usage":{"input_tokens":8,"output_tokens":3,"cache_read_input_tokens":2}}}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+    let fixture_path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["data"]["skipped"], 0);
+
+    let out = run(&db, &["status"]);
+    assert!(out.status.success(), "status failed: {}", stdout(&out));
+    let frame = parse_first_line(&out);
+    let usage = &frame["data"]["usage"];
+    assert!(
+        usage.is_object(),
+        "usage 投影必须出现在 status data 里: {frame}"
+    );
+    assert_eq!(usage["sessions"], 1);
+    assert_eq!(usage["input_tokens"], 108);
+    assert_eq!(usage["output_tokens"], 53);
+    assert_eq!(usage["cache_read_tokens"], 32);
+    assert_eq!(usage["cache_write_tokens"], 20);
+    assert_eq!(usage["reasoning_tokens"], 0);
+    assert_eq!(usage["observed_events"], 2);
+    assert_eq!(usage["derived_events"], 0);
+
+    // 重 ingest 同一文件：usage 投影参与 no-op，计数不翻倍。
+    let out = run(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "re-ingest failed: {}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["data"]["committed"], 0);
+    let out = run(&db, &["status"]);
+    let frame = parse_first_line(&out);
+    assert_eq!(
+        frame["data"]["usage"]["input_tokens"], 108,
+        "no-op 重 ingest 不得翻倍"
+    );
+    assert_eq!(frame["data"]["usage"]["observed_events"], 2);
+}
+
+#[test]
+fn ingest_codex_usage_flows_into_status_as_derived_totals() {
+    let (dir, db) = temp_db("usage-e2e-codex");
+    let fixture = dir.path().join("usage-codex.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"timestamp":"t1","type":"session_meta","payload":{"session_id":"usage-codex-aaaa-bbbb"}}"#,
+            "\n",
+            r#"{"timestamp":"t2","type":"response_item","payload":{"type":"message","id":"msg-cu-1","role":"user","content":[{"type":"input_text","text":"count my tokens"}]}}"#,
+            "\n",
+            r#"{"timestamp":"t3","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#,
+            "\n",
+            r#"{"timestamp":"t4","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}}}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+    let fixture_path = fixture.to_string_lossy().into_owned();
+
+    let out = run(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["data"]["skipped"], 0);
+
+    let out = run(&db, &["status"]);
+    assert!(out.status.success(), "status failed: {}", stdout(&out));
+    let frame = parse_first_line(&out);
+    let usage = &frame["data"]["usage"];
+    assert_eq!(usage["sessions"], 1);
+    // 首条：total（input 10−2=8）；第二条：last（5−1=4）。
+    assert_eq!(usage["input_tokens"], 12);
+    assert_eq!(usage["output_tokens"], 5);
+    assert_eq!(usage["cache_read_tokens"], 3);
+    assert_eq!(usage["reasoning_tokens"], 1);
+    assert_eq!(usage["observed_events"], 0);
+    assert_eq!(usage["derived_events"], 2);
+}
+
+// Relocation regressions use only synthetic provider files and disposable
+// catalogs. Snapshot every identity and live claim row, not merely counts.
+fn relocation_rows(db: &str, moved: Option<(&Path, &Path)>) -> Vec<(String, Vec<String>)> {
+    use rusqlite::types::Value;
+    let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open relocation snapshot read-only");
+    let mut result = Vec::new();
+    for table in [
+        "catalog",
+        "fts_ids",
+        "message_placements",
+        "message_edges",
+        "tool_activities",
+        "usage_events",
+        "session_titles",
+        "session_repo_slugs",
+        "message_vec",
+        "source_scans",
+        "source_membership",
+        "source_placement_membership",
+        "source_relation_scans",
+        "source_session_resume_claims",
+        "tool_activity_membership",
+        "usage_event_membership",
+        "source_installations",
+        "installation_namespaces",
+    ] {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table}"))
+            .expect("snapshot table");
+        let count = stmt.column_count();
+        let source_columns: Vec<_> = stmt
+            .column_names()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                matches!(*name, "source_path" | "source_key").then_some(index)
+            })
+            .collect();
+        let mut rows = stmt
+            .query_map([], |row| {
+                let mut values = (0..count)
+                    .map(|index| row.get::<_, Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let path_key = |path: &str| {
+                    let path = path.replace('\\', "/");
+                    if cfg!(windows) {
+                        path.to_ascii_lowercase()
+                    } else {
+                        path
+                    }
+                };
+                for index in &source_columns {
+                    if let Value::Text(source) = &mut values[*index] {
+                        *source = path_key(source);
+                        if let Some((new, old)) = moved {
+                            let new = path_key(&new.to_string_lossy());
+                            let old = path_key(&old.to_string_lossy());
+                            if let Some(suffix) = source.strip_prefix(&(new + "/")) {
+                                *source = format!("{old}/{suffix}");
+                            }
+                        }
+                    }
+                }
+                Ok(format!("{values:?}"))
+            })
+            .expect("read snapshot rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("snapshot rows");
+        rows.sort();
+        result.push((table.to_string(), rows));
+    }
+    result
+}
+
+fn assert_relocation_rows(
+    db: &str,
+    moved: Option<(&Path, &Path)>,
+    expected: &[(String, Vec<String>)],
+) {
+    let actual = relocation_rows(db, moved);
+    assert_eq!(actual.len(), expected.len());
+    for ((table, rows), (expected_table, expected_rows)) in actual.iter().zip(expected) {
+        assert_eq!(table, expected_table);
+        assert!(
+            rows == expected_rows,
+            "all rows in {table} must remain identical"
+        );
+    }
+}
+
+fn relocation_session_ids(db: &str) -> Vec<String> {
+    let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open catalog read-only");
+    conn.prepare("SELECT id FROM catalog WHERE id LIKE 'ses_v1_%' ORDER BY id")
+        .expect("select sessions")
+        .query_map([], |row| row.get(0))
+        .expect("read sessions")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("session ids")
+}
+
+fn relocation_fixture(provider: &str, original_cwd: &str) -> String {
+    if provider == "codex" {
+        return codex_fixture_with_cwd(
+            "relocation-private-native-session",
+            original_cwd,
+            &[(
+                "relocation-codex-message",
+                "user",
+                "relocation synthetic source message",
+            )],
+        );
+    }
+    let records = [
+        serde_json::json!({
+            "type": "user", "uuid": "relocation-claude-user", "parentUuid": null,
+            "sessionId": "relocation-private-native-session", "cwd": original_cwd,
+            "timestamp": "2026-08-15T03:00:00.000Z",
+            "message": {"role": "user", "content": "relocation synthetic source message"},
+        }),
+        serde_json::json!({
+            "type": "assistant", "uuid": "relocation-claude-assistant",
+            "parentUuid": "relocation-claude-user", "sessionId": "relocation-private-native-session",
+            "cwd": original_cwd, "timestamp": "2026-08-15T03:00:01.000Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "relocation synthetic answer"},
+                {"type": "tool_use", "id": "relocation-tool", "name": "Bash", "input": {"command": "echo synthetic"}},
+            ], "usage": {"input_tokens": 12, "output_tokens": 7}},
+        }),
+        serde_json::json!({
+            "type": "user", "uuid": "relocation-claude-tool-result",
+            "parentUuid": "relocation-claude-assistant", "sessionId": "relocation-private-native-session",
+            "cwd": original_cwd, "timestamp": "2026-08-15T03:00:02.000Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "relocation-tool", "content": "synthetic result"},
+            ]},
+        }),
+    ];
+    records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn assert_relocation_private(output: &Output, roots: &[&str]) {
+    let text = format!(
+        "{}{}",
+        stdout(output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for private in roots.iter().copied().chain([
+        "relocation-private-native-session",
+        "relocation synthetic source message",
+    ]) {
+        assert!(
+            !text.contains(private),
+            "private relocation input escaped its boundary"
+        );
+        assert!(
+            !text.contains(&private.replace('\\', "/")),
+            "normalized private input escaped"
+        );
+        assert!(
+            !text.contains(&private.replace('\\', "\\\\")),
+            "JSON-escaped private input escaped"
+        );
+    }
+}
+
+#[test]
+fn relocate_invalid_arguments_never_open_or_create_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.db").to_string_lossy().into_owned();
+    let old = dir
+        .path()
+        .join("private-old-root")
+        .to_string_lossy()
+        .into_owned();
+    let new = dir
+        .path()
+        .join("private-new-root")
+        .to_string_lossy()
+        .into_owned();
+    let backup = dir
+        .path()
+        .join("private-backup.db")
+        .to_string_lossy()
+        .into_owned();
+    let base = vec![
+        "relocate",
+        "--provider",
+        "claude",
+        "--from",
+        &old,
+        "--to",
+        &new,
+    ];
+    let extras: &[&[&str]] = &[
+        &["--apply"],
+        &["--apply", "--plan", "opaque-plan"],
+        &["--apply", "--backup", &backup],
+        &["--plan", "opaque-plan"],
+        &["--backup", &backup],
+        &["--alias-ttl-days", "0"],
+        &["--alias-ttl-days", "366"],
+        &["--alias-ttl-days", "1.5"],
+        &["--alias-ttl-days", "-1"],
+        &["--alias-ttl-days", "90", "--alias-ttl-days", "90"],
+        &["--from", &old],
+        &["--to", &new],
+        &["--provider", "codex"],
+        &[
+            "--apply",
+            "--apply",
+            "--plan",
+            "opaque-plan",
+            "--backup",
+            &backup,
+        ],
+        &["--apply", "--plan", "", "--backup", &backup],
+        &["--apply", "--plan", "opaque-plan", "--backup", ""],
+        &["--apply", "--plan", "--backup", &backup],
+        &["--private-unknown-option"],
+    ];
+    for extra in extras {
+        let mut args = base.clone();
+        args.extend_from_slice(extra);
+        let out = run(&db, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "invalid flags: {}",
+            stdout(&out)
+        );
+        let frame = parse_first_line(&out);
+        assert_envelope_shape(&frame, false);
+        assert_eq!(frame["command"], "relocate");
+        assert_eq!(frame["error"]["code"], "invalid_request");
+        assert!(
+            !Path::new(&db).exists(),
+            "invalid apply must not create a database"
+        );
+        assert!(
+            !Path::new(&backup).exists(),
+            "invalid apply must not create a backup"
+        );
+        assert_relocation_private(&out, &[&old, &new, &backup]);
+    }
+    for (provider, from, to) in [
+        ("private-unknown-provider", old.as_str(), new.as_str()),
+        ("claude", "private-relative-root", new.as_str()),
+        ("claude", old.as_str(), "private-relative-destination"),
+        ("claude", "", new.as_str()),
+        ("claude", old.as_str(), ""),
+    ] {
+        let out = run(
+            &db,
+            &[
+                "relocate",
+                "--provider",
+                provider,
+                "--from",
+                from,
+                "--to",
+                to,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+        assert!(!Path::new(&db).exists());
+        assert_relocation_private(
+            &out,
+            &[
+                &old,
+                &new,
+                "private-unknown-provider",
+                "private-relative-root",
+                "private-relative-destination",
+            ],
+        );
+    }
+}
+
+#[test]
+fn relocate_preview_and_apply_refuse_missing_or_old_catalogs_without_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.db").to_string_lossy().into_owned();
+    let old = dir
+        .path()
+        .join("private-old-root")
+        .to_string_lossy()
+        .into_owned();
+    let new = dir
+        .path()
+        .join("private-new-root")
+        .to_string_lossy()
+        .into_owned();
+    let backup = dir
+        .path()
+        .join("private-backup.db")
+        .to_string_lossy()
+        .into_owned();
+    for apply in [false, true] {
+        let mut args = vec![
+            "relocate",
+            "--provider",
+            "claude-code",
+            "--from",
+            &old,
+            "--to",
+            &new,
+        ];
+        if apply {
+            args.extend(["--apply", "--plan", "opaque-plan", "--backup", &backup]);
+        }
+        let out = Command::new(BIN)
+            .args(["--db", &db, "--robot"])
+            .args(&args)
+            .env("ASG_DEBUG_ERRORS", "1")
+            .output()
+            .expect("run missing catalog relocation");
+        assert_eq!(out.status.code(), Some(6), "{}", stdout(&out));
+        assert!(!Path::new(&db).exists());
+        assert!(!Path::new(&backup).exists());
+        assert_relocation_private(&out, &[&db, &old, &new, &backup]);
+    }
+    Connection::open(&db).expect("create synthetic older catalog")
+        .execute_batch("PRAGMA user_version = 17; CREATE TABLE catalog(id TEXT PRIMARY KEY, payload BLOB NOT NULL);")
+        .expect("set older schema");
+    let before = std::fs::read(&db).expect("read old catalog");
+    for apply in [false, true] {
+        let mut args = vec![
+            "relocate",
+            "--provider",
+            "claude-code",
+            "--from",
+            &old,
+            "--to",
+            &new,
+        ];
+        if apply {
+            args.extend(["--apply", "--plan", "opaque-plan", "--backup", &backup]);
+        }
+        let out = run(&db, &args);
+        assert_eq!(out.status.code(), Some(9), "{}", stdout(&out));
+        assert_eq!(
+            parse_first_line(&out)["error"]["code"],
+            "schema_incompatible"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "relocation cannot migrate older catalogs"
+        );
+        assert!(!Path::new(&backup).exists());
+    }
+}
+
+#[test]
+fn relocate_preserves_native_identity_claims_resume_and_incremental_discovery() {
+    for (provider, marker, subtree) in [
+        ("claude-code", ".claude", "projects/project"),
+        ("codex", ".codex", "sessions/2026"),
+    ] {
+        let (dir, db) = temp_db("relocate-lifecycle");
+        let old = dir.path().join("old-owner").join(marker);
+        let new = dir.path().join("迁移后 installation");
+        let old_source = old.join(subtree).join("session.jsonl");
+        let new_source = new.join(subtree).join("session.jsonl");
+        let backup = dir.path().join("catalog-backup.db");
+        let home = dir.path().join("isolated-discovery-home");
+        std::fs::create_dir_all(old_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let content = relocation_fixture(provider, &old.to_string_lossy());
+        std::fs::write(&old_source, &content).unwrap();
+        let initial = run(&db, &["sync", old_source.to_str().unwrap()]);
+        assert!(initial.status.success(), "{}", stdout(&initial));
+        let generation = parse_first_line(&initial)["data"]["generation"]
+            .as_u64()
+            .unwrap();
+        let sessions = relocation_session_ids(&db);
+        assert_eq!(sessions.len(), 1);
+        let before = relocation_rows(&db, None);
+        let context = parse_first_line(&run(&db, &["context", &sessions[0]]))["data"].clone();
+        let resume =
+            parse_first_line(&run(&db, &["get-session-resume", &sessions[0]]))["data"].clone();
+        if provider == "claude-code" {
+            for table in ["tool_activity_membership", "usage_event_membership"] {
+                assert!(
+                    !before
+                        .iter()
+                        .find(|(name, _)| name == table)
+                        .unwrap()
+                        .1
+                        .is_empty(),
+                    "exercise {table}"
+                );
+            }
+        }
+        std::fs::rename(&old, &new).unwrap();
+        let catalog_bytes = std::fs::read(&db).unwrap();
+        let preview = run(
+            &db,
+            &[
+                "relocate",
+                "--provider",
+                provider,
+                "--from",
+                old.to_str().unwrap(),
+                "--to",
+                new.to_str().unwrap(),
+            ],
+        );
+        assert!(preview.status.success(), "{}", stdout(&preview));
+        assert_relocation_private(
+            &preview,
+            &[
+                old.to_str().unwrap(),
+                new.to_str().unwrap(),
+                backup.to_str().unwrap(),
+            ],
+        );
+        let planned = parse_first_line(&preview);
+        assert_envelope_shape(&planned, true);
+        assert_eq!(planned["command"], "relocate.preview");
+        assert_eq!(planned["data"]["status"], "planned");
+        assert_eq!(planned["data"]["source_count"], 1);
+        assert_eq!(planned["data"]["session_count"], 1);
+        assert_eq!(planned["data"]["alias_ttl_days"], 90);
+        assert_eq!(planned["data"]["generation"], generation);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            catalog_bytes,
+            "preview must not write the catalog"
+        );
+        assert_relocation_rows(&db, None, &before);
+        assert!(!backup.exists());
+        let plan = planned["data"]["plan"].as_str().expect("opaque plan");
+        let claims = agent_session_grep_application::relocation::decode_plan(
+            plan,
+            E2E_CLOCK_MS.parse().unwrap(),
+        )
+        .expect("plan uses the CLI injected clock");
+        let claims = serde_json::to_string(&claims).unwrap();
+        for private in [
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "relocation-private-native-session",
+        ] {
+            assert!(
+                !claims.contains(private),
+                "opaque plan claims contain no private inputs"
+            );
+        }
+        let applied = run(
+            &db,
+            &[
+                "relocate",
+                "--provider",
+                provider,
+                "--from",
+                old.to_str().unwrap(),
+                "--to",
+                new.to_str().unwrap(),
+                "--apply",
+                "--plan",
+                plan,
+                "--backup",
+                backup.to_str().unwrap(),
+            ],
+        );
+        assert!(applied.status.success(), "{}", stdout(&applied));
+        assert_relocation_private(
+            &applied,
+            &[
+                old.to_str().unwrap(),
+                new.to_str().unwrap(),
+                backup.to_str().unwrap(),
+            ],
+        );
+        let applied = parse_first_line(&applied);
+        assert_eq!(applied["command"], "relocate.apply");
+        assert_eq!(applied["data"]["status"], "applied");
+        assert_eq!(applied["data"]["previous_generation"], generation);
+        assert_eq!(applied["data"]["generation"], generation + 1);
+        assert_relocation_rows(backup.to_str().unwrap(), None, &before);
+        assert_relocation_rows(&db, Some((&new, &old)), &before);
+        assert_eq!(
+            std::fs::read_to_string(&new_source).unwrap(),
+            content,
+            "apply never rewrites provider content"
+        );
+        assert!(
+            !old.exists(),
+            "apply must not recreate the retired directory"
+        );
+        assert_eq!(relocation_session_ids(&db), sessions);
+        let mut expected_context = context;
+        expected_context["generation"] = (generation + 1).into();
+        for evidence in expected_context["evidence"].as_array_mut().unwrap() {
+            evidence["generation"] = (generation + 1).into();
+        }
+        assert_eq!(
+            parse_first_line(&run(&db, &["context", &sessions[0]]))["data"],
+            expected_context
+        );
+        assert_eq!(
+            parse_first_line(&run(&db, &["get-session-resume", &sessions[0]]))["data"],
+            resume
+        );
+        let repeat = run(
+            &db,
+            &[
+                "relocate",
+                "--provider",
+                provider,
+                "--from",
+                old.to_str().unwrap(),
+                "--to",
+                new.to_str().unwrap(),
+            ],
+        );
+        assert!(repeat.status.success(), "{}", stdout(&repeat));
+        let repeat = parse_first_line(&repeat);
+        assert_eq!(
+            repeat["command"], "relocate.preview",
+            "no-op preview remains a preview"
+        );
+        assert_eq!(repeat["data"]["status"], "unchanged");
+        assert_eq!(repeat["data"]["generation"], generation + 1);
+        let second_backup = dir.path().join("unused-second-backup.db");
+        let repeat = run(
+            &db,
+            &[
+                "relocate",
+                "--provider",
+                provider,
+                "--from",
+                old.to_str().unwrap(),
+                "--to",
+                new.to_str().unwrap(),
+                "--apply",
+                "--plan",
+                plan,
+                "--backup",
+                second_backup.to_str().unwrap(),
+            ],
+        );
+        assert!(repeat.status.success(), "{}", stdout(&repeat));
+        assert_eq!(parse_first_line(&repeat)["data"]["status"], "unchanged");
+        assert!(
+            !second_backup.exists(),
+            "idempotent apply needs no second backup"
+        );
+        for command in ["sync", "ingest"] {
+            let again = run(&db, &[command, new_source.to_str().unwrap()]);
+            assert!(again.status.success(), "{}", stdout(&again));
+            assert_eq!(
+                parse_first_line(&again)["data"]["generation"],
+                generation + 1
+            );
+            assert_eq!(relocation_session_ids(&db), sessions);
+        }
+        let discover = run_with_home(&db, home.to_str().unwrap(), &["sync", "--discover"]);
+        assert!(discover.status.success(), "{}", stdout(&discover));
+        assert_eq!(
+            parse_first_line(&discover)["data"]["sources"],
+            1,
+            "registered non-default root is discovered"
+        );
+        assert_eq!(relocation_session_ids(&db), sessions);
+        let added = new_source.with_file_name("additional-source.jsonl");
+        std::fs::write(&added, &content).unwrap();
+        let discover = run_with_home(&db, home.to_str().unwrap(), &["sync", "--discover"]);
+        assert!(discover.status.success(), "{}", stdout(&discover));
+        assert_eq!(parse_first_line(&discover)["data"]["sources"], 2);
+        assert_eq!(
+            relocation_session_ids(&db),
+            sessions,
+            "new sibling sources reuse the moved installation namespace"
+        );
+        std::fs::remove_file(&new_source).unwrap();
+        let discover = run_with_home(&db, home.to_str().unwrap(), &["sync", "--discover"]);
+        assert!(discover.status.success(), "{}", stdout(&discover));
+        assert_eq!(
+            relocation_session_ids(&db),
+            sessions,
+            "deleting one relocated claim keeps its shared content"
+        );
+        assert!(run(&db, &["get", &sessions[0]]).status.success());
+        // A retired source is refused even when its bytes match the moved copy.
+        std::fs::create_dir_all(old_source.parent().unwrap()).unwrap();
+        std::fs::write(&old_source, &content).unwrap();
+        let before_retired = relocation_rows(&db, None);
+        let retired = run(&db, &["sync", old_source.to_str().unwrap()]);
+        assert_eq!(retired.status.code(), Some(2), "{}", stdout(&retired));
+        assert_relocation_private(&retired, &[old.to_str().unwrap(), new.to_str().unwrap()]);
+        assert_relocation_rows(&db, None, &before_retired);
+    }
+}
+
+#[test]
+fn relocate_occupied_target_preserves_independent_installations_with_equal_native_ids() {
+    let (dir, db) = temp_db("relocate-occupied");
+    let first = dir.path().join("installation-one");
+    let second = dir.path().join("installation-two");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let first_source = first.join("session.jsonl");
+    let second_source = second.join("session.jsonl");
+    let content = relocation_fixture("claude-code", "/synthetic/original-cwd");
+    std::fs::write(&first_source, &content).unwrap();
+    std::fs::write(&second_source, &content).unwrap();
+    let out = run(
+        &db,
+        &[
+            "sync",
+            first_source.to_str().unwrap(),
+            second_source.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(
+        relocation_session_ids(&db).len(),
+        2,
+        "equal native session ids do not merge installations"
+    );
+    let before = relocation_rows(&db, None);
+    let out = run(
+        &db,
+        &[
+            "relocate",
+            "--provider",
+            "claude",
+            "--from",
+            first.to_str().unwrap(),
+            "--to",
+            second.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["error"]["code"], "invalid_request");
+    assert_relocation_private(&out, &[first.to_str().unwrap(), second.to_str().unwrap()]);
+    assert_relocation_rows(&db, None, &before);
+}
+
+#[test]
+fn relocate_rejects_changed_expired_mismatched_and_stale_plans_without_writes() {
+    let (dir, db) = temp_db("relocate-plan-errors");
+    let old = dir.path().join("old-root");
+    let new = dir.path().join("new-root");
+    let backup = dir.path().join("backup.db");
+    std::fs::create_dir_all(&old).unwrap();
+    let content = relocation_fixture("claude-code", "/synthetic/original-cwd");
+    std::fs::write(old.join("session.jsonl"), &content).unwrap();
+    let initial = run(&db, &["sync", old.join("session.jsonl").to_str().unwrap()]);
+    assert!(initial.status.success(), "{}", stdout(&initial));
+    std::fs::rename(&old, &new).unwrap();
+    let base = [
+        "relocate",
+        "--provider",
+        "claude",
+        "--from",
+        old.to_str().unwrap(),
+        "--to",
+        new.to_str().unwrap(),
+        "--alias-ttl-days",
+        "7",
+    ];
+    let preview = run(&db, &base);
+    assert!(preview.status.success(), "{}", stdout(&preview));
+    let frame = parse_first_line(&preview);
+    let plan = frame["data"]["plan"].as_str().unwrap();
+    let generation = frame["data"]["generation"].as_u64().unwrap();
+    let mut apply = base.to_vec();
+    apply.extend([
+        "--apply",
+        "--plan",
+        plan,
+        "--backup",
+        backup.to_str().unwrap(),
+    ]);
+    let before = relocation_rows(&db, None);
+    for (token, clock, expected) in [
+        (
+            "private-invalid-plan-value",
+            E2E_CLOCK_MS.parse::<i64>().unwrap(),
+            2,
+        ),
+        (plan, E2E_CLOCK_MS.parse::<i64>().unwrap() + 900_001, 2),
+    ] {
+        let mut args = base.to_vec();
+        args.extend([
+            "--apply",
+            "--plan",
+            token,
+            "--backup",
+            backup.to_str().unwrap(),
+        ]);
+        let out = Command::new(BIN)
+            .args(["--db", &db, "--robot"])
+            .args(args)
+            .env("ASG_CLOCK_MS", clock.to_string())
+            .env("ASG_DEBUG_ERRORS", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(expected), "{}", stdout(&out));
+        assert_relocation_private(
+            &out,
+            &[
+                old.to_str().unwrap(),
+                new.to_str().unwrap(),
+                backup.to_str().unwrap(),
+                "private-invalid-plan-value",
+            ],
+        );
+        assert_relocation_rows(&db, None, &before);
+        assert!(!backup.exists());
+    }
+    let mut wrong_ttl = apply.clone();
+    let ttl = wrong_ttl
+        .iter()
+        .position(|value| *value == "--alias-ttl-days")
+        .unwrap()
+        + 1;
+    wrong_ttl[ttl] = "8";
+    let out = run(&db, &wrong_ttl);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert_relocation_rows(&db, None, &before);
+    assert!(!backup.exists());
+    std::fs::write(new.join("session.jsonl"), format!("{content}\n")).unwrap();
+    let out = run(&db, &apply);
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    assert_eq!(parse_first_line(&out)["error"]["code"], "source_changed");
+    assert_relocation_rows(&db, None, &before);
+    assert!(!backup.exists());
+    std::fs::write(new.join("session.jsonl"), &content).unwrap();
+    std::fs::write(&backup, b"existing backup must survive").unwrap();
+    let out = run(&db, &apply);
+    assert!(matches!(out.status.code(), Some(5 | 6)), "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        b"existing backup must survive"
+    );
+    assert_relocation_rows(&db, None, &before);
+    assert_eq!(
+        parse_first_line(&run(&db, &["status"]))["data"]["generation"],
+        generation
+    );
+    std::fs::remove_file(&backup).unwrap();
+    let extra = run(
+        &db,
+        &[
+            "index",
+            "relocation-generation-change",
+            "synthetic generation advance",
+        ],
+    );
+    assert!(extra.status.success(), "{}", stdout(&extra));
+    let advanced = relocation_rows(&db, None);
+    let out = run(&db, &apply);
+    assert_eq!(out.status.code(), Some(9), "{}", stdout(&out));
+    assert_eq!(
+        parse_first_line(&out)["error"]["code"],
+        "generation_mismatch"
+    );
+    assert_relocation_rows(&db, None, &advanced);
+    assert!(!backup.exists());
+}
+
+#[test]
+fn relocate_sqlite_sources_preserve_every_native_session_and_resume_observation() {
+    for provider in ["opencode", "cursor"] {
+        let (dir, db) = temp_db("relocate-sqlite-sessions");
+        let old = dir.path().join("old-installation");
+        let new = dir.path().join("new-installation");
+        let backup = dir.path().join("backup.db");
+        std::fs::create_dir_all(&old).unwrap();
+        let source = old.join("sessions.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        if provider == "opencode" {
+            conn.execute_batch(
+                "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT);
+                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);"
+            ).unwrap();
+            for label in ["first", "second"] {
+                conn.execute(
+                    "INSERT INTO session VALUES (?1, ?2)",
+                    rusqlite::params![label, format!("/synthetic/{label}")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO message VALUES (?1, ?1, '{\"role\":\"user\"}', 1)",
+                    [label],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO part VALUES (?1, ?1, json_object('type','text','text',?2), 1)",
+                    rusqlite::params![label, format!("relocation sqlite {label}")],
+                )
+                .unwrap();
+            }
+        } else {
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO ItemTable VALUES (?1, ?2)", rusqlite::params![
+                "workbench.panel.aichat.view.aichat.chatdata",
+                serde_json::json!({"tabs": [
+                    {"id": "first", "createdAt": 1, "bubbles": [{"type": "user", "text": "relocation sqlite first"}]},
+                    {"id": "second", "createdAt": 2, "bubbles": [{"type": "user", "text": "relocation sqlite second"}]},
+                ]}).to_string()
+            ]).unwrap();
+        }
+        let out = run(&db, &["ingest", source.to_str().unwrap()]);
+        assert!(out.status.success(), "{provider}: {}", stdout(&out));
+        let sessions = relocation_session_ids(&db);
+        assert_eq!(sessions.len(), 2);
+        let before = relocation_rows(&db, None);
+        let resume: Vec<_> = sessions
+            .iter()
+            .map(|id| parse_first_line(&run(&db, &["get-session-resume", id]))["data"].clone())
+            .collect();
+        // Closing the writer may checkpoint WAL; the logical snapshot is still
+        // the same source and must retain its Document and placement identities.
+        conn.close().unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        let base = [
+            "relocate",
+            "--provider",
+            provider,
+            "--from",
+            old.to_str().unwrap(),
+            "--to",
+            new.to_str().unwrap(),
+        ];
+        let out = run(&db, &base);
+        assert!(out.status.success(), "{provider}: {}", stdout(&out));
+        let preview = parse_first_line(&out);
+        assert_eq!(preview["data"]["source_count"], 1);
+        assert_eq!(preview["data"]["session_count"], 2);
+        let mut apply = base.to_vec();
+        apply.extend([
+            "--apply",
+            "--plan",
+            preview["data"]["plan"].as_str().unwrap(),
+            "--backup",
+            backup.to_str().unwrap(),
+        ]);
+        let out = run(&db, &apply);
+        assert!(out.status.success(), "{provider}: {}", stdout(&out));
+        assert_relocation_rows(&db, Some((&new, &old)), &before);
+        assert_eq!(relocation_session_ids(&db), sessions);
+        for (id, expected) in sessions.iter().zip(resume) {
+            assert_eq!(
+                parse_first_line(&run(&db, &["get-session-resume", id]))["data"],
+                expected
+            );
+            assert!(run(&db, &["context", id]).status.success());
+        }
+        let out = run(&db, &["sync", new.join("sessions.db").to_str().unwrap()]);
+        assert!(out.status.success(), "{provider}: {}", stdout(&out));
+        assert_eq!(relocation_session_ids(&db), sessions);
+    }
+}
+
+#[test]
+fn relocate_namespace_reservations_do_not_survive_a_failed_source_batch() {
+    let (dir, db) = temp_db("relocate-aborted-staging");
+    let first = dir.path().join("first.jsonl");
+    let second = dir.path().join("invalid.jsonl");
+    let content = relocation_fixture("claude-code", "/synthetic/original-cwd");
+    std::fs::write(&first, &content).unwrap();
+    std::fs::write(
+        &second,
+        content.replace("relocation-claude-user", "invalid message id"),
+    )
+    .unwrap();
+    let before = relocation_rows(&db, None);
+    let out = run(
+        &db,
+        &["sync", first.to_str().unwrap(), second.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "invalid native identity must abort the source batch"
+    );
+    assert_relocation_rows(&db, None, &before);
+    assert_eq!(
+        parse_first_line(&run(&db, &["status"]))["data"]["generation"],
+        0
+    );
+}
+
+#[test]
+fn relocate_help_capability_human_and_jsonl_surfaces_share_the_cli_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent.db");
+    let help = Command::new(BIN)
+        .args([
+            "--db",
+            absent.to_str().unwrap(),
+            "--robot",
+            "--request-id",
+            "relocation-help",
+            "relocate",
+            "--help",
+        ])
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{}", stdout(&help));
+    let help = parse_first_line(&help);
+    assert_eq!(help["request_id"], "relocation-help");
+    let text = help["data"].to_string();
+    for required in [
+        "--apply",
+        "--plan",
+        "--backup",
+        "--alias-ttl-days",
+        "15",
+        "90",
+        "MCP/Web",
+    ] {
+        assert!(text.contains(required), "help must describe {required}");
+    }
+    assert!(!absent.exists());
+    let providers = run(absent.to_str().unwrap(), &["providers"]);
+    assert!(providers.status.success());
+    let capability = &parse_first_line(&providers)["data"]["relocation"];
+    assert_eq!(capability["interfaces"], serde_json::json!(["cli"]));
+    assert_eq!(capability["default_action"], "preview");
+    assert_eq!(capability["plan_ttl_seconds"], 900);
+    assert_eq!(
+        capability["alias_ttl_days"],
+        serde_json::json!({"default":90,"minimum":1,"maximum":365})
+    );
+    let (dir, db) = temp_db("relocate-jsonl");
+    let old = dir.path().join("old-root");
+    let new = dir.path().join("new-root");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(
+        old.join("session.jsonl"),
+        relocation_fixture("claude-code", "/synthetic/original-cwd"),
+    )
+    .unwrap();
+    assert!(
+        run(&db, &["sync", old.join("session.jsonl").to_str().unwrap()])
+            .status
+            .success()
+    );
+    std::fs::rename(&old, &new).unwrap();
+    let args = [
+        "relocate",
+        "--provider",
+        "claude",
+        "--from",
+        old.to_str().unwrap(),
+        "--to",
+        new.to_str().unwrap(),
+    ];
+    let out = Command::new(BIN)
+        .args([
+            "--db",
+            &db,
+            "--output",
+            "jsonl",
+            "--request-id",
+            "relocation-jsonl",
+        ])
+        .args(args)
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(
+        stdout(&out).lines().count(),
+        1,
+        "preview emits one bounded response, no progress paths"
+    );
+    let frame = parse_first_line(&out);
+    assert_envelope_shape(&frame, true);
+    assert_eq!(frame["request_id"], "relocation-jsonl");
+    assert_eq!(frame["command"], "relocate.preview");
+    let mut keys: Vec<_> = frame["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "alias_ttl_days",
+            "generation",
+            "installation_count",
+            "namespace_count",
+            "plan",
+            "previous_generation",
+            "session_count",
+            "source_count",
+            "status"
+        ]
+    );
+    assert_relocation_private(&out, &[old.to_str().unwrap(), new.to_str().unwrap()]);
+    let human = run_human(&db, &args);
+    assert!(human.status.success(), "{}", stdout(&human));
+    assert!(stdout(&human).contains("planned"));
+    assert!(stdout(&human).contains("plan:"));
+    assert_relocation_private(&human, &[old.to_str().unwrap(), new.to_str().unwrap()]);
+}
+
+#[cfg(windows)]
+#[test]
+fn relocate_equivalent_windows_root_is_a_readonly_noop() {
+    let (dir, db) = temp_db("relocate-case");
+    let root = dir.path().join("MixedCase-安装");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("session.jsonl");
+    std::fs::write(
+        &source,
+        relocation_fixture("claude-code", "/synthetic/original-cwd"),
+    )
+    .unwrap();
+    let first = run(&db, &["sync", source.to_str().unwrap()]);
+    assert!(first.status.success());
+    let generation = parse_first_line(&first)["data"]["generation"].clone();
+    let before = relocation_rows(&db, None);
+    let alternate = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_uppercase();
+    let out = run(
+        &db,
+        &[
+            "relocate",
+            "--provider",
+            "claude",
+            "--from",
+            &alternate,
+            "--to",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    let frame = parse_first_line(&out);
+    assert_eq!(frame["command"], "relocate.preview");
+    assert_eq!(frame["data"]["status"], "unchanged");
+    assert_eq!(frame["data"]["generation"], generation);
+    assert_relocation_rows(&db, None, &before);
 }

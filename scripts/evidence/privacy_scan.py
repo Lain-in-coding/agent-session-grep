@@ -3,8 +3,8 @@
 
 Scans every path reported by ``git ls-files -z`` for personal or machine
 absolute paths that must not ship in a public repository (user homes, local
-checkout roots, worktree coordinates). Binary files and UTF-16 blobs (Windows
-PowerShell transcripts) are skipped. A small allowlist covers paths that are
+checkout roots, worktree coordinates). Relative filenames are always scanned;
+binary and UTF-16 payloads (Windows PowerShell transcripts) are not decoded. A small allowlist covers paths that are
 deliberately synthetic (test fixtures and documentation examples); every
 allowlist entry is exact and commented with its rationale.
 
@@ -18,18 +18,24 @@ with ``public``.
 Rule literals are assembled from fragments so this scanner never contains a
 matchable copy of the tokens it forbids.
 
+Historical import policy metadata is omitted only after exact tool-owned
+path/raw-hash/schema verification. Changed or unknown snapshots fail closed.
+
 Uses only the Python standard library.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 SCANNER_NAME = "scripts/evidence/privacy_scan.py"
 
@@ -111,6 +117,22 @@ PROFILES: dict[str, tuple[tuple[str, str, re.Pattern[str]], ...]] = {
 }
 
 
+# Reviewed immutable archives only. Neither a candidate file nor a caller can
+# supply this registry. Each pin binds COMPLETE raw bytes before policy fields
+# are omitted; the original root manifest deliberately has no alias here.
+HISTORICAL_SNAPSHOTS = MappingProxyType({
+    "docs/operations/imports/public-tree-v1-"
+    "e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af.json": (
+        "e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af",
+        "agent-session-grep.public-tree/v1", frozenset({"excluded_prefixes"}),
+    ),
+    "docs/operations/imports/public-tree-v2-f587c73332158342330a63874fabdc8f565624ec.json": (
+        "121e09c2ab6f7e5922a0862ea095fae3ae343913847cc3efa62546cf71585ead",
+        "agent-session-grep.public-tree/v2", frozenset({"excluded_prefixes", "profile"}),
+    ),
+})
+
+
 @dataclass(frozen=True)
 class Finding:
     """One privacy rule hit inside a tracked text file."""
@@ -165,6 +187,12 @@ ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
             "user-home",
             LINUX_HOME + "user",
         ),
+        # Hand-authored, byte-pinned Pi v3 branch fixture; see its PROVENANCE.md.
+        (
+            "crates/agent-session-grep-provider-pi/tests/golden/v3-branched.jsonl",
+            "user-home",
+            LINUX_HOME + "user",
+        ),
         ("spikes/search-backend/src/corpus.rs", "user-home", LINUX_HOME + "user"),
         # Synthetic Windows user homes in redaction/path-handling fixtures:
         # accounts named `secret`, `someone`, `me`, `dev` are placeholders, and
@@ -177,6 +205,11 @@ ALLOWLIST: frozenset[tuple[str, str, str]] = frozenset(
         ("crates/agent-session-grep-cli/src/human.rs", "user-home", WIN_HOME + "someone"),
         ("crates/agent-session-grep-cli/src/human.rs", "user-home", WIN_HOME + "…"),
         ("crates/agent-session-grep-cli/src/protocol.rs", "user-home", SLASH_WIN_HOME + "secret"),
+        # Registered-root tests use the placeholder account x in both Windows
+        # spellings; MCP error-frame tests must redact the synthetic secret path.
+        ("crates/agent-session-grep-cli/src/lib.rs", "user-home", SLASH_WIN_HOME + "x"),
+        ("crates/agent-session-grep-cli/src/lib.rs", "user-home", WIN_HOME + "x"),
+        ("crates/agent-session-grep-cli/src/mcp.rs", "user-home", SLASH_WIN_HOME + "secret"),
         # serve's POST-echo regression asserts a synthetic Windows user-home
         # transcript path is never reflected back in the 501 body.
         ("crates/agent-session-grep-cli/src/serve.rs", "user-home", SLASH_WIN_HOME + "alice"),
@@ -251,17 +284,69 @@ def scan_lines(
     return findings
 
 
-def scan_repo(repo: Path, profile: str = "repo") -> list[Finding]:
-    """Scan every tracked text file under ``repo`` with the named profile."""
+def scan_content(
+    path: str,
+    data: bytes,
+    profile: str = "repo",
+    *,
+    _generated_snapshot: tuple[str, str] | None = None,
+) -> list[Finding]:
+    """Scan a relative filename and bytes once under the shared policy.
+
+    The private generated-snapshot grant is one (path, raw SHA256) pair from
+    the trusted exporter's exact tool/profile check, never candidate config.
+    It applies only to that invocation's v2 output, cannot override an archive
+    pin, and cannot choose omitted fields. Standalone scans never supply it.
+    """
     rules = PROFILES[profile]
+    # Filenames are scan input too, including when the payload is binary.
+    findings = scan_lines(path, [path], rules=rules)
+    text = decode_text(data)
+    document = None
+    if text is not None:
+        try:
+            document = json.loads(text)
+        except (ValueError, RecursionError):
+            pass  # Ordinary non-JSON text still gets the unchanged line scan.
+    schema = document.get("schema") if isinstance(document, dict) else None
+    snapshot_name = Path(path).name.casefold()
+    snapshot = (
+        snapshot_name == "public-tree-manifest.json"
+        or (snapshot_name.startswith("public-tree-") and snapshot_name.endswith(".json"))
+        or (isinstance(schema, str) and schema.startswith("agent-session-grep.public-tree/"))
+    )
+    omitted: frozenset[str] = frozenset()
+    pinned = HISTORICAL_SNAPSHOTS.get(path)
+    if pinned is not None:
+        digest, expected_schema, fields = pinned
+        if hashlib.sha256(data).hexdigest() != digest or schema != expected_schema:
+            findings.append(Finding(path, 1, "snapshot-integrity", "", ""))
+        else:
+            omitted = fields
+    elif (_generated_snapshot is not None
+          and _generated_snapshot == (path, hashlib.sha256(data).hexdigest())
+          and schema == "agent-session-grep.public-tree/v2"
+          and isinstance(document.get("source_commit"), str)
+          and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", document["source_commit"])
+          and path == "docs/operations/imports/public-tree-v2-" + document["source_commit"] + ".json"):
+        omitted = frozenset({"excluded_prefixes", "profile"})
+    elif snapshot:
+        findings.append(Finding(path, 1, "unregistered-snapshot", "", ""))
+    if omitted:
+        # Retain EVERY other top-level field and all nested content, including
+        # unknown free text and inventory entries. Never rewrite source bytes.
+        text = json.dumps({key: value for key, value in document.items() if key not in omitted},
+                          indent=2, ensure_ascii=False)
+    if text is not None:
+        findings.extend(scan_lines(path, text.splitlines(), rules=rules))
+    return findings
+
+
+def scan_repo(repo: Path, profile: str = "repo") -> list[Finding]:
+    """Scan every tracked filename and supported payload with the named profile."""
     findings: list[Finding] = []
     for name in tracked_files(repo):
-        path = repo / name
-        data = path.read_bytes()
-        text = decode_text(data)
-        if text is None:
-            continue
-        findings.extend(scan_lines(name, text.splitlines(), rules=rules))
+        findings.extend(scan_content(name, (repo / name).read_bytes(), profile))
     return findings
 
 
@@ -289,8 +374,8 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(args.repo).resolve()
     try:
         findings = scan_repo(repo, args.profile)
-    except subprocess.CalledProcessError as error:
-        print(f"{SCANNER_NAME}: git ls-files failed: {error}", file=sys.stderr)
+    except (subprocess.CalledProcessError, OSError):
+        print(f"{SCANNER_NAME}: tracked-file scan failed", file=sys.stderr)
         return 2
 
     if not findings:
@@ -304,13 +389,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     for finding in findings:
         print(
-            f"  {finding.path}:{finding.line}: [{finding.rule}] {finding.match}",
+            f"  privacy finding: [{finding.rule}]",
             file=sys.stderr,
         )
     print(
         "Replace personal paths with <repo>/<user-home> or a repository-relative "
         "path; drop internal tracker/task-id/reference-clone/private-repository "
-        "references; extend ALLOWLIST only for provably synthetic fixtures.",
+        "references; preserve snapshot bytes and review unknown or changed snapshots; "
+        "extend ALLOWLIST only for provably synthetic fixtures.",
         file=sys.stderr,
     )
     return 1

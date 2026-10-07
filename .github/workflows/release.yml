@@ -158,7 +158,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked --release --target '${{ matrix.target }}' `
+          # --no-default-features pins the shipped feature set (today the
+          # default set is empty) so a later change to defaults cannot
+          # silently alter the released binary; --locked pins Cargo.lock.
+          cargo build --locked --release --no-default-features --target '${{ matrix.target }}' `
             -p agent-session-grep-cli --bin agent-session-grep
           git diff --exit-code -- Cargo.toml Cargo.lock
 
@@ -281,6 +284,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job deliberately has no checkout, so gh has no git remote to
+          # resolve the repository from and does not read GITHUB_REPOSITORY.
+          # Without GH_REPO every gh call below fails to determine a base repo.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'

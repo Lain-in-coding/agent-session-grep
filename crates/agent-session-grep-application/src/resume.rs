@@ -91,9 +91,53 @@ pub fn build_resume_descriptor(metadata: &SessionResumeMetadata) -> ResumePrevie
         "codex" => ("codex", vec!["resume".to_string(), session_id.to_string()]),
         "pi" => ("pi", vec!["--session".to_string(), session_id.to_string()]),
         "grok-build" => ("grok", vec!["--resume".to_string(), session_id.to_string()]),
+        // 证据：fast-resume antigravity.rs `resume_command` = `agy --conversation
+        // <id>`（同一 `~/.gemini/antigravity-cli` 源面，brain/*/logs JSONL 为
+        // 回退面）；agent-sessions 的 AntigravityResumeCommandBuilder 同形并
+        // 以 `agy --help` 校验 `--conversation` 存在。双源一致。
+        "antigravity" => (
+            "agy",
+            vec!["--conversation".to_string(), session_id.to_string()],
+        ),
+        // 证据：fast-resume kimi.rs `resume_command` = `kimi --session <id>`。
+        // 同源已核验：fast-resume 解析 `$KIMI_CODE_HOME/sessions/**/agents/main/
+        // wire.jsonl` + `state.json`（默认 `~/.kimi-code/sessions`），与本
+        // provider-kimi 的 wire.jsonl 面（`context.append_message` 封套）同一
+        // CLI；provider-kimi PROVENANCE.md 亦明言结构适配自 fast-resume。
+        "kimi-code" => (
+            "kimi",
+            vec!["--session".to_string(), session_id.to_string()],
+        ),
+        // 证据：AgentRecall platform.ts `getResumeCommand` 对 codebuddy-cli
+        // （读 `~/.codebuddy/projects/*.jsonl`，与本 provider 同一源面）生成
+        // `cd <repo> && codebuddy --resume <id>`；其 live-detection 亦识别真实
+        // `codebuddy --resume <id>` 进程行。
+        "tencent-codebuddy" => (
+            "codebuddy",
+            vec!["--resume".to_string(), session_id.to_string()],
+        ),
+        // 证据：fast-resume opencode.rs `resume_command` =
+        // `opencode <directory> --session <id>`——directory 是 positional 参数，
+        // 来自会话原始工作目录（SQLite 源同面）。目录缺失时省略 positional
+        // 参数：cc-switch（`opencode -s <id>`，目录由 shell cwd 承担）与 agf
+        // （`opencode -s '<id>'`）均已验证明该省略形态。
+        "opencode" => {
+            let mut args = Vec::new();
+            if let Some(dir) = metadata.original_working_directory.as_deref()
+                && !dir.trim().is_empty()
+            {
+                args.push(dir.to_string());
+            }
+            args.push("--session".to_string());
+            args.push(session_id.to_string());
+            ("opencode", args)
+        }
         // Unknown/unverified providers: resume command is null/— (not fabricated).
-        // These include: opencode, antigravity, hermes, kimi-code (version conflicts),
-        // and all not-yet-implemented providers.
+        // These include: hermes（各参考项目 resume 命令冲突：agf `hermes
+        // --resume <id>`、hstry `hermes --session <id>`、cc-switch/AgentRecall
+        // 无 CLI resume，无权威结论）、qoder（参考项目无 resume 命令证据）、
+        // cursor（fast-resume 的 `agent --resume` 属 Cursor CLI store.db 面，
+        // 与本 provider 的 VS Code vscdb 面不同源），及所有未实现 provider。
         _ => {
             return ResumePreview {
                 descriptor: ResumeDescriptor {
@@ -132,14 +176,94 @@ pub fn build_resume_descriptor(metadata: &SessionResumeMetadata) -> ResumePrevie
 }
 
 /// Format a resume command as a displayable string for dry-run preview.
+///
+/// Every interpolated token is provider-transcript data, which the threat model
+/// treats as untrusted input (`docs/security/THREAT-MODEL.md` §2). The preview
+/// exists to be copied into a shell — and an MCP/Robot client may hand it to one
+/// directly — so an unquoted token turns a poisoned `cwd` into command
+/// execution: a session whose recorded working directory ends in
+/// `…\ws" && <injected> && cd "…` renders as a command string that runs
+/// `<injected>` before ever reaching the provider.
+///
+/// Tokens are therefore quoted when they need it, and the whole preview is
+/// refused — empty string, projected as `command: null` — when a token contains
+/// a character that can still escape or expand *inside* double quotes in some
+/// common shell. No single quoting style is safe across cmd.exe, PowerShell and
+/// POSIX shells simultaneously, so for such a token the honest answer is no
+/// command rather than a plausible-looking one; `working_directory` is still
+/// reported structurally. Actual execution is unaffected either way: `--yes`
+/// spawns argv directly with `current_dir` and never goes through a shell.
 fn format_command(binary: &str, args: &[String], cwd: &Option<String>) -> String {
-    let mut parts = vec![binary.to_string()];
-    parts.extend(args.iter().cloned());
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    for token in std::iter::once(binary).chain(args.iter().map(String::as_str)) {
+        match quote_preview_token(token) {
+            Some(quoted) => parts.push(quoted),
+            None => return String::new(),
+        }
+    }
     let cmd = parts.join(" ");
-    if let Some(dir) = cwd {
-        format!("(cd {dir} && {cmd})")
+    match cwd {
+        Some(dir) => match quote_preview_token(dir) {
+            Some(quoted) => format!("(cd {quoted} && {cmd})"),
+            None => String::new(),
+        },
+        None => cmd,
+    }
+}
+
+/// Render one preview token, or `None` when it cannot be rendered safely.
+///
+/// - Rejected outright: `"` (closes the quote in every shell), `$` and
+///   `` ` `` (expand inside double quotes in POSIX shells and PowerShell), `%`
+///   and `!` (expand inside double quotes in cmd.exe), and any control
+///   character (a newline splits the command line). A token *ending* in `\` is
+///   rejected too: quoted, the `\"` is a literal quote in both POSIX shells and
+///   Windows argv parsing, so the closing quote never closes and the rest of the
+///   line is swallowed into the argument; bare, POSIX reads it as a line
+///   continuation. Interior backslashes are fine, so ordinary Windows paths
+///   still preview.
+/// - Double-quoted: anything carrying whitespace or a shell metacharacter that
+///   double quotes *do* neutralise everywhere (`& | ; < > ( ) ^ ' * ? [ ] { } ~
+///   #`), so an ordinary path with spaces still previews correctly.
+/// - Left bare: plain tokens, keeping the common preview byte-identical to a
+///   hand-typed command.
+fn quote_preview_token(token: &str) -> Option<String> {
+    if token
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '$' | '`' | '%' | '!'))
+    {
+        return None;
+    }
+    if token.ends_with('\\') {
+        return None;
+    }
+    let needs_quotes = token.is_empty()
+        || token.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '&' | '|'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '^'
+                        | '\''
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '~'
+                        | '#'
+                )
+        });
+    if needs_quotes {
+        Some(format!("\"{token}\""))
     } else {
-        cmd
+        Some(token.to_string())
     }
 }
 
@@ -214,6 +338,87 @@ mod tests {
     }
 
     #[test]
+    fn preview_command_refuses_shell_injection_from_transcript_cwd() {
+        // 真实缺陷（安全审计复现）：`original_working_directory` 逐字来自
+        // provider transcript（不可信输入），旧实现把它裸插进 `(cd {dir} && …)`。
+        // 一条被污染的会话记录即可让 dry-run 预览变成"复制即执行"的注入串，
+        // 而这个串正是给人和 MCP 客户端照抄的。
+        let evil = "C:\\ws\" && echo INJECTED && cd \".";
+        let m = metadata("claude-code", true, "abc-123", Some(evil));
+        let preview = build_resume_descriptor(&m);
+        // 结构化执行面不受影响：--yes 走 argv + current_dir，不经 shell。
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.working_directory.as_deref(), Some(evil));
+        // 展示面 fail-closed：宁可没有命令，也不给一个能注入的命令。
+        assert!(
+            preview.command_string.is_empty(),
+            "不安全的 cwd 必须拒绝出预览串，实际：{}",
+            preview.command_string
+        );
+
+        // `$`/反引号/`%`/`!`/控制字符同样必须拒绝（分别对应 POSIX shell、
+        // PowerShell、cmd.exe 的引号内展开，以及换行拆命令）。
+        for hostile in [
+            "/tmp/$(id)",
+            "/tmp/`id`",
+            "C:\\ws\\%USERPROFILE%",
+            "C:\\ws\\!DELAYED!",
+            "/tmp/a\nrm -rf /",
+        ] {
+            let m = metadata("claude-code", true, "abc-123", Some(hostile));
+            assert!(
+                build_resume_descriptor(&m).command_string.is_empty(),
+                "cwd `{hostile}` 仍产出了预览串"
+            );
+        }
+
+        // 会话 id 也来自 transcript：同一纪律适用于 args。
+        let m = metadata(
+            "claude-code",
+            true,
+            "abc\" && echo INJECTED && echo \"",
+            None,
+        );
+        assert!(build_resume_descriptor(&m).command_string.is_empty());
+    }
+
+    #[test]
+    fn preview_command_refuses_a_cwd_ending_in_a_backslash() {
+        // 真实缺陷：以 `\` 结尾的 cwd（Windows 上非常常见的"带尾分隔符"写法）
+        // 被引号包起来后是 `"C:\ws\"`——`\"` 在 POSIX shell 和 Windows argv
+        // 解析里都是"字面引号"，收尾引号因此不收尾，后面的 `&& claude …`
+        // 被整段吞进同一个参数，预览串照抄过去只会报语法错误。
+        let m = metadata("claude-code", true, "abc-123", Some("C:\\ws\\"));
+        assert!(
+            build_resume_descriptor(&m).command_string.is_empty(),
+            "尾随反斜杠的 cwd 必须拒绝出预览串"
+        );
+
+        // 但只有"尾随"才危险：路径中间的反斜杠是 Windows 常态，必须照常出串。
+        let m = metadata("claude-code", true, "abc-123", Some("C:\\ws\\proj"));
+        assert_eq!(
+            build_resume_descriptor(&m).command_string,
+            "(cd C:\\ws\\proj && claude --resume abc-123)"
+        );
+    }
+
+    #[test]
+    fn preview_command_quotes_ordinary_paths_with_spaces() {
+        // 普通含空格路径不该被拒绝，只需要引号——预览仍然可以照抄执行。
+        let m = metadata(
+            "claude-code",
+            true,
+            "abc-123",
+            Some("C:\\Program Files (x86)\\proj"),
+        );
+        let preview = build_resume_descriptor(&m);
+        assert_eq!(
+            preview.command_string,
+            "(cd \"C:\\Program Files (x86)\\proj\" && claude --resume abc-123)"
+        );
+    }
+
+    #[test]
     fn builds_claude_resume_command() {
         let m = metadata("claude-code", true, "abc-123", Some("/home/user/proj"));
         let preview = build_resume_descriptor(&m);
@@ -244,7 +449,9 @@ mod tests {
 
     #[test]
     fn unverified_provider_returns_unavailable() {
-        let m = metadata("kimi-code", true, "k-sess", None);
+        // hermes：参考项目 resume 命令冲突（agf `--resume` vs hstry `--session`
+        // vs cc-switch/AgentRecall 无 CLI），无权威结论——必须保持 unavailable。
+        let m = metadata("hermes", true, "k-sess", None);
         let preview = build_resume_descriptor(&m);
         assert!(!preview.available);
         assert!(
@@ -280,6 +487,64 @@ mod tests {
         assert!(preview.available);
         assert_eq!(preview.descriptor.provider_binary, "grok");
         assert_eq!(preview.descriptor.args, vec!["--resume", "grok-sess"]);
+    }
+
+    #[test]
+    fn builds_antigravity_resume_command() {
+        let m = metadata("antigravity", true, "agy-conv-1", None);
+        let preview = build_resume_descriptor(&m);
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.provider_binary, "agy");
+        assert_eq!(
+            preview.descriptor.args,
+            vec!["--conversation", "agy-conv-1"]
+        );
+    }
+
+    #[test]
+    fn builds_opencode_resume_command_with_directory() {
+        let m = metadata("opencode", true, "ses_opencode_1", Some("/work/opencode"));
+        let preview = build_resume_descriptor(&m);
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.provider_binary, "opencode");
+        // fast-resume 形态：directory 为 positional 参数。
+        assert_eq!(
+            preview.descriptor.args,
+            vec!["/work/opencode", "--session", "ses_opencode_1"]
+        );
+        assert!(
+            preview
+                .command_string
+                .contains("opencode /work/opencode --session ses_opencode_1")
+        );
+    }
+
+    #[test]
+    fn builds_opencode_resume_command_without_directory() {
+        // 目录缺失时省略 positional 参数（cc-switch/agf 的 `opencode -s <id>`
+        // 已验证形态，目录由 shell cwd 承担），不臆造目录。
+        let m = metadata("opencode", true, "ses_opencode_2", None);
+        let preview = build_resume_descriptor(&m);
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.args, vec!["--session", "ses_opencode_2"]);
+    }
+
+    #[test]
+    fn builds_kimi_code_resume_command() {
+        let m = metadata("kimi-code", true, "kimi-sess-1", None);
+        let preview = build_resume_descriptor(&m);
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.provider_binary, "kimi");
+        assert_eq!(preview.descriptor.args, vec!["--session", "kimi-sess-1"]);
+    }
+
+    #[test]
+    fn builds_tencent_codebuddy_resume_command() {
+        let m = metadata("tencent-codebuddy", true, "cb-sess-1", None);
+        let preview = build_resume_descriptor(&m);
+        assert!(preview.available);
+        assert_eq!(preview.descriptor.provider_binary, "codebuddy");
+        assert_eq!(preview.descriptor.args, vec!["--resume", "cb-sess-1"]);
     }
 
     #[test]

@@ -1,5 +1,13 @@
 # ADR-0009：会话恢复信息采用双 ID 与渐进披露
 
+> **编号冲突警告**：本仓库有**两个** ADR 声明 `decision_id: ADR-0009`——本文件
+> （会话恢复元数据，status **Accepted**）与
+> `ADR-0009-cross-boundary-output-redaction.md`（跨边界输出默认脱敏，status
+> **Proposed**）。两者的决策内容与状态都不同，因此裸引用「ADR-0009」是歧义的：
+> 核对引用时必须看上下文——谈 resume/双 ID/`get_session_resume` 的指本文件，谈
+> 脱敏/Robot/MCP/Web 输出边界的指另一份。改号需要同步约 90 处引用（含 20 个源码
+> 文件的注释），属 owner 决策，未执行前保留本警告。
+
 > 治理记录（Governance Record）
 >
 > - decision_id: ADR-0009

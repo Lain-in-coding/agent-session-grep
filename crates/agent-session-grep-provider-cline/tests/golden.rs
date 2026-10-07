@@ -7,13 +7,14 @@
 //! Cline 是单文件 JSON 数组（`api_conversation_history.json`）。适配器不产出
 //! 字节 span（`span: None`）——span round-trip 标记 N/A；capability.rs 的
 //! `source_span` 诚实声明为 `unsupported`。
+//!
+//! 全字段捕获 sink、fixture 读取与 BLAKE3 校验、canonical JSON 投影复用
+//! `agent_session_grep_testkit::golden`，本文件只保留 cline 特有的断言。
 
-use agent_session_grep_ports::{
-    CanonicalEventSink, Confidence, MessageEvent, ParseReport, ProviderAdapter,
-};
+use agent_session_grep_ports::{Confidence, ParseReport, ProviderAdapter};
 use agent_session_grep_provider_cline::ClineAdapter;
 use agent_session_grep_testkit::assert_read_only;
-use serde_json::{Value, json};
+use agent_session_grep_testkit::golden::{self, CapturingSink};
 
 const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/basic.json");
 const EXPECTED_PATH: &str = concat!(
@@ -21,104 +22,24 @@ const EXPECTED_PATH: &str = concat!(
     "/tests/golden/basic.expected.json"
 );
 
-#[derive(Default)]
-struct CollectingSink {
-    messages: Vec<Captured>,
-}
-
-struct Captured {
-    seq: u32,
-    native_id: String,
-    parent_native_id: Option<String>,
-    role: String,
-    text: String,
-    timestamp: Option<String>,
-    is_sidechain: bool,
-    span: Option<(u64, u64)>,
-}
-
-impl CanonicalEventSink for CollectingSink {
-    fn emit_message(
-        &mut self,
-        event: MessageEvent<'_>,
-    ) -> agent_session_grep_ports::PortResult<()> {
-        self.messages.push(Captured {
-            seq: event.seq,
-            native_id: event.native_id.to_string(),
-            parent_native_id: event.parent_native_id.map(str::to_string),
-            role: event.role.to_string(),
-            text: event.text.to_string(),
-            timestamp: event.timestamp.map(str::to_string),
-            is_sidechain: event.is_sidechain,
-            span: event.span,
-        });
-        Ok(())
-    }
-}
-
-fn read_expected() -> Value {
-    let bytes = std::fs::read(EXPECTED_PATH).expect("read basic.expected.json");
-    serde_json::from_slice(&bytes).expect("basic.expected.json must be valid JSON")
-}
-
-fn read_fixture_verified(expected: &Value) -> Vec<u8> {
-    let bytes = std::fs::read(FIXTURE_PATH).expect("read basic.json fixture");
-    let actual = blake3::hash(&bytes).to_hex().to_string();
-    let pinned = expected["fixture_blake3"]
-        .as_str()
-        .expect("expected.json must pin fixture_blake3");
-    assert_eq!(
-        actual, pinned,
-        "fixture bytes drifted — check .gitattributes -text rules (actual blake3 = {actual})"
-    );
-    bytes
-}
-
-fn parse_fixture(bytes: &[u8]) -> (ParseReport, Vec<Captured>) {
-    let mut sink = CollectingSink::default();
-    let report = ClineAdapter::new()
-        .parse(bytes, &mut sink)
-        .expect("golden fixture parse must succeed");
-    (report, sink.messages)
-}
-
-fn canonical_json(fixture_blake3: &str, report: &ParseReport, messages: &[Captured]) -> Value {
-    json!({
-        "fixture_blake3": fixture_blake3,
-        "session_native_id": report.session_native_id,
-        "committed": report.committed,
-        "skipped": report.skipped,
-        "messages": messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "seq": m.seq,
-                    "native_id": m.native_id,
-                    "parent_native_id": m.parent_native_id,
-                    "role": m.role,
-                    "text": m.text,
-                    "timestamp": m.timestamp,
-                    "is_sidechain": m.is_sidechain,
-                    "span": m.span.map(|(start, end)| json!({"start": start, "end": end})),
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
+/// 解析 fixture：经共享 sink 全字段捕获，返回报告与 sink。
+fn parse_fixture(bytes: &[u8]) -> (ParseReport, CapturingSink) {
+    golden::parse_golden(&ClineAdapter::new(), bytes)
 }
 
 #[test]
 fn probe_never_mutates_source_bytes() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
     assert_read_only(&bytes, |source| ClineAdapter::new().probe(source))
         .expect("golden fixture probe must succeed");
 }
 
 #[test]
 fn parse_never_mutates_source_bytes() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let mut sink = CollectingSink::default();
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let mut sink = CapturingSink::default();
     let report = assert_read_only(&bytes, |source| {
         ClineAdapter::new().parse(source, &mut sink)
     })
@@ -134,11 +55,11 @@ fn golden_provenance_revision_matches_manifest() {
 
 #[test]
 fn golden_canonical_output_is_pinned() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let (report, messages) = parse_fixture(&bytes);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let (report, sink) = parse_fixture(&bytes);
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    let actual = canonical_json(&hash, &report, &messages);
+    let actual = golden::canonical_json(&hash, &report, &sink.messages);
     let actual_pretty = serde_json::to_string_pretty(&actual).expect("serialize actual");
     assert_eq!(
         actual, expected,
@@ -150,8 +71,8 @@ fn golden_canonical_output_is_pinned() {
 fn golden_probe_confirms_fixture() {
     // Cline 是单文档 JSON 数组：probe 直接解析整体，无"破损行"概念。fixture 必须
     // 被确认为 Cline（数组 + 含 role 字段的记录）。
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
     let r = ClineAdapter::new()
         .probe(&bytes)
         .expect("golden fixture probe must succeed");
@@ -161,9 +82,10 @@ fn golden_probe_confirms_fixture() {
 #[test]
 fn golden_messages_carry_no_byte_span() {
     // JSON 数组无行式字节坐标：span round-trip 标记 N/A，全部消息 span 为 None。
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let (_, messages) = parse_fixture(&bytes);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let (_, sink) = parse_fixture(&bytes);
+    let messages = &sink.messages;
     assert!(!messages.is_empty(), "golden fixture must emit messages");
     assert!(
         messages.iter().all(|m| m.span.is_none()),
@@ -180,9 +102,10 @@ fn golden_messages_carry_no_byte_span() {
 fn print_actual_canonical_output_for_regeneration() {
     let bytes = std::fs::read(FIXTURE_PATH).expect("read basic.json fixture");
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    let (report, messages) = parse_fixture(&bytes);
+    let (report, sink) = parse_fixture(&bytes);
     println!(
         "{}",
-        serde_json::to_string_pretty(&canonical_json(&hash, &report, &messages)).unwrap()
+        serde_json::to_string_pretty(&golden::canonical_json(&hash, &report, &sink.messages))
+            .unwrap()
     );
 }

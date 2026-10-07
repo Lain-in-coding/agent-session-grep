@@ -3,10 +3,11 @@
 > Evidence record
 >
 > - evidence id: `IB-REAL-DATA-REGRESSION-001`
-> - status: **passed** — the latest fixed-binary full-corpus run
->   (2026-08-13) satisfies all six invariants with harness exit 0.
-> - latest full run: generated `2026-08-13T01:46:55Z` (Thursday, August 13,
->   2026 local date), outcome `passed` (v5, review-fixed renamed binary).
+> - status: **passed** — the latest full-corpus run (2026-08-24) satisfies
+>   all **seven** invariants with harness exit 0. Earlier runs recorded on
+>   this page predate `INV-SOURCES-UNCHANGED` and evaluated six.
+> - latest full run: generated `2026-08-24T17:22:18Z`, outcome `passed`
+>   (v10, first seven-invariant run).
 > - harness: `scripts/evidence/real_data_regression.py`
 > - authorization: the operator's own machine and transcripts; data never
 >   leaves the host. This file carries aggregate-only facts.
@@ -15,7 +16,9 @@
 
 The harness built a throwaway temporary data root, ingested the authorized
 Claude Code and Codex corpus through the real release binary in `--robot` mode,
-and was configured to evaluate six invariants. Sources remained read-only.
+and evaluates the seven invariants listed in the harness. Sources remained
+read-only. Runs up to v5 predate `INV-SOURCES-UNCHANGED` and therefore report
+six invariants; v10 is the first to cover all seven.
 
 The generated report matched the exact closed aggregate key sets. A raw-value
 scan found no Windows, Unix-home, or UNC paths, UUIDs, or complete stable entity
@@ -113,6 +116,47 @@ INV-CONTEXT-NONEMPTY  PASS  242 sessions, 0 failed, 11 zero-placement, 0 interna
 INV-SPAN-COVERAGE     PASS  630/630 spans have byte precision
 INV-REBUILD-STABLE    PASS  rebuild exit 0, catalog 169060 -> 169060, sampled terms match
 ```
+
+## Latest run: v10 (2026-08-24, seven invariants, PASSED)
+
+The v10 run is the first full-corpus run evaluated against **all seven**
+invariants, including `INV-SOURCES-UNCHANGED` (added after v5). It ran over a
+frozen snapshot of the authorized corpus staged outside the repository, so no
+source could be appended to mid-scan.
+
+| Item | Value |
+|---|---|
+| Generated | `2026-08-24T17:22:18Z` |
+| Binary | `agent-session-grep.exe` 0.1.0, sha256 `e416d45683e532bffde93f5516483d930acef87dc4b322d7d0857857437dd794` |
+| Corpus | 1,900 source files, 2,222,889,692 bytes |
+| Outcome | `passed` |
+| Sync result | exit 0, 326,100 emitted records, 0 skipped |
+| Catalog | 312,553 de-duplicated `msg_v1_` entities, 239 sessions, 1,898 documents |
+| Rebuild | catalog 314,690 -> 314,690, ids match |
+
+```text
+INV-SYNC-OK            PASS  exit 0, ok=True, 1900 sources, 326100 emitted, 0 skipped
+INV-NO-PARSE-LOSS      PASS  provider emitted 326100, persisted 326100 claims, skipped 0
+INV-SESSION-PRESENT    PASS  239 sessions for 1900 source files
+INV-CONTEXT-NONEMPTY   PASS  239 sessions, 0 failed, 9 zero-placement, 0 internal
+INV-SPAN-COVERAGE      PASS  515/515 spans have byte precision
+INV-REBUILD-STABLE     PASS  rebuild exit 0, catalog 314690 -> 314690, sampled terms match
+INV-SOURCES-UNCHANGED  PASS  1900 sources checked, 1900 unchanged, 0 changed
+```
+
+Two product defects were found and fixed on the way to this run; both are
+real bugs that only a full real corpus surfaced:
+
+- **Duplicate activity ids within one source** (`catalog_error`, exit 6). Tool
+  activity ids are content-addressed over all facts, so a message containing
+  two byte-identical tool calls derives one id. The batch validator treated
+  that intra-source collision as a conflict and rejected the whole sync. It now
+  de-duplicates by id and fails closed only when two rows share an id but
+  disagree on facts.
+- **Unicode line splitting in the harness itself.** `str.splitlines()` splits
+  on U+2028/U+2029/U+0085, which JSON permits unescaped inside strings, so a
+  transcript containing one made the envelope parser read a fragment. Three
+  evidence scripts had the same latent bug; all now split on `\n` only.
 
 ## Earlier failed full run (2026-07-31, recorded as-is)
 
