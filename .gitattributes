@@ -12,3 +12,6 @@ crates/*/tests/golden/*.db binary
 # silently breaks every `set -euo pipefail` script on Unix CI.
 *.sh text eol=lf
 *.py text eol=lf
+
+# Public projection hashes must not depend on checkout newline conversion.
+scripts/release/public_AGENTS.md text eol=lf
