@@ -7,13 +7,14 @@ actually runs: an action reference that is not pinned to a commit SHA, a
 repository from, a release build that stopped binding the lockfile / feature
 set / target, a matrix that lost an operating system, and a verification
 workflow that quietly gained the ability to publish. The assertions are
-text-based on purpose — the helper suites are standard-library only, so no
-YAML parser is available; ``scripts/release/validate_workflows.py`` adds a
+text-based for YAML structure; Python argv uses the stdlib AST. No extra
+YAML parser is required; ``scripts/release/validate_workflows.py`` adds a
 real YAML parse for local runs.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -62,6 +63,31 @@ def cargo_build_commands(text: str) -> list[str]:
     return commands
 
 
+def has_python_gh_call(block: str) -> bool:
+    """Recognize literal subprocess argv, not a comment mentioning `gh`."""
+    if not re.search(r"(?m)^        shell: python(?: \{0\})?$", block):
+        return False
+    match = re.search(r"(?ms)^        run: \|\n(.*)$", block)
+    if match is None:
+        raise AssertionError("Python command step has no literal run block")
+    lines = []
+    for line in match[1].splitlines():
+        if line and not line.startswith("          "):
+            break
+        lines.append(line[10:] if line else "")
+    source = "\n".join(lines)
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr in {"run", "check_call", "check_output"}
+                and node.args and isinstance(node.args[0], (ast.List, ast.Tuple))):
+            argv = node.args[0].elts
+            if argv and isinstance(argv[0], ast.Constant) and argv[0].value == "gh":
+                return True
+    return False
+
+
 class WorkflowContractTests(unittest.TestCase):
     def test_workflow_directory_is_not_empty(self) -> None:
         # Guards the tests below against silently passing over zero files.
@@ -93,7 +119,7 @@ class WorkflowContractTests(unittest.TestCase):
         offenders: list[str] = []
         gh_steps = 0
         for block in STEP_BOUNDARY.split(text):
-            if not GH_COMMAND.search(block):
+            if not GH_COMMAND.search(block) and not has_python_gh_call(block):
                 continue
             gh_steps += 1
             if "GH_REPO:" not in block and "--repo" not in block:
@@ -175,12 +201,23 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("x86_64-apple-darwin", targets)
         self.assertIn("aarch64-apple-darwin", targets)
 
-    def test_verify_matrix_keeps_one_runner_per_os_family(self) -> None:
-        # Deliberate difference from release.yml: one runner per OS family
-        # keeps verification runner minutes down; the release matrix still
-        # covers the second macOS arch.
-        runners = MATRIX_RUNNER.findall(read_workflow("release-verify.yml"))
-        self.assertEqual(len(runners), 3, f"verify runners: {runners}")
+    def test_release_and_verify_matrices_cover_exactly_four_targets(self) -> None:
+        expected_targets = {
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        }
+        for name in RELEASE_BUILD_WORKFLOWS:
+            text = read_workflow(name)
+            runners = MATRIX_RUNNER.findall(text)
+            targets = MATRIX_TARGET.findall(text)
+            self.assertEqual(len(runners), 4, f"{name}: runners {runners}")
+            self.assertCountEqual(targets, expected_targets,
+                                  f"{name}: incomplete or duplicate targets")
+            for family, count in (("windows", 1), ("ubuntu", 1), ("macos", 2)):
+                self.assertEqual(sum(family in runner for runner in runners),
+                                 count, f"{name}: {family} runner count")
 
     def test_release_workflows_upload_artifacts_with_checksums(self) -> None:
         for name in RELEASE_BUILD_WORKFLOWS:

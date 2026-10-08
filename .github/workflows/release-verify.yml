@@ -1,129 +1,231 @@
 name: release-verify
 
-# Verifies the release build path for the current commit on the three
-# operating systems without creating a tag, a GitHub Release, or any other
-# published artifact. The tag-driven release.yml is the only publishing
-# workflow; this one exists because release.yml cannot run until an owner
-# pushes a v* tag, so the build/test/package/checksum chain would otherwise
-# never be exercised or downloadable for a commit under review.
-#
-# Boundary: everything this workflow uploads is an unsigned GitHub Actions
-# artifact with a retention window, not a release asset. The archive names
-# follow the same packaging helper as a real release, so read the artifact
-# name (release-verify-<commit>-<target>) and the unsigned provenance block
-# inside each manifest before assuming anything about its status.
-#
-# Windows MSVC additionally runs a CRT-static RUSTFLAGS build. The tag-driven
-# release.yml matrix still builds both macOS architectures; this verification
-# matrix deliberately keeps one runner per OS family to bound runner minutes.
-
+# The unfiltered PR/main entry runs one quality matrix and all four release
+# targets. These are temporary unsigned Actions artifacts, never Releases.
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/release-verify.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/ci.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "scripts/release/**"
-      - "scripts/install/**"
-      - "scripts/verify-release.py"
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/release-verify.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/ci.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "scripts/release/**"
-      - "scripts/install/**"
-      - "scripts/verify-release.py"
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
   MACOSX_DEPLOYMENT_TARGET: "12.0"
 
 jobs:
-  # The test half of the loop is the existing required CI gate, unchanged and
-  # not duplicated: three-OS fmt/clippy/test plus the installer smoke job.
   quality:
     name: required CI quality gates
+    needs: [prepare]
     uses: ./.github/workflows/ci.yml
+    with:
+      source_commit: ${{ needs.prepare.outputs.source_commit }}
 
   prepare:
-    name: resolve verification inputs
+    name: resolve exact source and release inputs
     runs-on: ubuntu-22.04
     outputs:
-      version: ${{ steps.source.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
       source_commit: ${{ steps.source.outputs.source_commit }}
-      source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
+      source_date_epoch: ${{ steps.version.outputs.source_date_epoch }}
+      cargo_lock_sha256: ${{ steps.version.outputs.cargo_lock_sha256 }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
+      - name: Resolve exact prepared source
+        id: source
+        shell: python {0}
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          import re
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+
+          import os
+
+          if __name__ == "__main__":
+              source = validate_source_commit(os.environ["SOURCE_COMMIT"])
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"source_commit={source}\n")
+
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # Keep settings action-local. The assertion below restores only the eight
+        # release inputs from raw Git blobs, independent of checkout EOL handling.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          ref: ${{ steps.source.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert exact source checkout
+        id: assert_source
+        shell: python {0}
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          import os
+          import subprocess
+          import stat
+          from pathlib import Path
+
+          def assert_source(source_commit):
+              expected = validate_source_commit(source_commit)
+              actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if actual != expected:
+                  raise ValueError("checkout HEAD does not match prepared source_commit")
+
+          RELEASE_INPUTS = ("Cargo.lock", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE",
+                            "CHANGELOG.md", "SECURITY.md", "NOTICE")
+
+          def materialize_release_inputs(source_commit):
+              source = validate_source_commit(source_commit)
+              tree = subprocess.check_output(["git", "ls-tree", "-z", "--full-tree", source, "--", *RELEASE_INPUTS])
+              if not tree.endswith(b"\0"):
+                  raise ValueError("required release input tree is missing or incomplete")
+              names = {name.encode("ascii"): name for name in RELEASE_INPUTS}
+              objects = {}
+              for record in tree[:-1].split(b"\0"):
+                  header, separator, filename = record.partition(b"\t")
+                  fields = header.split()
+                  if (not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}
+                          or fields[1] != b"blob" or not re.fullmatch(rb"[0-9a-f]{40}", fields[2])
+                          or filename not in names or names[filename] in objects):
+                      raise ValueError("release inputs must be unique regular Git blobs")
+                  objects[names[filename]] = fields[2].decode("ascii")
+              if set(objects) != set(RELEASE_INPUTS):
+                  raise ValueError("required release input inventory is incomplete")
+              prepared = []
+              for name in RELEASE_INPUTS:
+                  path = Path(name)
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                      raise ValueError("release input is not a singly linked regular working file")
+                  content = subprocess.check_output(["git", "cat-file", "blob", objects[name]])
+                  prepared.append((path, info, content))
+              # Validate the complete inventory and read all immutable blobs before
+              # any write. Never normalize other files, create a missing input or
+              # run smudge/textconv filters while materializing these eight paths.
+              for path, info, content in prepared:
+                  with path.open("r+b") as handle:
+                      current = os.fstat(handle.fileno())
+                      if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                              or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)):
+                          raise ValueError("release input identity changed before materialization")
+                      if handle.read() != content:
+                          handle.seek(0)
+                          handle.write(content)
+                          handle.truncate()
+
+          if __name__ == "__main__":
+              assert_source(os.environ["SOURCE_COMMIT"])
+              materialize_release_inputs(os.environ["SOURCE_COMMIT"])
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - name: Resolve workspace version and source commit
-        id: source
-        shell: pwsh
+      - name: Validate workspace version and immutable inputs
+        id: version
+        shell: python {0}
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          REQUESTED_TAG: ""
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          # The verified commit is the checked-out commit itself (for a pull
-          # request that is the merge commit GitHub built), never a tag.
-          $commit = (git rev-parse HEAD).Trim()
-          $epoch = (git show -s --format=%ct HEAD).Trim()
-          $inSection = $false
-          $version = $null
-          foreach ($line in Get-Content 'Cargo.toml') {
-            if ($line -match '^\s*\[') {
-              $inSection = $line -match '^\s*\[workspace\.package\]\s*$'
-              continue
-            }
-            if ($inSection -and $line -match '^\s*version\s*=\s*"([^"]+)"\s*$') {
-              $version = $Matches[1]
-              break
-            }
-          }
-          if (-not $version) {
-            throw 'Cargo.toml must declare exactly one [workspace.package] version'
-          }
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "source_commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "source_date_epoch=$epoch" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+
+          def validate_version(value):
+              if not isinstance(value, str) or not re.fullmatch(
+                  r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                  r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+              ):
+                  raise ValueError("version must be a canonical SemVer archive component")
+              prerelease = value.split("+", 1)[0].partition("-")[2]
+              if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
+                  raise ValueError("numeric prerelease identifiers cannot have leading zeroes")
+              return value
+
+          def validate_tag(tag):
+              if not isinstance(tag, str) or not tag.startswith("v"):
+                  raise ValueError("release tag must be v<version>")
+              validate_version(tag[1:])
+              return tag
+
+          import hashlib
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          if __name__ == "__main__":
+              source_commit = validate_source_commit(os.environ["SOURCE_COMMIT"])
+              with Path("Cargo.toml").open("rb") as manifest:
+                  version = validate_version(tomllib.load(manifest)["workspace"]["package"]["version"])
+              tag = "v" + version
+              requested = os.environ["REQUESTED_TAG"]
+              if requested and validate_tag(requested) != tag:
+                  raise ValueError("tag and workspace version disagree")
+              epoch = subprocess.check_output(["git", "show", "-s", "--format=%ct", source_commit], text=True).strip()
+              if not re.fullmatch(r"0|[1-9][0-9]*", epoch):
+                  raise ValueError("invalid source date epoch")
+              lock_hash = hashlib.sha256(Path("Cargo.lock").read_bytes()).hexdigest()
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  for key, value in {"tag": tag, "version": version, "source_date_epoch": epoch,
+                                     "cargo_lock_sha256": lock_hash}.items():
+                      output.write(f"{key}={value}\n")
 
       - name: Generate locked metadata and dependency inventory
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Path 'release-inputs' | Out-Null
           cargo metadata --locked --format-version 1 |
             Set-Content -Encoding utf8NoBOM -Path 'release-inputs/cargo-metadata.json'
+          python scripts/release/build-manifest.py validate `
+            --workspace . --tag $env:RELEASE_TAG --version $env:VERSION `
+            --metadata 'release-inputs/cargo-metadata.json'
           python scripts/release/build-manifest.py inventory `
-            --workspace . `
-            --metadata 'release-inputs/cargo-metadata.json' `
-            --version '${{ steps.source.outputs.version }}' `
-            --output-dir 'release-inputs'
-          Remove-Item 'release-inputs/cargo-metadata.json'
+            --workspace . --metadata 'release-inputs/cargo-metadata.json' `
+            --version $env:VERSION --output-dir 'release-inputs'
+          Remove-Item -LiteralPath 'release-inputs/cargo-metadata.json'
           git diff --exit-code -- Cargo.toml Cargo.lock
 
-      - name: Upload verification inputs
+      - name: Upload common release inputs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-verify-inputs-${{ github.sha }}
+          name: release-verify-inputs-${{ steps.source.outputs.source_commit }}-${{ github.run_attempt }}
           path: |
             release-inputs/THIRD-PARTY-DEPENDENCIES.json
             release-inputs/THIRD-PARTY-DEPENDENCIES.csv
@@ -149,33 +251,122 @@ jobs:
             binary: agent-session-grep
             archive_format: tar.gz
             rustflags: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: agent-session-grep
+            archive_format: tar.gz
+            rustflags: ""
           - runner: macos-15
             target: aarch64-apple-darwin
             binary: agent-session-grep
             archive_format: tar.gz
             rustflags: ""
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+      ARCHIVE_FORMAT: ${{ matrix.archive_format }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        # Keep settings action-local. The assertion below restores only the eight
+        # release inputs from raw Git blobs, independent of checkout EOL handling.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - name: Assert exact source checkout
+        id: assert_source
+        shell: python {0}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          import os
+          import subprocess
+          import stat
+          from pathlib import Path
+
+          def assert_source(source_commit):
+              expected = validate_source_commit(source_commit)
+              actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if actual != expected:
+                  raise ValueError("checkout HEAD does not match prepared source_commit")
+
+          RELEASE_INPUTS = ("Cargo.lock", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE",
+                            "CHANGELOG.md", "SECURITY.md", "NOTICE")
+
+          def materialize_release_inputs(source_commit):
+              source = validate_source_commit(source_commit)
+              tree = subprocess.check_output(["git", "ls-tree", "-z", "--full-tree", source, "--", *RELEASE_INPUTS])
+              if not tree.endswith(b"\0"):
+                  raise ValueError("required release input tree is missing or incomplete")
+              names = {name.encode("ascii"): name for name in RELEASE_INPUTS}
+              objects = {}
+              for record in tree[:-1].split(b"\0"):
+                  header, separator, filename = record.partition(b"\t")
+                  fields = header.split()
+                  if (not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}
+                          or fields[1] != b"blob" or not re.fullmatch(rb"[0-9a-f]{40}", fields[2])
+                          or filename not in names or names[filename] in objects):
+                      raise ValueError("release inputs must be unique regular Git blobs")
+                  objects[names[filename]] = fields[2].decode("ascii")
+              if set(objects) != set(RELEASE_INPUTS):
+                  raise ValueError("required release input inventory is incomplete")
+              prepared = []
+              for name in RELEASE_INPUTS:
+                  path = Path(name)
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                      raise ValueError("release input is not a singly linked regular working file")
+                  content = subprocess.check_output(["git", "cat-file", "blob", objects[name]])
+                  prepared.append((path, info, content))
+              # Validate the complete inventory and read all immutable blobs before
+              # any write. Never normalize other files, create a missing input or
+              # run smudge/textconv filters while materializing these eight paths.
+              for path, info, content in prepared:
+                  with path.open("r+b") as handle:
+                      current = os.fstat(handle.fileno())
+                      if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                              or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)):
+                          raise ValueError("release input identity changed before materialization")
+                      if handle.read() != content:
+                          handle.seek(0)
+                          handle.write(content)
+                          handle.truncate()
+
+          if __name__ == "__main__":
+              assert_source(os.environ["SOURCE_COMMIT"])
+              materialize_release_inputs(os.environ["SOURCE_COMMIT"])
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Download verification inputs
+      - name: Download common release inputs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-verify-inputs-${{ github.sha }}
+          name: release-verify-inputs-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: release-inputs
 
-      # Same flags as release.yml: --locked pins Cargo.lock, --no-default-features
-      # pins the shipped feature set (today the default set is empty), and
-      # --target pins the exact triple.
       - name: Build locked release binary
         shell: pwsh
         env:
@@ -183,76 +374,730 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked --release --no-default-features --target '${{ matrix.target }}' `
+          cargo build --locked --release --no-default-features --target $env:TARGET `
             -p agent-session-grep-cli --bin agent-session-grep
           git diff --exit-code -- Cargo.toml Cargo.lock
+
+      - name: Verify exact binary version
+        id: verify_binary
+        shell: python {0}
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def validate_binary_version(reported, version):
+              expected = "agent-session-grep " + version
+              if reported not in (expected, expected + "\n", expected + "\r\n"):
+                  raise ValueError("binary version does not exactly match the prepared version")
+
+          if __name__ == "__main__":
+              binary = Path("target", os.environ["TARGET"], "release", os.environ["BINARY"]).resolve(strict=True)
+              validate_binary_version(subprocess.check_output([str(binary), "--version"], text=True), os.environ["VERSION"])
 
       - name: Synthetic release smoke
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $binary = (Resolve-Path (Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}')).Path
+          $binary = (Resolve-Path -LiteralPath "target/$env:TARGET/release/$env:BINARY").Path
           python scripts/verify-release.py --asg $binary
 
-      - name: Package unsigned verification archive
+      - name: Build deterministic unsigned archive and manifest
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $binary = (Resolve-Path (Join-Path 'target/${{ matrix.target }}/release' '${{ matrix.binary }}')).Path
-          # The archive is only as trustworthy as the version it claims: fail
-          # closed when the binary and the workspace version disagree.
-          $reported = (& $binary --version | Out-String).Trim()
-          if (-not $reported.Contains('${{ needs.prepare.outputs.version }}')) {
-            throw "built binary reports '$reported' but Cargo.toml declares ${{ needs.prepare.outputs.version }}"
-          }
-          # The packaging helper requires tag == v<version>; the tag string is
-          # the archive-name component only. No ref or GitHub Release is
-          # created by this workflow.
+          $binary = (Resolve-Path -LiteralPath "target/$env:TARGET/release/$env:BINARY").Path
+          # In release-verify the v<version> string is only an archive component;
+          # packaging never creates a Git ref or a GitHub Release.
           python scripts/release/build-manifest.py package `
-            --workspace . `
-            --binary $binary `
+            --workspace . --binary $binary `
             --dependency-json 'release-inputs/THIRD-PARTY-DEPENDENCIES.json' `
             --dependency-csv 'release-inputs/THIRD-PARTY-DEPENDENCIES.csv' `
-            --target '${{ matrix.target }}' `
-            --tag 'v${{ needs.prepare.outputs.version }}' `
-            --version '${{ needs.prepare.outputs.version }}' `
-            --source-commit '${{ needs.prepare.outputs.source_commit }}' `
-            --source-date-epoch '${{ needs.prepare.outputs.source_date_epoch }}' `
-            --archive-format '${{ matrix.archive_format }}' `
-            --output-dir dist
+            --target $env:TARGET --tag $env:RELEASE_TAG --version $env:VERSION `
+            --source-commit $env:SOURCE_COMMIT --source-date-epoch $env:SOURCE_DATE_EPOCH `
+            --archive-format $env:ARCHIVE_FORMAT --output-dir dist
 
-      - name: Write and re-verify SHA256SUMS
+      - name: Write target artifact checksums
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           python scripts/release/build-manifest.py checksums `
-            --directory dist `
-            --output dist/SHA256SUMS
-          # Fail closed when the written list does not match the bytes on disk.
-          $listed = 0
-          foreach ($line in Get-Content 'dist/SHA256SUMS') {
-            if ($line -notmatch '^([0-9a-f]{64})  (.+)$') {
-              throw "malformed SHA256SUMS line: $line"
-            }
-            $expected = $Matches[1]
-            $name = $Matches[2]
-            $actual = (Get-FileHash -LiteralPath (Join-Path 'dist' $name) -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -ne $expected) {
-              throw "sha256 mismatch for $name"
-            }
-            $listed++
-          }
-          if ($listed -lt 2) {
-            throw "SHA256SUMS should cover the archive and its manifest; covered $listed files"
-          }
+            --directory dist --output dist/SHA256SUMS
 
-      - name: Upload unsigned verification artifact
+      - name: Upload unsigned target artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-verify-${{ github.sha }}-${{ matrix.target }}
+          name: release-verify-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+  assemble:
+    name: validate complete four-target unsigned bundle
+    needs: [prepare, quality, build]
+    runs-on: ubuntu-22.04
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+      CARGO_LOCK_SHA256: ${{ needs.prepare.outputs.cargo_lock_sha256 }}
+      ARTIFACT_PREFIX: release-verify-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}-
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Assert exact source checkout
+        id: assert_source
+        shell: python {0}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          import os
+          import subprocess
+          import stat
+          from pathlib import Path
+
+          def assert_source(source_commit):
+              expected = validate_source_commit(source_commit)
+              actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if actual != expected:
+                  raise ValueError("checkout HEAD does not match prepared source_commit")
+
+          RELEASE_INPUTS = ("Cargo.lock", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE",
+                            "CHANGELOG.md", "SECURITY.md", "NOTICE")
+
+          def materialize_release_inputs(source_commit):
+              source = validate_source_commit(source_commit)
+              tree = subprocess.check_output(["git", "ls-tree", "-z", "--full-tree", source, "--", *RELEASE_INPUTS])
+              if not tree.endswith(b"\0"):
+                  raise ValueError("required release input tree is missing or incomplete")
+              names = {name.encode("ascii"): name for name in RELEASE_INPUTS}
+              objects = {}
+              for record in tree[:-1].split(b"\0"):
+                  header, separator, filename = record.partition(b"\t")
+                  fields = header.split()
+                  if (not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}
+                          or fields[1] != b"blob" or not re.fullmatch(rb"[0-9a-f]{40}", fields[2])
+                          or filename not in names or names[filename] in objects):
+                      raise ValueError("release inputs must be unique regular Git blobs")
+                  objects[names[filename]] = fields[2].decode("ascii")
+              if set(objects) != set(RELEASE_INPUTS):
+                  raise ValueError("required release input inventory is incomplete")
+              prepared = []
+              for name in RELEASE_INPUTS:
+                  path = Path(name)
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                      raise ValueError("release input is not a singly linked regular working file")
+                  content = subprocess.check_output(["git", "cat-file", "blob", objects[name]])
+                  prepared.append((path, info, content))
+              # Validate the complete inventory and read all immutable blobs before
+              # any write. Never normalize other files, create a missing input or
+              # run smudge/textconv filters while materializing these eight paths.
+              for path, info, content in prepared:
+                  with path.open("r+b") as handle:
+                      current = os.fstat(handle.fileno())
+                      if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                              or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)):
+                          raise ValueError("release input identity changed before materialization")
+                      if handle.read() != content:
+                          handle.seek(0)
+                          handle.write(content)
+                          handle.truncate()
+
+          if __name__ == "__main__":
+              assert_source(os.environ["SOURCE_COMMIT"])
+              materialize_release_inputs(os.environ["SOURCE_COMMIT"])
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Download separate target artifacts without merging
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-verify-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Download common dependency inventory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-verify-inputs-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: release-inputs
+
+      - name: Validate target inventories before assembling
+        id: assemble_artifacts
+        shell: python {0}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          def validate_version(value):
+              if not isinstance(value, str) or not re.fullmatch(
+                  r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                  r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+              ):
+                  raise ValueError("version must be a canonical SemVer archive component")
+              prerelease = value.split("+", 1)[0].partition("-")[2]
+              if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
+                  raise ValueError("numeric prerelease identifiers cannot have leading zeroes")
+              return value
+
+          def validate_tag(tag):
+              if not isinstance(tag, str) or not tag.startswith("v"):
+                  raise ValueError("release tag must be v<version>")
+              validate_version(tag[1:])
+              return tag
+
+          import hashlib
+          import json
+          from pathlib import Path
+
+          TARGETS = {
+              "x86_64-pc-windows-msvc": ("zip", "agent-session-grep.exe"),
+              "x86_64-unknown-linux-gnu": ("tar.gz", "agent-session-grep"),
+              "x86_64-apple-darwin": ("tar.gz", "agent-session-grep"),
+              "aarch64-apple-darwin": ("tar.gz", "agent-session-grep"),
+          }
+          DEPENDENCIES = ("THIRD-PARTY-DEPENDENCIES.json", "THIRD-PARTY-DEPENDENCIES.csv")
+          DOCUMENTS = ("README.md", "LICENSE-MIT", "LICENSE-APACHE", "CHANGELOG.md", "SECURITY.md", "NOTICE")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON field")
+                  result[key] = value
+              return result
+
+          def hash_stream(handle):
+              digest, size = hashlib.sha256(), 0
+              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                  digest.update(chunk)
+                  size += len(chunk)
+              return digest.hexdigest(), size
+
+          def sha256_file(path):
+              with Path(path).open("rb") as handle:
+                  return hash_stream(handle)[0]
+
+          def require_files(root, expected):
+              root = Path(root)
+              if root.is_symlink() or not root.is_dir():
+                  raise ValueError("artifact directory is missing or linked")
+              files = list(root.iterdir())
+              if {path.name for path in files} != set(expected) or any(path.is_symlink() or not path.is_file() for path in files):
+                  raise ValueError("artifact file inventory does not exactly match the contract")
+
+          def validate_checksums(root, expected):
+              root = Path(root)
+              require_files(root, {*expected, "SHA256SUMS"})
+              found = set()
+              for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+                  match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+                  if not match or match[2] not in expected or match[2] in found:
+                      raise ValueError("malformed, duplicate or unexpected checksum entry")
+                  found.add(match[2])
+                  if sha256_file(root / match[2]) != match[1]:
+                      raise ValueError("artifact checksum mismatch")
+              if found != set(expected):
+                  raise ValueError("checksum inventory is incomplete")
+
+          import os
+          import shutil
+
+          def assemble_artifacts(artifact_root, input_root, output_root, prefix, tag):
+              validate_tag(tag)
+              if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9-]+-", prefix):
+                  raise ValueError("invalid artifact prefix")
+              artifact_root, input_root, output_root = map(Path, (artifact_root, input_root, output_root))
+              expected_directories = {prefix + target for target in TARGETS}
+              if artifact_root.is_symlink() or not artifact_root.is_dir():
+                  raise ValueError("target artifact root is missing or linked")
+              directories = list(artifact_root.iterdir())
+              if ({path.name for path in directories} != expected_directories
+                      or any(path.is_symlink() or not path.is_dir() for path in directories)):
+                  raise ValueError("expected exactly four target artifact directories")
+              require_files(input_root, DEPENDENCIES)
+              sources = [input_root / name for name in DEPENDENCIES]
+              for target, (archive_format, _) in TARGETS.items():
+                  base = f"agent-session-grep-{tag}-{target}"
+                  names = {base + "." + archive_format, base + ".manifest.json"}
+                  folder = artifact_root / (prefix + target)
+                  validate_checksums(folder, names)
+                  sources.extend(folder / name for name in sorted(names))
+              # Never merge download directories or overwrite colliding candidate files.
+              output_root.mkdir()
+              for source in sources:
+                  with source.open("rb") as incoming, (output_root / source.name).open("xb") as outgoing:
+                      shutil.copyfileobj(incoming, outgoing)
+
+          if __name__ == "__main__":
+              assemble_artifacts("artifacts", "release-inputs", "dist", os.environ["ARTIFACT_PREFIX"], os.environ["RELEASE_TAG"])
+
+      - name: Write complete bundle checksums with the existing helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/release/build-manifest.py checksums `
+            --directory dist --output dist/SHA256SUMS
+
+      - name: Verify all bundle bytes and unsigned provenance
+        id: validate_artifacts
+        shell: python {0}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          def validate_version(value):
+              if not isinstance(value, str) or not re.fullmatch(
+                  r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                  r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", value
+              ):
+                  raise ValueError("version must be a canonical SemVer archive component")
+              prerelease = value.split("+", 1)[0].partition("-")[2]
+              if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
+                  raise ValueError("numeric prerelease identifiers cannot have leading zeroes")
+              return value
+
+          def validate_tag(tag):
+              if not isinstance(tag, str) or not tag.startswith("v"):
+                  raise ValueError("release tag must be v<version>")
+              validate_version(tag[1:])
+              return tag
+
+          import hashlib
+          import json
+          from pathlib import Path
+
+          TARGETS = {
+              "x86_64-pc-windows-msvc": ("zip", "agent-session-grep.exe"),
+              "x86_64-unknown-linux-gnu": ("tar.gz", "agent-session-grep"),
+              "x86_64-apple-darwin": ("tar.gz", "agent-session-grep"),
+              "aarch64-apple-darwin": ("tar.gz", "agent-session-grep"),
+          }
+          DEPENDENCIES = ("THIRD-PARTY-DEPENDENCIES.json", "THIRD-PARTY-DEPENDENCIES.csv")
+          DOCUMENTS = ("README.md", "LICENSE-MIT", "LICENSE-APACHE", "CHANGELOG.md", "SECURITY.md", "NOTICE")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON field")
+                  result[key] = value
+              return result
+
+          def hash_stream(handle):
+              digest, size = hashlib.sha256(), 0
+              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                  digest.update(chunk)
+                  size += len(chunk)
+              return digest.hexdigest(), size
+
+          def sha256_file(path):
+              with Path(path).open("rb") as handle:
+                  return hash_stream(handle)[0]
+
+          def require_files(root, expected):
+              root = Path(root)
+              if root.is_symlink() or not root.is_dir():
+                  raise ValueError("artifact directory is missing or linked")
+              files = list(root.iterdir())
+              if {path.name for path in files} != set(expected) or any(path.is_symlink() or not path.is_file() for path in files):
+                  raise ValueError("artifact file inventory does not exactly match the contract")
+
+          def validate_checksums(root, expected):
+              root = Path(root)
+              require_files(root, {*expected, "SHA256SUMS"})
+              found = set()
+              for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+                  match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+                  if not match or match[2] not in expected or match[2] in found:
+                      raise ValueError("malformed, duplicate or unexpected checksum entry")
+                  found.add(match[2])
+                  if sha256_file(root / match[2]) != match[1]:
+                      raise ValueError("artifact checksum mismatch")
+              if found != set(expected):
+                  raise ValueError("checksum inventory is incomplete")
+
+          import tarfile
+          import time
+          import zipfile
+
+          def validate_archive_members(path, archive, binary, dependency_hashes, source_date_epoch):
+              root = archive["root"]
+              modes = {root + "/" + name: "0644" for name in (*DOCUMENTS, *DEPENDENCIES)}
+              modes[root + "/" + binary] = "0755"
+              records = archive.get("files")
+              if not isinstance(records, list) or len(records) != len(modes):
+                  raise ValueError("archive member manifest is incomplete")
+              by_name = {}
+              for record in records:
+                  if not isinstance(record, dict) or set(record) != {"name", "mode", "size_bytes", "sha256"}:
+                      raise ValueError("malformed archive member manifest")
+                  name = record["name"]
+                  if not isinstance(name, str) or name not in modes or name in by_name:
+                      raise ValueError("unexpected or duplicate archive member path")
+                  if (record["mode"] != modes[name] or type(record["size_bytes"]) is not int or record["size_bytes"] < 0
+                          or not isinstance(record["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])):
+                      raise ValueError("invalid archive member metadata")
+                  leaf = name.split("/")[-1]
+                  if leaf in dependency_hashes and record["sha256"] != dependency_hashes[leaf]:
+                      raise ValueError("archive dependency inventory does not match the common inputs")
+                  by_name[name] = record
+              if set(by_name) != set(modes):
+                  raise ValueError("archive member set differs from the packaging contract")
+
+              def check_member(name, size, mode, handle):
+                  record = by_name[name]
+                  if size != record["size_bytes"] or mode != int(record["mode"], 8):
+                      raise ValueError("archive member size or mode mismatch")
+                  digest, actual_size = hash_stream(handle)
+                  if digest != record["sha256"] or actual_size != record["size_bytes"]:
+                      raise ValueError("archive member content hash mismatch")
+
+              # Read bounded members; never extract paths, execute binaries or import code.
+              if archive["format"] == "zip":
+                  date_time = time.gmtime(max(source_date_epoch, 315_532_800))[:6]
+                  date_time = date_time[:5] + (date_time[5] // 2 * 2,)
+                  with zipfile.ZipFile(path) as packed:
+                      members = packed.infolist()
+                      if len(members) != len(by_name) or {m.filename for m in members} != set(by_name):
+                          raise ValueError("zip member inventory is not exact")
+                      for member in members:
+                          if member.date_time != date_time:
+                              raise ValueError("zip member timestamp differs from the source date epoch")
+                          kind = (member.external_attr >> 16) & 0o170000
+                          if member.is_dir() or kind not in {0, 0o100000}:
+                              raise ValueError("zip links and non-regular members are forbidden")
+                          with packed.open(member) as handle:
+                              check_member(member.filename, member.file_size, (member.external_attr >> 16) & 0o7777, handle)
+              else:
+                  with Path(path).open("rb") as raw:
+                      header = raw.read(10)
+                  if (len(header) != 10 or header[:3] != b"\x1f\x8b\x08"
+                          or int.from_bytes(header[4:8], "little") != source_date_epoch):
+                      raise ValueError("gzip header timestamp differs from the source date epoch")
+                  with tarfile.open(path, mode="r:gz") as packed:
+                      members = packed.getmembers()
+                      if len(members) != len(by_name) or {m.name for m in members} != set(by_name):
+                          raise ValueError("tar member inventory is not exact")
+                      for member in members:
+                          if member.mtime != source_date_epoch:
+                              raise ValueError("tar member timestamp differs from the source date epoch")
+                          if not member.isfile() or member.issparse():
+                              raise ValueError("tar links and non-regular members are forbidden")
+                          with packed.extractfile(member) as handle:
+                              check_member(member.name, member.size, member.mode, handle)
+
+          def validate_artifacts(root, tag, version, source_commit, source_date_epoch, cargo_lock_sha256):
+              root = Path(root)
+              if validate_tag(tag) != "v" + validate_version(version):
+                  raise ValueError("bundle tag and version mismatch")
+              validate_source_commit(source_commit)
+              if type(source_date_epoch) is not int or source_date_epoch < 0:
+                  raise ValueError("invalid bundle source date epoch")
+              if not isinstance(cargo_lock_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", cargo_lock_sha256):
+                  raise ValueError("invalid prepared lockfile digest")
+              expected = set(DEPENDENCIES)
+              for target, (archive_format, _) in TARGETS.items():
+                  base = f"agent-session-grep-{tag}-{target}"
+                  expected.update({base + "." + archive_format, base + ".manifest.json"})
+              validate_checksums(root, expected)
+              dependency_report = json.loads((root / DEPENDENCIES[0]).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+              if (not isinstance(dependency_report, dict)
+                      or dependency_report.get("schema") != "agent-session-grep.third-party-dependencies/v1"
+                      or dependency_report.get("release_version") != version or dependency_report.get("spdx_document") is not False
+                      or not isinstance(dependency_report.get("dependencies"), list)
+                      or type(dependency_report.get("dependency_count")) is not int
+                      or dependency_report["dependency_count"] != len(dependency_report["dependencies"])):
+                  raise ValueError("common dependency inventory contract mismatch")
+              dependency_hashes = {name: sha256_file(root / name) for name in DEPENDENCIES}
+              shared_hashes = None
+              for target, (archive_format, binary) in TARGETS.items():
+                  base = f"agent-session-grep-{tag}-{target}"
+                  manifest = json.loads((root / (base + ".manifest.json")).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+                  if (not isinstance(manifest, dict) or set(manifest) != {"schema", "release", "archive", "inputs", "provenance"}
+                      or manifest.get("schema") != "agent-session-grep.release-archive-manifest/v1"):
+                      raise ValueError("unsupported archive manifest schema")
+                  release = manifest.get("release")
+                  if (not isinstance(release, dict) or release != {"tag": tag, "version": version, "target": target,
+                          "source_commit": source_commit, "source_date_epoch": source_date_epoch, "unsigned": True}
+                          or release.get("unsigned") is not True or type(release.get("source_date_epoch")) is not int):
+                      raise ValueError("archive release provenance mismatch")
+                  inputs, provenance, archive = manifest.get("inputs"), manifest.get("provenance"), manifest.get("archive")
+                  if (not isinstance(inputs, dict) or set(inputs) != {"cargo_lock_sha256", "dependency_inventory_schema"}
+                          or inputs.get("cargo_lock_sha256") != cargo_lock_sha256
+                          or inputs.get("dependency_inventory_schema") != "agent-session-grep.third-party-dependencies/v1"
+                          or not isinstance(provenance, dict) or set(provenance) != {"kind", "cryptographic_attestation", "limitation"}
+                          or provenance.get("kind") != "self-reported-build-metadata"
+                          or provenance.get("cryptographic_attestation") is not False
+                          or provenance.get("limitation") != "This manifest is unsigned metadata, not a signature, notarization, or GitHub Artifact Attestation."):
+                      raise ValueError("archive input or unsigned provenance mismatch")
+                  filename = base + "." + archive_format
+                  if (not isinstance(archive, dict) or set(archive) != {"filename", "format", "root", "sha256", "size_bytes", "files"}
+                          or archive.get("filename") != filename
+                          or archive.get("format") != archive_format or archive.get("root") != base
+                          or type(archive.get("size_bytes")) is not int or archive["size_bytes"] != (root / filename).stat().st_size
+                          or archive.get("sha256") != sha256_file(root / filename)):
+                      raise ValueError("archive metadata or digest mismatch")
+                  validate_archive_members(root / filename, archive, binary, dependency_hashes, source_date_epoch)
+                  document_hashes = {entry["name"].split("/")[-1]: entry["sha256"] for entry in archive["files"]
+                                     if entry["name"].split("/")[-1] in DOCUMENTS}
+                  if shared_hashes is not None and document_hashes != shared_hashes:
+                      raise ValueError("release documents differ between target archives")
+                  shared_hashes = document_hashes
+
+          import os
+
+          if __name__ == "__main__":
+              validate_artifacts("dist", os.environ["RELEASE_TAG"], os.environ["VERSION"], os.environ["SOURCE_COMMIT"],
+                                 int(os.environ["SOURCE_DATE_EPOCH"]), os.environ["CARGO_LOCK_SHA256"])
+
+      - name: Upload complete temporary unsigned bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-session-grep-verify-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  gate:
+    name: all required verification checks
+    if: always()
+    needs: [prepare, quality, build, assemble]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every result and all four completed build jobs
+        id: gate
+        shell: python {0}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise ValueError("unexpected GitHub API redirect")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON field")
+                  result[key] = value
+              return result
+
+          def api_get(path, allow_not_found=False):
+              if not path.startswith("/repos/") or "#" in path:
+                  raise ValueError("unexpected GitHub API path")
+              request = urllib.request.Request(
+                  os.environ["GITHUB_API_URL"].rstrip("/") + path,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                      if response.status != 200:
+                          raise ValueError("unexpected GitHub API status")
+                      data = json.loads(response.read(), object_pairs_hook=unique_object)
+                      if not isinstance(data, (dict, list)):
+                          raise ValueError("malformed GitHub API JSON root")
+                      return data
+              except urllib.error.HTTPError as error:
+                  if allow_not_found and error.code == 404:
+                      return None
+                  raise ValueError(f"GitHub API returned HTTP {error.code}") from None
+              except (urllib.error.URLError, TimeoutError):
+                  raise ValueError("GitHub API request failed") from None
+
+          def require_success(needs, expected):
+              if not expected or len(set(expected)) != len(expected):
+                  raise ValueError("required job inventory is empty or duplicated")
+              if not isinstance(needs, dict) or set(needs) != set(expected):
+                  raise ValueError("required job result inventory is incomplete")
+              for name in expected:
+                  if not isinstance(needs[name], dict) or needs[name].get("result") != "success":
+                      raise ValueError("required job did not succeed: " + name)
+
+          def load_jobs(api, repo, run_id, run_attempt):
+              result, seen, total = [], set(), None
+              page = 1
+              while total is None or len(result) < total:
+                  data = api(f"/repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}/jobs?per_page=100&page={page}")
+                  if not isinstance(data, dict) or type(data.get("total_count")) is not int or data["total_count"] < 0:
+                      raise ValueError("invalid job pagination metadata")
+                  if total is not None and total != data["total_count"]:
+                      raise ValueError("job inventory changed while paginating")
+                  total = data["total_count"]
+                  batch = data.get("jobs")
+                  if not isinstance(batch, list) or len(batch) > 100 or (not batch and len(result) != total):
+                      raise ValueError("incomplete job pagination")
+                  for job in batch:
+                      if not isinstance(job, dict) or type(job.get("id")) is not int or job["id"] <= 0 or job["id"] in seen:
+                          raise ValueError("invalid or duplicate job record")
+                      seen.add(job["id"])
+                  result.extend(batch)
+                  if len(result) > total:
+                      raise ValueError("job count exceeds declared total")
+                  page += 1
+              return result
+
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          def expected_api_head(event_name, event, caller_sha):
+              caller_sha = validate_source_commit(caller_sha)
+              if not isinstance(event, dict):
+                  raise ValueError("caller event must be an object")
+              if event_name == "pull_request":
+                  pull_request = event.get("pull_request")
+                  if not isinstance(pull_request, dict) or not isinstance(pull_request.get("head"), dict):
+                      raise ValueError("PR event is missing its head identity")
+                  # The API describes the PR branch head H, while checkout/test uses the
+                  # event's synthetic merge commit M. Neither is a fallback for the other.
+                  return validate_source_commit(pull_request["head"].get("sha"))
+              if event_name not in {"push", "workflow_dispatch", "schedule"}:
+                  raise ValueError("unsupported caller event for API job identity")
+              return caller_sha
+
+          def required_step_names(name):
+              source = ["Checkout exact source", "Assert exact source checkout"]
+              if name == "validate exact CI source":
+                  return ["Validate required source SHA"]
+              if name == "resolve audit source":
+                  return ["Resolve exact audit source"]
+              if name == "all required quality checks":
+                  return ["Require every quality result and matrix member"]
+              if name.startswith("test ("):
+                  return source + ["Install Rust toolchain", "Install Python", "Cache cargo registry and target",
+                      "Format check", "Clippy", "Test", "Web client interaction tests", "Test semantic-candle feature",
+                      "Check semantic-candle entrypoints", "Robot contract tests", "Release verifier and entry-point tests",
+                      "Release manifest tests", "Evidence harness tests"]
+              if name.startswith("installer smoke ("):
+                  platform = "windows" if name == "installer smoke (windows-latest)" else "unix"
+                  return source + ["Install Rust toolchain", "Install Python", "Cache cargo registry and target", "Build release binary",
+                      f"Install into a workspace-local prefix ({platform})", f"Invoke both installed commands ({platform})",
+                      f"Surface smoke ({platform})", f"Uninstall twice ({platform})", "Regression harness self-test"]
+              if name == "Cargo dependency audit":
+                  return source + ["Install pinned audit tools", "Verify committed lockfile", "Check dependency policy",
+                                   "Check zero-egress static audit", "Check RustSec advisories"]
+              if name.startswith(("build ", "verify ")):
+                  return source + ["Install Python", "Install Rust toolchain", "Download common release inputs", "Build locked release binary",
+                                  "Verify exact binary version", "Synthetic release smoke", "Build deterministic unsigned archive and manifest",
+                                  "Write target artifact checksums", "Upload unsigned target artifact"]
+              if name == "resolve exact source and release inputs":
+                  return ["Resolve exact prepared source", *source, "Install Python", "Install Rust toolchain",
+                          "Validate workspace version and immutable inputs", "Generate locked metadata and dependency inventory",
+                          "Upload common release inputs"]
+              if name == "validate complete four-target unsigned bundle":
+                  return source + ["Install Python", "Download separate target artifacts without merging", "Download common dependency inventory",
+                                  "Validate target inventories before assembling", "Write complete bundle checksums with the existing helper",
+                                  "Verify all bundle bytes and unsigned provenance", "Upload complete temporary unsigned bundle"]
+              raise ValueError("unknown required job step contract")
+
+          def require_steps(job, expected):
+              steps = job.get("steps")
+              if not isinstance(steps, list) or not expected or len(set(expected)) != len(expected):
+                  raise ValueError("required step inventory is missing or invalid")
+              numbers, found = set(), {name: [] for name in expected}
+              for step in steps:
+                  if (not isinstance(step, dict) or not isinstance(step.get("name"), str)
+                          or type(step.get("number")) is not int or step["number"] <= 0 or step["number"] in numbers):
+                      raise ValueError("malformed or duplicate step record")
+                  numbers.add(step["number"])
+                  if step["name"] in found:
+                      found[step["name"]].append(step)
+              for name, matches in found.items():
+                  if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
+                      raise ValueError("required command step is missing, duplicated or non-success: " + name)
+
+          def require_jobs(jobs, expected, run_id, run_attempt, caller_sha):
+              import re
+              if (not isinstance(caller_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", caller_sha)
+                      or caller_sha == "0" * 40 or type(run_id) is not int or run_id <= 0
+                      or type(run_attempt) is not int or run_attempt <= 0):
+                  raise ValueError("invalid caller run identity")
+              if not isinstance(jobs, list) or not expected or len(set(expected)) != len(expected):
+                  raise ValueError("invalid required matrix inventory")
+              found = {name: [] for name in expected}
+              seen = set()
+              for job in jobs:
+                  if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+                      raise ValueError("malformed workflow job")
+                  if type(job.get("id")) is not int or job["id"] <= 0 or job["id"] in seen:
+                      raise ValueError("invalid or duplicate workflow job ID")
+                  seen.add(job["id"])
+                  leaf = job["name"].split(" / ")[-1]
+                  if leaf in found:
+                      prefixes = [""]
+                      if leaf.startswith(("test (", "installer smoke (")) or leaf in {"validate exact CI source", "all required quality checks"}:
+                          prefixes.append("required CI quality gates / ")
+                      elif leaf in {"Cargo dependency audit", "resolve audit source"}:
+                          prefixes.extend(["required security audit / ",
+                                           "required CI quality gates / required security audit / "])
+                      if job["name"] not in {prefix + leaf for prefix in prefixes}:
+                          raise ValueError("unexpected reusable job name prefix")
+                      found[leaf].append(job)
+              for name, matches in found.items():
+                  if len(matches) != 1:
+                      raise ValueError("required matrix job missing or duplicated: " + name)
+                  job = matches[0]
+                  if (type(job.get("run_id")) is not int or job["run_id"] != run_id
+                          or type(job.get("run_attempt")) is not int or job["run_attempt"] != run_attempt
+                          or job.get("head_sha") != caller_sha
+                          or job.get("status") != "completed" or job.get("conclusion") != "success"):
+                      raise ValueError("required matrix job is stale or non-success: " + name)
+                  require_steps(job, required_step_names(name))
+
+
+          if __name__ == "__main__":
+              require_success(json.loads(os.environ["NEEDS_JSON"]), ["prepare", "quality", "build", "assemble"])
+              run_id, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                  event = json.load(event_file, object_pairs_hook=unique_object)
+              api_head = expected_api_head(os.environ["EVENT_NAME"], event, os.environ["GITHUB_SHA"])
+              expected = ["verify " + target for target in (
+                  "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin")]
+              expected.extend(["resolve exact source and release inputs", "validate complete four-target unsigned bundle",
+                               "all required quality checks"])
+              require_jobs(load_jobs(api_get, os.environ["GITHUB_REPOSITORY"], run_id, attempt), expected, run_id, attempt,
+                           api_head)
