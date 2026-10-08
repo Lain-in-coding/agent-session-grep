@@ -1,0 +1,4 @@
+# Trusted tool-owned configuration. Candidate files and environment never select it.
+title = "agent-session-grep offline credential policy"
+[extend]
+useDefault = true
