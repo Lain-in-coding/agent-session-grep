@@ -152,11 +152,29 @@ consent, and one owner email is not a substitute for contribution checks.
 `scripts/governance/` owns the shared Python-stdlib policy, checker tests,
 path/credential wrappers, and opt-in local hook adapter. Hooks are optional
 local feedback, not merge authority; never replace global or existing
-hooks. The helper interfaces below are integrated by the candidate
-`governance` workflow; hosted bootstrap and enforcement remain pending.
-Consult each reviewed helper's `--help`. These commands do not establish
-that hosted enforcement is installed.
-Replace input placeholders with verified data, never untrusted shell text.
+hooks. The helper interfaces below are integrated by the `governance`
+workflow. The owner-reviewed frozen bootstrap checker is
+`06dfe15b40191098807623e5c46d60b780a5f4eb`. Canonical
+[governance run 37956268872](https://github.com/Lain-in-coding/agent-session-grep/actions/runs/37956268872)
+succeeded on 2026-10-09 UTC for candidate
+`ce6dfe43c77886cd95128892990fbeae9d72f5ae`. This is a historical bootstrap
+checkpoint, not evidence for later commits or installed branch protection.
+
+Before a merge, independently read back current `main` protection and the
+current-base checks: `gate` and `all required verification checks`, from
+the GitHub Actions App. Verify administrator enforcement, the PR
+requirement, and the ordinary-merge-only policy as well as actual results.
+A workflow file or old successful run does not establish these controls.
+The solo-owner acceptance requirement above remains separate.
+
+`.github/CODEOWNERS` names the real maintainer and explicitly owns its
+control directory. GitHub uses the PR base branch's CODEOWNERS; delivery
+on a candidate does not activate main-based owner requests before a
+separately approved merge. Draft PRs do not automatically request owners.
+This file supplies neither a second reviewer nor a self-approval.
+
+Consult each reviewed helper's `--help`. Replace input placeholders with
+verified data, never untrusted shell text.
 
 ```text
 python scripts/governance/check_commit.py --message-file <file>
