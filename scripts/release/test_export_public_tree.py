@@ -57,7 +57,7 @@ class PublicTreeExportTests(unittest.TestCase):
         # must fail the export, so the exporter has to select `public`.
         repo_root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temp_name:
-            destination = Path(temp_name)
+            destination = Path(temp_name).resolve()
             (destination / "notes.md").write_text(
                 f"see .{TRACKER}/tasks/x/prd.md\n", encoding="utf-8"
             )
@@ -67,7 +67,7 @@ class PublicTreeExportTests(unittest.TestCase):
 
     def test_export_manifest_is_sorted_and_path_free(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
-            root = Path(temp_name)
+            root = Path(temp_name).resolve()
             repo = root / "repo"
             destination = root / "public"
             import subprocess
