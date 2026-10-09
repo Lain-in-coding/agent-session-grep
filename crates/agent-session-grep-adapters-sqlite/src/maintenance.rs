@@ -223,14 +223,14 @@ fn peak_process_memory() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(status) = fs::read_to_string("/proc/self/status") {
-            if let Some(kib) = status.lines().find_map(|line| {
+        if let Ok(status) = fs::read_to_string("/proc/self/status")
+            && let Some(kib) = status.lines().find_map(|line| {
                 line.strip_prefix("VmHWM:")
                     .and_then(|v| v.split_whitespace().next())
                     .and_then(|v| v.parse::<u64>().ok())
-            }) {
-                return kib.saturating_mul(1024);
-            }
+            })
+        {
+            return kib.saturating_mul(1024);
         }
     }
     0
