@@ -52,8 +52,9 @@ below; unchanged placeholders or checked boxes are not a rationale.
       where supported.
 - [ ] `ProviderAdapter::manifest()` matches the capability matrix.
 - [ ] Maturity is evidence-based; new adapters start as `Experimental`.
-- [ ] External-process manifests declare provider/variant, roots,
-      capabilities, maturity, license, and network permission.
+- [ ] For planned external-process proposals only, manifests declare
+      provider/variant, roots, capabilities, maturity, license, and
+      network permission; this is not an implemented plugin API.
 
 ## Privacy and security
 

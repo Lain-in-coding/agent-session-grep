@@ -51,36 +51,49 @@ comparable, so search refuses instead of returning a wrong hit set — see
 reported (a build fact) while the store-side fields are `null`, never guessed.
 
 If `doctor` fails instead of reporting, the error envelope names the reason —
-most usefully `schema_incompatible` when the store is newer than the binary.
+most usefully `schema_incompatible` when the store schema differs from the
+binary's supported version, whether older or newer. `doctor` is read-only and
+does not perform an upgrade.
 
 ## Procedure 1: Schema upgrade
 
-There is no manual upgrade command. Opening an older store with a newer
-binary migrates it in a single transaction gated by `PRAGMA user_version`;
-on failure the transaction rolls back and the old binary can still read the
-store. `SCHEMA_VERSION` is currently 17, and v8 through v17 are the current
-additive steps (v8 resume-claims, v9 source-scan provider id, v10 semantic
-vector sidecar, v11 session-metadata search projection, v12 tool-activity
-projection, v13 session-title display projection, v14 source-scan parser
-version, v15 token-usage projection, v16 repo-identity projection, v17
-store-level index-projection version). They run stepwise on
-first open; the v7 → v17 chain is specified
-in this runbook's procedures below and in the store source
-(`crates/agent-session-grep-adapters-sqlite/src/lib.rs`, the
-`migrate_v7_to_v8` … `migrate_v16_to_v17` steps), not restated here. The
-v5 → v6 (`migration-v5-to-v6.md`) and v6 → v7 (`migration-v6-to-v7.md`) steps
-are historical by design; stores at v5 or v6 migrate stepwise to the current
-version on first open by the current binary.
+There is no separate upgrade subcommand. Read-only opens (`doctor`, search,
+MCP) require the supported schema and never migrate an older catalog. An
+explicit write path such as `index rebuild`, `sync`, or `ingest` takes the
+writer lease and migrates before its own operation. It may also refresh stale
+index projections; choose and authorize that write deliberately.
+
+`SCHEMA_VERSION` is currently 19. The additive steps include v8 resume claims,
+v9 source-scan provider id, v10 semantic vectors, v11 session-metadata search,
+v12 tool activity, v13 session titles, v14 parser version, v15 token usage,
+v16 repo identity, v17 index-projection version, v18 installation/relocation
+records, and v19 journal-compaction records. `PRAGMA user_version` gates the
+steps in `crates/agent-session-grep-adapters-sqlite/src/lib.rs`
+(`migrate_v7_to_v8` through `migrate_v18_to_v19`); the v17 → v18 implementation
+is in `crates/agent-session-grep-adapters-sqlite/src/relocation.rs`.
+The v5 → v6 (`migration-v5-to-v6.md`) and v6 → v7 (`migration-v6-to-v7.md`)
+records remain historical; those stores upgrade on an explicit write open.
+
+Transaction boundaries are migration units, not the entire upgrade chain:
+legacy v1–v6 changes share one transaction, and v6 → v7 and subsequent steps
+have their own transactions. A failed unit rolls back its changes, but earlier
+committed units can remain. Do not assume failure restores the original
+schema or guarantees old-binary readability; retain the pre-upgrade backup.
 
 Operational sequence:
 
-1. Note the pre-state: `agent-session-grep --robot doctor --db <path>`.
-2. Keep a copy of the data root before first open if it matters. There is no
-   production snapshot or bundle API today (`CB-PROD-SNAPSHOT-API-001` is
-   `not_implemented`); the WAL-aware feasibility spike shows why copying the
-   main database file alone while a writer is live is unsafe.
-3. Run the new binary against the store: `agent-session-grep --robot doctor --db <path>`.
-4. Confirm `data.schema` is the new version and `data.db` is `"ok"`.
+1. Record the binary version/commit and the pre-state with a compatible old
+   binary's `agent-session-grep --robot doctor --db <path>`. A new binary can
+   instead return `schema_incompatible`; that read is not an upgrade.
+2. Stop writers and retain a verified consistent copy of the data root before
+   any write open. The WAL-aware feasibility spike explains why copying only
+   the main database file while a writer is live is unsafe; preserve committed
+   WAL state in the backup rather than assuming the main file is sufficient.
+3. Run the explicitly chosen write with the new binary:
+   `agent-session-grep --robot --db <path> index rebuild`. Check its exit code;
+   stop and inspect on failure rather than assuming the whole chain rolled back.
+4. Run `agent-session-grep --robot doctor --db <path>` again. This read-only
+   verification must report `data.schema: 19` and `data.db: "ok"`.
 5. Re-ingest sources (`sync`) to lift legacy rows to current fidelity.
    Migration never fabricates data; rows created before v6 have no session or
    span attribution until re-ingested. `context` remains disabled with
@@ -136,6 +149,9 @@ store-level `store_metadata.index_projection_version` (schema v17). It is
 deliberately a whole-store singleton, not a per-source column like
 `source_scans.parser_version`: one reprojection rewrites every row, so a
 per-source record has no self-consistent value in a partially migrated store.
+
+The following projection-version behavior assumes a current-schema catalog;
+a schema mismatch itself refuses the read open, as described above.
 
 What happens on a mismatch:
 
@@ -224,7 +240,7 @@ The result reports `data.reindexed` (messages written back into FTS) and
   on large stores fast. `fts_rowid` is part of the `fts_ids` sidecar
   (introduced at schema v3): new catalogs carry the column from the v3 DDL,
   and catalogs created before it existed gain it via `ensure_fts_ids_rowid`
-  on their next open, with `user_version` unchanged.
+  on a write open, with that repair itself leaving `user_version` unchanged.
 
 A rebuild **advances the generation**, which invalidates outstanding cursors.
 It does not rewrite catalog payloads, so evidence spans inside payloads are
@@ -253,14 +269,18 @@ agent-session-grep --robot --db C:/data/example-new.db sync <file1.jsonl> <file2
 
 Semantics that make this safe to reason about:
 
-- Identity is deterministic. Message ids prefer the provider-native id; the
-  fallback (path plus sequence) and the content-addressed document ids are
-  reproducible for the same bytes. Re-ingesting the same source upserts in
-  place instead of duplicating.
-- `sync` is all-or-nothing across its file list: every source is staged
-  first, then one durable batch commits. A failure partway leaves the store
-  at its previous generation. Files that moved out of a re-scanned source
-  become tombstones.
+- Identity: Message ids prefer the provider-native id. The no-native fallback
+  is path-free (provider + variant + document ID + sequence), and is marked
+  `Unstable`: parser/filter changes can shift sequence values, so there is
+  no cross-parser stability guarantee. Document IDs are content-addressed
+  within their provider/variant.
+- `sync` commits eligible staged sources in a single durable batch. Only a
+  `source_changed` detected during final post-stage verification is deferred,
+  with that source's previously indexed data preserved; other eligible sources
+  may still commit (see Procedure 4). Earlier capture/reopen failures, including
+  `source_changed`, abort `sync` before the batch commit. This does not promise
+  that every file-list member commits or that all failure classes behave alike;
+  inspect the exit status, `deferred` count, and bounded diagnostics.
 - A `sync` whose content matches what is already committed is a no-op: no new
   generation, and `data.committed` is `0` while `data.unchanged` reports the
   message count. Rerunning a reconstruction command is therefore cheap and
@@ -288,17 +308,18 @@ FTS. The next write open (`sync`, `ingest`, `index rebuild`) marks the
 stranded intents aborted automatically. Do not delete rows from
 `index_batches` directly.
 
-**`source_changed` (exit 5).** A transcript file was modified between its
-capture and the post-stage verification, and nothing could be committed for it.
-`sync` no longer fails the whole run for this: the affected source is
-**deferred** — dropped from the commit batch, reported through a per-source
-diagnostic and the `deferred` count, with any content it had already indexed
-left untouched — and every other source commits normally. That matters because
-the normal case is an agent writing its own transcript while you sync, often
-the very session you are typing in; failing the run meant one growing file
-discarded the entire scan. Re-run `sync` once the file is no longer being
-written. `ingest` of a single source still reports exit 5, since there is no
-other source to carry the run.
+**`source_changed` (exit 5 when returned as an error).** A source changed
+while being read. Only a change detected during final post-stage verification
+is **deferred** by `sync`: that source is dropped from the commit batch,
+reported through a per-source diagnostic and the `deferred` count, and its
+previously indexed content is left untouched. Other eligible sources may still
+commit together; this is not a promise to commit every input.
+
+Earlier capture/reopen failures, including `source_changed`, still
+abort `sync` before the batch commit. Other error classes are not automatically
+deferred either. Inspect the actual exit status and `deferred` count; re-run
+once the source is no longer being written. `ingest` of a single source still
+returns exit 5 for `source_changed`, rather than using the batch deferral path.
 
 **`catalog_error` (exit 6) that `doctor` cannot explain.** The masked message
 ("database internal error") covers two different situations: the store failed

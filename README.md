@@ -12,8 +12,12 @@ Application ADT.
 workspace version. Provider adapters are Experimental maturity and the optional
 semantic backend carries no quality claim — see
 [`docs/product/PROVIDER-MATURITY-MATRIX.md`](docs/product/PROVIDER-MATURITY-MATRIX.md).
-Release archives are built from source; no signed or notarized binaries are
-published yet.
+The canonical [v0.1.0 Release](https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0)
+has GitHub-generated source archives and no uploaded assets (no prebuilt
+binaries). This checkout contains unreleased changes beyond that tag even
+though Cargo still reports 0.1.0; record `git rev-parse HEAD` with source-build
+results. Unsigned Actions artifacts are not Release assets or signed/notarized
+binary distribution.
 
 ## Why?
 
@@ -185,9 +189,12 @@ MIT OR Apache-2.0
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Community provider adapters follow
-the Provider Adapter Protocol (versioned external process, manifest-declared,
-read-only, no network by default).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Provider Adapter Contributor Guide](docs/PROVIDER-ADAPTER-CONTRIBUTOR-GUIDE.md).
+Implemented adapters use the in-tree Rust contract. The versioned
+external-process boundary is planned, not a loadable plugin API; proposals
+must declare their manifest, read-only source behavior, and network permissions
+(none by default).
 
 Release history is tracked in [CHANGELOG.md](CHANGELOG.md); security
 boundaries and the vulnerability reporting process are in

@@ -1,8 +1,10 @@
 # Release Rehearsal Runbook
 
-> Status: 五入口一致性 harness 已去 skip-as-pass（Web loopback + TUI 快照）
-> 且 verify-release 已补全；semantic/resume/handoff/offline 步骤已落地。仍 pending:
-> Gate D performance、三平台干净环境演练（macOS 受外部 CI 阻塞）。
+> Current harness: all five entry points are directly compared (real loopback
+> Web and a headless TUI snapshot); missing coverage is not a pass.
+> Source-bound hosted verification is distinct from this clean-environment
+> rehearsal. Each candidate still needs its own performance and clean-machine
+> evidence; see the owner checklist for the dated canonical CI checkpoint.
 
 This runbook defines the full release-rehearsal procedure for
 agent-session-grep. It is executed per-platform (Windows, macOS, Linux) in a
@@ -18,10 +20,10 @@ work, or an unexpected result is a defect and must be tracked and fixed.
 
 ### 0.1 Platform requirements
 
-Each rehearsal run uses a clean VM or container image — **never** a
-GitHub-hosted runner. The `core-beta-evidence.yml` CI job marks hosted runners
-as `ci_configured_only` (preinstalled toolchains disqualify them from
-release-certified status).
+Each clean-environment rehearsal uses a clean VM or container image, not a
+GitHub-hosted runner. A named successful hosted run is CI verification, not
+clean-machine certification: hosted images have preinstalled toolchains.
+Keep its source/run/attempt and status separate from this procedure's evidence.
 
 | Platform | Image requirement | Notes |
 |---|---|---|
@@ -61,10 +63,13 @@ A completed manifest is the entry ticket — no manifest, no rehearsal.
 
 ### 0.4 Unsigned release artifact contract
 
-`.github/workflows/release.yml` is configured for `v*` tag pushes and explicit
-`workflow_dispatch` runs against an existing `v*` tag. Configuration is not
-execution evidence: until a named successful run and downloaded assets are
-recorded, its accounting state is `ci_configured_only`.
+`.github/workflows/release.yml` handles `v*` tag pushes and explicit
+`workflow_dispatch` runs against an existing `v*` tag. It resolves one immutable
+`source_commit` and passes it through reusable quality checks, builds, and
+assembly. `release-verify.yml` exercises the same four targets without
+publishing. A named successful verification run and downloaded Actions bundle
+do not prove execution of the publication workflow, clean-machine support, or
+an actual Release. Record evidence separately for each source and workflow.
 
 The configured matrix matches the committed platform targets:
 
@@ -75,19 +80,25 @@ The configured matrix matches the committed platform targets:
 
 Each archive is allowlist-built and contains only the canonical binary,
 `README.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `CHANGELOG.md`, `SECURITY.md`,
-and the JSON/CSV third-party dependency inventory. The assembled bundle also
+`NOTICE`, and the JSON/CSV third-party dependency inventory. The assembled bundle also
 contains per-target `*.manifest.json` files, the common dependency inventory,
 and `SHA256SUMS`. Manifests record target, version, full source commit,
 Cargo.lock hash, archive/member hashes, and `unsigned: true`; they intentionally
 contain no build-machine paths or identities.
 
-Before any artifact upload, the workflow validates that the checked-out tag
-points at `HEAD`, that `v<version>` matches `Cargo.toml`, Cargo metadata, and
-the CLI entry in `Cargo.lock`, then runs `scripts/verify-release.py` on the
-built target using committed synthetic fixtures only. A manual dispatch stores
+During preparation, the workflow validates that the checked-out tag points
+at `HEAD` and that `v<version>` matches `Cargo.toml`, Cargo metadata, and the
+CLI entry in `Cargo.lock` before uploading common dependency inputs.
+Before target-artifact upload, each built target must pass
+`scripts/verify-release.py` using committed synthetic fixtures only.
+A manual dispatch stores
 the complete bundle as a GitHub Actions artifact but does **not** create a
-GitHub Release. A future owner-created `v*` tag push may create or update that
-tag's GitHub Release with the same explicitly unsigned assets.
+GitHub Release. Separately authorized tag-push publication is create-new-only:
+it refuses an existing draft or published Release, including one with zero
+uploaded assets. A partial creation or publication error stops for owner review;
+there is no automatic retry, cleanup/deletion, update, or asset replacement.
+Corrections require a newly reviewed version, not a rerun that clobbers an old
+release. The existing v0.1.0 source-only Release must remain unchanged.
 
 `SHA256SUMS` and the self-reported manifests provide integrity and reproducible
 provenance inputs; they are not signatures, notarization, or cryptographic
@@ -115,31 +126,72 @@ user-level prefix; `agent-session-grep --version` prints the expected version.
 
 ## 2. Ingest / index synthetic corpus
 
-### 2.1 Prepare fixture corpus
+### 2.1 Select the committed fixture and an isolated catalog
 
-Use the synthetic fixture generator from `scripts/evidence/core_beta_benchmark.py`
-or a hand-written set of Claude Code JSONL files with synthetic content only.
-**Never** use real provider transcripts without explicit operator authorization.
+Run from the reviewed checkout root, using an already-built/installed binary
+from that source. Use only the committed synthetic fixture
+`scripts/evidence/fixtures/gate/claude/session-alpha.jsonl`; its known search
+term is `retry`. Do not discover or read real user transcripts in this smoke.
 
-```bash
-# Generate a smoke-profile corpus (2 files, 12 messages each):
-python scripts/evidence/core_beta_benchmark.py run --profile smoke \
-    --output-dir /tmp/rehearsal-corpus/ --workspace .
+`core_beta_benchmark.py --output-dir` writes reports, not a retained corpus:
+its generated sources live in a temporary directory that is removed afterwards.
+Use that benchmark for evidence in §8, not as a source-file exporter.
 
-# Or use a hand-written fixture directory with .jsonl files.
-```
-
-(Full `core_beta_benchmark.py` usage: `--help`. It also supports
-`validate-report <report>` for evidence verification.)
-
-### 2.2 First index
+Bash (Linux/macOS):
 
 ```bash
-agent-session-grep --db /tmp/rehearsal.db ingest /tmp/rehearsal-corpus/*.jsonl
+ASG="$(command -v agent-session-grep)"
+test -n "$ASG" && test -x "$ASG" || exit 1
+REHEARSAL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/asg-rehearsal.XXXXXX")" || exit 1
+DB="$REHEARSAL_ROOT/asg.db"
+FIXTURE="scripts/evidence/fixtures/gate/claude/session-alpha.jsonl"
 ```
 
-**Expected evidence**: exit code 0; robot envelope reports `committed > 0`,
-`skipped == 0`.
+PowerShell 7 (Windows):
+
+```powershell
+$ASG = (Get-Command agent-session-grep -CommandType Application -ErrorAction Stop).Source
+$REHEARSAL_ROOT = Join-Path ([IO.Path]::GetTempPath()) ("asg-rehearsal-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $REHEARSAL_ROOT -ErrorAction Stop | Out-Null
+$DB = Join-Path $REHEARSAL_ROOT 'asg.db'
+$FIXTURE = Join-Path (Get-Location).Path 'scripts/evidence/fixtures/gate/claude/session-alpha.jsonl'
+```
+
+You may supply the absolute path of the just-built binary as `ASG` instead of
+looking it up on PATH; verify its version and source first. Keep this new
+catalog separate from any existing user data root. Retain the variables for
+the remaining steps. Later command blocks use Bash syntax; in PowerShell use
+`& $ASG` to invoke the same binary, `$DB` for the catalog, and check each native
+exit code as below. Substitute actual IDs returned by search, never sample IDs.
+
+### 2.2 First index and existing release smoke
+
+Bash:
+
+```bash
+"$ASG" --db "$DB" --robot sync "$FIXTURE" || exit 1
+"$ASG" --db "$DB" --robot search "retry" || exit 1
+python scripts/verify-release.py --asg "$ASG" || exit 1
+```
+
+PowerShell:
+
+```powershell
+& $ASG --db $DB --robot sync $FIXTURE
+if ($LASTEXITCODE -ne 0) { throw 'synthetic sync failed' }
+& $ASG --db $DB --robot search 'retry'
+if ($LASTEXITCODE -ne 0) { throw 'synthetic search failed' }
+python scripts/verify-release.py --asg $ASG
+if ($LASTEXITCODE -ne 0) { throw 'release smoke failed' }
+```
+
+**Expected evidence**: sync exits 0 with one Robot envelope, `data.committed > 0`
+and `data.skipped == 0`; search returns real hits for `retry`. The existing
+`verify-release.py` runs its bounded checks with the same committed fixture in
+its own throwaway catalog. It does not build, install, publish, or exercise
+Web; §9 covers the five real entry points separately. Preserve each verdict,
+not only the last command's exit status. These smoke results alone are not
+clean-machine or four-target certification.
 
 **Run id**: `ingest-<platform>-<date>`.
 
@@ -150,7 +202,7 @@ agent-session-grep --db /tmp/rehearsal.db ingest /tmp/rehearsal-corpus/*.jsonl
 ### 3.1 Lexical search
 
 ```bash
-agent-session-grep --db /tmp/rehearsal.db --robot search "<canonical-query>"
+"$ASG" --db "$DB" --robot search "retry"
 ```
 
 **Expected evidence**: hits returned; each hit has `id`, `score`, `session_id`,
@@ -160,12 +212,12 @@ agent-session-grep --db /tmp/rehearsal.db --robot search "<canonical-query>"
 
 ```bash
 # Build the bigram-hash embedding projection first (catalog-derived, rebuildable):
-agent-session-grep --db /tmp/rehearsal.db --robot index embeddings
+"$ASG" --db "$DB" --robot index embeddings
 
 # Then the semantic/hybrid modes become effective (until then they fall back
 # explicitly to lexical_fallback with a warning — never silently):
-agent-session-grep --db /tmp/rehearsal.db --robot search "<canonical-query>" --mode semantic
-agent-session-grep --db /tmp/rehearsal.db --robot search "<canonical-query>" --mode hybrid
+"$ASG" --db "$DB" --robot search "retry" --mode semantic
+"$ASG" --db "$DB" --robot search "retry" --mode hybrid
 ```
 
 **Expected evidence**: `index embeddings` reports `model_id: bigram-hash-v1`,
@@ -182,7 +234,7 @@ are experimental and lexical remains the default.
 ## 4. Context
 
 ```bash
-agent-session-grep --db /tmp/rehearsal.db --robot context "<session-id-from-search>"
+"$ASG" --db "$DB" --robot context "<session-id-from-search>"
 ```
 
 **Expected evidence**: mainline messages returned in order; sidechains excluded
@@ -196,19 +248,21 @@ by default; evidence spans are present.
 
 ```bash
 # Read-only resume metadata (fixed nullable fields; never echoes a source path):
-agent-session-grep --db /tmp/rehearsal.db --robot get-session-resume "<session-id-from-search>"
+"$ASG" --db "$DB" --robot get-session-resume "<session-id-from-search>"
 
-# Dry-run execution preview (default, no side effects):
-agent-session-grep --db /tmp/rehearsal.db --robot resume "<session-id-from-search>"
+# Dry-run execution preview (default, no provider process):
+"$ASG" --db "$DB" --robot resume "<session-id-from-search>"
 ```
 
 **Expected evidence**: `get-session-resume` reports `resume_available` as a
-boolean with `provider_session_id` and `original_working_directory` present
-only when resolved. `resume` defaults to dry-run: `executed: false`, prints
-the full command/cwd/permission mode, and makes **no** side effects. First-run
-forces a preview; `--yes` is the explicit opt-in for real execution.
-Unverified providers report `available: false` rather than fabricating a
-command.
+boolean and always includes nullable `provider_session_id` and
+`original_working_directory` fields. `resume` defaults to a preview with
+`executed: false`; command/cwd/permission fields can be null and the permission
+mode is not verified. An unavailable or unsafe-to-render command is not
+fabricated. First use can record the local preview marker but never launches
+the provider, even with `--yes`. A subsequent explicit `--yes` request is the
+opt-in for real execution; do not execute native resume in this synthetic
+rehearsal.
 
 **Run id**: `resume-<platform>-<date>`.
 
@@ -217,7 +271,7 @@ command.
 ## 6. Handoff pack generation
 
 ```bash
-agent-session-grep --db /tmp/rehearsal.db --robot handoff "<query>"
+"$ASG" --db "$DB" --robot handoff "retry"
 ```
 
 **Expected evidence**: pack conforms to `HandoffPack` schema version `1.0`
@@ -233,7 +287,7 @@ are applied; the pack is deterministic (two runs produce the identical
 ## 7. Web UI walkthrough
 
 ```bash
-agent-session-grep --db /tmp/rehearsal.db serve
+"$ASG" --db "$DB" serve
 ```
 
 The server prints the effective loopback URL with a per-session bearer token
@@ -256,7 +310,7 @@ return 401 and non-loopback Host requests return 403.
 
 ```bash
 python scripts/evidence/core_beta_benchmark.py run --profile smoke \
-    --output-dir /tmp/rehearsal-bench-evidence/ --binary $(which agent-session-grep)
+    --output-dir "$REHEARSAL_ROOT/benchmark-reports" --binary "$ASG"
 ```
 
 **Expected evidence**: benchmark report JSON with all invariant verdicts
@@ -270,8 +324,8 @@ passing, then `validate-report` confirms the report is well-formed.
 
 ```bash
 python scripts/rehearsal/compare_entrypoints.py \
-    --binary $(which agent-session-grep) \
-    --out /tmp/consistency-report.json
+    --binary "$ASG" \
+    --out "$REHEARSAL_ROOT/consistency-report.json"
 ```
 
 **Expected evidence**: `overall_verdict == "consistent"`; every declared entry
@@ -395,9 +449,10 @@ derived from it) with:
 - Privacy / performance / materials check results
 - Owner sign-off block
 
-The current draft is `docs/release/go-no-go.2026-08-16.md` (No-Go: local
-P0/external gates remain open). Submit to owner for the final public-release
-decision. On Windows the local rehearsal evidence (including any WSL Linux
+`docs/release/go-no-go.2026-08-16.md` is the historical No-Go draft for that
+date, not the current candidate's report; preserve it unchanged. Fill a fresh
+report for the actual candidate version and full source SHA, then submit it
+to the owner for a separately authorized public-release decision. On Windows the local rehearsal evidence (including any WSL Linux
 rehearsal) is recorded in aggregate — environment, commit, and hashes only,
 with no personal paths.
 

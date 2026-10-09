@@ -37,14 +37,36 @@ Use [the evidence matrix](../operations/core-beta-evidence-matrix.md) to
 separate `locally_verified`, `ci_configured_only`, and `ci_verified`.
 No previous repository run certifies this canonical SHA.
 
-`release-verify.yml` exercises the locked/no-default-features/target-bound
-build, synthetic release smoke, packaging, manifests, and `SHA256SUMS` without
-publishing. Its unsigned Actions artifacts expire after 30 days and are not
-release assets. The imported verification matrix currently covers three OS
-families; the publishing definition covers four architecture targets. That
-coverage difference and the pending CI/release-integrity work must be resolved
-before claiming full release readiness. Record skipped, failed, cancelled,
-missing, and not-started checks as non-success, not proof by YAML presence.
+`release-verify.yml` and `release.yml` prepare one immutable `source_commit`
+and pass it to reusable-only `ci.yml` for three-OS quality, security, and
+installer checks. Quality, build, assembly, and aggregate checks are bound to
+that source, not the caller's implicit branch. Both release workflows cover
+the same four architecture targets across three OS families:
+
+- `x86_64-pc-windows-msvc`
+- `x86_64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+`release-verify.yml` performs locked/no-default-features/target-bound builds,
+synthetic smoke, deterministic packaging, manifests, `SHA256SUMS`, and complete
+four-target bundle validation without publishing. Its unsigned Actions
+artifacts expire after 30 days and are not Release assets.
+
+**Historical canonical checkpoint, 2026-10-09 UTC:**
+[release verification run 37956269837](https://github.com/Lain-in-coding/agent-session-grep/actions/runs/37956269837)
+completed three-OS quality/security and the four-target unsigned rehearsal for
+candidate `ce6dfe43c77886cd95128892990fbeae9d72f5ae`, using tested merge source
+`018f00c26718c29c79545731b833fed1d4ccb2c2`. That object is not an actual main
+merge. The result belongs only to those sources; it does not certify later
+checkout changes or execute `release.yml` publication. Retain the run's actual
+ignored/inapplicable/advisory categories rather than claiming zero warnings.
+
+Every new candidate needs fresh source/event/run/attempt-bound checks and
+artifact verification. Main-branch activation, clean-machine/minimum-OS
+certification, provider promotion, signing, and future binary publication are
+separate gates. Record skipped, failed, cancelled, missing, and not-started
+mandatory work as non-success, not proof by YAML presence.
 
 ## 3. Review governance and provider evidence
 
@@ -84,8 +106,10 @@ owner-controlled work; never request or publish credentials in this checklist.
 Stop until the owner approves the specific new version, candidate SHA,
 release notes, provenance, checks, and action. Do not run an old `v0.1.0` tag
 recipe, silently overwrite assets, change visibility, or bypass unavailable
-hosted prerequisites. The existing publication workflow still requires the
-planned integrity review; its presence is not permission to execute it.
+hosted prerequisites. The publication workflow now binds quality and packaging
+to the prepared source, rechecks the tag, and refuses an existing Release
+(including a draft or one with zero assets). Its implemented controls and a
+successful non-publishing rehearsal are not permission to execute publication.
 
 After a separately authorized publication, verify the actual tag, source SHA,
 asset hashes, manifests, and release identity. Preserve the existing release

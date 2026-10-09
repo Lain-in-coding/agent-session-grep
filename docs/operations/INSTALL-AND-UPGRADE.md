@@ -15,20 +15,31 @@ Its private raw logs and local Git coordinates are not public evidence and are
 not imported here. Reproduce the procedure with `scripts/install/smoke.ps1`
 and the build/install commands below, recording the canonical tested SHA.
 
-The current workflow definitions are:
+The current source-bound workflow definitions are:
 
-- `ci.yml`: three-OS fmt/clippy/test and installer/uninstaller/surface smoke.
-- `release.yml`: tag-driven, four-target unsigned packaging and publication;
-  running it requires separate owner authorization. Existing release assets
-  must not be replaced. Workflow-integrity changes are still pending review.
+- `ci.yml`: reusable-only three-OS quality/security and
+  installer/uninstaller/surface smoke, given an explicit `source_commit` by
+  `release-verify.yml` or `release.yml` rather than testing an implicit caller.
 - `release-verify.yml`: non-publishing, locked/no-default-features/target-bound
-  builds, synthetic smoke, packaging, and checksum verification on three OS
-  families. Its 30-day Actions artifacts are not release assets.
+  builds, synthetic smoke, packaging, and complete unsigned-bundle validation.
+  It covers the same four architecture targets as `release.yml`:
+  `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
+  `x86_64-apple-darwin`, and `aarch64-apple-darwin` (three OS families).
+  Its 30-day Actions artifacts are not Release assets.
+- `release.yml`: prepares the requested tag's immutable source once and uses
+  it for quality, all four builds, assembly, and publication checks. A manual
+  dispatch does not publish a Release. Tag-push publication is create-new-only;
+  an existing Release is refused even with no assets. Execution requires
+  separate owner authorization.
 
-These definitions are `ci_configured_only` for this reconciliation until named
-canonical runs for the tested SHA exist. Historical CI records are described
-with their scope in [the evidence matrix](core-beta-evidence-matrix.md); they
-must not be reused as certification of this candidate or a clean machine.
+A successful canonical three-OS/four-target checkpoint exists for
+`ce6dfe43c77886cd95128892990fbeae9d72f5ae`; see the source, tested-merge, and
+[run bindings in the owner checklist](../release/OWNER-RELEASE-CHECKLIST.md#2-obtain-real-ci-and-non-publishing-artifact-evidence).
+It is historical verification of that source, not a pass for later checkout
+changes, activation on `main`, clean-machine/minimum-OS certification, or a
+published binary release. Obtain fresh named runs for each new candidate.
+Imported older CI records retain their original scope in
+[the evidence matrix](core-beta-evidence-matrix.md); do not relabel them.
 
 ## What the installer does
 
@@ -133,11 +144,13 @@ agent-session-grep --robot doctor --db C:/data/example.db
 That form reports `schema`, `generation`, and `interrupted_batches` for the
 store. See `rebuild-and-migration-runbook.md` for how to read those fields.
 
-When loading transcripts, `ingest <file>` and each input passed to
-`sync <file>...` treat one file as one session source. A transcript file should
-therefore contain a single distinct `sessionId`. If several are detected, the
-file remains assigned to the first session and the command returns a bounded
-warning listing the detected session count and IDs.
+When loading transcripts with `ingest <file>` or `sync <file>...`, one source
+may contain multiple sessions if the adapter supplies per-message session
+identities. Messages and resume claims are then attributed to their own
+sessions, not collapsed into the first session. If the adapter reports mixed
+sessions without per-message session identities, ingestion rejects the source
+atomically (`invalid_request`, exit 2), preserving previously indexed data.
+Diagnostics are bounded and do not list source paths or native session IDs.
 
 ## Upgrade
 
@@ -159,13 +172,22 @@ output followed the new artifact. There is still no second released version to
 upgrade across, so this proves the replacement mechanics, not compatibility
 between two real releases.
 
-An upgraded binary may need to migrate an existing data root on first open.
-Migration is automatic, transactional, and stepwise; the current store schema
-is v17, whose last step records the store-level index-projection version. The
-per-step list is not restated here — `rebuild-and-migration-runbook.md` owns it,
-and the v5 → v6 and v6 → v7 steps in `migration-v5-to-v6.md` and
-`migration-v6-to-v7.md` are historical. An older binary refuses to open a newer
-store with `schema_incompatible` (exit 9) rather than downgrading it.
+An upgraded binary may need to migrate an existing catalog. The current store
+schema is v19: v18 added installation/relocation records and v19 added journal
+compaction records. Read-only commands (`doctor`, search, and MCP) do not
+migrate; a different schema returns `schema_incompatible` (exit 9).
+
+Before migration, stop writers and retain a consistent, WAL-aware backup of
+the data root. Then explicitly choose a write command such as
+`agent-session-grep --robot --db <path> index rebuild`: its write open takes
+the writer lease and runs the required migration units before doing its work.
+Migration is stepwise and transactional per unit, not one transaction across
+the whole chain; a failed later step does not undo earlier committed steps
+or guarantee that the old binary can still read the catalog. Follow
+`rebuild-and-migration-runbook.md`, then use read-only `doctor` to verify v19.
+The v5 → v6 and v6 → v7 records in `migration-v5-to-v6.md` and
+`migration-v6-to-v7.md` remain historical. An older binary refuses a newer
+store rather than downgrading it.
 
 ## Uninstall
 

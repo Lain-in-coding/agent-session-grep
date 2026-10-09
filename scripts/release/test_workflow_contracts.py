@@ -406,6 +406,80 @@ def gate_environment(name, checkout_sha):
             "GITHUB_SHA": checkout_sha, "SOURCE_COMMIT": checkout_sha}
 
 
+class MaintainedReleaseDocumentationTests(unittest.TestCase):
+    """Current instructions only; dated evidence and release records are not rewritten."""
+
+    def section(self, path, heading):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        self.assertEqual(text.count(heading), 1, f"missing/ambiguous maintained section: {heading}")
+        return text.split(heading, 1)[1].split("\n## ", 1)[0]
+
+    def test_publication_is_create_new_only_even_without_assets(self):
+        section = self.section("docs/release/rehearsal-runbook.md", "### 0.4 Unsigned release artifact contract")
+        flat = " ".join(section.split())
+        self.assertNotIn("create or update", flat)
+        for boundary in ("create-new-only", "zero uploaded assets", "partial", "owner review"):
+            self.assertIn(boundary, flat)
+        self.assertIn("does **not** create a GitHub Release", flat)
+        self.assertNotIn("Before any artifact upload", flat,
+                         "preparation uploads common inputs before native builds and smoke")
+        for boundary in ("During preparation", "before uploading common dependency inputs",
+                         "Before target-artifact upload", "scripts/verify-release.py"):
+            self.assertIn(boundary, flat)
+
+    def test_archive_document_list_matches_the_real_packager(self):
+        section = self.section("docs/release/rehearsal-runbook.md", "### 0.4 Unsigned release artifact contract")
+        archive = section.split("Each archive is allowlist-built", 1)[1].split("The assembled bundle", 1)[0]
+        self.assertCountEqual(re.findall(r"`([^`]+)`", archive), BUILD_MANIFEST.REQUIRED_DOCUMENTS)
+        distribution = " ".join((ROOT / "NOTICE").read_text(encoding="utf-8").splitlines()[-2:])
+        self.assertIn("binary bundles produced by this packaging workflow", distribution)
+
+    def test_current_verification_docs_cover_the_actual_four_targets(self):
+        for path, heading in (
+            ("docs/operations/INSTALL-AND-UPGRADE.md", "## Historical installer evidence and current verification"),
+            ("docs/release/OWNER-RELEASE-CHECKLIST.md", "## 2. Obtain real CI and non-publishing artifact evidence"),
+        ):
+            with self.subTest(path=path):
+                section = self.section(path, heading)
+                for target in TARGETS:
+                    self.assertIn(f"`{target}`", section)
+                self.assertIn("source_commit", section)
+                self.assertNotIn("coverage difference", section)
+                self.assertNotIn("integrity changes are still pending", section)
+
+    def test_first_index_uses_committed_fixture_and_isolated_robot_sync(self):
+        section = self.section("docs/release/rehearsal-runbook.md", "## 2. Ingest / index synthetic corpus")
+        fixture = "scripts/evidence/fixtures/gate/claude/session-alpha.jsonl"
+        self.assertTrue((ROOT / fixture).is_file())
+        self.assertIn(fixture, section)
+        self.assertIn('"$ASG" --db "$DB" --robot sync "$FIXTURE"', section)
+        self.assertIn('& $ASG --db $DB --robot sync $FIXTURE', section)
+        self.assertIn("mktemp -d", section)
+        self.assertIn("[guid]::NewGuid()", section)
+        self.assertIn("scripts/verify-release.py --asg", section)
+        blocks = re.findall(r"```(?:bash|powershell)\n(.*?)```", section, re.S)
+        self.assertGreaterEqual(len(blocks), 2)
+        self.assertTrue(all("core_beta_benchmark.py run" not in block for block in blocks),
+                        "benchmark output directories contain reports, not a retained fixture corpus")
+        self.assertNotIn("*.jsonl", section)
+
+    def test_go_no_go_requires_a_new_candidate_and_five_real_comparisons(self):
+        path = "docs/release/go-no-go.template.md"
+        text = (ROOT / path).read_text(encoding="utf-8")
+        self.assertIn("v<version>", text.splitlines()[0])
+        self.assertIn("**Source commit**", text)
+        section = self.section(path, "## 4. Five-entry-point consistency")
+        rows = re.findall(r"^\| ([^|]+) \| <([^>]+)> \|", section, re.M)
+        self.assertEqual(len(rows), 5)
+        for surface, options in rows:
+            self.assertEqual(options.split("/"), ["pass", "fail"], surface)
+            self.assertNotIn("alias", surface)
+        for surface_flag in ("--output json", "--robot", "--snapshot-json"):
+            self.assertIn(surface_flag, section)
+        self.assertIn("skipped", section)
+        self.assertIn("unimplemented", section)
+
+
 class WorkflowWiringTests(unittest.TestCase):
     def test_ci_is_reusable_only_and_requires_source_commit(self):
         trigger = top_block(read_workflow("ci.yml"), "on")

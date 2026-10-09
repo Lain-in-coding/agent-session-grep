@@ -5,7 +5,7 @@ description: Search local AI coding-agent session history (16-provider capabilit
 
 # agent-session-grep
 
-agent-session-grep indexes local AI coding-agent transcripts into a read-only searchable catalog: full-text search, session context assembly, and evidence spans that point back into the source files. The provider capability matrix spans 16 rows — 14 implemented providers (claude-code, codex, grok-build, opencode, antigravity, pi, hermes, cursor, kimi-code, openclaw, qoder, tencent-codebuddy, cline, aider) plus 2 deferred unsupported (deepseek-harness, zcode). The authoritative per-provider maturity and field capabilities live in `docs/product/PROVIDER-MATURITY-MATRIX.md`. Reach for it when you need to recall what happened in a past coding session.
+Provider transcripts stay read-only; agent-session-grep indexes them into a writable local catalog for full-text search, session context assembly, and evidence spans that point back into the source files. The provider capability matrix spans 16 rows — 14 implemented providers (claude-code, codex, grok-build, opencode, antigravity, pi, hermes, cursor, kimi-code, openclaw, qoder, tencent-codebuddy, cline, aider) plus 2 deferred unsupported (deepseek-harness, zcode). The authoritative per-provider maturity and field capabilities live in `docs/product/PROVIDER-MATURITY-MATRIX.md`. Reach for it when you need to recall what happened in a past coding session.
 
 Two machine surfaces exist. Prefer the MCP server when the client supports MCP; otherwise drive the robot CLI. Never scrape human-mode output.
 
@@ -79,7 +79,7 @@ loop:
 | 10 | partial success — results are usable but truncated; raise the budget knob named in `data.truncation.reason`, or paginate |
 | 70 | internal error (bug signal) |
 
-`--help` / `--version` always exit 0 — never a configuration error. In robot/json/jsonl modes they are success envelopes, not bare text: help text or version string ride in `data.help_text` / `data.version` (ADR-0006).
+Valid `--help` / `--version` requests exit 0. Invalid leading/global arguments (for example an invalid `--output` or `--request-id`) still fail with `invalid_request` (exit 2); help/version do not bypass validation. In robot/json/jsonl modes valid requests are success envelopes, not bare text: help text or version string ride in `data.help_text` / `data.version` (ADR-0006).
 
 ### Commands
 
@@ -146,7 +146,7 @@ Run the same binary as a stdio MCP server (tools only, sequential, read-only):
 
 | tool | when to use |
 | --- | --- |
-| `search_sessions` | full-text query; params: `query` (required), `limit`, `cursor`, `max_items`, `max_bytes`; optional `providers` (`claude`/`claude-code`/`codex`), `since`/`until`, `include_system`, `group_by_session`; facets `sidechain` (`include`/`main_only`/`subagent_only`), `tool_kind` (`file`/`command`/`web`/`query`/`unknown`), `tool_name`; each hit includes canonical `session_id` and `resume_available`; non-default facets are echoed in `data.facets` |
+| `search_sessions` | full-text query; params: `query` (required), `limit`, `cursor`, `max_items`, `max_bytes`; optional `providers` (OR filter over implemented, searchable rows from CLI `providers` / MCP `list_providers`, plus the `claude` alias for `claude-code`; unknown/deferred ids are rejected), `since`/`until`, `include_system`, `group_by_session`; facets `sidechain` (`include`/`main_only`/`subagent_only`), `tool_kind` (`file`/`command`/`web`/`query`/`unknown`), `tool_name`; each hit includes canonical `session_id` and `resume_available`; non-default facets are echoed in `data.facets` |
 | `get_session_context` | pull one session branch: `session_id` (required, canonical `ses_v1_...`), `policy` (`mainline` or `full`), `level` (`raw`/`talks`/`sessions`), `max_messages`, `max_bytes`; the response includes projected `tool_activities` for the assembled messages |
 | `get_session_resume` | resolve fixed-shape Resume Metadata from a canonical `session_id`; nullable `provider_session_id` and `original_working_directory`; never returns a command or Source path |
 | `get_message` | return one Message and bounded mainline neighbors; params include canonical `message_id`, optional canonical `session_id`, `around`, and budgets |
@@ -158,13 +158,13 @@ Run the same binary as a stdio MCP server (tools only, sequential, read-only):
 
 - Tool results carry the payload twice: `content[0].text` (serialized) and `structuredContent` = `{ outcome, data, redaction, warnings, page }` — the same shapes as the robot envelope. `redaction` reports whether cross-boundary redaction touched this payload (`status: none | applied`, `redacted_count`), so a `[redacted:...]` value is never mistaken for literal transcript text.
 - Business failures (bad cursor, not found) come back as `isError: true` results with `structuredContent.error.canonical_code`; malformed or invalid params are JSON-RPC errors (`-32602`).
-- Cursors are stateless signed tokens: a `page.next_cursor` from one `search_sessions` call works in a later call — even across server restarts — as long as the index generation is unchanged and the TTL has not passed.
+- Cursors are self-contained unsigned, keyless integrity-checked tokens (unkeyed BLAKE3), not signatures: they do not authenticate an issuer or prevent a caller from forging a new digest. A `page.next_cursor` from one `search_sessions` call works in a later call — even across server restarts — only while the contract, query/sort/result-set binding, index generation, and TTL remain valid. Treat the token as opaque, not as authorization.
 - v0 executes requests sequentially; `notifications/cancelled` is accepted but is a best-effort no-op.
 
 ## Cautions
 
-- Read-only: search/context/resume/MCP never modify your history. The MCP server opens only the `--db` store given at startup; it exposes no arbitrary file read, no SQL, no command execution.
+- Source/read boundary: provider transcripts remain read-only. Explicit `sync`, `ingest`, and `index` operations write the local catalog; search/context and Resume Metadata reads do not. The MCP server opens only the `--db` store given at startup; it exposes no arbitrary file read, no SQL, no command execution.
 - Two-ID contract: canonical `session_id` (`ses_v1_...`) is the catalog identity used by every tool; the Provider-native Session ID is Resume Metadata obtainable only via `get-session-resume` / `get_session_resume`. Never treat the native ID as canonical or vice versa.
-- Resume Metadata is structured data only. If you need to resume a native session, take the returned `provider_session_id` and run the provider's own resume flow yourself; this tool never builds or runs that command.
+- `get-session-resume` / `get_session_resume` return structured Resume Metadata only, never a command. For an authorized continuation, CLI `resume <session-id>` previews the provider command, working directory, and permission mode. Inspect that preview and obtain explicit user approval before `resume <session-id> --yes`. First use forces a preview even with `--yes`; execution needs a subsequent explicit request. The CLI can then launch the provider with an argument vector, not shell interpolation; this execution capability is not an MCP tool. A preview does not launch the provider but can record the first-use marker in the local data root.
 - Cursor lifecycle: cursors expire after 15 minutes and die whenever new data is ingested (generation change). On `cursor_expired`, `cursor_invalid`, or `generation_mismatch`, do not retry the token — re-issue the query from page 1. Cursors are also result-set-bound: a `search` cursor only works for `search`, a `list` cursor for `list`, and a `list_sessions` cursor for `list_sessions`.
 - Never parse human-mode output (the default without `--robot`); its wording can change at any time. Machine consumption is `--robot`, `--output json` / `--output jsonl`, or MCP only.

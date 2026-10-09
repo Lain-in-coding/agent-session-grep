@@ -54,16 +54,16 @@ Exit Code(权威为 `schemas/robot/v1/error-catalog.json` 的 14 码，实现镜
 模式 human/json/jsonl/--robot/MCP 各自冻结: stdout frame、stderr、颜色、进度、warnings、零结果、
 部分成功、fatal、broken pipe、取消、exit code。
 - Robot JSON 单 envelope；Robot JSONL 只允许版本化协议 frame；进程诊断永远走 stderr。
-- `--help` / `--version` 在任何输出模式下恒 exit 0（语义上不是错误）：human 模式打印文本；robot/json/jsonl 模式返回 success envelope，帮助文本/版本号置于 `data.help_text` / `data.version`（ADR-0006，已实现）。
+- 有效的 `--help` / `--version` 请求在各输出模式下 exit 0：human 模式打印文本；robot/json/jsonl 模式返回 success envelope，帮助文本/版本号置于 `data.help_text` / `data.version`（ADR-0006，已实现）。当前实现仍先校验前置/全局参数：非法 `--output` 或 `--request-id` 返回 `invalid_request`（exit 2），help/version 不绕过校验。
 - MCP stdout 只允许合法 MCP frame，panic/backtrace 不得污染 stdout。
 
 ## 7. Cursor 生命周期（无状态保留模型）
 
 - Search v2 query digest 绑定 requested/effective mode、model、查询向量维度及内容、RRF/排序窗口版本、filters/facets、可见性/分组及当前仓库信号。旧 search cursor 明确拒绝；不静默重启查询。
 - 搜索续页保留首次请求的 `issued_at_ms` 和 `expires_at_ms`，时效评分使用首次请求时刻，只更新 offset；15 分钟 TTL 从首次请求起算，续页不续期。List 保持既有行为。
-- Cursor 自包含并签名: contract_major/generation/issued_at_ms/expires_at_ms/query_digest/sort_digest/offset/result_set。`list` 与 `list_sessions` 的 result_set 判别器互斥——跨结果集复用 cursor 显式拒绝，绝不静默从第一页继续。
+- 当前实现的 Cursor 自包含且**未签名、无密钥完整性校验（unsigned, keyless integrity-checked）**：contract_major/generation/issued_at_ms/expires_at_ms/query_digest/sort_digest/offset/result_set。线格式保持 `base64url_no_pad(claims JSON) + "." + hex16(blake3("as-cursor-v1" || claims JSON))`；摘要不是签名，不认证签发者，也不能阻止调用者重新计算摘要来伪造 token。这里说明现有实现边界，不改变本 Draft 的治理状态或线格式。`list` 与 `list_sessions` 的 result_set 判别器互斥——跨结果集复用 cursor 显式拒绝，绝不静默从第一页继续。
 - 系统不登记活动 Cursor；GC 按 activation + max_cursor_ttl + clock_skew 保留旧 generation。
-- generation 回收/协议不兼容/签名失败/超 TTL → 明确 cursor_expired*，绝不静默从第一页继续。
+- 当前错误分类保持区分：结构/摘要/查询/排序/result_set 不符 → `cursor_invalid`；超 TTL → `cursor_expired`；活动 generation 不符 → `generation_mismatch`；contract major 不兼容 → `schema_incompatible`。绝不静默从第一页继续。
 - 已由 sqlite-snapshot-wal spike 验证：旧 generation 快照在新写入期间可只读打开，支撑分页 pinning。
 
 ## 8. MCP 契约

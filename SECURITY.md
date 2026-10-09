@@ -5,12 +5,12 @@ their content through search, context assembly, resume, and handoff
 features. The security posture below applies to every boundary that emits
 that content.
 
-## Supported versions
+## Publication status
 
-| Version | Supported |
+| Version / source | Publication |
 |---|---|
-| 0.1.x | Planned first public series; not released yet |
-| Published releases | None |
+| v0.1.0 | Published source release; GitHub-generated source archives, no uploaded assets or prebuilt binaries |
+| Current checkout | Unreleased changes beyond v0.1.0, even when the workspace version is still 0.1.0 |
 
 ## Reporting a vulnerability
 

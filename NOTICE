@@ -66,5 +66,5 @@ tool itself; operators import a verified local bundle with
 | blake3 | CC0-1.0 OR Apache-2.0 | hashing |
 | ratatui / crossterm | MIT | TUI |
 
-The full resolved graph with per-package declared licenses ships in every
-release archive as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`.
+The full resolved graph with declared licenses ships in binary bundles produced by this packaging workflow
+as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`, not in GitHub-generated source archives.

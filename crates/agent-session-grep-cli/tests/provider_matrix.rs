@@ -1626,6 +1626,284 @@ fn readme_release_status_and_maturity_tiers_match_authoritative_sources() {
     }
 }
 
+// These guards cover maintained instructions, not historical evidence or live
+// GitHub state. Runtime cursor/schema/session tests remain the behavior authority.
+fn current_doc_section(document: &str, heading: &str) -> String {
+    document
+        .split_once(heading)
+        .unwrap_or_else(|| panic!("missing maintained section: {heading}"))
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn public_contract_release_separates_source_publication_and_checkout() {
+    let security = include_str!("../../../SECURITY.md");
+    let publication = security.split("## Reporting").next().unwrap();
+    assert!(
+        !publication.contains("not released yet")
+            && !publication.contains("| Published releases | None |"),
+        "the maintained publication table must not deny the recorded source release"
+    );
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(publication.contains(&format!("v{version}")));
+    assert!(publication.contains("source archives"));
+    assert!(publication.contains("no uploaded assets"));
+    let intro = README.split("## Why?").next().unwrap();
+    let intro = intro.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(intro.contains(&format!("releases/tag/v{version}")));
+    assert!(intro.contains("unreleased changes"));
+    assert!(intro.contains("no uploaded assets"));
+    assert!(intro.contains("Actions artifacts are not Release assets"));
+}
+
+#[test]
+fn public_contract_issue_examples_use_the_current_binary_version() {
+    for (name, form) in [
+        (
+            "bug",
+            include_str!("../../../.github/ISSUE_TEMPLATE/bug-report.yml"),
+        ),
+        (
+            "feature",
+            include_str!("../../../.github/ISSUE_TEMPLATE/feature-request.yml"),
+        ),
+    ] {
+        let version = form.split_once("    id: version").unwrap().1;
+        let version = version.split("  - type:").next().unwrap();
+        let example = format!(
+            "placeholder: agent-session-grep {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            version.contains(&example),
+            "{name}: version example must match the binary, not a roadmap milestone"
+        );
+        assert!(
+            version.contains("--version"),
+            "{name}: request exact binary output"
+        );
+        assert!(form.contains("40-character commit SHA"));
+    }
+}
+
+#[test]
+fn public_contract_adapter_docs_keep_external_process_support_planned() {
+    let contributing = current_doc_section(README, "## Contributing");
+    assert!(
+        contributing.contains("in-tree Rust"),
+        "implemented adapters are in-tree Rust, not loadable external plugins"
+    );
+    assert!(contributing.contains("planned") && contributing.contains("external-process"));
+    assert!(contributing.contains("docs/PROVIDER-ADAPTER-CONTRIBUTOR-GUIDE.md"));
+    let template = include_str!("../../../.github/pull_request_template.md");
+    let adapters = current_doc_section(template, "## Provider adapter evidence");
+    assert!(adapters.contains("planned external-process proposals"));
+}
+
+#[test]
+fn public_contract_cursor_guidance_is_unsigned_and_keyless() {
+    let cursor = SKILL_MD
+        .lines()
+        .find(|line| line.starts_with("- Cursors "))
+        .unwrap();
+    assert!(
+        cursor.contains("unsigned") && cursor.contains("keyless"),
+        "an unkeyed digest is not a signature"
+    );
+    assert!(cursor.contains("do not authenticate"));
+    let contract = current_doc_section(CLI_CONTRACT, "## 7. Cursor");
+    assert!(contract.contains("unsigned") && contract.contains("keyless"));
+    assert!(!contract.contains("Cursor 自包含并签名"));
+    assert!(contract.contains("as-cursor-v1"));
+    for code in [
+        "cursor_invalid",
+        "cursor_expired",
+        "generation_mismatch",
+        "schema_incompatible",
+    ] {
+        assert!(
+            contract.contains(code),
+            "cursor failures must keep distinct category {code}"
+        );
+    }
+    let ttl_minutes = agent_session_grep_application::cursor::DEFAULT_TTL_MS / 60_000;
+    assert!(contract.contains(&format!("{ttl_minutes} 分钟")));
+}
+
+#[test]
+fn public_contract_machine_help_and_provider_filters_match_current_interfaces() {
+    let help = SKILL_MD
+        .lines()
+        .find(|line| line.contains("`--help` / `--version`"))
+        .unwrap();
+    assert!(
+        !help.contains("always exit 0"),
+        "invalid global arguments still fail before help/version"
+    );
+    let contract = current_doc_section(CLI_CONTRACT, "## 6. Output Truth Table");
+    for text in [help, contract.as_str()] {
+        for token in ["--output", "--request-id", "invalid_request"] {
+            assert!(
+                text.contains(token),
+                "help/version guidance omits invalid-global-argument boundary {token}"
+            );
+        }
+    }
+    let search = SKILL_MD
+        .lines()
+        .find(|line| line.starts_with("| `search_sessions`"))
+        .unwrap();
+    assert!(search.contains("implemented, searchable") && search.contains("list_providers"));
+    assert!(search.contains("`claude`"));
+    assert!(!search.contains("(`claude`/`claude-code`/`codex`)"));
+}
+
+#[test]
+fn public_contract_skill_separates_catalog_writes_and_explicit_resume() {
+    let intro = SKILL_MD.split("## Robot CLI").next().unwrap();
+    assert!(
+        !intro.contains("read-only searchable catalog"),
+        "source transcripts, not the writable catalog, are read-only"
+    );
+    assert!(
+        intro.contains("writable local catalog") && intro.contains("transcripts stay read-only")
+    );
+    let cautions = current_doc_section(SKILL_MD, "## Cautions");
+    for token in [
+        "`sync`",
+        "`index`",
+        "resume <session-id> --yes",
+        "user approval",
+        "argument vector",
+    ] {
+        assert!(
+            cautions.contains(token),
+            "machine guidance omits the explicit write/execute boundary {token}"
+        );
+    }
+    assert!(cautions.contains("no command execution"));
+    assert!(!cautions.contains("this tool never builds or runs that command"));
+}
+
+#[test]
+fn public_contract_upgrade_uses_current_schema_and_explicit_writer() {
+    let install = include_str!("../../../docs/operations/INSTALL-AND-UPGRADE.md");
+    let migration = include_str!("../../../docs/operations/rebuild-and-migration-runbook.md");
+    let upgrade = current_doc_section(install, "## Upgrade");
+    let procedure = current_doc_section(migration, "## Procedure 1: Schema upgrade");
+    let schema = agent_session_grep_adapters_sqlite::SCHEMA_VERSION;
+    assert!(
+        upgrade.contains(&format!("v{schema}")),
+        "install guidance must use the current schema, not an old milestone"
+    );
+    assert!(procedure.contains(&format!("currently {schema}")));
+    for text in [&upgrade, &procedure] {
+        assert!(text.contains("read-only") && text.contains("writer lease"));
+        assert!(text.contains("index rebuild"));
+        assert!(!text.contains("migrates it in a single transaction"));
+    }
+    let loading = current_doc_section(install, "## Verify the install");
+    assert!(loading.contains("per-message session identities") && loading.contains("atomically"));
+    assert!(!loading.contains("assigned to the first session"));
+}
+
+#[test]
+fn public_contract_reconstruction_identity_has_only_document_scoped_fallback() {
+    let procedure = current_doc_section(
+        include_str!("../../../docs/operations/rebuild-and-migration-runbook.md"),
+        "## Procedure 3: Store reconstruction by re-ingest",
+    );
+    // Inspect this bullet, not a path-free claim in a different procedure.
+    let identity = procedure
+        .split_once("- Identity")
+        .expect("Procedure 3 identity bullet")
+        .1
+        .split(" - ")
+        .next()
+        .unwrap();
+    assert!(
+        !identity.contains("path plus sequence"),
+        "derive_message_id uses provider + variant + document + sequence, never the source path"
+    );
+    for fact in [
+        "provider-native",
+        "path-free",
+        "provider + variant + document ID + sequence",
+        "`Unstable`",
+        "parser/filter",
+        "no cross-parser stability guarantee",
+    ] {
+        assert!(identity.contains(fact), "Procedure 3 identity omits {fact}");
+    }
+}
+
+#[test]
+fn public_contract_reconstruction_sync_distinguishes_eligible_batch_and_deferral() {
+    let procedure = current_doc_section(
+        include_str!("../../../docs/operations/rebuild-and-migration-runbook.md"),
+        "## Procedure 3: Store reconstruction by re-ingest",
+    );
+    // Procedure 4 already mentions deferral on the old baseline. It must not
+    // make this contradictory all-file-list claim pass the documentation guard.
+    let sync = procedure
+        .split_once("- `sync`")
+        .expect("Procedure 3 sync bullet")
+        .1
+        .split(" - ")
+        .next()
+        .unwrap();
+    assert!(
+        !sync.contains("all-or-nothing across its file list"),
+        "one durable eligible-source batch is not a promise to commit every requested file"
+    );
+    for fact in [
+        "eligible staged sources",
+        "single durable batch",
+        "`source_changed`",
+        "deferred",
+        "previously indexed data",
+        "other eligible sources",
+        "Procedure 4",
+    ] {
+        assert!(sync.contains(fact), "Procedure 3 sync omits {fact}");
+    }
+    let failures = current_doc_section(
+        include_str!("../../../docs/operations/rebuild-and-migration-runbook.md"),
+        "## Procedure 4: Writer-lease contention and interrupted batches",
+    );
+    let source_changed = failures
+        .split_once("**`source_changed`")
+        .expect("Procedure 4 source_changed explanation")
+        .1
+        .split(" **`catalog_error`")
+        .next()
+        .unwrap();
+    assert!(
+        !sync.contains("A source reported as `source_changed` is deferred"),
+        "the error category alone does not imply per-source deferral"
+    );
+    assert!(
+        !source_changed.contains("`sync` no longer fails the whole run for this")
+            && !source_changed.contains("every other source commits normally"),
+        "earlier capture/reopen failures still abort sync before its batch commit"
+    );
+    for (scope, text) in [("Procedure 3", sync), ("Procedure 4", source_changed)] {
+        for boundary in [
+            "post-stage verification",
+            "capture/reopen failures",
+            "abort `sync` before the batch commit",
+        ] {
+            assert!(text.contains(boundary), "{scope} omits {boundary}");
+        }
+    }
+}
+
 /// CHANGELOG 原文：`[Unreleased]` 段落逐一点名 provider，与 README 同属对外声明。
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 
