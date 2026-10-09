@@ -130,7 +130,17 @@ jobs:
       # discovered separately because they are not importable packages, so
       # discovery does not recurse into them.
       - name: Release verifier and entry-point tests
-        run: python -m unittest discover -s scripts -p "test_*.py" -v
+        shell: bash
+        env:
+          AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH: "1"
+        run: |
+          bash_executable="$BASH"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # MSYS may omit .exe in BASH; export the actual native executable.
+            bash_executable="$(cygpath -am "${BASH%.exe}.exe")"
+          fi
+          export AGENT_SESSION_GREP_TEST_BASH="$bash_executable"
+          python -m unittest discover -s scripts -p "test_*.py" -v
 
       - name: Release manifest tests
         run: python -m unittest discover -s scripts/release -p "test_*.py" -v

@@ -486,6 +486,66 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("--verify-tag", publish)
 
 
+class NativeBashCIWiringTests(unittest.TestCase):
+    def root_step(self):
+        title = "Release verifier and entry-point tests"
+        found = [block for block in steps("ci.yml", "test")
+                 if re.search(r"(?m)^name: " + re.escape(title) + r"$", block)]
+        self.assertEqual(len(found), 1, "the existing required root-suite step must remain unique")
+        return found[0]
+
+    def test_root_suite_requires_and_exports_its_native_bash(self):
+        block = self.root_step()
+        self.assertIn('          AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH: "1"\n', block)
+        self.assertRegex(block, r"(?m)^        shell: bash$")
+        self.assertNotRegex(block, r"(?m)^        (?:if|continue-on-error):")
+        source = run_source(block)
+        self.assertIn('bash_executable="$BASH"', source)
+        self.assertIn('if [[ "$RUNNER_OS" == "Windows" ]]; then', source)
+        self.assertIn('bash_executable="$(cygpath -am "${BASH%.exe}.exe")"', source)
+        export = 'export AGENT_SESSION_GREP_TEST_BASH="$bash_executable"'
+        command = 'python -m unittest discover -s scripts -p "test_*.py" -v'
+        self.assertEqual(source.count(export), 1)
+        self.assertEqual(source.count(command), 1)
+        self.assertLess(source.index(export), source.index(command))
+        self.assertNotIn("GITHUB_ENV", source)
+        self.assertNotIn("GITHUB_PATH", source)
+
+    def test_native_bash_configuration_is_scoped_to_the_root_step(self):
+        block = self.root_step()
+        for name in WORKFLOWS:
+            text = read_workflow(name)
+            if name == "ci.yml":
+                self.assertEqual(text.count(block), 1)
+                text = text.replace(block, "", 1)
+            with self.subTest(workflow=name):
+                self.assertNotIn("AGENT_SESSION_GREP_TEST_BASH", text)
+                self.assertNotIn("AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH", text)
+
+    def test_removed_native_bash_guard_or_wiring_is_rejected(self):
+        original = read_workflow("ci.yml")
+        replacements = (
+            ('          AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH: "1"\n', ""),
+            ('          AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH: "1"',
+             '          AGENT_SESSION_GREP_REQUIRE_NATIVE_BASH: "0"'),
+            ('        shell: bash\n', '        shell: pwsh\n'),
+            ('bash_executable="$BASH"', 'bash_executable="bash"'),
+            ('${BASH%.exe}.exe', '$BASH'),
+            ('export AGENT_SESSION_GREP_TEST_BASH="$bash_executable"', ':'),
+            ('python -m unittest discover -s scripts -p "test_*.py" -v', ':'),
+        )
+        reader = read_workflow
+        for before, after in replacements:
+            with self.subTest(removed=before):
+                block = self.root_step()
+                self.assertIn(before, block)
+                mutated = original.replace(block, block.replace(before, after, 1), 1)
+                with patch(__name__ + ".read_workflow", side_effect=lambda name:
+                           mutated if name == "ci.yml" else reader(name)):
+                    with self.assertRaises(AssertionError):
+                        self.test_root_suite_requires_and_exports_its_native_bash()
+
+
 class SourceCommitControlTests(unittest.TestCase):
     def test_full_nonzero_lowercase_sha_is_preserved(self):
         control, _ = load_step("release.yml", "prepare", "release")
