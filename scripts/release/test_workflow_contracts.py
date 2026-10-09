@@ -739,7 +739,9 @@ class InstalledCommandControlTests(unittest.TestCase):
                 # Exercise real native exit handling without needing an installed
                 # Windows product binary on the other quality-matrix platforms.
                 code = 17 if index == failure else 0
-                return real_run([sys.executable, "-c", f"raise SystemExit({code})"], **kwargs)
+                # Isolate the stub without changing captured workflow arguments.
+                probe_kwargs = {"env": {}, **kwargs}
+                return real_run([sys.executable, "-c", f"raise SystemExit({code})"], **probe_kwargs)
 
             with self.subTest(failed_command=failure), patch("subprocess.run", side_effect=synthetic_native):
                 if failure is None:
@@ -764,7 +766,8 @@ class InstalledCommandControlTests(unittest.TestCase):
                 def synthetic_script(argv, **kwargs):
                     index = len(calls)
                     calls.append((argv, kwargs))
-                    return real_run([sys.executable, "-c", f"raise SystemExit({17 if index == failure else 0})"], **kwargs)
+                    probe_kwargs = {"env": {}, **kwargs}
+                    return real_run([sys.executable, "-c", f"raise SystemExit({17 if index == failure else 0})"], **probe_kwargs)
 
                 with contextlib.chdir(directory), patch("subprocess.run", side_effect=synthetic_script):
                     if failure is None:
@@ -788,6 +791,46 @@ class InstalledCommandControlTests(unittest.TestCase):
                     run_main(control, source, {})
                 command.assert_called_once()
                 self.assertEqual(remaining.read_bytes(), b"synthetic installed command")
+
+
+    def test_native_probes_use_explicit_environment_in_fresh_process(self):
+        # Select only the two existing exit tests, not this containing suite.
+        # Bootstrap imports normally: unittest.mock needs Windows system variables.
+        # Only exit-only probes use an empty environment. The spy catches omitted
+        # env even on platforms where implicit inheritance happens to work.
+        probe = """
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+from test_workflow_contracts import InstalledCommandControlTests
+
+real_run = subprocess.run
+
+def checked_native(argv, **kwargs):
+    if kwargs.get("env") != {}:
+        raise AssertionError("exit-only native probes must receive explicit env={}")
+    return real_run(argv, **kwargs)
+
+methods = (
+    "test_every_windows_installed_command_must_succeed",
+    "test_windows_uninstall_checks_each_script_exit",
+)
+suite = unittest.TestSuite(InstalledCommandControlTests(name) for name in methods)
+with patch("subprocess.run", side_effect=checked_native):
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+if result.testsRun != len(methods) or result.skipped:
+    raise AssertionError("both original native-exit tests must run without skips")
+raise SystemExit(not result.wasSuccessful())
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", probe, str(Path(__file__).resolve().parent)],
+            env=os.environ.copy(), capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 class ZeroEgressControlTests(unittest.TestCase):
