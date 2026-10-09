@@ -4,7 +4,10 @@ use agent_session_grep_adapters_sqlite::{
     maintenance_queue::{QueueLock, SqliteMaintenanceQueue},
 };
 use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
-use agent_session_grep_ports::maintenance::{MaintenanceJob, MaintenanceQueue, MaintenanceState};
+use agent_session_grep_ports::{
+    PortError, PortResult,
+    maintenance::{MaintenanceJob, MaintenancePhase, MaintenanceQueue, MaintenanceState},
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -96,32 +99,45 @@ impl Fixture {
     fn job(&self, id: &str) -> MaintenanceJob {
         self.queue().get(id).unwrap()
     }
+    fn observe_job(&self, id: &str) -> PortResult<Option<MaintenanceJob>> {
+        let Some(queue) = SqliteMaintenanceQueue::open_existing(self.root.path())? else {
+            return Ok(None);
+        };
+        queue.get(id).map(Some)
+    }
     fn wait(&self, id: &str, predicate: impl Fn(&MaintenanceJob) -> bool) -> MaintenanceJob {
+        self.wait_in_phase(id, "state-predicate", predicate)
+    }
+    fn wait_in_phase(
+        &self,
+        id: &str,
+        caller_phase: &str,
+        predicate: impl Fn(&MaintenanceJob) -> bool,
+    ) -> MaintenanceJob {
         let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            let job = self.job(id);
-            if predicate(&job) {
-                return job;
-            }
-            assert!(
-                job.state.is_runnable(),
-                "unexpected terminal state: {:?}",
-                job.summary()
-            );
-            assert!(
-                Instant::now() < deadline,
-                "maintenance timed out: {:?}",
-                job.summary()
-            );
-            thread::sleep(Duration::from_millis(40));
-        }
+        wait_for_observation(
+            deadline,
+            predicate,
+            || self.observe_job(id),
+            Instant::now,
+            thread::sleep,
+        )
+        .unwrap_or_else(|failure| {
+            panic!(
+                "{}",
+                observation_failure_message(id, caller_phase, &failure)
+            )
+        })
     }
     fn completed(&self, id: &str) -> MaintenanceJob {
-        let job = self.wait(id, |job| !job.state.is_runnable());
+        self.completed_in_phase(id, "completion")
+    }
+    fn completed_in_phase(&self, id: &str, caller_phase: &str) -> MaintenanceJob {
+        let job = self.wait_in_phase(id, caller_phase, |job| !job.state.is_runnable());
         assert_eq!(
             job.state,
             MaintenanceState::Completed,
-            "{:?}",
+            "{caller_phase}: {:?}",
             job.summary()
         );
         job
@@ -135,6 +151,100 @@ impl Fixture {
         }
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum ObservationFailureReason {
+    TimedOut,
+    MissingQueue,
+    UnexpectedTerminal,
+    ReadError(&'static str),
+}
+
+// Bounded, test-only diagnostics: never retain a backend payload or whole job.
+#[derive(Debug, PartialEq, Eq)]
+struct ObservationFailure {
+    reason: ObservationFailureReason,
+    last_observed: Option<(MaintenanceState, MaintenancePhase)>,
+    busy_observations: usize,
+    busy_retries: usize,
+}
+
+fn observation_failure_message(
+    id: &str,
+    caller_phase: &str,
+    failure: &ObservationFailure,
+) -> String {
+    format!("maintenance observation failed: caller={caller_phase} job={id} {failure:?}")
+}
+
+fn observation_error_code(error: &PortError) -> &'static str {
+    match error {
+        PortError::InvalidRequest(_) => "invalid_request",
+        PortError::GenerationMismatch(_) => "generation_mismatch",
+        PortError::Backend(_) => "backend",
+        PortError::SourceIo(_) => "source_io",
+        PortError::SchemaIncompatible(_) => "schema_incompatible",
+        PortError::NotFound(_) => "not_found",
+        PortError::SnapshotChanged(_) => "snapshot_changed",
+        PortError::WriterBusy(_) => "writer_busy",
+    }
+}
+
+// Only the existing wait loop owns retries. Direct queue/job assertions do not.
+fn wait_for_observation(
+    deadline: Instant,
+    predicate: impl Fn(&MaintenanceJob) -> bool,
+    mut observe: impl FnMut() -> PortResult<Option<MaintenanceJob>>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<MaintenanceJob, ObservationFailure> {
+    let mut last_observed = None;
+    let mut busy_observations = 0;
+    let mut busy_retries = 0;
+    let mut retry_after_busy = false;
+    let reason = loop {
+        // An in-flight synchronous read cannot be cancelled; do not start a new
+        // one after expiry. Its successful predicate/terminal ordering is kept.
+        if now() >= deadline {
+            break ObservationFailureReason::TimedOut;
+        }
+        if retry_after_busy {
+            busy_retries += 1;
+        }
+        retry_after_busy = false;
+        match observe() {
+            Ok(Some(job)) => {
+                last_observed = Some((job.state, job.phase));
+                if predicate(&job) {
+                    return Ok(job);
+                }
+                if !job.state.is_runnable() {
+                    break ObservationFailureReason::UnexpectedTerminal;
+                }
+            }
+            Ok(None) => break ObservationFailureReason::MissingQueue,
+            Err(PortError::WriterBusy(_)) => {
+                busy_observations += 1;
+                retry_after_busy = true;
+            }
+            Err(error) => {
+                break ObservationFailureReason::ReadError(observation_error_code(&error));
+            }
+        }
+        let observed_at = now();
+        if observed_at >= deadline {
+            break ObservationFailureReason::TimedOut;
+        }
+        sleep(Duration::from_millis(40).min(deadline.saturating_duration_since(observed_at)));
+    };
+    Err(ObservationFailure {
+        reason,
+        last_observed,
+        busy_observations,
+        busy_retries,
+    })
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if SqliteMaintenanceQueue::path(self.root.path()).exists() {
@@ -565,7 +675,7 @@ fn cancellation_is_independent_of_catalog_writer_contention() {
 fn enqueue_competing_with_final_idle_exit_has_no_lost_wake() {
     let f = Fixture::seeded(2);
     let first = f.submit(&f.preview());
-    f.completed(&first);
+    f.completed_in_phase(&first, "initial-completion");
     let store = SqliteStore::open_for_write(f.db.to_str().unwrap()).unwrap();
     commit(&store, 3);
     drop(store);
@@ -593,7 +703,10 @@ fn enqueue_competing_with_final_idle_exit_has_no_lost_wake() {
         String::from_utf8_lossy(&output.stdout)
     );
     let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
-    f.completed(frame["data"]["job"]["id"].as_str().unwrap());
+    f.completed_in_phase(
+        frame["data"]["job"]["id"].as_str().unwrap(),
+        "post-contention-completion",
+    );
 }
 
 #[test]
@@ -684,4 +797,477 @@ fn empty_preview_cannot_submit_and_unsupported_catalog_is_not_migrated() {
             .unwrap()
             .is_empty()
     );
+}
+
+mod observation_tests {
+    use super::*;
+    use agent_session_grep_ports::maintenance::{MaintenanceSelection, MaintenanceTarget};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+    };
+
+    fn job(state: MaintenanceState) -> MaintenanceJob {
+        MaintenanceJob {
+            id: "observation-test-job".into(),
+            token: "synthetic-plan-not-for-diagnostics".into(),
+            compaction_id: "synthetic-compaction-not-for-diagnostics".into(),
+            target: MaintenanceTarget {
+                canonical_path: "synthetic-target-not-for-diagnostics".into(),
+                file_identity: "synthetic-identity-not-for-diagnostics".into(),
+                schema_version: 1,
+            },
+            selection: MaintenanceSelection {
+                plan_digest: String::new(),
+                aggregated_fields: Vec::new(),
+                batches: Vec::new(),
+                detail_bytes_before: 0,
+                estimated_detail_bytes_after: 0,
+                estimated_saved_bytes: 0,
+            },
+            max_write_seconds: 30,
+            state,
+            phase: if state.is_runnable() {
+                MaintenancePhase::Validate
+            } else {
+                MaintenancePhase::Done
+            },
+            reason: None,
+            attempts: 0,
+            consecutive_budget_exhaustions: 0,
+            next_retry_at_ms: 0,
+            cancel_requested: false,
+            backup: None,
+            logical_compaction_committed: false,
+            logical_compaction_reconciled: false,
+            cleanup_started: false,
+            metrics: Default::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            revision: 0,
+        }
+    }
+
+    type ObservationStep = (Duration, PortResult<Option<MaintenanceJob>>);
+
+    struct Script {
+        start: Instant,
+        now: Cell<Instant>,
+        steps: RefCell<VecDeque<ObservationStep>>,
+        observations: Cell<usize>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+    impl Script {
+        fn new(steps: impl IntoIterator<Item = ObservationStep>) -> Self {
+            let start = Instant::now();
+            Self {
+                start,
+                now: Cell::new(start),
+                steps: RefCell::new(steps.into_iter().collect()),
+                observations: Cell::new(0),
+                sleeps: RefCell::new(Vec::new()),
+            }
+        }
+        fn run(
+            &self,
+            budget: Duration,
+            predicate: impl Fn(&MaintenanceJob) -> bool,
+        ) -> Result<MaintenanceJob, ObservationFailure> {
+            wait_for_observation(
+                self.start + budget,
+                predicate,
+                || {
+                    self.observations.set(self.observations.get() + 1);
+                    let (elapsed, result) = self
+                        .steps
+                        .borrow_mut()
+                        .pop_front()
+                        .expect("unexpected extra observation");
+                    self.now.set(self.now.get() + elapsed);
+                    result
+                },
+                || self.now.get(),
+                |duration| {
+                    self.sleeps.borrow_mut().push(duration);
+                    self.now.set(self.now.get() + duration);
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn retries_typed_busy_then_completes() {
+        let script = Script::new([
+            (
+                Duration::ZERO,
+                Err(PortError::WriterBusy("synthetic-busy-payload".into())),
+            ),
+            (Duration::ZERO, Ok(Some(job(MaintenanceState::Completed)))),
+        ]);
+        let result = script.run(Duration::from_millis(90), |job| {
+            job.state == MaintenanceState::Completed
+        });
+        assert!(
+            result.is_ok(),
+            "transient Busy must be observed again: {:?}",
+            result.err()
+        );
+        assert_eq!(script.observations.get(), 2);
+        assert_eq!(*script.sleeps.borrow(), [Duration::from_millis(40)]);
+    }
+
+    #[test]
+    fn immediate_success_does_not_sleep_or_read_again() {
+        let script = Script::new([(Duration::ZERO, Ok(Some(job(MaintenanceState::Completed))))]);
+        let observed = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Completed
+            })
+            .unwrap();
+        assert_eq!(observed.id, "observation-test-job");
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn every_non_busy_error_fails_without_retry_or_payload_disclosure() {
+        let payload = "untrusted-busy-payload-not-for-diagnostics";
+        let cases = [
+            (PortError::InvalidRequest(payload.into()), "invalid_request"),
+            (
+                PortError::GenerationMismatch(payload.into()),
+                "generation_mismatch",
+            ),
+            (PortError::Backend(payload.into()), "backend"),
+            (PortError::SourceIo(payload.into()), "source_io"),
+            (
+                PortError::SchemaIncompatible(payload.into()),
+                "schema_incompatible",
+            ),
+            (PortError::NotFound(payload.into()), "not_found"),
+            (
+                PortError::SnapshotChanged(payload.into()),
+                "snapshot_changed",
+            ),
+        ];
+        for (error, code) in cases {
+            let script = Script::new([(Duration::ZERO, Err(error))]);
+            let failure = script
+                .run(Duration::from_millis(90), |_| false)
+                .err()
+                .unwrap();
+            assert_eq!(failure.reason, ObservationFailureReason::ReadError(code));
+            assert_eq!(failure.last_observed, None);
+            assert_eq!(failure.busy_observations, 0);
+            assert_eq!(failure.busy_retries, 0);
+            assert!(!format!("{failure:?}").contains(payload));
+            assert_eq!(script.observations.get(), 1);
+            assert!(script.sleeps.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_queue_fails_without_retry() {
+        let script = Script::new([(Duration::ZERO, Ok(None))]);
+        let failure = script
+            .run(Duration::from_millis(90), |_| false)
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::MissingQueue);
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn real_missing_queue_observation_creates_nothing() {
+        let fixture = Fixture::empty();
+        assert!(fixture.observe_job("missing-job").unwrap().is_none());
+        assert_eq!(fs::read_dir(fixture.root.path()).unwrap().count(), 0);
+        assert!(!fixture.db.exists());
+    }
+
+    #[test]
+    fn permanent_busy_expires_without_an_extra_observation() {
+        let script = Script::new((0..3).map(|_| {
+            (
+                Duration::ZERO,
+                Err(PortError::WriterBusy("synthetic-busy-payload".into())),
+            )
+        }));
+        let failure = script
+            .run(Duration::from_millis(90), |_| false)
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(failure.last_observed, None);
+        assert_eq!(failure.busy_observations, 3);
+        assert_eq!(failure.busy_retries, 2);
+        assert_eq!(script.observations.get(), 3);
+        assert_eq!(
+            *script.sleeps.borrow(),
+            [
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+                Duration::from_millis(10)
+            ]
+        );
+        assert_eq!(
+            script.now.get().duration_since(script.start),
+            Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn runnable_without_progress_still_times_out() {
+        let script =
+            Script::new((0..3).map(|_| (Duration::ZERO, Ok(Some(job(MaintenanceState::Running))))));
+        let failure = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Completed
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(
+            failure.last_observed,
+            Some((MaintenanceState::Running, MaintenancePhase::Validate))
+        );
+        assert_eq!(failure.busy_observations, 0);
+        assert_eq!(failure.busy_retries, 0);
+        assert_eq!(script.observations.get(), 3);
+        assert_eq!(
+            script.now.get().duration_since(script.start),
+            Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn busy_and_runnable_share_one_deadline_and_retry_count() {
+        for busy_at in [0, 1] {
+            let script = Script::new((0..3).map(|index| {
+                (
+                    Duration::ZERO,
+                    if index == busy_at {
+                        Err(PortError::WriterBusy("synthetic-busy-payload".into()))
+                    } else {
+                        Ok(Some(job(MaintenanceState::Running)))
+                    },
+                )
+            }));
+            let failure = script
+                .run(Duration::from_millis(90), |_| false)
+                .err()
+                .unwrap();
+            assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+            assert_eq!(
+                failure.last_observed,
+                Some((MaintenanceState::Running, MaintenancePhase::Validate))
+            );
+            assert_eq!(failure.busy_observations, 1);
+            assert_eq!(failure.busy_retries, 1);
+            assert_eq!(script.observations.get(), 3);
+            assert_eq!(
+                *script.sleeps.borrow(),
+                [
+                    Duration::from_millis(40),
+                    Duration::from_millis(40),
+                    Duration::from_millis(10)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn matching_terminal_predicate_is_preserved() {
+        let script = Script::new([(Duration::ZERO, Ok(Some(job(MaintenanceState::Cancelled))))]);
+        let observed = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Cancelled
+            })
+            .unwrap();
+        assert_eq!(observed.state, MaintenanceState::Cancelled);
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn unexpected_terminal_state_fails_immediately() {
+        let script = Script::new([(Duration::ZERO, Ok(Some(job(MaintenanceState::Failed))))]);
+        let failure = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Completed
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::UnexpectedTerminal);
+        assert_eq!(
+            failure.last_observed,
+            Some((MaintenanceState::Failed, MaintenancePhase::Done))
+        );
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_deadline_does_not_start_an_observation() {
+        let script = Script::new([]);
+        let failure = script.run(Duration::ZERO, |_| false).err().unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(failure.last_observed, None);
+        assert_eq!(failure.busy_observations, 0);
+        assert_eq!(failure.busy_retries, 0);
+        assert_eq!(script.observations.get(), 0);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn observation_time_is_charged_and_sleep_uses_only_remaining_budget() {
+        let script = Script::new([(
+            Duration::from_millis(80),
+            Err(PortError::WriterBusy("synthetic-busy-payload".into())),
+        )]);
+        let failure = script
+            .run(Duration::from_millis(90), |_| false)
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(failure.busy_observations, 1);
+        assert_eq!(failure.busy_retries, 0);
+        assert_eq!(script.observations.get(), 1);
+        assert_eq!(*script.sleeps.borrow(), [Duration::from_millis(10)]);
+    }
+
+    #[test]
+    fn in_flight_matching_predicate_retains_priority_at_and_after_deadline() {
+        for millis in [90, 95] {
+            let script = Script::new([(
+                Duration::from_millis(millis),
+                Ok(Some(job(MaintenanceState::Completed))),
+            )]);
+            let observed = script
+                .run(Duration::from_millis(90), |job| {
+                    job.state == MaintenanceState::Completed
+                })
+                .unwrap();
+            assert_eq!(observed.state, MaintenanceState::Completed);
+            assert_eq!(script.observations.get(), 1);
+            assert!(script.sleeps.borrow().is_empty());
+            assert_eq!(
+                script.now.get().duration_since(script.start),
+                Duration::from_millis(millis)
+            );
+        }
+    }
+
+    #[test]
+    fn in_flight_unexpected_terminal_retains_priority_over_timeout() {
+        let script = Script::new([(
+            Duration::from_millis(95),
+            Ok(Some(job(MaintenanceState::Failed))),
+        )]);
+        let failure = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Completed
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::UnexpectedTerminal);
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn in_flight_runnable_after_deadline_does_not_get_another_budget() {
+        let script = Script::new([(
+            Duration::from_millis(95),
+            Ok(Some(job(MaintenanceState::Running))),
+        )]);
+        let failure = script
+            .run(Duration::from_millis(90), |job| {
+                job.state == MaintenanceState::Completed
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(
+            failure.last_observed,
+            Some((MaintenanceState::Running, MaintenancePhase::Validate))
+        );
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn in_flight_busy_after_deadline_is_not_counted_as_a_retry() {
+        let script = Script::new([(
+            Duration::from_millis(95),
+            Err(PortError::WriterBusy("synthetic-busy-payload".into())),
+        )]);
+        let failure = script
+            .run(Duration::from_millis(90), |_| false)
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, ObservationFailureReason::TimedOut);
+        assert_eq!(failure.busy_observations, 1);
+        assert_eq!(failure.busy_retries, 0);
+        assert_eq!(script.observations.get(), 1);
+        assert!(script.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_keep_bounded_state_but_not_private_job_or_error_fields() {
+        let script = Script::new([
+            (Duration::ZERO, Ok(Some(job(MaintenanceState::Running)))),
+            (
+                Duration::ZERO,
+                Err(PortError::Backend(
+                    "untrusted-payload-not-for-diagnostics".into(),
+                )),
+            ),
+        ]);
+        let failure = script
+            .run(Duration::from_millis(90), |_| false)
+            .err()
+            .unwrap();
+        let message = observation_failure_message(
+            "observation-test-job",
+            "post-contention-completion",
+            &failure,
+        );
+        assert!(message.contains("caller=post-contention-completion"));
+        assert!(message.contains("job=observation-test-job"));
+        assert!(message.contains("Running, Validate"));
+        for forbidden in [
+            "synthetic-plan-not-for-diagnostics",
+            "synthetic-target-not-for-diagnostics",
+            "synthetic-identity-not-for-diagnostics",
+            "synthetic-compaction-not-for-diagnostics",
+            "untrusted-payload-not-for-diagnostics",
+        ] {
+            assert!(!message.contains(forbidden));
+        }
+        assert_eq!(script.observations.get(), 2);
+        assert_eq!(*script.sleeps.borrow(), [Duration::from_millis(40)]);
+    }
+
+    #[test]
+    fn diagnostics_distinguish_caller_phases_without_an_observed_job() {
+        let script = Script::new([]);
+        let failure = script.run(Duration::ZERO, |_| false).err().unwrap();
+        let initial =
+            observation_failure_message("observation-test-job", "initial-completion", &failure);
+        let final_message = observation_failure_message(
+            "observation-test-job",
+            "post-contention-completion",
+            &failure,
+        );
+        assert!(initial.contains("caller=initial-completion"));
+        assert!(final_message.contains("caller=post-contention-completion"));
+        assert_ne!(initial, final_message);
+        for message in [initial, final_message] {
+            assert!(message.contains("last_observed: None"));
+            assert!(message.contains("busy_observations: 0"));
+            assert!(message.contains("busy_retries: 0"));
+        }
+    }
 }
