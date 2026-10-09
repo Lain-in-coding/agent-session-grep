@@ -322,7 +322,7 @@ impl McpServer<'_> {
                 "protocolVersion": negotiate_version(Some(requested)),
                 "capabilities": { "tools": {} },
                 "serverInfo": {
-                    "name": "agent-session-grep",
+                    "name": crate::PRODUCT_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
                 },
             }),
@@ -3412,7 +3412,7 @@ mod tests {
         let mut server = ready(&store);
         let v = call(&mut server, "doctor", json!({}));
         let data = &v["result"]["structuredContent"]["data"];
-        assert_eq!(data["tool"], env!("CARGO_PKG_NAME"));
+        assert_eq!(data["tool"], "agent-session-grep");
         assert_eq!(data["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(data["db"], "ok");
         assert!(data["schema"].is_number());

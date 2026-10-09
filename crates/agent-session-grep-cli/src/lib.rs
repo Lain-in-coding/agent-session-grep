@@ -65,6 +65,9 @@ use agent_session_grep_provider_qoder::QoderAdapter;
 use protocol::{CanonicalCode, ProtocolError};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Public identity shared by both executable aliases and the MCP surface.
+const PRODUCT_NAME: &str = "agent-session-grep";
+
 /// Provider parse diagnostics exposed through the existing success-envelope
 /// `warnings` channel are bounded at the CLI boundary. This keeps a badly
 /// damaged source from producing an unbounded response while preserving the
@@ -507,7 +510,7 @@ fn run(
             HelpRequest::TopLevelHelp => emit_help("help", &help_text(), mode, request_id),
             HelpRequest::TopLevelVersion => emit_version(
                 "version",
-                &format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+                &format!("{} {}", PRODUCT_NAME, env!("CARGO_PKG_VERSION")),
                 mode,
                 request_id,
             ),
@@ -1376,7 +1379,7 @@ GLOBAL（全局 flag 放在命令名之前；子命令 flag 如 --max-items 放�
 
 EXIT CODES:
     0 成功；10 部分成功（预算截断，结果可用但不完整）；其余见 error catalog",
-        name = env!("CARGO_PKG_NAME"),
+        name = PRODUCT_NAME,
         version = env!("CARGO_PKG_VERSION"),
     )
 }
@@ -1654,7 +1657,7 @@ fn doctor(
     let db_opt = extract_db_flag_anywhere(args)?;
     let data = match db_opt {
         None => serde_json::json!({
-            "tool": env!("CARGO_PKG_NAME"),
+            "tool": PRODUCT_NAME,
             "version": env!("CARGO_PKG_VERSION"),
             "db": "not-checked",
             "schema": null,
@@ -1729,7 +1732,7 @@ pub(crate) fn doctor_store_data(
     let index_projection_version = store.index_projection_version()?;
     let index_projection_stale = index_projection_version != i64::from(INDEX_PROJECTION_VERSION);
     Ok(serde_json::json!({
-        "tool": env!("CARGO_PKG_NAME"),
+        "tool": PRODUCT_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "db": "ok",
         "schema": schema,

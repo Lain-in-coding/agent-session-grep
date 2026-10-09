@@ -1028,9 +1028,43 @@ class VersionControlTests(unittest.TestCase):
                 self.assertIsNone(validate("agent-session-grep 1.2.3" + suffix, "1.2.3"))
             for reported in ("", None, "agent-session-grep 11.2.3", "agent-session-grep 1.2.30",
                              "agent-session-grep 1.2.3-extra", "asg 1.2.3", "other 1.2.3",
-                             "agent-session-grep 1.2.3\nextra", " agent-session-grep 1.2.3"):
+                             "agent-session-grep 1.2.3\nextra", " agent-session-grep 1.2.3",
+                             "agent-session-grep-cli 1.2.3", "agent-session-grep-cli 1.2.3\n",
+                             "agent-session-grep 1.2.3 ", "agent-session-grep 1.2.3\t",
+                             "agent-session-grep 1.2.3\n\n", "agent-session-grep 1.2.3\r",
+                             "agent-session-grep 1.2.3\r\n\r\n", "agent-session-grep 1.2.3\x00",
+                             "agent-session-grep v1.2.3", "agent-session-grep 1.2.3+extra"):
                 with self.subTest(workflow=name, reported=reported), self.assertRaises(ValueError):
                     validate(reported, "1.2.3")
+
+    def test_binary_version_entry_rejects_nonzero_exit_even_with_correct_stdout(self):
+        for name in ("release.yml", "release-verify.yml"):
+            control, source = load_step(name, "build", "verify_binary")
+            env = {"TARGET": "test-target", "BINARY": "agent-session-grep", "VERSION": "1.2.3"}
+            with self.subTest(workflow=name), tempfile.TemporaryDirectory() as tmp:
+                with contextlib.chdir(tmp):
+                    binary = Path("target/test-target/release/agent-session-grep")
+                    binary.parent.mkdir(parents=True)
+                    binary.write_bytes(b"synthetic executable seam")
+                    resolved = str(binary.resolve(strict=True))
+                    error = subprocess.CalledProcessError(7, [resolved, "--version"],
+                                                         output="agent-session-grep 1.2.3\n")
+                    with patch("subprocess.check_output", side_effect=error) as execute:
+                        with self.assertRaises(subprocess.CalledProcessError) as caught:
+                            run_main(control, source, env)
+                    self.assertEqual(caught.exception.returncode, 7)
+                    self.assertEqual(caught.exception.output, "agent-session-grep 1.2.3\n")
+                    execute.assert_called_once_with([resolved, "--version"], text=True)
+
+    def test_binary_version_entry_rejects_missing_binary_before_execution(self):
+        for name in ("release.yml", "release-verify.yml"):
+            control, source = load_step(name, "build", "verify_binary")
+            env = {"TARGET": "test-target", "BINARY": "missing", "VERSION": "1.2.3"}
+            with self.subTest(workflow=name), tempfile.TemporaryDirectory() as tmp:
+                with contextlib.chdir(tmp), patch("subprocess.check_output") as execute:
+                    with self.assertRaises(FileNotFoundError):
+                        run_main(control, source, env)
+                    execute.assert_not_called()
 
     def test_version_rejects_noncanonical_and_hostile_components(self):
         for name in ("release.yml", "release-verify.yml"):

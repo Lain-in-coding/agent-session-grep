@@ -11,6 +11,9 @@ use std::process::{Command, Output, Stdio};
 
 /// 刚构建出的 `agent-session-grep` 二进制的绝对路径（由 Cargo 在编译期注入）。
 const BIN: &str = env!("CARGO_BIN_EXE_agent-session-grep");
+const BINS: [&str; 2] = [BIN, env!("CARGO_BIN_EXE_asg")];
+const HUMAN_MODES: [&[&str]; 2] = [&[], &["--output", "human"]];
+const MACHINE_MODES: [&[&str]; 3] = [&["--robot"], &["--output", "json"], &["--output", "jsonl"]];
 
 /// 固定应用时钟（`ASG_CLOCK_MS`，2026-08-25T00:00:00Z 的 Unix 毫秒）：rank
 /// signals 的时效衰减随注入时钟确定，e2e 子进程全部注入该值——同 query 同
@@ -276,6 +279,78 @@ fn run_bare(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to spawn agent-session-grep binary")
+}
+
+/// Run either freshly built entrypoint without touching a real user's data roots.
+fn run_identity(binary: &str, args: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("identity sandbox");
+    let home = dir.path().join("home");
+    let out = Command::new(binary)
+        .args(args)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+        .output()
+        .expect("spawn Cargo-provided identity binary");
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("sandbox entries")
+            .count(),
+        0,
+        "{binary} {args:?} must not create default data/config/cache files"
+    );
+    out
+}
+
+fn assert_identity_success(out: &Output) {
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(out));
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+}
+
+fn identity_frame(out: &Output, command: &str, request_id: &str) -> serde_json::Value {
+    assert_identity_success(out);
+    assert_eq!(stdout(out).lines().count(), 1, "exactly one envelope");
+    let frame = parse_first_line(out);
+    assert_envelope_shape(&frame, true);
+    assert_eq!(frame["outcome"], "success");
+    assert_eq!(frame["command"], command);
+    assert_eq!(frame["request_id"], request_id);
+    assert_eq!(frame["warnings"], serde_json::json!([]));
+    assert_eq!(frame["page"]["has_more"], false);
+    assert!(frame["page"]["next_cursor"].is_null());
+    frame
+}
+
+fn assert_human_doctor(out: &Output, with_db: bool) {
+    assert_identity_success(out);
+    let text = stdout(out);
+    let lines: Vec<_> = text.lines().collect();
+    assert!(
+        lines.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted key-value output: {text}"
+    );
+    assert!(lines.contains(&"tool: agent-session-grep"), "{text}");
+    assert!(
+        lines.contains(&format!("version: {}", env!("CARGO_PKG_VERSION")).as_str()),
+        "{text}"
+    );
+    assert!(
+        lines.contains(&if with_db { "db: ok" } else { "db: not-checked" }),
+        "{text}"
+    );
+    if with_db {
+        assert!(lines.contains(&"generation: 1"), "{text}");
+        assert!(lines.contains(&"interrupted_batches: 0"), "{text}");
+    } else {
+        assert!(lines.contains(&"schema: null"), "{text}");
+        assert!(lines.contains(&"index_projection_version: null"), "{text}");
+        assert!(lines.contains(&"index_projection_stale: null"), "{text}");
+    }
 }
 
 #[test]
@@ -1131,27 +1206,29 @@ fn help_and_version_pipe_closed_early_exit_zero_without_panic() {
     // CONTRACT §6：下游提前关闭管道（head/pager）时 --help/--version 必须
     // 静默 exit 0，不得 panic（exit 101）或污染 stderr。
     use std::process::Stdio;
-    for args in [&["--help"][..], &["--version"][..]] {
-        let mut child = Command::new(BIN)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn");
-        // 立即关闭读端：子进程写 stdout 时管道已断 → EPIPE。
-        drop(child.stdout.take());
-        let out = child.wait_with_output().expect("wait");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "{args:?} must exit 0 on EPIPE, stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert!(
-            !stderr.contains("panic"),
-            "{args:?} must not panic on EPIPE: {stderr}"
-        );
+    for binary in BINS {
+        for args in [&["--help"][..], &["-h"], &["--version"], &["-V"]] {
+            let mut child = Command::new(binary)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            // 立即关闭读端：子进程写 stdout 时管道已断 → EPIPE。
+            drop(child.stdout.take());
+            let out = child.wait_with_output().expect("wait");
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{args:?} must exit 0 on EPIPE, stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                stderr.is_empty(),
+                "{args:?} must not panic on EPIPE: {stderr}"
+            );
+        }
     }
 }
 
@@ -1265,81 +1342,86 @@ fn error_outputs_never_disclose_source_path_or_content() {
 
 #[test]
 fn version_flag_prints_version_without_db() {
-    // --version 不需要 --db：在 parse_db_flag 之前拦截。
-    let out = run_bare(&["--version"]);
-    assert!(out.status.success());
-    assert!(stdout(&out).contains("0.1.0"));
+    for binary in BINS {
+        for mode in HUMAN_MODES {
+            for flag in ["--version", "-V"] {
+                let mut args = mode.to_vec();
+                args.push(flag);
+                let out = run_identity(binary, &args);
+                assert_identity_success(&out);
+                assert_eq!(
+                    stdout(&out),
+                    format!("agent-session-grep {}\n", env!("CARGO_PKG_VERSION")),
+                    "{binary} {args:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn help_flag_lists_commands_without_db() {
-    let out = run_bare(&["--help"]);
-    assert!(out.status.success());
-    let s = stdout(&out);
-    // 帮助里应列出核心子命令，便于发现。
-    assert!(s.contains("ingest"), "help 应列出 ingest: {s}");
-    assert!(s.contains("search"), "help 应列出 search: {s}");
+    for binary in BINS {
+        for mode in HUMAN_MODES {
+            for flag in ["--help", "-h"] {
+                let mut args = mode.to_vec();
+                args.push(flag);
+                let out = run_identity(binary, &args);
+                assert_identity_success(&out);
+                let text = stdout(&out);
+                let expected = format!("agent-session-grep {}", env!("CARGO_PKG_VERSION"));
+                assert_eq!(
+                    text.lines().next(),
+                    Some(expected.as_str()),
+                    "{binary} {args:?}"
+                );
+                assert!(text.contains("ingest"), "help must list ingest: {text}");
+                assert!(text.contains("search"), "help must list search: {text}");
+            }
+        }
+    }
 }
 
 #[test]
 fn machine_mode_help_emits_single_success_envelope() {
-    // ADR-0006（R3.2）：--robot / --output json / --output jsonl 的 --help 都是
-    // exit 0 的 success envelope，帮助文本在 data.help_text；jsonl 恰为一帧；
-    // --request-id 原样回显。
-    for (mode_args, command) in [
-        (vec!["--robot"], "help"),
-        (vec!["--output", "json"], "help"),
-        (vec!["--output", "jsonl"], "help"),
-    ] {
-        let mut args = vec!["--request-id", "help.req-1"];
-        args.extend(mode_args.iter().copied());
-        args.push("--help");
-        let out = run_bare(&args);
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "{mode_args:?}: {}",
-            stdout(&out)
-        );
-        let text = stdout(&out);
-        assert_eq!(
-            text.lines().count(),
-            1,
-            "{mode_args:?} 的 --help 应恰好一帧: {text}"
-        );
-        let frame: serde_json::Value = serde_json::from_str(text.lines().next().unwrap())
-            .expect("help envelope must be valid JSON");
-        assert_envelope_shape(&frame, true);
-        assert_eq!(frame["command"], command, "{mode_args:?}: {frame}");
-        assert_eq!(frame["request_id"], "help.req-1", "{frame}");
-        assert!(
-            frame["data"]["help_text"]
-                .as_str()
-                .is_some_and(|help| help.contains("COMMANDS")),
-            "data.help_text 应携带帮助文本: {frame}"
-        );
+    for binary in BINS {
+        for mode in MACHINE_MODES {
+            for flag in ["--help", "-h"] {
+                let mut args = vec!["--request-id", "help.req-1"];
+                args.extend_from_slice(mode);
+                args.push(flag);
+                let out = run_identity(binary, &args);
+                let frame = identity_frame(&out, "help", "help.req-1");
+                let help = frame["data"]["help_text"].as_str().expect("help text");
+                let expected = format!("agent-session-grep {}", env!("CARGO_PKG_VERSION"));
+                assert_eq!(
+                    help.lines().next(),
+                    Some(expected.as_str()),
+                    "{binary} {args:?}"
+                );
+                assert!(help.contains("COMMANDS"), "{frame}");
+            }
+        }
     }
 }
 
 #[test]
 fn machine_mode_version_emits_single_success_envelope() {
-    // ADR-0006（R3.2）：--robot --version 是 success envelope，版本串在
-    // data.version；request-id 回显。
-    let out = run_bare(&["--robot", "--request-id", "ver.42", "--version"]);
-    assert_eq!(out.status.code(), Some(0), "stdout={}", stdout(&out));
-    let text = stdout(&out);
-    assert_eq!(text.lines().count(), 1, "一帧: {text}");
-    let frame: serde_json::Value =
-        serde_json::from_str(text.lines().next().unwrap()).expect("valid JSON");
-    assert_envelope_shape(&frame, true);
-    assert_eq!(frame["command"], "version");
-    assert_eq!(frame["request_id"], "ver.42");
-    assert!(
-        frame["data"]["version"]
-            .as_str()
-            .is_some_and(|version| version.contains("agent-session-grep")),
-        "data.version 应携带版本串: {frame}"
-    );
+    for binary in BINS {
+        for mode in MACHINE_MODES {
+            for flag in ["--version", "-V"] {
+                let mut args = mode.to_vec();
+                args.extend_from_slice(&["--request-id", "ver.42", flag]);
+                let out = run_identity(binary, &args);
+                let frame = identity_frame(&out, "version", "ver.42");
+                assert_eq!(
+                    frame["data"]["version"],
+                    format!("agent-session-grep {}", env!("CARGO_PKG_VERSION")),
+                    "{binary} {args:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1401,39 +1483,129 @@ fn machine_mode_subcommand_help_echoes_request_id() {
 
 #[test]
 fn help_and_version_require_no_db_and_create_no_file() {
-    // R3.1：help/version 在 --db 解析与存储打开之前拦截——全新库路径上跑
-    // 顶层与子命令 help、version 都不得创建 db 文件。
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = dir.path().join("must-not-exist.db");
-    let db_s = db.to_string_lossy().into_owned();
-    let cases: Vec<Vec<&str>> = vec![
-        vec!["--db", &db_s, "--robot", "--help"],
-        vec!["--db", &db_s, "--robot", "--version"],
-        vec!["--db", &db_s, "--robot", "search", "--help"],
-        vec!["--db", &db_s, "--robot", "index", "rebuild", "--help"],
-        vec!["--db", &db_s, "doctor", "--help"],
-    ];
-    for args in cases {
-        let out = run_bare(&args);
-        assert!(out.status.success(), "{args:?}: {}", stdout(&out));
-        assert!(
-            !db.exists(),
-            "{args:?} 不得创建 db 文件: {}",
-            dir.path().display()
-        );
+    let parent = dir.path().join("must-not-exist");
+    let db = parent.join("catalog.db");
+    let db_s = db.to_string_lossy();
+    for binary in BINS {
+        for mode in HUMAN_MODES.into_iter().chain(MACHINE_MODES) {
+            for command in [
+                &["--help"][..],
+                &["-h"],
+                &["--version"],
+                &["-V"],
+                &["search", "--help"],
+                &["index", "rebuild", "--help"],
+                &["doctor", "--help"],
+            ] {
+                let mut args = vec!["--db", db_s.as_ref()];
+                args.extend_from_slice(mode);
+                args.extend_from_slice(command);
+                let out = run_identity(binary, &args);
+                assert_identity_success(&out);
+                assert!(
+                    !parent.exists(),
+                    "{binary} {args:?} must not create catalog or parent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn identity_flags_preserve_usage_errors_and_missing_doctor_db() {
+    let (_store_dir, existing_db) = temp_db("identity-errors");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parent = dir.path().join("missing");
+    let db = parent.join("catalog.db");
+    let db_s = db.to_string_lossy();
+    for binary in BINS {
+        for mode in HUMAN_MODES.into_iter().chain(MACHINE_MODES) {
+            for (tail, exit, code) in [
+                (vec!["doctor"], 6, "catalog_error"),
+                (
+                    vec!["--request-id", "bad id", "--help"],
+                    2,
+                    "invalid_request",
+                ),
+                (
+                    vec!["--request-id", "bad id", "--version"],
+                    2,
+                    "invalid_request",
+                ),
+                (vec!["--output", "invalid", "--help"], 2, "invalid_request"),
+                (
+                    vec!["--output", "invalid", "--version"],
+                    2,
+                    "invalid_request",
+                ),
+                (vec!["search", "foo", "--help"], 2, "invalid_request"),
+            ] {
+                let db_arg = if tail[0] == "search" {
+                    existing_db.as_str()
+                } else {
+                    db_s.as_ref()
+                };
+                let mut args = vec!["--db", db_arg];
+                args.extend_from_slice(mode);
+                args.extend_from_slice(&tail);
+                let out = run_identity(binary, &args);
+                assert_eq!(
+                    out.status.code(),
+                    Some(exit),
+                    "{binary} {args:?}: {}",
+                    stdout(&out)
+                );
+                // Output-mode parse failures always use the existing error-envelope
+                // fallback, even when Human was requested; do not redefine it here.
+                if HUMAN_MODES.contains(&mode) && tail[0] != "--output" {
+                    assert!(out.stdout.is_empty(), "human errors must not print help");
+                    assert!(!out.stderr.is_empty(), "human error diagnostic");
+                    if exit == 6 {
+                        assert!(String::from_utf8_lossy(&out.stderr).contains("sync"));
+                    }
+                } else {
+                    assert!(out.stderr.is_empty(), "machine stderr: {:?}", out.stderr);
+                    assert_eq!(stdout(&out).lines().count(), 1);
+                    let frame = parse_first_line(&out);
+                    assert_envelope_shape(&frame, false);
+                    assert_eq!(frame["error"]["code"], code);
+                    if exit == 6 {
+                        assert!(frame["error"]["message"].as_str().unwrap().contains("sync"));
+                    }
+                }
+                assert!(
+                    !parent.exists(),
+                    "{binary} {args:?} must not create catalog or parent"
+                );
+            }
+        }
     }
 }
 
 #[test]
 fn doctor_reports_ok_without_db() {
-    let out = run_bare(&["--robot", "doctor"]);
-    assert!(out.status.success());
-    let s = stdout(&out);
-    assert!(s.contains("\"ok\":true"), "doctor 应报告 ok:true: {s}");
-    assert!(
-        s.contains("\"db\":\"not-checked\""),
-        "无 --db 时应标记未校验: {s}"
-    );
+    for binary in BINS {
+        for mode in HUMAN_MODES.into_iter().chain(MACHINE_MODES) {
+            let mut args = mode.to_vec();
+            args.extend_from_slice(&["--request-id", "doctor.bare-1", "doctor"]);
+            let out = run_identity(binary, &args);
+            if HUMAN_MODES.contains(&mode) {
+                assert_human_doctor(&out, false);
+            } else {
+                let frame = identity_frame(&out, "doctor", "doctor.bare-1");
+                assert_eq!(
+                    frame["data"]["tool"], "agent-session-grep",
+                    "{binary} {args:?}"
+                );
+                assert_eq!(frame["data"]["version"], env!("CARGO_PKG_VERSION"));
+                assert_eq!(frame["data"]["db"], "not-checked");
+                assert!(frame["data"]["schema"].is_null());
+                assert!(frame["data"]["index_projection_version"].is_null());
+                assert!(frame["data"]["index_projection_stale"].is_null());
+            }
+        }
+    }
 }
 
 #[test]
@@ -1543,34 +1715,47 @@ fn doctor_with_db_reports_generation_and_recovery_evidence() {
     let out = run(&db, &["index", "d1", "doctor evidence content"]);
     assert!(out.status.success());
 
-    // `run` 已在前缀位置给出 --db；doctor 的 --db 跟在命令名后会造成重复
-    // --db（R8.2 用法错误），故只传子命令本身。
-    let out = run(&db, &["doctor"]);
-    assert!(out.status.success(), "doctor failed: {}", stdout(&out));
-    let frame = parse_first_line(&out);
-    assert_envelope_shape(&frame, true);
-    assert_eq!(frame["data"]["db"], "ok");
-    // 一致性/恢复证据：活动 generation + 待收敛 intent 数（干净库应为 0）。
-    assert_eq!(frame["data"]["generation"], 1, "doctor={}", stdout(&out));
-    assert_eq!(
-        frame["data"]["interrupted_batches"],
-        0,
-        "干净库不应有待收敛 intent: {}",
-        stdout(&out)
-    );
-    // 工具活动保留策略证据：干净库无孤儿投影行。
-    assert_eq!(
-        frame["data"]["orphaned_tool_activities"],
-        0,
-        "干净库不应有孤儿活动行: {}",
-        stdout(&out)
-    );
-    assert_eq!(
-        frame["data"]["orphaned_activity_memberships"],
-        0,
-        "干净库不应有孤儿成员行: {}",
-        stdout(&out)
-    );
+    for binary in BINS {
+        for mode in HUMAN_MODES.into_iter().chain(MACHINE_MODES) {
+            let mut args = vec!["--db", db.as_str(), "--request-id", "doctor.store-1"];
+            args.extend_from_slice(mode);
+            args.push("doctor");
+            let out = run_identity(binary, &args);
+            if HUMAN_MODES.contains(&mode) {
+                assert_human_doctor(&out, true);
+                continue;
+            }
+            let frame = identity_frame(&out, "doctor", "doctor.store-1");
+            assert_eq!(
+                frame["data"]["tool"], "agent-session-grep",
+                "{binary} {args:?}"
+            );
+            assert_eq!(frame["data"]["version"], env!("CARGO_PKG_VERSION"));
+            assert!(frame["data"]["schema"].is_number());
+            assert_eq!(frame["data"]["db"], "ok");
+            // 一致性/恢复证据：活动 generation + 待收敛 intent 数（干净库应为 0）。
+            assert_eq!(frame["data"]["generation"], 1, "doctor={}", stdout(&out));
+            assert_eq!(
+                frame["data"]["interrupted_batches"],
+                0,
+                "干净库不应有待收敛 intent: {}",
+                stdout(&out)
+            );
+            // 工具活动保留策略证据：干净库无孤儿投影行。
+            assert_eq!(
+                frame["data"]["orphaned_tool_activities"],
+                0,
+                "干净库不应有孤儿活动行: {}",
+                stdout(&out)
+            );
+            assert_eq!(
+                frame["data"]["orphaned_activity_memberships"],
+                0,
+                "干净库不应有孤儿成员行: {}",
+                stdout(&out)
+            );
+        }
+    }
 }
 
 #[test]
