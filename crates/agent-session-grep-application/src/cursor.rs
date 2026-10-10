@@ -207,7 +207,7 @@ const B64_URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// base64url 编码，无 `=` 填充。
-fn base64url_encode(data: &[u8]) -> String {
+pub(crate) fn base64url_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let n = (u32::from(chunk[0]) << 16)
@@ -226,7 +226,7 @@ fn base64url_encode(data: &[u8]) -> String {
 }
 
 /// base64url 解码；非法字符、`=` 填充或非法长度（`len % 4 == 1`）返回 `None`。
-fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     fn sextet(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some(u32::from(c - b'A')),

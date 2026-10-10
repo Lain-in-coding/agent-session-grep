@@ -4,14 +4,20 @@
 //! 本 crate 是 hexagonal 架构里的 driven adapter——只依赖 domain + ports 的抽象，
 //! 把端口契约翻译成具体的 SQLite/FTS5 SQL，绝不反向依赖 application。
 //!
-//! 唯一例外：CJK bigram transform（ADR-0007）与 RFC3339/ISO-8601 时间戳解析按约定
+//! 共享纯策略：CJK n-gram transform（ADR-0007，单字 + bigram）与 RFC3339/ISO-8601
+//! 时间戳解析按约定
 //! 放在 application crate（`cjk` 模块 / `parse_search_instant`），由本 crate 在 FTS
 //! 写入/查询两侧与时间过滤谓词的标量函数中调用（索引与查询必须共享同一 transform、
-//! 过滤谓词与请求边界必须共享同一解析才能一致），纯函数无 use-case 语义。
+//! 过滤谓词与请求边界必须共享同一解析才能一致）；relocation 模块同样复用
+//! Application 的纯路径/计划策略。SQL、文件读取及持久化仍只在适配器中。
 
 mod cas;
 mod lease;
+pub mod maintenance;
+pub mod maintenance_queue;
+mod relocation;
 mod source_fs;
+mod trace;
 
 pub use cas::{cas_activate, read_current, write_current};
 pub use lease::WriterLease;
@@ -19,23 +25,36 @@ pub use source_fs::{
     FileSource, SnapshotFs, capture, open_snapshot_source, read_verified, verify_snapshot,
 };
 
-use agent_session_grep_application::{bigram_cjk, parse_search_instant};
+use agent_session_grep_application::{bounded_index_text, fts_tokens_cjk, parse_search_instant};
 use agent_session_grep_domain::{
     EvidenceSpan, IdKind, Message, MessageEdge, MessagePlacement, MessageRelation, PlacementId,
-    Role, SessionContextGraph, SourceDocument, StableId, ToolActivity,
+    Role, SessionContextGraph, SourceDocument, StableId, ToolActivity, UsageObservation,
 };
 use agent_session_grep_ports::{
     CatalogEntry, CatalogStore, ContextGraphStore, ContextStats, MessageContextCandidate,
-    PortError, PortResult, ResumeClaimsStore, SearchFacets, SearchHit, SearchIndex, SearchQuery,
-    SemanticIndex, SessionResumeMetadata, SidechainFacet, SourcePlacement, SourceResumeClaim,
+    PortError, PortResult, RepoTotals, ResumeClaimsStore, SearchFacets, SearchHit, SearchIndex,
+    SearchQuery, SemanticIndex, SessionResumeMetadata, SidechainFacet, SourcePlacement,
+    SourceResumeClaim, TOOL_ACTIVITY_TARGET_MAX_CHARS, UsageTotals,
 };
+use relocation::{InstallationAssignment, RelocationManifest};
 use rusqlite::{Connection, OptionalExtension};
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 语义证据门默认相似度下限（B4）：`query_semantic_filtered` 在候选进入 top-k
+/// 堆**之前**丢弃 `cosine_similarity < floor` 的候选（证据门同样遵守
+/// filter-before-topk 不变量），hybrid 的 RRF 名次分因此只作用于有相似度证据
+/// 的语义候选——零相似度向量不能再仅凭名次进入融合结果。
+///
+/// 取值由独立 holdout 阈值扫描与冻结回归交叉校验决定；
+/// `0.0` 表示仅保留防御路径（只排除负相似度候选）。
+/// 覆盖通道：[`SqliteStore::set_semantic_similarity_floor`]（测试/评测）与
+/// CLI 环境变量 `ASG_SEMANTIC_SIMILARITY_FLOOR`（显式注入，仅评测使用）。
+pub const SEMANTIC_SIMILARITY_FLOOR_DEFAULT: f32 = 0.2;
 
 /// Translate adapter failures into the stable port error vocabulary.
 ///
@@ -61,6 +80,19 @@ fn backend<E: std::fmt::Display + 'static>(e: E) -> PortError {
     }
 }
 
+/// 把一行里的非负 INTEGER 列读成 u64（schema CHECK 约束保证非负；
+/// 损坏行 fail-closed 报错，绝不静默 wrap——usage 五桶专用）。
+fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// 批量 `IN (...)` 查询的单块 id 上限。SQLite 的变量上限是 999（旧版）/
@@ -68,6 +100,9 @@ static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
 const BATCH_IN_CHUNK: usize = 500;
 /// Session 元数据搜索投影（`session_fts.text`）单字段的字符上限（schema v11）。
 const SESSION_SEARCH_FIELD_CHARS: usize = 4096;
+/// 会话标题显示投影（`session_titles.title`）的字符上限（schema v13，
+/// 借鉴清单 #6：≤80 字符，char 边界截断）。
+const SESSION_TITLE_MAX_CHARS: usize = 80;
 
 /// 批量 INSERT 每块行数。
 ///
@@ -138,7 +173,22 @@ fn operation_id() -> PortResult<String> {
     ))
 }
 
-const INDEX_PROJECTION_VERSION: &[u8] = b"sqlite-fts5-v1";
+/// 聚合计划 id：与 operation_id 同源（时间 + pid + 单调序号），前缀区分域。
+fn journal_compaction_id() -> PortResult<String> {
+    let seq = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "cmp_v1_{}_{}_{}",
+        unix_ms()?,
+        std::process::id(),
+        seq
+    ))
+}
+
+/// Batch-manifest digest 的后端域分隔串。**字节值已冻结**：它参与
+/// `index_batches.operation_digest`，改动会与既有 data root 中已存摘要不符。
+/// 与 [`INDEX_PROJECTION_VERSION`] 无关——后者是可演进的投影版本，本常量只是
+/// 摘要域标签。
+const INDEX_BATCH_DIGEST_DOMAIN: &[u8] = b"sqlite-fts5-v1";
 
 /// 从存储的 catalog payload 投影出可检索正文——rebuild 的规范投影函数。
 ///
@@ -148,6 +198,11 @@ const INDEX_PROJECTION_VERSION: &[u8] = b"sqlite-fts5-v1";
 /// 无前缀纯文本）。因此仅凭 catalog 即可无损重建 FTS 投影，无需依赖可能已损坏/丢失的
 /// 旧 FTS 内容。
 ///
+/// 投影统一施加 [`bounded_index_text`] 截断（借鉴清单 #3：ctx 文本保留策略，
+/// [`agent_session_grep_application::MESSAGE_FTS_MAX_CHARS`]）：catalog payload 保留
+/// provider 原文全文，FTS 投影有界——rebuild/merge/put 与直接写入路径必须产出
+/// 同一有界文本，否则 current 判定两侧分叉、重同步幂等失效。
+///
 /// 已知限制：切片期 `index` 命令若写入本身含制表符的正文，历史格式投影会截断到首个
 /// 制表符之后——该命令仅供切片期测试，真实数据均经 ingest/sync 以 JSON payload 写入。
 fn searchable_text(payload: &[u8]) -> String {
@@ -155,7 +210,7 @@ fn searchable_text(payload: &[u8]) -> String {
     // let structural tokens (`user`, `null`, `sessions`) match every message.
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
         if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
-            return text.to_string();
+            return bounded_index_text(text);
         }
         // JSON that lacks a string `text` field must not fall back to
         // indexing the raw JSON (structural-token pollution). It carries no
@@ -164,8 +219,8 @@ fn searchable_text(payload: &[u8]) -> String {
     }
     let text = String::from_utf8_lossy(payload);
     match text.split_once('\t') {
-        Some((_role, body)) => body.to_string(),
-        None => text.into_owned(),
+        Some((_role, body)) => bounded_index_text(body),
+        None => bounded_index_text(&text),
     }
 }
 
@@ -196,8 +251,18 @@ fn merge_message_payloads(_wire: &str, left: &[u8], right: &[u8]) -> PortResult<
             Ok(serde_json::Value::Object(map)) => Ok(map),
             // Slice-era rows hold bare text rather than canonical JSON. Those
             // cannot be reconciled field by field, so the conflict stands.
+            // The two refusals below must stay distinguishable: the caller masks
+            // the detail into `catalog_error`, and "an old row predates the
+            // canonical payload" and "two sources disagree about a stable field"
+            // need opposite remedies. Neither text may name an entity — a
+            // provider native id is adopted verbatim into the wire id, so it is
+            // untrusted content (see `conflicting_message_projections_are_still_
+            // rejected`).
             _ => Err(PortError::Backend(
-                "message has conflicting projections across sources".into(),
+                "message has conflicting projections across sources \
+                 (a stored projection is not canonical JSON — a pre-canonical row \
+                 cannot be reconciled field by field)"
+                    .into(),
             )),
         }
     };
@@ -298,9 +363,10 @@ fn merge_message_payloads(_wire: &str, left: &[u8], right: &[u8]) -> PortResult<
                 {
                     continue;
                 }
-                return Err(PortError::Backend(
-                    "message has conflicting projections across sources".into(),
-                ));
+                return Err(PortError::Backend(format!(
+                    "message has conflicting projections across sources \
+                     (stable field `{key}` differs)"
+                )));
             }
         }
     }
@@ -452,6 +518,7 @@ enum RelationUpsertManifest {
     Placement(MessagePlacement),
     Edge(MessageEdge),
     Activity(StoredActivity),
+    Usage(StoredUsage),
 }
 
 impl RelationUpsertManifest {
@@ -460,6 +527,7 @@ impl RelationUpsertManifest {
             Self::Placement(placement) => format!("placement:{}", placement.id.as_str()),
             Self::Edge(edge) => format!("edge:{}", edge.child_placement_id.as_str()),
             Self::Activity(activity) => format!("activity:{}", activity.activity_id),
+            Self::Usage(usage) => format!("usage:{}", usage.usage_id),
         }
     }
 
@@ -485,6 +553,20 @@ impl RelationUpsertManifest {
                     "status": activity.status,
                 },
             }),
+            Self::Usage(usage) => serde_json::json!({
+                "kind": "usage_event",
+                "usage": {
+                    "usage_id": usage.usage_id,
+                    "session_id": usage.session_id,
+                    "message_id": usage.message_id,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                    "reasoning_tokens": usage.reasoning_tokens,
+                    "token_source": usage.token_source,
+                },
+            }),
         }
     }
 }
@@ -495,6 +577,7 @@ enum RelationDeleteManifest {
     Placement(PlacementId),
     Edge(PlacementId),
     Activity(String),
+    Usage(String),
 }
 
 impl RelationDeleteManifest {
@@ -503,6 +586,7 @@ impl RelationDeleteManifest {
             Self::Placement(id) => format!("placement:{}", id.as_str()),
             Self::Edge(id) => format!("edge:{}", id.as_str()),
             Self::Activity(activity_id) => format!("activity:{activity_id}"),
+            Self::Usage(usage_id) => format!("usage:{usage_id}"),
         }
     }
 
@@ -519,6 +603,10 @@ impl RelationDeleteManifest {
             Self::Activity(activity_id) => serde_json::json!({
                 "kind": "tool_activity",
                 "activity_id": activity_id,
+            }),
+            Self::Usage(usage_id) => serde_json::json!({
+                "kind": "usage_event",
+                "usage_id": usage_id,
             }),
         }
     }
@@ -548,6 +636,8 @@ struct SourceReplacementManifest {
     placement_ids: Vec<PlacementId>,
     /// 该源声明的工具活动 id（v12；按 activity_id 排序去重）。
     activity_ids: Vec<String>,
+    /// 该源声明的 token 用量事件 id（v15；按 usage_id 排序去重）。
+    usage_ids: Vec<String>,
     relation_complete: bool,
     /// 捕获时源字节长度与内容指纹（source-scan 指纹缓存）。
     len_bytes: Option<i64>,
@@ -555,8 +645,9 @@ struct SourceReplacementManifest {
     /// 该 source 的 provider id；写入 `source_scans.provider_id` 供 discover diff。
     provider_id: Option<String>,
     /// Source-scoped Resume Metadata 声明（ADR-0009）：随本 source replacement
-    /// 同事务原子写入；`None` = 该 source 无可声明值（清除旧声明）。
-    resume_claim: Option<SourceResumeClaim>,
+    /// 同事务原子写入；空列表表示清除该 source 的旧声明。
+    resume_claims: Vec<SourceResumeClaim>,
+    installation: Option<InstallationAssignment>,
 }
 
 impl SourceReplacementManifest {
@@ -571,17 +662,27 @@ impl SourceReplacementManifest {
         placement_ids.sort();
         let mut activity_ids = self.activity_ids.clone();
         activity_ids.sort();
-        serde_json::json!({
+        let mut usage_ids = self.usage_ids.clone();
+        usage_ids.sort();
+        let mut claims: Vec<_> = self.resume_claims.iter().collect();
+        claims.sort_by_key(|claim| &claim.session_id);
+        let claims: Vec<_> = claims.into_iter().map(resume_claim_value).collect();
+        let mut value = serde_json::json!({
             "source_path": self.source_path,
             "entity_memberships": entity_memberships,
             "placement_ids": placement_ids,
             "activity_ids": activity_ids,
+            "usage_ids": usage_ids,
             "relation_complete": self.relation_complete,
             "len_bytes": self.len_bytes,
             "fingerprint": self.fingerprint,
             "provider_id": self.provider_id,
-            "resume_claim": self.resume_claim.as_ref().map(resume_claim_value),
-        })
+            "resume_claims": claims,
+        });
+        if let Some(installation) = &self.installation {
+            value["installation"] = installation.canonical_value();
+        }
+        value
     }
 }
 
@@ -625,18 +726,21 @@ impl StoredResumeClaim {
     }
 }
 
-/// 读取某 source 当前的 resume claim 行（写入路径保证每 source 至多一行）。
+/// Read all per-session resume claims for one source in deterministic order.
 fn stored_resume_claim(
     conn: &Connection,
     source_path: &str,
-) -> PortResult<Option<StoredResumeClaim>> {
-    conn.query_row(
-        "SELECT session_id, provider_id, provider_session_id, provider_session_id_state,
+) -> PortResult<BTreeMap<String, StoredResumeClaim>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, provider_id, provider_session_id, provider_session_id_state,
                 original_working_directory, original_working_directory_state, pair_observed
-         FROM source_session_resume_claims WHERE source_path = ?1",
-        [source_path],
-        |row| {
-            Ok(StoredResumeClaim {
+         FROM source_session_resume_claims WHERE source_path = ?1 ORDER BY session_id",
+        )
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map([source_path], |row| {
+            let claim = StoredResumeClaim {
                 session_id: row.get(0)?,
                 provider_id: row.get(1)?,
                 provider_session_id: row.get(2)?,
@@ -644,11 +748,11 @@ fn stored_resume_claim(
                 original_working_directory: row.get(4)?,
                 original_working_directory_state: row.get(5)?,
                 pair_observed: row.get(6)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(backend)
+            };
+            Ok((claim.session_id.clone(), claim))
+        })
+        .map_err(backend)?;
+    rows.collect::<Result<_, _>>().map_err(backend)
 }
 
 /// 把一条声明行解析为固定形状的 [`SessionResumeMetadata`]（fail closed）：
@@ -691,19 +795,32 @@ struct RelationManifests {
     relation_upserts: Vec<RelationUpsertManifest>,
     relation_deletes: Vec<RelationDeleteManifest>,
     source_replacements: Vec<SourceReplacementManifest>,
+    relocation: Option<RelocationManifest>,
 }
 
 impl RelationManifests {
     fn validate(&self) -> PortResult<()> {
+        if let Some(relocation) = &self.relocation {
+            if !self.relation_upserts.is_empty()
+                || !self.relation_deletes.is_empty()
+                || !self.source_replacements.is_empty()
+            {
+                return Err(PortError::Backend(
+                    "relocation cannot include source replacements".into(),
+                ));
+            }
+            relocation.validate()?;
+        }
         for upsert in &self.relation_upserts {
             match upsert {
                 RelationUpsertManifest::Placement(placement) => {
                     validate_placement(placement)?;
                 }
                 RelationUpsertManifest::Edge(edge) => validate_edge(edge)?,
-                // StoredActivity 在构造（stored_activity_from）时已完成
-                // 领域校验与边界截断；此处只做清单结构校验（键唯一等）。
-                RelationUpsertManifest::Activity(_) => {}
+                // StoredActivity/StoredUsage 在构造（stored_activity_from /
+                // stored_usage_from）时已完成领域校验与边界截断；此处只做清单
+                // 结构校验（键唯一等）。
+                RelationUpsertManifest::Activity(_) | RelationUpsertManifest::Usage(_) => {}
             }
         }
         let mut upsert_keys: Vec<_> = self
@@ -797,7 +914,7 @@ impl RelationManifests {
                 ));
             }
 
-            if let Some(claim) = &replacement.resume_claim {
+            for claim in &replacement.resume_claims {
                 let claim_session = StableId::from_wire(&claim.session_id).ok_or_else(|| {
                     PortError::Backend(
                         "source replacement has an invalid resume claim session id".into(),
@@ -866,6 +983,7 @@ struct CanonicalBatchManifest {
     relation_upserts_json: String,
     relation_deletes_json: String,
     source_replacements_json: String,
+    relocation_json: String,
     operation_digest: String,
 }
 
@@ -909,7 +1027,7 @@ fn batch_manifest(
     // 数据兼容性：分隔串刻意保留旧名 `agentsessions`——operation_digest 持久化在
     // index_batches 表并与既有 data root 中已存摘要交叉比对，改名会破坏 v7 数据兼容。
     hash_field(&mut hasher, b"agentsessions-index-batch-v1");
-    hash_field(&mut hasher, INDEX_PROJECTION_VERSION);
+    hash_field(&mut hasher, INDEX_BATCH_DIGEST_DOMAIN);
     for (id, payload, text) in ordered_upserts {
         hash_field(&mut hasher, b"upsert");
         hash_field(&mut hasher, id.as_str().as_bytes());
@@ -929,6 +1047,17 @@ fn batch_manifest(
     hash_field(&mut hasher, relation_deletes_json.as_bytes());
     hash_field(&mut hasher, b"source_replacements");
     hash_field(&mut hasher, source_replacements_json.as_bytes());
+    let relocation_json = serde_json::to_string(
+        &relations
+            .relocation
+            .as_ref()
+            .map(RelocationManifest::canonical_value),
+    )
+    .map_err(backend)?;
+    if relations.relocation.is_some() {
+        hash_field(&mut hasher, b"installation_relocation_v1");
+        hash_field(&mut hasher, relocation_json.as_bytes());
+    }
 
     Ok(CanonicalBatchManifest {
         upsert_ids,
@@ -936,6 +1065,7 @@ fn batch_manifest(
         relation_upserts_json,
         relation_deletes_json,
         source_replacements_json,
+        relocation_json,
         operation_digest: hasher.finalize().to_hex().to_string(),
     })
 }
@@ -955,6 +1085,14 @@ pub struct IndexBatch {
     pub source_replacements: Vec<serde_json::Value>,
     pub durable_point: String,
     pub error_code: Option<String>,
+    /// 明细布局版本：`full` 或 `aggregated_v1`（见保留合同常量
+    /// `JOURNAL_DETAIL_FORMAT_*`）。未知值使读取 fail-closed。
+    pub detail_format: String,
+    /// 聚合摘要：仅 `aggregated_v1` 行有值；`full` 行恒为 None。
+    ///
+    /// `aggregated_v1` 行的 `upsert_ids`/`delete_ids`/关系与 source-replacement
+    /// 向量是占位空值，**不是事实**——规模与承诺一律以本摘要为准。
+    pub detail_summary: Option<AggregatedJournalDetail>,
 }
 
 /// Handle returned after an outbox intent reaches its first durable point.
@@ -964,6 +1102,172 @@ pub struct PendingIndexBatch {
     pub base_generation: u64,
     pub target_generation: u64,
     pub operation_digest: String,
+}
+
+/// 保留合同版本标记：该行仍保存完整的 durable intent 明细（v19 之前的既有行
+/// 在迁移时按此值回填——它们的明细确实是完整的）。
+pub const JOURNAL_DETAIL_FORMAT_FULL: &str = "full";
+
+/// 保留合同版本标记：terminal 批次明细已聚合为可验证摘要（schema v19 起）。
+///
+/// 该格式行的五个可聚合列（`upsert_ids_json`、`delete_ids_json`、
+/// `relation_upserts_json`、`relation_deletes_json`、`source_replacements_json`）
+/// 是占位 `[]`，规模/承诺记录在 `detail_summary_json`（[`AggregatedJournalDetail`]）；
+/// 批次身份、代数、状态与 `operation_digest` 不变。未知格式值 fail-closed。
+pub const JOURNAL_DETAIL_FORMAT_AGGREGATED_V1: &str = "aggregated_v1";
+
+/// 聚合计划持久化格式（`journal_compactions.plan_json`）的版本；未知版本 fail-closed。
+pub const JOURNAL_COMPACTION_PLAN_VERSION: u32 = 1;
+
+/// 可聚合的明细字段清单（保留合同表的实现镜像）。
+///
+/// `relocation_json` 刻意不在列：搬迁 manifest 体积小、且是 relocation 审计的
+/// 一手证据，属于永久保留字段。未决状态（building/search_built/cleanup_pending）
+/// 的任何字段都不进聚合——它们仍参与恢复与 CAS 校验。
+pub const JOURNAL_COMPACTION_FIELDS: [&str; 5] = [
+    "upsert_ids_json",
+    "delete_ids_json",
+    "relation_upserts_json",
+    "relation_deletes_json",
+    "source_replacements_json",
+];
+
+/// terminal 批次状态：明细可被有约束聚合（不是"未决"）。
+const JOURNAL_TERMINAL_STATES: [&str; 3] = ["activated", "aborted", "superseded"];
+
+/// 未决/保留中的批次状态：明细永久保留（仍参与恢复、重放与 CAS 校验）。
+const JOURNAL_RESOLVED_PENDING_STATES: [&str; 3] = ["building", "search_built", "cleanup_pending"];
+
+/// journal 明细承诺的域分隔串（v19 新格式，无历史兼容负担）。
+const JOURNAL_DETAIL_DIGEST_DOMAIN: &[u8] = b"journal-detail-v1";
+
+/// 聚合计划承诺的域分隔串。
+const JOURNAL_COMPACTION_PLAN_DOMAIN: &[u8] = b"journal-compaction-plan-v1";
+
+/// preview 计划过期（journal 在预览之后变化）时的稳定原因串：写进审计行、
+/// 进入错误消息。不含任何路径、id 或内容。
+const STALE_JOURNAL_COMPACTION_REASON: &str =
+    "journal changed since the compaction preview; re-run preview";
+
+/// 单个 terminal 批次某一可聚合字段的规模（preview 项；只含规模，不含正文）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalDetailFieldPreview {
+    /// 字段名（[`JOURNAL_COMPACTION_FIELDS`] 之一）。
+    pub field: String,
+    /// 聚合前该列文本的字节数。
+    pub bytes: u64,
+    /// 该列 JSON 数组的元素个数（如 upsert id 数、placement 数）。
+    pub items: u64,
+}
+
+/// 单个 terminal 批次将聚合的内容（preview 项）。
+///
+/// 只含身份、规模与摘要承诺：preview 本身不复制它准备压缩的明细正文，因此不会
+/// 把 journal 的增长问题原样搬进诊断输出。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalCompactionPreviewItem {
+    /// durable intent 的 operation_id（永久保留字段；聚合后仍是行主键）。
+    pub operation_id: String,
+    /// 行状态（terminal：activated/aborted/superseded）。
+    pub state: String,
+    pub base_generation: u64,
+    pub target_generation: u64,
+    /// 批次摘要（永久保留；聚合不改写）。
+    pub operation_digest: String,
+    /// 五个可聚合列原始文本的字节级承诺；apply 用它检测 preview 之后的漂移。
+    pub detail_digest: String,
+    pub fields: Vec<JournalDetailFieldPreview>,
+}
+
+/// journal 聚合预览：先展示、后执行（执行入口独立，默认不自动调用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCompactionPreview {
+    /// 计划身份：由本预览生成，stage 时固化；用于 apply 与审计。
+    pub compaction_id: String,
+    /// 计划承诺（排序后的逐行指纹 + 规模 + 字段清单）；stage/apply 的 CAS 依据。
+    pub plan_digest: String,
+    /// 将被聚合的 terminal 批次数。
+    pub affected_batches: u64,
+    /// 被聚合的字段清单（[`JOURNAL_COMPACTION_FIELDS`]）。
+    pub aggregated_fields: Vec<String>,
+    /// 聚合前五个可聚合字段的字节总量。
+    pub detail_bytes_before: u64,
+    /// 聚合后明细字节量（五个 `[]` 占位 + 摘要 JSON；摘要是确定性的，故为精确值）。
+    pub estimated_detail_bytes_after: u64,
+    /// 预计体积收益 = before - after（字节）。
+    pub estimated_saved_bytes: u64,
+    /// 逐批次规模展示（按 target_generation, operation_id 排序）。
+    pub batches: Vec<JournalCompactionPreviewItem>,
+}
+
+/// 已 durable 落盘的聚合计划句柄（`staged`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCompactionStage {
+    pub compaction_id: String,
+    pub plan_digest: String,
+    pub affected_batches: u64,
+    pub detail_bytes_before: u64,
+    pub estimated_saved_bytes: u64,
+}
+
+/// 一次聚合提交的结果（计划自带的精确数字；`already_committed` 表示幂等重入）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCompactionOutcome {
+    pub compaction_id: String,
+    pub state: String,
+    /// 本次实际改写的行数（已提交计划重入时为 0）。
+    pub applied_batches: u64,
+    /// true = 该计划此前已提交，本次没有改写任何行。
+    pub already_committed: bool,
+    pub detail_bytes_before: u64,
+    pub detail_bytes_after: u64,
+    pub saved_bytes: u64,
+}
+
+/// 崩溃后对 `staged` 计划的收敛报告。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalCompactionRecovery {
+    /// 本次提交的 staged 计划数。
+    pub committed: u64,
+    /// 本次确认的已提交计划数（幂等）。
+    pub already_committed: u64,
+    /// 因漂移被显式放弃的计划数（明细未改写，原因写入审计行）。
+    pub abandoned: u64,
+    /// 收敛后仍 staged 的计划数（正常为 0）。
+    pub staged_remaining: u64,
+}
+
+/// `journal_compactions` 行的诊断读回。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCompactionEvent {
+    pub compaction_id: String,
+    /// staged | committed | abandoned。
+    pub state: String,
+    pub plan_digest: String,
+    pub affected_batches: u64,
+    pub detail_bytes_before: u64,
+    pub detail_bytes_after: u64,
+    pub saved_bytes: u64,
+    pub created_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+    pub reason: Option<String>,
+}
+
+/// `detail_format = 'aggregated_v1'` 行的摘要：聚合后唯一保留的明细证据。
+///
+/// 与同行的 `operation_digest` 组成可验证审计链：`operation_digest` 承诺完整
+/// manifest（含 payload/正文哈希），`detail_digest` 承诺被替换掉的五个列原文；
+/// 持有 compact 前备份的一方可重算两者核对摘要未被伪造。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AggregatedJournalDetail {
+    pub format: String,
+    pub compaction_id: String,
+    /// 字段 → 元素个数（占位 `[]` 不代表事实，规模一律以本表为准）。
+    pub items: BTreeMap<String, u64>,
+    /// 字段 → 聚合前字节数。
+    pub bytes: BTreeMap<String, u64>,
+    /// 被聚合明细的字节级承诺（域分隔 blake3，原列文本原样入哈希）。
+    pub detail_digest: String,
 }
 
 /// 一个 source 完整成功 scan 后的全部消息条目。
@@ -992,6 +1296,12 @@ pub struct SourceBatch {
     /// 活动锚定在 `message_id` 上；同一活动事实 + 同一锚点在不同源里派生同一
     /// activity_id（跨源副本去重，claims 计数决定行生命周期）。
     pub activities: Vec<SourceActivity>,
+    /// 本次 source scan 观察到的全部 token 用量事件（v15 投影；默认为空）。
+    ///
+    /// 事件锚定在 `session_id` 上（`message_id` 可空：provider 逐消息给用量时
+    /// 挂消息，session 级累计事件挂会话）。同一事实 + 同一锚点跨源派生同一
+    /// usage_id（去重，claims 计数决定行生命周期）。
+    pub usage_events: Vec<SourceUsage>,
     /// 该 source 是否完成了零 skipped 的 relation scan。
     ///
     /// B1 不提交 completeness marker；B2 将据此替换或撤销 marker。
@@ -1004,8 +1314,8 @@ pub struct SourceBatch {
     /// leave this NULL so discover never tombstones paths outside its known root.
     pub provider_id: Option<String>,
     /// Source-scoped Resume Metadata 声明（ADR-0009）；随 source 事务原子写入，
-    /// source 移除时同事务清除。`None` = 该 source 无可声明值。
-    pub resume_claim: Option<SourceResumeClaim>,
+    /// source 移除时同事务清除。每个 canonical Session 至多一个声明。
+    pub resume_claims: Vec<SourceResumeClaim>,
 }
 
 /// 一条锚定在稳定消息上的工具活动（v12）。
@@ -1013,6 +1323,103 @@ pub struct SourceBatch {
 pub struct SourceActivity {
     pub message_id: StableId,
     pub activity: ToolActivity,
+}
+
+/// 一条锚定在稳定会话上的 token 用量事件（v15）。
+///
+/// `message_id` 为 `None` 表示 session 级观察（如 Codex `token_count` 累计
+/// 事件没有消息关联）；`Some` 表示 provider 逐消息给出（如 Claude Code 的
+/// `message.usage` 锚在 assistant 记录上）。绝不臆造锚点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUsage {
+    pub session_id: StableId,
+    pub message_id: Option<StableId>,
+    pub usage: UsageObservation,
+}
+
+/// `usage_events` 表行 + 用量 id 的存储视图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredUsage {
+    usage_id: String,
+    session_id: String,
+    message_id: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    token_source: String,
+}
+
+impl StoredUsage {
+    fn matches(&self, other: &StoredUsage) -> bool {
+        self.session_id == other.session_id
+            && self.message_id == other.message_id
+            && self.input_tokens == other.input_tokens
+            && self.output_tokens == other.output_tokens
+            && self.cache_read_tokens == other.cache_read_tokens
+            && self.cache_write_tokens == other.cache_write_tokens
+            && self.reasoning_tokens == other.reasoning_tokens
+            && self.token_source == other.token_source
+    }
+}
+
+/// 内容寻址的用量 id：`use_v1_<hex16(blake3("usage-event-v1" || …))>`。
+///
+/// 同一 (session_id, message_id, 五桶, token_source) 派生同一 id——跨源副本
+/// 天然去重；message_id 为 None 时以空串参与哈希（与 Some("") 无歧义）。
+fn usage_id_for(session_id: &str, message_id: Option<&str>, usage: &UsageObservation) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"usage-event-v1");
+    hasher.update(session_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(message_id.unwrap_or("").as_bytes());
+    hasher.update(&[0]);
+    for bucket in [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        usage.reasoning_tokens,
+    ] {
+        hasher.update(&bucket.to_le_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.update(usage.token_source.as_str().as_bytes());
+    let hex = hasher.finalize().to_hex();
+    format!("use_v1_{}", &hex.as_str()[..16])
+}
+
+/// 把领域用量观察规范化为存储行（fail-closed：锚点种类校验）。
+fn stored_usage_from(
+    session_id: &StableId,
+    message_id: Option<&StableId>,
+    usage: &UsageObservation,
+) -> PortResult<StoredUsage> {
+    if session_id.kind() != IdKind::Session {
+        return Err(PortError::Backend(
+            "usage event session anchor has the wrong kind".into(),
+        ));
+    }
+    if let Some(message_id) = message_id
+        && message_id.kind() != IdKind::Message
+    {
+        return Err(PortError::Backend(
+            "usage event message anchor has the wrong kind".into(),
+        ));
+    }
+    let row = StoredUsage {
+        usage_id: usage_id_for(session_id.as_str(), message_id.map(StableId::as_str), usage),
+        session_id: session_id.as_str().to_string(),
+        message_id: message_id.map(|id| id.as_str().to_string()),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        token_source: usage.token_source.as_str().to_string(),
+    };
+    Ok(row)
 }
 
 /// `tool_activities` 表行 + 活动 id 的存储视图。
@@ -1040,9 +1447,9 @@ impl StoredActivity {
 
 /// 工具名存储上限（字符数）：显式截断，防止 provider 失控的工具名膨胀存储。
 const TOOL_ACTIVITY_NAME_MAX_CHARS: usize = 128;
-/// 工具 target 存储上限（字符数）：显式截断；真实 transcript 的路径/命令
-/// 可能很长，但活动只承载检索面事实，不需要全文。
-const TOOL_ACTIVITY_TARGET_MAX_CHARS: usize = 512;
+// 工具 target 存储上限（字符数）由 ports 的
+// `TOOL_ACTIVITY_TARGET_MAX_CHARS` 单一持有（provider 的可检索正文投影用同一
+// 常量），此处直接引用，避免两侧数值漂移。
 
 /// 内容寻址的活动 id：`act_v1_<hex16(blake3("tool-activity-v1" || …))>`。
 ///
@@ -1147,6 +1554,7 @@ struct PreparedSource {
     prior_entity_memberships: BTreeMap<String, Option<String>>,
     prior_placement_ids: BTreeSet<String>,
     prior_activity_ids: BTreeSet<String>,
+    prior_usage_ids: BTreeSet<String>,
     observed_placements: BTreeMap<String, MessagePlacement>,
     observed_edges: BTreeMap<String, MessageEdge>,
     replacement: SourceReplacementManifest,
@@ -1223,6 +1631,50 @@ fn stored_relation(value: &str) -> PortResult<MessageRelation> {
     }
 }
 
+/// Repo slug 解析器（schema v16）：cwd → 宿主仓 `host/owner/name` 三段 slug。
+///
+/// 写入路径由组合根注入真实实现（CLI 的 git 检测；借鉴 Recall 的
+/// repo_identity），测试注入确定性的 fake。解析器是环境事实探测器：
+/// 检测失败一律 `None`（诚实降级），绝不报错、绝不猜——sync/index 永远
+/// 不因 git 不可用而失败。
+pub trait RepoSlugResolver {
+    /// cwd → repo slug；任何一步失败（目录不存在/非 git 仓库/无 origin/
+    /// URL 形状不认识）返回 None。
+    fn resolve(&self, cwd: &str) -> Option<String>;
+}
+
+/// 默认解析器：不探测（repo identity 投影关闭）。未注入解析器时
+/// `session_repo_slugs` 恒为空——"无行 = 未知"，与"有解析器但检测失败"
+/// 同义，读取侧无需区分。
+pub struct NoopRepoSlugResolver;
+
+impl RepoSlugResolver for NoopRepoSlugResolver {
+    fn resolve(&self, _cwd: &str) -> Option<String> {
+        None
+    }
+}
+
+/// 重投影时对 repo 身份投影（schema v16 `session_repo_slugs`）的处置。
+///
+/// 该表是本适配器唯一**不可从 catalog 重建**的派生投影：slug 只能由注入的
+/// [`RepoSlugResolver`] 现场探测本机 git 得到，catalog 里没有任何字节能还原它
+/// （按设计——绝对路径不进这张表）。因此"从权威 catalog 全量重投影"这个动作
+/// 对它没有权威：若无条件清表重派生，一次解析器缺席（打开时自愈尚未装配组合根
+/// 注入的解析器，或 git 临时不可用）就会把整条 repo 维度删空，同时把
+/// `index_projection_version` 盖成当前——此后 `search --repo` 恒 0 命中、
+/// `status` 恒无仓库，而没有任何信号会报告这次丢失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoIdentityRebuild {
+    /// 重派生：显式 `index rebuild` 与增量提交路径。调用方已装配解析器，
+    /// 且会话集合可能变化（退役会话必须同事务删除其 slug 行）。
+    Rederive,
+    /// 原样保留：打开时的投影版本自愈（[`SqliteStore::ensure_index_projection_current`]）。
+    /// 自愈只重投影 catalog 可重建的词元流与显示投影，完全不改变会话集合，
+    /// 因此保留既有 slug 行不会留下孤儿。slug 派生规则本身变化时的收敛动作
+    /// 是显式 `index rebuild`（它会重新探测 git），不是打开时自愈。
+    Preserve,
+}
+
 /// SQLite 支撑的存储：catalog 表存规范化实体负载，FTS5 表提供全文检索。
 ///
 /// 单连接 + `RefCell` 内部可变：端口 trait 以 `&self` 取用，而 rusqlite 的写操作
@@ -1238,27 +1690,80 @@ pub struct SqliteStore {
     /// 全部方法降级为空/未就绪。设置它是调用方声明"这些向量属于哪个模型"，
     /// 换模型后旧维度向量因 model_id 不匹配自然被排除。
     semantic_model_id: RefCell<Option<String>>,
+    /// 语义证据门下限（B4）：`query_semantic_filtered` 在 top-k 名额分配前
+    /// 丢弃低于该相似度的候选。默认 [`SEMANTIC_SIMILARITY_FLOOR_DEFAULT`]，
+    /// 仅测试/评测经 [`Self::set_semantic_similarity_floor`] 覆盖。
+    semantic_similarity_floor: Cell<f32>,
+    /// Repo slug 解析器（schema v16）：写路径由组合根注入真实 git 实现；
+    /// 默认 [`NoopRepoSlugResolver`]（投影关闭）。解析器是环境事实探测器，
+    /// 失败一律 None。
+    repo_slug_resolver: RefCell<Box<dyn RepoSlugResolver>>,
+    /// Staging reservations only; persisted with the matching source replacement.
+    pending_installations: RefCell<BTreeMap<String, InstallationAssignment>>,
+    relocation_clock: fn() -> PortResult<i64>,
 }
 
 /// 一批源路径的指纹缓存项：捕获时长度与内容指纹。
-pub type SourceFingerprint = (Option<i64>, Option<String>);
+/// 一条 source-scan 指纹缓存行：`(len_bytes, fingerprint, parser_version)`。
+///
+/// parser_version 是解析语义版本（[`PARSER_SEMANTIC_VERSION`] 的存储镜像）：
+/// CLI 的 unchanged 判定必须三者同时匹配——版本落后即视为需要重解析，
+/// 否则解析逻辑升级后源文件未变化的库永远不重解析。
+pub type SourceFingerprint = (Option<i64>, Option<String>, i64);
+
+/// 一条 `source_scans` 行的 current 判定视图：
+/// `(len_bytes, fingerprint, provider_id, parser_version)`。
+type StoredSourceScan = (Option<i64>, Option<String>, Option<String>, i64);
+
+/// 全库关系/成员视图，提交开始时读取一次，供后续 no-op 探测复用。
+struct CatalogStateSnapshot<'a> {
+    entities_by_source: &'a BTreeMap<String, BTreeMap<String, Option<String>>>,
+    placements_by_source: &'a BTreeMap<String, BTreeSet<String>>,
+    activities_by_source: &'a BTreeMap<String, BTreeSet<String>>,
+    usages_by_source: &'a BTreeMap<String, BTreeSet<String>>,
+    placements: &'a BTreeMap<String, StoredPlacement>,
+    edges: &'a BTreeMap<String, StoredEdge>,
+    activities: &'a BTreeMap<String, StoredActivity>,
+    usages: &'a BTreeMap<String, StoredUsage>,
+}
 
 impl SqliteStore {
     /// 只读打开（不抢 writer lease）。供 search/get/doctor 等读路径。
     pub fn open(path: &str) -> PortResult<Self> {
-        let conn = Connection::open(path).map_err(backend)?;
-        Self::init(&conn)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(backend)?;
+        conn.busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(backend)?;
+        let current: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if current != SCHEMA_VERSION {
+            return Err(PortError::SchemaIncompatible(format!(
+                "catalog schema version {current} differs from supported {SCHEMA_VERSION}; \
+                 run index rebuild with a compatible agent-session-grep version"
+            )));
+        }
+        Self::register_scalar_functions(&conn)?;
         Ok(SqliteStore {
             conn: RefCell::new(conn),
             _lease: None,
             semantic_model_id: RefCell::new(None),
+            semantic_similarity_floor: Cell::new(SEMANTIC_SIMILARITY_FLOOR_DEFAULT),
+            repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
+            pending_installations: RefCell::new(BTreeMap::new()),
+            relocation_clock: unix_ms,
         })
     }
 
-    /// 写入路径打开：先在 db 所在目录获取 data-root writer lease，再打开库。
+    /// 写入路径打开：先在 db 所在目录获取 data-root writer lease，再打开库，
+    /// 最后收敛派生投影。
     ///
     /// 若另一进程已持 lease，立即失败（不阻塞）。lease 随本 store 存活，
     /// Drop 时释放，以维持每个 data root 单写者不变量。
+    ///
+    /// 注意本函数在返回**之前**就可能重投影派生索引（投影版本自愈），此时
+    /// 组合根还没机会 [`set_repo_slug_resolver`](Self::set_repo_slug_resolver)。
+    /// 因此自愈路径刻意不重派生 repo 身份投影——见 [`RepoIdentityRebuild`]。
     pub fn open_for_write(path: &str) -> PortResult<Self> {
         let db_path = Path::new(path);
         // 裸相对文件名（如 "catalog.db"）的 parent() 是空串 ""，create_dir_all("")
@@ -1275,9 +1780,17 @@ impl SqliteStore {
             conn: RefCell::new(conn),
             _lease: Some(lease),
             semantic_model_id: RefCell::new(None),
+            semantic_similarity_floor: Cell::new(SEMANTIC_SIMILARITY_FLOOR_DEFAULT),
+            repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
+            pending_installations: RefCell::new(BTreeMap::new()),
+            relocation_clock: unix_ms,
         };
         // lease 已到手，当前进程是唯一写者；安全收敛上次崩溃留下的无副作用 intent。
         store.recover_interrupted()?;
+        // 投影版本自愈（schema v17）：本二进制的投影变换与库中现存词元流失配时，
+        // 从权威 catalog 重投影（无需 reparse）。放在 lease 之后——重投影是写操作，
+        // 必须由唯一写者执行；读路径（`open`）无 lease 不写，改为查询期 fail-closed。
+        store.ensure_index_projection_current()?;
         Ok(store)
     }
 
@@ -1289,6 +1802,10 @@ impl SqliteStore {
             conn: RefCell::new(conn),
             _lease: None,
             semantic_model_id: RefCell::new(None),
+            semantic_similarity_floor: Cell::new(SEMANTIC_SIMILARITY_FLOOR_DEFAULT),
+            repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
+            pending_installations: RefCell::new(BTreeMap::new()),
+            relocation_clock: unix_ms,
         })
     }
 
@@ -1297,8 +1814,11 @@ impl SqliteStore {
     /// WAL journal 模式的 PRAGMA 初始化复制自 ctx（ctxrs，Apache-2.0）的
     /// catalog 初始化。
     fn init(conn: &Connection) -> PortResult<()> {
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(backend)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA cache_size = -131072;",
+        )
+        .map_err(backend)?;
         Self::migrate(conn)?;
         Self::register_scalar_functions(conn)
     }
@@ -1372,7 +1892,8 @@ impl SqliteStore {
             mig.execute_batch(
                 "CREATE TABLE IF NOT EXISTS store_metadata (
                      singleton         INTEGER PRIMARY KEY CHECK(singleton = 1),
-                     active_generation INTEGER NOT NULL CHECK(active_generation >= 0)
+                     active_generation INTEGER NOT NULL CHECK(active_generation >= 0),
+                     index_projection_version INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO store_metadata(singleton, active_generation)
                  VALUES(1, 0);
@@ -1462,7 +1983,8 @@ impl SqliteStore {
                      scanned_at_ms INTEGER NOT NULL,
                      len_bytes     INTEGER,
                      fingerprint   TEXT,
-                     provider_id   TEXT
+                     provider_id   TEXT,
+                     parser_version INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .map_err(backend)?;
@@ -1509,6 +2031,27 @@ impl SqliteStore {
         }
         if current < 12 {
             Self::migrate_v11_to_v12(conn)?;
+        }
+        if current < 13 {
+            Self::migrate_v12_to_v13(conn)?;
+        }
+        if current < 14 {
+            Self::migrate_v13_to_v14(conn)?;
+        }
+        if current < 15 {
+            Self::migrate_v14_to_v15(conn)?;
+        }
+        if current < 16 {
+            Self::migrate_v15_to_v16(conn)?;
+        }
+        if current < 17 {
+            Self::migrate_v16_to_v17(conn)?;
+        }
+        if current < 18 {
+            Self::migrate_v17_to_v18(conn)?;
+        }
+        if current < 19 {
+            Self::migrate_v18_to_v19(conn)?;
         }
         // 不随 user_version 门控：旧 v7 库（本列存在前建成的）打开时同样需要。
         Self::ensure_fts_ids_rowid(conn)?;
@@ -1821,6 +2364,318 @@ impl SqliteStore {
         tx.commit().map_err(backend)
     }
 
+    /// Add the v13 session-title display projection in one explicit
+    /// transaction (additive, non-destructive).
+    ///
+    /// `session_titles` stores the derived display title per canonical Session
+    /// （借鉴清单 #6 的 custom-title > ai-title > 首条有效 user 派生链，
+    /// ≤[`SESSION_TITLE_MAX_CHARS`] 字符）。与 `session_fts` 同属"catalog +
+    /// claims 可重建投影"：旧库迁到 v13 后表为空，由 rebuild 或后续 affected
+    /// source 提交回填。`user_version = 13` 与 DDL 同事务。
+    fn migrate_v12_to_v13(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v12_to_v13_inner(conn, false)
+    }
+
+    fn migrate_v12_to_v13_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_titles (
+                 session_wire TEXT PRIMARY KEY,
+                 title        TEXT NOT NULL
+             );
+             PRAGMA user_version = 13;",
+        )
+        .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v12-to-v13 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// Add the v14 `parser_version` column to `source_scans` (additive,
+    /// non-destructive).
+    ///
+    /// 借鉴 Recall 的 parser_version 增量同步（usage/event parser_version
+    /// 三层判断）：任何改变已索引内容的解析语义升级都递增
+    /// [`PARSER_SEMANTIC_VERSION`]，sync 的 unchanged 判定把存储的
+    /// parser_version 纳入比较——版本落后的源即使字节未变也走 targeted
+    /// backfill（重跑 parse + commit），不再依赖手动 `index rebuild` 或源
+    /// 文件变化。旧行 DEFAULT 0——0 永不等于当前版本（≥1），因此迁移后
+    /// 第一次 sync 自动 backfill 全部已扫源。列存在即无害：未升级的 v13
+    /// 代码路径忽略它。新库在 v5 建表 DDL 已带本列（v9 provider_id 同一
+    /// 模式），此处短路只对齐 user_version。`user_version = 14` 与 DDL
+    /// 同事务。
+    fn migrate_v13_to_v14(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v13_to_v14_inner(conn, false)
+    }
+
+    fn migrate_v13_to_v14_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let has_parser_version = conn
+            .prepare("PRAGMA table_info(source_scans)")
+            .map_err(backend)?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+            .iter()
+            .any(|name| name == "parser_version");
+        if has_parser_version {
+            // 已有列（新库建表时已带或本迁移重跑）；只对齐 user_version。
+            conn.execute_batch("PRAGMA user_version = 14;")
+                .map_err(backend)?;
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(
+            "ALTER TABLE source_scans ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 14;",
+        )
+        .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v13-to-v14 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// Add the v15 token-usage projection in one explicit transaction
+    /// (additive, non-destructive).
+    ///
+    /// `usage_events` stores typed token-usage observations anchored to stable
+    /// session wire ids (`message_id` nullable：provider 逐消息给出时挂消息，
+    /// session 级累计事件挂会话）；`usage_event_membership` records per-source
+    /// claims so the lifecycle mirrors `tool_activities`（complete-scan replace,
+    /// incomplete-scan union, tombstone via claims）。五桶非负、`token_source`
+    /// 只允许 observed/derived（覆盖标记：行存在 = provider 报过用量，真 0 与
+    /// 未知可区分）。步骤只依赖 v7+ 表，在 v7..=14 的任意 catalog 上都能干净
+    /// 运行——与并行 schema 分支 merge-safe。`user_version = 15` 与 DDL 同事务。
+    fn migrate_v14_to_v15(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v14_to_v15_inner(conn, false)
+    }
+
+    fn migrate_v14_to_v15_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_events (
+                 usage_id           TEXT PRIMARY KEY,
+                 session_id         TEXT NOT NULL,
+                 message_id         TEXT,
+                 input_tokens       INTEGER NOT NULL CHECK(input_tokens >= 0),
+                 output_tokens      INTEGER NOT NULL CHECK(output_tokens >= 0),
+                 cache_read_tokens  INTEGER NOT NULL CHECK(cache_read_tokens >= 0),
+                 cache_write_tokens INTEGER NOT NULL CHECK(cache_write_tokens >= 0),
+                 reasoning_tokens   INTEGER NOT NULL CHECK(reasoning_tokens >= 0),
+                 token_source       TEXT NOT NULL
+                     CHECK(token_source IN ('observed', 'derived'))
+             );
+             CREATE INDEX IF NOT EXISTS usage_events_session ON usage_events(session_id);
+             CREATE INDEX IF NOT EXISTS usage_events_message ON usage_events(message_id);
+             CREATE TABLE IF NOT EXISTS usage_event_membership (
+                 source_path TEXT NOT NULL,
+                 usage_id    TEXT NOT NULL,
+                 PRIMARY KEY(source_path, usage_id)
+             );
+             CREATE INDEX IF NOT EXISTS usage_event_membership_usage
+             ON usage_event_membership(usage_id);
+             PRAGMA user_version = 15;",
+        )
+        .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v14-to-v15 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// Add the v16 repo-identity projection in one explicit transaction
+    /// (additive, non-destructive).
+    ///
+    /// `session_repo_slugs` stores the privacy-safe `host/owner/name` slug
+    /// derived from each Session's pair-observed working directory via the
+    /// injected [`RepoSlugResolver`]（git rev-parse --show-toplevel +
+    /// remote get-url origin，Recall 同款）。绝对路径绝不落此表——只有三段
+    /// slug。行存在 = 检测成功；无行 = 未知/未派生（诚实降级，不猜）。
+    /// 生命周期与 `session_fts` 同一重建批次（affected-session commit +
+    /// rebuild 同事务），session 退役时同事务删除。旧库迁到 v16 后表为空，
+    /// 由 rebuild 或后续 affected source 提交回填。步骤只依赖 v7+ 表，在
+    /// v7..=15 的任意 catalog 上都能干净运行——与并行 schema 分支
+    /// merge-safe。`user_version = 16` 与 DDL 同事务。
+    fn migrate_v15_to_v16(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v15_to_v16_inner(conn, false)
+    }
+
+    fn migrate_v15_to_v16_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_repo_slugs (
+                 session_wire TEXT PRIMARY KEY,
+                 repo_slug    TEXT NOT NULL
+             );
+             PRAGMA user_version = 16;",
+        )
+        .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v15-to-v16 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// Add the v17 `store_metadata.index_projection_version` column (additive,
+    /// non-destructive) and stamp it honestly for this catalog.
+    ///
+    /// 该列是**库级**投影属性（见 [`INDEX_PROJECTION_VERSION`]）：它回答
+    /// "现存 FTS 词元流与派生投影是哪个变换写的"。它不是 per-source 事实
+    /// （不像 `source_scans.parser_version`）——一次重投影重写整库的每一行，
+    /// 部分迁移状态没有可自洽的答案，故落在 singleton `store_metadata`，与
+    /// `active_generation` 同表同语义层级。
+    ///
+    /// 迁移期的标记取自**可观测事实**而非库版本：投影为空（`fts` 与
+    /// `session_fts` 都无行）说明没有任何旧变换写下的词元，直接标记当前版本
+    /// （新库/未索引库因此不会在第一次打开时被判失配）；投影非空的旧库保持
+    /// DEFAULT 0——0 永不等于当前版本（≥1），因此写路径打开时自动重投影
+    /// （[`SqliteStore::ensure_index_projection_current`]），读路径 fail-closed
+    /// 而不是静默返回错误命中集。`user_version = 17` 与 DDL 同事务。
+    fn migrate_v16_to_v17(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v16_to_v17_inner(conn, false)
+    }
+
+    fn migrate_v16_to_v17_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let has_column = conn
+            .prepare("PRAGMA table_info(store_metadata)")
+            .map_err(backend)?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+            .iter()
+            .any(|name| name == "index_projection_version");
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        if !has_column {
+            // 新库在 v2 建表 DDL 已带本列（v5 parser_version / v9 provider_id
+            // 同一模式）；旧库在此加法扩展。
+            tx.execute_batch(
+                "ALTER TABLE store_metadata
+                 ADD COLUMN index_projection_version INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(backend)?;
+        }
+        if Self::index_projection_is_empty_in_tx(&tx)? {
+            tx.execute(
+                "UPDATE store_metadata SET index_projection_version = ?1 WHERE singleton = 1",
+                [i64::from(INDEX_PROJECTION_VERSION)],
+            )
+            .map_err(backend)?;
+        }
+        tx.execute_batch("PRAGMA user_version = 17;")
+            .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v16-to-v17 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// v19：journal 保留合同——`index_batches` 增加明细格式标记与聚合摘要列，
+    /// 新增 `journal_compactions` 计划/审计表（加法式、非破坏）。
+    ///
+    /// terminal 批次（activated/aborted/superseded）的重复明细可被显式 compact
+    /// 为可验证摘要（见 [`SqliteStore::preview_journal_compaction`]）；未决
+    /// （building/search_built/cleanup_pending）行永不进入聚合。既有行按
+    /// `full` 回填——它们的明细确实是完整的——因此旧格式可读、恢复/重放语义
+    /// 不变；未知格式值在本二进制里一律 fail-closed。列与表都做存在性检查，
+    /// 对"列已在建表 DDL 里"的新库幂等。`user_version = 19` 与 DDL 同事务。
+    fn migrate_v18_to_v19(conn: &Connection) -> PortResult<()> {
+        Self::migrate_v18_to_v19_inner(conn, false)
+    }
+
+    fn migrate_v18_to_v19_inner(conn: &Connection, inject_failure: bool) -> PortResult<()> {
+        let columns: BTreeSet<String> = conn
+            .prepare("PRAGMA table_info(index_batches)")
+            .map_err(backend)?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(backend)?
+            .collect::<Result<_, _>>()
+            .map_err(backend)?;
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        if !columns.contains("detail_format") {
+            tx.execute_batch(
+                "ALTER TABLE index_batches
+                 ADD COLUMN detail_format TEXT NOT NULL DEFAULT 'full';",
+            )
+            .map_err(backend)?;
+        }
+        if !columns.contains("detail_summary_json") {
+            tx.execute_batch(
+                "ALTER TABLE index_batches
+                 ADD COLUMN detail_summary_json TEXT;",
+            )
+            .map_err(backend)?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS journal_compactions (
+                 compaction_id    TEXT PRIMARY KEY,
+                 state            TEXT NOT NULL CHECK(state IN (
+                     'staged', 'committed', 'abandoned'
+                 )),
+                 plan_json        TEXT NOT NULL,
+                 plan_digest      TEXT NOT NULL,
+                 affected_batches INTEGER NOT NULL,
+                 detail_bytes_before INTEGER NOT NULL,
+                 detail_bytes_after  INTEGER NOT NULL,
+                 saved_bytes         INTEGER NOT NULL,
+                 created_at_ms    INTEGER NOT NULL,
+                 resolved_at_ms   INTEGER,
+                 reason           TEXT,
+                 CHECK((state = 'staged' AND resolved_at_ms IS NULL)
+                    OR (state IN ('committed', 'abandoned') AND resolved_at_ms IS NOT NULL))
+             );
+             CREATE INDEX IF NOT EXISTS journal_compactions_state
+             ON journal_compactions(state);",
+        )
+        .map_err(backend)?;
+        tx.execute_batch("PRAGMA user_version = 19;")
+            .map_err(backend)?;
+
+        if inject_failure {
+            return Err(PortError::Backend(
+                "injected v18-to-v19 migration failure".into(),
+            ));
+        }
+
+        tx.commit().map_err(backend)
+    }
+
+    /// True when no derived FTS projection row exists（`fts` 与 `session_fts`
+    /// 都为空）：此时不存在任何旧变换写下的词元，投影版本可无条件标记为当前。
+    fn index_projection_is_empty_in_tx(conn: &Connection) -> PortResult<bool> {
+        let empty: bool = conn
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM fts)
+                        AND NOT EXISTS(SELECT 1 FROM session_fts)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        Ok(empty)
+    }
+
     /// 声明语义向量归属的模型 id（#3）。未设置时 `SemanticIndex` 全部方法
     /// 视为未配置：`is_ready` 为 false、查询返回空、写入报错——这样"忘了配模型"
     /// 不会变成往表里写无归属向量。
@@ -1828,14 +2683,133 @@ impl SqliteStore {
         *self.semantic_model_id.borrow_mut() = Some(model_id.into());
     }
 
+    /// 覆盖语义证据门下限（B4）。仅测试/评测使用（生产值来自
+    /// [`SEMANTIC_SIMILARITY_FLOOR_DEFAULT`]）；非有限值显式报错，绝不静默
+    /// 换成一个与调用方声明不同的阈值（评测数字必须绑定真实生效的门）。
+    pub fn set_semantic_similarity_floor(&self, floor: f32) -> PortResult<()> {
+        if !floor.is_finite() {
+            return Err(PortError::Backend(
+                "semantic similarity floor must be finite".into(),
+            ));
+        }
+        self.semantic_similarity_floor.set(floor);
+        Ok(())
+    }
+
+    /// 当前生效的语义相似度下限（B4）。
+    pub fn semantic_similarity_floor(&self) -> f32 {
+        self.semantic_similarity_floor.get()
+    }
+
+    /// 注入 repo slug 解析器（schema v16）。写路径（sync/index）在提交前
+    /// 注入真实 git 实现；未注入时投影恒为空（诚实降级，不猜）。
+    ///
+    /// 可以在 [`open_for_write`](Self::open_for_write) 之后注入：打开时的投影
+    /// 版本自愈不重派生该投影（见 [`RepoIdentityRebuild`]），因此注入时机不会
+    /// 让已探测出的 repo 身份被删空。
+    pub fn set_repo_slug_resolver(&self, resolver: Box<dyn RepoSlugResolver>) {
+        *self.repo_slug_resolver.borrow_mut() = resolver;
+    }
+
     /// 清除当前模型下的全部向量（换模型或 rebuild 语义索引时使用）。
     /// 返回删除行数。向量表是投影而非权威数据，清除永不影响 catalog。
     pub fn clear_embeddings(&self, model_id: &str) -> PortResult<usize> {
-        let conn = self.conn.borrow();
-        let n = conn
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(backend)?;
+        let n = tx
             .execute("DELETE FROM message_vec WHERE model_id = ?1", [model_id])
             .map_err(backend)?;
+        if n > 0 {
+            Self::advance_generation_in_tx(&tx)?;
+        }
+        tx.commit().map_err(backend)?;
         Ok(n)
+    }
+
+    /// Atomically replace one model's projection from bounded catalog keyset
+    /// batches. The encoder is called only for Messages and must not access
+    /// this store while its transaction is open. Returns indexed/skipped/cleared.
+    pub fn rebuild_embeddings_from_catalog(
+        &self,
+        model_id: &str,
+        dimension: usize,
+        batch_size: usize,
+        mut encode: impl FnMut(&CatalogEntry) -> PortResult<Option<Vec<f32>>>,
+    ) -> PortResult<(usize, usize, usize)> {
+        if model_id.is_empty() || dimension == 0 || !(1..=512).contains(&batch_size) {
+            return Err(PortError::Backend(
+                "invalid embedding rebuild configuration".into(),
+            ));
+        }
+        let dimension = i64::try_from(dimension).map_err(backend)?;
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(backend)?;
+        let cleared = tx
+            .execute("DELETE FROM message_vec WHERE model_id = ?1", [model_id])
+            .map_err(backend)?;
+        let mut indexed = 0;
+        let mut skipped = 0;
+        {
+            let mut read = tx
+                .prepare("SELECT id, payload FROM catalog WHERE id > ?1 ORDER BY id LIMIT ?2")
+                .map_err(backend)?;
+            let mut write = tx
+                .prepare(
+                    "INSERT INTO message_vec(wire_id, model_id, dimension, embedding)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(wire_id) DO UPDATE SET
+                     model_id = excluded.model_id,
+                     dimension = excluded.dimension,
+                     embedding = excluded.embedding",
+                )
+                .map_err(backend)?;
+            let mut after = String::new();
+            loop {
+                let batch = read
+                    .query_map(rusqlite::params![after, batch_size as i64], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(backend)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend)?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (wire, payload) in batch {
+                    let id = StableId::from_wire(&wire).ok_or_else(|| {
+                        PortError::Backend("catalog contains an invalid entity id".into())
+                    })?;
+                    after = wire;
+                    if id.kind() != IdKind::Message {
+                        skipped += 1;
+                        continue;
+                    }
+                    let Some(vector) = encode(&CatalogEntry { id, payload })? else {
+                        skipped += 1;
+                        continue;
+                    };
+                    if vector.len() != dimension as usize
+                        || vector.iter().any(|value| !value.is_finite())
+                    {
+                        return Err(PortError::Backend(
+                            "embedding has invalid dimension or non-finite values".into(),
+                        ));
+                    }
+                    write
+                        .execute(rusqlite::params![
+                            after,
+                            model_id,
+                            dimension,
+                            f32_slice_to_bytes(&vector)
+                        ])
+                        .map_err(backend)?;
+                    indexed += 1;
+                }
+            }
+        }
+        Self::advance_generation_in_tx(&tx)?;
+        tx.commit().map_err(backend)?;
+        Ok((indexed, skipped, cleared))
     }
 
     /// Batch-load role + sidechain facts for the given message wire ids.
@@ -1856,10 +2830,17 @@ impl SqliteStore {
         for chunk in chunk_ids(&wires) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             // Role from catalog payload JSON; sidechain via EXISTS on placements.
+            // `json_valid` 门必须在 `json_extract` 之前：catalog 里合法存在
+            // 非 JSON payload（切片期 `index <fact> <text>` 写入的裸文本），
+            // 直接 json_extract 会让整条语句以 "malformed JSON" 失败。
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT c.id,
-                            COALESCE(json_extract(c.payload, '$.role'), 'unknown'),
+                            COALESCE(
+                                CASE WHEN json_valid(c.payload)
+                                     THEN json_extract(c.payload, '$.role') END,
+                                'unknown'
+                            ),
                             EXISTS(
                               SELECT 1 FROM message_placements mp
                               WHERE mp.message_id = c.id AND mp.is_sidechain = 1
@@ -1939,6 +2920,95 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// 全库 token 用量聚合（usage 维度只读投影，status 展示用）。
+    ///
+    /// 覆盖标记原则：`sessions == 0` 表示库中没有任何 usage 事实（未知），
+    /// 而不是"用量为零"——真 0 与未知必须可区分（agentsview has_*_tokens
+    /// 同义）。事件计数按 token_source 分列（observed/derived）。
+    pub fn usage_totals(&self) -> PortResult<Option<UsageTotals>> {
+        let conn = self.conn.borrow();
+        // usage_events 表只在 v15 迁移后存在；无投影返回 None（诚实区分
+        // "无投影"与"有投影但零事实"）。
+        let has_table: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_events'")
+            .map_err(backend)?
+            .query_row([], |_| Ok(true))
+            .optional()
+            .map_err(backend)?
+            .unwrap_or(false);
+        if !has_table {
+            return Ok(None);
+        }
+        let totals: (i64, i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT session_id),
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cache_read_tokens), 0),
+                        COALESCE(SUM(cache_write_tokens), 0),
+                        COALESCE(SUM(reasoning_tokens), 0),
+                        COALESCE(SUM(CASE WHEN token_source = 'observed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN token_source = 'derived' THEN 1 ELSE 0 END), 0)
+                 FROM usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .map_err(backend)?;
+        let to_u64 = |value: i64| u64::try_from(value.max(0)).map_err(backend);
+        Ok(Some(UsageTotals {
+            sessions: to_u64(totals.0)?,
+            input_tokens: to_u64(totals.1)?,
+            output_tokens: to_u64(totals.2)?,
+            cache_read_tokens: to_u64(totals.3)?,
+            cache_write_tokens: to_u64(totals.4)?,
+            reasoning_tokens: to_u64(totals.5)?,
+            observed_events: to_u64(totals.6)?,
+            derived_events: to_u64(totals.7)?,
+        }))
+    }
+
+    /// 全库 repo 身份聚合（schema v16 只读投影，status 展示用）。
+    ///
+    /// 每 slug 一行 `(repo_slug, sessions)`，会话数降序、slug 升序
+    /// tiebreak（确定性）。无投影行 → 空列表（未知 ≠ 零——绝不把
+    /// "没有 repo 事实"说成"零个仓库"）。
+    pub fn repo_totals(&self) -> PortResult<Vec<RepoTotals>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare(
+                "SELECT repo_slug, COUNT(*)
+                 FROM session_repo_slugs
+                 GROUP BY repo_slug
+                 ORDER BY COUNT(*) DESC, repo_slug ASC",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(backend)?;
+        let mut totals = Vec::new();
+        for row in rows {
+            let (repo_slug, sessions) = row.map_err(backend)?;
+            totals.push(RepoTotals {
+                repo_slug,
+                sessions: u64::try_from(sessions.max(0)).map_err(backend)?,
+            });
+        }
+        Ok(totals)
+    }
+
     /// v12 工具活动投影的孤儿扫描（只读，doctor/维护证据）：
     /// 返回 `(孤儿活动行数, 孤儿成员行数)`。
     ///
@@ -1978,6 +3048,42 @@ impl SqliteStore {
         ))
     }
 
+    /// v15 usage 投影的孤儿扫描（只读，doctor/维护证据）：
+    /// 返回 `(孤儿用量行数, 孤儿成员行数)`。
+    ///
+    /// - 孤儿用量：`usage_events` 行没有对应的 catalog 会话行。用量是会话
+    ///   的投影，会话退役时其事件由 claims 推导同事务删除；残余行是投影
+    ///   漂移证据。
+    /// - 孤儿成员：`usage_event_membership` 行指向不存在的事件（悬空 claim）。
+    pub fn orphaned_usage_counts(&self) -> PortResult<(u64, u64)> {
+        let conn = self.conn.borrow();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events ue
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM catalog c WHERE c.id = ue.session_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let memberships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_event_membership m
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM usage_events ue
+                     WHERE ue.usage_id = m.usage_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        Ok((
+            u64::try_from(events).map_err(backend)?,
+            u64::try_from(memberships).map_err(backend)?,
+        ))
+    }
+
     /// 确定性修剪孤儿工具活动行（v12 保留策略的维护路径）。
     ///
     /// 活动是 catalog 的投影：正常写入路径里，source 退役与消息 tombstone 会
@@ -1991,9 +3097,20 @@ impl SqliteStore {
     /// 删除成员行数)`——成员行数含随孤儿活动删除而级联清除的 claim。无孤儿时
     /// 不写库（返回 `(0, 0)`，generation 不动）——修剪是收敛操作，空跑不
     /// 产生 journal churn。
+    ///
+    /// v15 起同事务一并修剪孤儿 usage 投影行（会话退役后的漂移残余，同一
+    /// 维护语义）：删除没有 catalog 会话的 `usage_events` 行与悬空
+    /// `usage_event_membership` claim。返回值仍只报告活动行数（对外契约
+    /// 不变）；usage 修剪结果经 [`orphaned_usage_counts`](Self::orphaned_usage_counts)
+    /// 复核。
     pub fn purge_orphaned_activities(&self) -> PortResult<(u64, u64)> {
         let (activities, memberships) = self.orphaned_activity_counts()?;
-        if activities == 0 && memberships == 0 {
+        let (orphaned_usages, orphaned_usage_memberships) = self.orphaned_usage_counts()?;
+        if activities == 0
+            && memberships == 0
+            && orphaned_usages == 0
+            && orphaned_usage_memberships == 0
+        {
             return Ok((0, 0));
         }
         // 空变更集的 durable intent：与 rebuild 同一条 CAS 前置条件
@@ -2001,7 +3118,9 @@ impl SqliteStore {
         let pending = self.begin_index_batch(&[], &[])?;
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction().map_err(backend)?;
-        Self::verify_pending_in_tx(&tx, &pending, &[], &[], &RelationManifests::default())?;
+        let relations = RelationManifests::default();
+        let manifest = batch_manifest(&[], &[], &relations)?;
+        Self::verify_pending_in_tx(&tx, &pending, &[], &[], &relations, &manifest)?;
         // 确定性删除：谓词自包含，只删事务时刻仍然悬空的行（与扫描同一谓词）。
         // 先删孤儿活动行，再清悬空 claim——claim 的悬空定义是"指向不存在的
         // 活动"，第二个语句同时覆盖预先悬空的 claim 与刚删活动的 claim；
@@ -2022,6 +3141,23 @@ impl SqliteStore {
                 [],
             )
             .map_err(backend)?;
+        // v15 usage 投影修剪：先删没有 catalog 会话的事件行，再清悬空 claim
+        // （与活动同一顺序语义——先删事件行，claim 的悬空定义才会同时覆盖
+        // 预先悬空与刚删行的 claim）。
+        tx.execute(
+            "DELETE FROM usage_events
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM catalog c WHERE c.id = usage_events.session_id
+             )",
+            [],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM usage_event_membership
+             WHERE usage_id NOT IN (SELECT usage_id FROM usage_events)",
+            [],
+        )
+        .map_err(backend)?;
         tx.execute(
             "UPDATE store_metadata SET active_generation = ?1 WHERE singleton = 1",
             [pending.target_generation as i64],
@@ -2086,11 +3222,12 @@ impl SqliteStore {
         Ok(entries)
     }
 
-    /// 读取一批源路径的指纹缓存（source_scans 的 len/fingerprint 列）。
+    /// 读取一批源路径的指纹缓存（source_scans 的 len/fingerprint 列 +
+    /// parser_version）。
     ///
-    /// 返回 `path -> (len_bytes, fingerprint)`；从未扫描过的源不在 map 中。
-    /// CLI 用它跳过未变化源的重复解析（capture 后先比指纹，相同则不再
-    /// parse，直接按 no-op 处理）。
+    /// 返回 `path -> (len_bytes, fingerprint, parser_version)`；从未扫描过的
+    /// 源不在 map 中。CLI 用它跳过未变化源的重复解析（capture 后先比指纹与
+    /// 解析语义版本，相同则不再 parse，直接按 no-op 处理）。
     pub fn source_fingerprints(
         &self,
         paths: &[String],
@@ -2100,9 +3237,10 @@ impl SqliteStore {
         for path in paths {
             let row: Option<SourceFingerprint> = conn
                 .query_row(
-                    "SELECT len_bytes, fingerprint FROM source_scans WHERE source_path = ?1",
+                    "SELECT len_bytes, fingerprint, parser_version
+                     FROM source_scans WHERE source_path = ?1",
                     [path],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(backend)?;
@@ -2488,10 +3626,10 @@ impl SqliteStore {
                 )
                 .optional()
                 .map_err(backend)?;
-            // fts 存的是 bigram 变换后的正文（见 fts 写入侧），current 判定
-            // 必须对同一 text 施加同一 transform 再比较，否则已同步的源每次
-            // 重同步都被误判为 not-current、反复推进 generation。
-            let expected = bigram_cjk(text);
+            // fts 存的是 CJK n-gram（单字 + bigram）变换后的正文（见 fts 写入侧），
+            // current 判定必须对同一 text 施加同一 transform 再比较，否则已同步
+            // 的源每次重同步都被误判为 not-current、反复推进 generation。
+            let expected = fts_tokens_cjk(text);
             if indexed_text.as_deref() != Some(expected.as_str()) {
                 return Ok(false);
             }
@@ -2505,7 +3643,11 @@ impl SqliteStore {
     /// derive tombstones. Incomplete scans union observed claims, derive no
     /// tombstones, and clear the source relation-completeness marker.
     pub fn commit_source_batches_if_changed(&self, sources: &[SourceBatch]) -> PortResult<bool> {
-        let mut ordered_sources: Vec<&SourceBatch> = sources.iter().collect();
+        let canonical_sources = self.canonicalize_source_batches(sources)?;
+        let mut ordered_sources: Vec<&SourceBatch> = canonical_sources
+            .iter()
+            .map(|source| source.as_ref())
+            .collect();
         ordered_sources.sort_by(|left, right| left.source_path.cmp(&right.source_path));
         let paths: Vec<&str> = ordered_sources
             .iter()
@@ -2517,29 +3659,159 @@ impl SqliteStore {
             ));
         }
 
-        // Cheap no-op check FIRST: building the merged view, claimer graph,
+        let mut trace_stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
+        let trace_source_count = ordered_sources.len();
+        let trace_started = trace::begin();
+        // A no-op still promises a valid batch. Validate incoming identities
+        // and multiplicities before set/map comparison can erase duplicates.
+        for source in &ordered_sources {
+            self.installation_for_source_commit(source)?;
+            batch_manifest(&source.entries, &[], &RelationManifests::default())?;
+            self.ensure_stored_identity_metadata_matches(&source.entries)?;
+            let mut placements = BTreeSet::new();
+            let mut slots = BTreeSet::new();
+            for placement in &source.placements {
+                validate_placement(placement)?;
+                if !placements.insert(placement.id.as_str())
+                    || !slots.insert((
+                        placement.session_id.as_str(),
+                        placement.source_document_id.as_str(),
+                        placement.source_ordinal,
+                    ))
+                {
+                    return Err(PortError::Backend(
+                        "source batch contains duplicate placement facts".into(),
+                    ));
+                }
+            }
+            let mut children = BTreeSet::new();
+            for edge in &source.edges {
+                validate_edge(edge)?;
+                if !placements.contains(edge.child_placement_id.as_str())
+                    || !children.insert(edge.child_placement_id.as_str())
+                {
+                    return Err(PortError::Backend(
+                        "source batch contains invalid or duplicate edge children".into(),
+                    ));
+                }
+            }
+            let mut claim_sessions = BTreeSet::new();
+            for claim in &source.resume_claims {
+                if !claim_sessions.insert(&claim.session_id) {
+                    return Err(PortError::Backend(
+                        "source batch contains duplicate resume claims".into(),
+                    ));
+                }
+            }
+        }
+
+        // Cheap no-op check: building the merged view, claimer graph,
         // and manifest below costs O(whole catalog). When every source in
         // this batch is already current (entries, relations, membership,
         // claims, scans), skip all of it and report no generation change.
         // The per-batch cost is then proportional to the batch, not the
         // catalog — this is what makes an unchanged re-sync fast.
-        if self.sources_are_current(&ordered_sources)? {
+        trace::add(&mut trace_stages, "validate_incoming", trace_started);
+        let trace_started = trace::begin();
+        let batch_current = self.sources_are_current(&ordered_sources)?;
+        trace::add(&mut trace_stages, "noop_probe", trace_started);
+        if batch_current {
+            trace::emit(
+                "adapter:catalog",
+                &trace_stages,
+                &format!("noop=true sources={trace_source_count}"),
+            );
             return Ok(false);
         }
 
+        let trace_started = trace::begin();
         let scanned_paths: BTreeSet<String> = paths.into_iter().map(str::to_string).collect();
-        let current_entities_by_source = self.source_entity_membership_state()?;
-        let current_placements_by_source = self.source_placement_membership_state()?;
-        let current_activities_by_source = self.source_activity_membership_state()?;
-        let stored_placements = self.stored_placements()?;
-        let stored_edges = self.stored_edges()?;
-        let stored_activities = self.stored_activities()?;
+        // Batch-scoped state: only this batch's own sources plus the ids they
+        // observe/claim. Whole-catalog maps cost ~23 s and multi-GiB peak RSS on
+        // the 6th 200k-message batch against a 1M catalog (measured 2026-09-29).
+        let mut entity_candidates = BTreeSet::<String>::new();
+        let mut placement_candidates = BTreeSet::<String>::new();
+        let mut activity_candidates = BTreeSet::<String>::new();
+        let mut usage_candidates = BTreeSet::<String>::new();
+        for source in &ordered_sources {
+            for (id, _, _) in &source.entries {
+                entity_candidates.insert(id.as_str().to_string());
+            }
+            for placement in &source.placements {
+                placement_candidates.insert(placement.id.as_str().to_string());
+            }
+            for activity in &source.activities {
+                let stored = stored_activity_from(&activity.message_id, &activity.activity)?;
+                activity_candidates.insert(stored.activity_id);
+            }
+            for usage in &source.usage_events {
+                let stored =
+                    stored_usage_from(&usage.session_id, usage.message_id.as_ref(), &usage.usage)?;
+                usage_candidates.insert(stored.usage_id);
+            }
+        }
+        let mut current_entities_by_source =
+            self.source_entity_membership_state_for_sources(&scanned_paths)?;
+        for memberships in current_entities_by_source.values() {
+            for entity_id in memberships.keys() {
+                entity_candidates.insert(entity_id.clone());
+            }
+        }
+        self.extend_entity_claims_for_candidates(
+            &mut current_entities_by_source,
+            &entity_candidates,
+            &scanned_paths,
+        )?;
+        let mut current_placements_by_source =
+            self.source_placement_membership_state_for_sources(&scanned_paths)?;
+        for placement_ids in current_placements_by_source.values() {
+            for placement_id in placement_ids {
+                placement_candidates.insert(placement_id.clone());
+            }
+        }
+        self.extend_placement_claims_for_candidates(
+            &mut current_placements_by_source,
+            &placement_candidates,
+            &scanned_paths,
+        )?;
+        let mut current_activities_by_source =
+            self.source_activity_membership_state_for_sources(&scanned_paths)?;
+        for activity_ids in current_activities_by_source.values() {
+            for activity_id in activity_ids {
+                activity_candidates.insert(activity_id.clone());
+            }
+        }
+        self.extend_activity_claims_for_candidates(
+            &mut current_activities_by_source,
+            &activity_candidates,
+            &scanned_paths,
+        )?;
+        let mut current_usages_by_source =
+            self.source_usage_membership_state_for_sources(&scanned_paths)?;
+        for usage_ids in current_usages_by_source.values() {
+            for usage_id in usage_ids {
+                usage_candidates.insert(usage_id.clone());
+            }
+        }
+        self.extend_usage_claims_for_candidates(
+            &mut current_usages_by_source,
+            &usage_candidates,
+            &scanned_paths,
+        )?;
+        let stored_placements = self.stored_placements_for(&placement_candidates)?;
+        let stored_edges = self.stored_edges_for(&placement_candidates)?;
+        let stored_activities = self.stored_activities_for(&activity_candidates)?;
+        let stored_usages = self.stored_usages_for(&usage_candidates)?;
+        trace::add(&mut trace_stages, "load_catalog_state", trace_started);
 
         let mut merged = BTreeMap::<String, (StableId, Vec<u8>, String)>::new();
         let mut observed_placements = BTreeMap::<String, MessagePlacement>::new();
         let mut observed_edges = BTreeMap::<String, MessageEdge>::new();
         let mut observed_activities = BTreeMap::<String, StoredActivity>::new();
+        let mut observed_usages = BTreeMap::<String, StoredUsage>::new();
         let mut prepared_sources = BTreeMap::<String, PreparedSource>::new();
+
+        let trace_started = trace::begin();
 
         for source in ordered_sources {
             let present: BTreeSet<&str> = source
@@ -2647,19 +3919,25 @@ impl SqliteStore {
             };
             final_placement_ids.extend(source_placements.keys().cloned());
 
-            // 工具活动（v12）：派生活动 id、校验锚点/重复，跨源事实冲突拒绝。
+            // 工具活动（v12）：派生活动 id、校验锚点，跨源事实冲突拒绝。
             let mut source_activities = BTreeMap::new();
             for source_activity in &source.activities {
                 let stored =
                     stored_activity_from(&source_activity.message_id, &source_activity.activity)?;
-                if source_activities
-                    .insert(stored.activity_id.clone(), stored.clone())
-                    .is_some()
-                {
-                    return Err(PortError::Backend(format!(
-                        "source batch contains duplicate activity ids ({})",
-                        stored.activity_id
-                    )));
+                // 活动 id 对全部事实内容寻址（activity_id_for），所以同 id 蕴含同事实：
+                // 一条消息里两次完全相同的工具调用（同 kind/actor/name/target/status，
+                // 例如连续读同一文件、或 target 截断后相同）本就是同一检索面事实的
+                // 重复观察，按 id 去重而非当作冲突——这与跨源副本走同一去重规则。
+                // 仅当同 id 行事实不同（哈希碰撞或派生逻辑漂移）才 fail-closed。
+                if let Some(existing) = source_activities.get(&stored.activity_id) {
+                    if existing != &stored {
+                        return Err(PortError::Backend(format!(
+                            "activity {} has conflicting facts within one source",
+                            stored.activity_id
+                        )));
+                    }
+                } else {
+                    source_activities.insert(stored.activity_id.clone(), stored.clone());
                 }
                 if let Some(existing) = observed_activities.get(&stored.activity_id) {
                     if existing != &stored {
@@ -2683,6 +3961,48 @@ impl SqliteStore {
             };
             final_activity_ids.extend(source_activities.keys().cloned());
 
+            // token 用量事件（v15）：派生活用 id、校验锚点，跨源事实冲突拒绝。
+            // 事件行对 (session, message, 五桶, source) 内容寻址，同 id 即同事实；
+            // 仅当同 id 行事实不同（哈希碰撞或派生逻辑漂移）才 fail-closed。
+            let mut source_usages = BTreeMap::new();
+            for source_usage in &source.usage_events {
+                let stored = stored_usage_from(
+                    &source_usage.session_id,
+                    source_usage.message_id.as_ref(),
+                    &source_usage.usage,
+                )?;
+                if let Some(existing) = source_usages.get(&stored.usage_id) {
+                    if existing != &stored {
+                        return Err(PortError::Backend(format!(
+                            "usage event {} has conflicting facts within one source",
+                            stored.usage_id
+                        )));
+                    }
+                } else {
+                    source_usages.insert(stored.usage_id.clone(), stored.clone());
+                }
+                if let Some(existing) = observed_usages.get(&stored.usage_id) {
+                    if existing != &stored {
+                        return Err(PortError::Backend(format!(
+                            "usage event {} has conflicting projections across sources",
+                            stored.usage_id
+                        )));
+                    }
+                } else {
+                    observed_usages.insert(stored.usage_id.clone(), stored);
+                }
+            }
+            let prior_usage_ids = current_usages_by_source
+                .get(&source.source_path)
+                .cloned()
+                .unwrap_or_default();
+            let mut final_usage_ids = if source.relation_complete {
+                BTreeSet::new()
+            } else {
+                prior_usage_ids.clone()
+            };
+            final_usage_ids.extend(source_usages.keys().cloned());
+
             let replacement = SourceReplacementManifest {
                 source_path: source.source_path.clone(),
                 entity_memberships: final_entities
@@ -2701,11 +4021,13 @@ impl SqliteStore {
                     })
                     .collect::<PortResult<Vec<_>>>()?,
                 activity_ids: final_activity_ids.into_iter().collect(),
+                usage_ids: final_usage_ids.into_iter().collect(),
                 relation_complete: source.relation_complete,
                 len_bytes: source.len_bytes,
                 fingerprint: source.fingerprint.clone(),
                 provider_id: source.provider_id.clone(),
-                resume_claim: source.resume_claim.clone(),
+                resume_claims: source.resume_claims.clone(),
+                installation: self.installation_for_source_commit(source)?,
             };
             prepared_sources.insert(
                 source.source_path.clone(),
@@ -2714,6 +4036,7 @@ impl SqliteStore {
                     prior_entity_memberships,
                     prior_placement_ids,
                     prior_activity_ids,
+                    prior_usage_ids,
                     observed_placements: source_placements,
                     observed_edges: source_edges,
                     replacement,
@@ -2765,6 +4088,8 @@ impl SqliteStore {
 
         // 合并前先批量读取 catalog 中已有的 payload(分块 IN,同 get_many 模式),
         // 取代逐实体 get 的 N+1;与 get 语义一致:目录中不存在的 id 视为 None。
+        trace::add(&mut trace_stages, "merge_sources", trace_started);
+        let trace_started = trace::begin();
         let merged_ids: Vec<StableId> = merged.values().map(|(id, _, _)| id.clone()).collect();
         let stored_payloads = self.get_many(&merged_ids)?;
         let stored_by_id: BTreeMap<String, Vec<u8>> = stored_payloads
@@ -2795,6 +4120,8 @@ impl SqliteStore {
             };
         }
 
+        trace::add(&mut trace_stages, "merge_stored", trace_started);
+        let trace_started = trace::begin();
         let mut final_entity_claimers = BTreeMap::<String, BTreeSet<String>>::new();
         for (source_path, memberships) in &current_entities_by_source {
             if scanned_paths.contains(source_path) {
@@ -2853,10 +4180,31 @@ impl SqliteStore {
                     .insert(source_path.clone());
             }
         }
+        let mut final_usage_claimers = BTreeMap::<String, BTreeSet<String>>::new();
+        for (source_path, usage_ids) in &current_usages_by_source {
+            if scanned_paths.contains(source_path) {
+                continue;
+            }
+            for usage_id in usage_ids {
+                final_usage_claimers
+                    .entry(usage_id.clone())
+                    .or_default()
+                    .insert(source_path.clone());
+            }
+        }
+        for (source_path, prepared) in &prepared_sources {
+            for usage_id in &prepared.replacement.usage_ids {
+                final_usage_claimers
+                    .entry(usage_id.clone())
+                    .or_default()
+                    .insert(source_path.clone());
+            }
+        }
 
         let mut deletes = BTreeMap::new();
         let mut placement_delete_ids = BTreeSet::new();
         let mut activity_delete_ids = BTreeSet::new();
+        let mut usage_delete_ids = BTreeSet::new();
         // 失败/不完整扫描不变量（与 fast-resume `failed_incremental_scan` 同一
         // 原则：任何 IO/解析/目录错误都不删除已索引内容）：relation_complete=false
         // 的源绝不推导 tombstone——"这次没看到"不是"已被删除"，只有完整成功的
@@ -2910,6 +4258,21 @@ impl SqliteStore {
                     && stored_activities.contains_key(prior)
                 {
                     activity_delete_ids.insert(prior.clone());
+                }
+            }
+
+            let final_usage_ids: BTreeSet<&str> = prepared
+                .replacement
+                .usage_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            for prior in &prepared.prior_usage_ids {
+                if !final_usage_ids.contains(prior.as_str())
+                    && !final_usage_claimers.contains_key(prior)
+                    && stored_usages.contains_key(prior)
+                {
+                    usage_delete_ids.insert(prior.clone());
                 }
             }
         }
@@ -2998,6 +4361,8 @@ impl SqliteStore {
             }
         }
 
+        trace::add(&mut trace_stages, "tombstones", trace_started);
+
         let upserts: Vec<(StableId, Vec<u8>, String)> = merged.into_values().collect();
         let deletes: Vec<StableId> = deletes.into_values().collect();
         let relations = RelationManifests {
@@ -3013,6 +4378,11 @@ impl SqliteStore {
                     observed_activities
                         .into_values()
                         .map(RelationUpsertManifest::Activity),
+                )
+                .chain(
+                    observed_usages
+                        .into_values()
+                        .map(RelationUpsertManifest::Usage),
                 )
                 .collect(),
             relation_deletes: edge_delete_ids
@@ -3036,21 +4406,151 @@ impl SqliteStore {
                         .into_iter()
                         .map(|id| Ok(RelationDeleteManifest::Activity(id))),
                 )
+                .chain(
+                    usage_delete_ids
+                        .into_iter()
+                        .map(|id| Ok(RelationDeleteManifest::Usage(id))),
+                )
                 .collect::<PortResult<Vec<_>>>()?,
             source_replacements: prepared_sources
                 .into_values()
                 .map(|prepared| prepared.replacement)
                 .collect(),
+            relocation: None,
         };
 
-        batch_manifest(&upserts, &deletes, &relations)?;
+        let trace_started = trace::begin();
+        let manifest = batch_manifest(&upserts, &deletes, &relations)?;
         self.ensure_stored_identity_metadata_matches(&upserts)?;
-        if self.source_batches_are_current(&upserts, &relations)? {
+        let batch_current = self.source_batches_are_current(
+            &upserts,
+            &relations,
+            &CatalogStateSnapshot {
+                entities_by_source: &current_entities_by_source,
+                placements_by_source: &current_placements_by_source,
+                activities_by_source: &current_activities_by_source,
+                usages_by_source: &current_usages_by_source,
+                placements: &stored_placements,
+                edges: &stored_edges,
+                activities: &stored_activities,
+                usages: &stored_usages,
+            },
+        )?;
+        trace::add(&mut trace_stages, "manifest", trace_started);
+        if batch_current {
+            trace::emit(
+                "adapter:catalog",
+                &trace_stages,
+                &format!("noop=late sources={trace_source_count}"),
+            );
             return Ok(false);
         }
 
-        let pending = self.begin_index_batch_with_relations(&upserts, &deletes, &relations)?;
-        self.commit_index_batch_with_relations(&pending, &upserts, &deletes, &relations)?;
+        let trace_started = trace::begin();
+        let pending =
+            self.begin_index_batch_with_manifest(&manifest, &upserts, &deletes, &relations)?;
+        trace::add(&mut trace_stages, "outbox_intent", trace_started);
+        let trace_started = trace::begin();
+        self.commit_index_batch_with_relations(
+            &pending, &upserts, &deletes, &relations, &manifest,
+        )?;
+        trace::add(&mut trace_stages, "apply_commit", trace_started);
+        let trace_started = trace::begin();
+        self.clear_installation_reservations(
+            relations
+                .source_replacements
+                .iter()
+                .map(|source| source.source_path.as_str()),
+        );
+        trace::add(&mut trace_stages, "finalize", trace_started);
+        if trace::enabled() {
+            // Approximate retained bytes of the full-catalog maps that this
+            // batch loaded; the harness measures the process peak externally.
+            let payload_bytes: usize = upserts
+                .iter()
+                .map(|(_, payload, text)| payload.len() + text.len())
+                .sum();
+            let stored_payload_bytes: usize = stored_by_id
+                .iter()
+                .map(|(id, payload)| id.len() + payload.len() + 48)
+                .sum();
+            let placement_bytes: usize = stored_placements
+                .iter()
+                .map(|(id, row)| {
+                    id.len()
+                        + row.session_id.len()
+                        + row.document_id.len()
+                        + row.message_id.len()
+                        + 72
+                })
+                .sum();
+            let edge_bytes: usize = stored_edges
+                .iter()
+                .map(|(id, row)| {
+                    id.len()
+                        + row.parent_message_id.len()
+                        + row.parent_native_id.as_deref().map_or(0, str::len)
+                        + row.relation.len()
+                        + 64
+                })
+                .sum();
+            let activity_bytes: usize = stored_activities.keys().map(|id| id.len() + 160).sum();
+            let usage_bytes: usize = stored_usages.keys().map(|id| id.len() + 96).sum();
+            let entity_membership_bytes: usize = current_entities_by_source
+                .iter()
+                .map(|(source, rows)| {
+                    source.len()
+                        + rows
+                            .iter()
+                            .map(|(id, document)| {
+                                id.len() + document.as_deref().map_or(0, str::len) + 48
+                            })
+                            .sum::<usize>()
+                })
+                .sum();
+            let placement_membership_bytes: usize = current_placements_by_source
+                .iter()
+                .map(|(source, rows)| {
+                    source.len() + rows.iter().map(|id| id.len() + 32).sum::<usize>()
+                })
+                .sum();
+            trace::emit(
+                "adapter:bytes",
+                &[],
+                &format!(
+                    "upserts={} upsert_bytes~{} stored_payloads={} stored_payload_bytes~{} \
+                     stored_placements={} placement_bytes~{} stored_edges={} edge_bytes~{} \
+                     stored_activities={} activity_bytes~{} stored_usages={} usage_bytes~{} \
+                     entity_membership_bytes~{} placement_membership_bytes~{}",
+                    upserts.len(),
+                    payload_bytes,
+                    stored_by_id.len(),
+                    stored_payload_bytes,
+                    stored_placements.len(),
+                    placement_bytes,
+                    stored_edges.len(),
+                    edge_bytes,
+                    stored_activities.len(),
+                    activity_bytes,
+                    stored_usages.len(),
+                    usage_bytes,
+                    entity_membership_bytes,
+                    placement_membership_bytes
+                ),
+            );
+        }
+        trace::emit(
+            "adapter:catalog",
+            &trace_stages,
+            &format!(
+                "noop=false sources={trace_source_count} upserts={} deletes={} relation_upserts={} relation_deletes={} source_replacements={}",
+                upserts.len(),
+                deletes.len(),
+                relations.relation_upserts.len(),
+                relations.relation_deletes.len(),
+                relations.source_replacements.len()
+            ),
+        );
         Ok(true)
     }
 
@@ -3063,19 +4563,24 @@ impl SqliteStore {
     fn sources_are_current(&self, ordered_sources: &[&SourceBatch]) -> PortResult<bool> {
         let conn = self.conn.borrow();
         for source in ordered_sources {
+            if !self.installation_is_current(&conn, source)? {
+                return Ok(false);
+            }
             // A source that has never been scanned cannot be current; skip the
             // per-entity queries (which dominate on first ingest of an
             // empty catalog) and go straight to the heavy path.
-            let stored_scan: Option<(Option<i64>, Option<String>, Option<String>)> = conn
+            let stored_scan: Option<StoredSourceScan> = conn
                 .query_row(
-                    "SELECT len_bytes, fingerprint, provider_id
+                    "SELECT len_bytes, fingerprint, provider_id, parser_version
                      FROM source_scans WHERE source_path = ?1",
                     [&source.source_path],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(backend)?;
-            let Some((stored_len, stored_fingerprint, stored_provider_id)) = stored_scan else {
+            let Some((stored_len, stored_fingerprint, stored_provider_id, stored_parser_version)) =
+                stored_scan
+            else {
                 return Ok(false);
             };
             // 指纹缓存参与 current 判定：len/fingerprint 任一变说明源字节已变而
@@ -3084,6 +4589,13 @@ impl SqliteStore {
             if source.len_bytes != stored_len
                 || source.fingerprint.as_deref() != stored_fingerprint.as_deref()
             {
+                return Ok(false);
+            }
+            // 解析语义版本参与 current 判定（借鉴 Recall 的 parser_version 增量
+            // 同步）：版本落后说明本二进制解析语义已升级，字节未变也必须走提交
+            // 路径重写 source_scans（targeted backfill）——否则重解析结果与库
+            // 一致时 no-op 短路会让版本永不收敛、每次 sync 都重复解析。
+            if stored_parser_version != i64::from(PARSER_SEMANTIC_VERSION) {
                 return Ok(false);
             }
             // provider_id 回填同样参与 current 判定：discover 发现的源可能携带
@@ -3148,8 +4660,16 @@ impl SqliteStore {
                 }
             }
             for (id, _payload, text) in &source.entries {
-                // 与写入侧同一 transform：fts 正文存的是 bigram(text)。
-                let expected = bigram_cjk(text);
+                // 非 Message 实体不进 fts 全文表（见 batch_upsert_fts_in_tx），
+                // 恒无 fts 行；拿 fts_tokens_cjk(text) 与“无行”比较会让任何
+                // 含 session/document 条目的批次——即每个真实 ingest 批次——
+                // 永远判为 not-current，快路径整体失效，重同步退化为 O(全库)。
+                // 与 batch_is_current_with_derived_context 的同一判定保持一致。
+                if id.kind() != IdKind::Message {
+                    continue;
+                }
+                // 与写入侧同一 transform：fts 正文存的是 fts_tokens_cjk(text)。
+                let expected = fts_tokens_cjk(text);
                 if fts_text.get(id.as_str()).map(String::as_str) != Some(expected.as_str()) {
                     return Ok(false);
                 }
@@ -3360,6 +4880,83 @@ impl SqliteStore {
                     return Ok(false);
                 }
             }
+            // Usage-event claims for this source only（v15）。
+            let mut stmt = conn
+                .prepare(
+                    "SELECT usage_id FROM usage_event_membership
+                     WHERE source_path = ?1 ORDER BY usage_id",
+                )
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([&source.source_path], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            let stored_usage_claims: BTreeSet<String> =
+                rows.collect::<Result<_, _>>().map_err(backend)?;
+            let expected_usage_claims: BTreeSet<String> = source
+                .usage_events
+                .iter()
+                .map(|source_usage| {
+                    stored_usage_from(
+                        &source_usage.session_id,
+                        source_usage.message_id.as_ref(),
+                        &source_usage.usage,
+                    )
+                    .map(|stored| stored.usage_id)
+                })
+                .collect::<PortResult<BTreeSet<_>>>()?;
+            if stored_usage_claims != expected_usage_claims {
+                return Ok(false);
+            }
+            // Stored usage rows for this source's ids (batched, chunked).
+            let mut stored_usage_rows: BTreeMap<String, StoredUsage> = BTreeMap::new();
+            let usage_ids: Vec<String> = expected_usage_claims.into_iter().collect();
+            for chunk in chunk_ids(&usage_ids) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT usage_id, session_id, message_id, input_tokens, output_tokens,
+                                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                                token_source
+                         FROM usage_events WHERE usage_id IN ({placeholders})"
+                    ))
+                    .map_err(backend)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        let id: String = row.get(0)?;
+                        Ok((
+                            id.clone(),
+                            StoredUsage {
+                                usage_id: id,
+                                session_id: row.get(1)?,
+                                message_id: row.get(2)?,
+                                input_tokens: row_u64(row, 3)?,
+                                output_tokens: row_u64(row, 4)?,
+                                cache_read_tokens: row_u64(row, 5)?,
+                                cache_write_tokens: row_u64(row, 6)?,
+                                reasoning_tokens: row_u64(row, 7)?,
+                                token_source: row.get(8)?,
+                            },
+                        ))
+                    })
+                    .map_err(backend)?;
+                for row in rows {
+                    let (id, stored) = row.map_err(backend)?;
+                    stored_usage_rows.insert(id, stored);
+                }
+            }
+            for source_usage in &source.usage_events {
+                let expected = stored_usage_from(
+                    &source_usage.session_id,
+                    source_usage.message_id.as_ref(),
+                    &source_usage.usage,
+                )?;
+                if !stored_usage_rows
+                    .get(&expected.usage_id)
+                    .is_some_and(|stored| stored.matches(&expected))
+                {
+                    return Ok(false);
+                }
+            }
             // Completeness marker (scan record already checked at loop head).
             let complete: bool = conn
                 .query_row(
@@ -3378,9 +4975,15 @@ impl SqliteStore {
             // 未变而跳过。
             let stored_resume = stored_resume_claim(&conn, &source.source_path)?;
             let expected_resume = source
-                .resume_claim
-                .as_ref()
-                .map(StoredResumeClaim::from_claim);
+                .resume_claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.session_id.clone(),
+                        StoredResumeClaim::from_claim(claim),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             if stored_resume != expected_resume {
                 return Ok(false);
             }
@@ -3388,6 +4991,7 @@ impl SqliteStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn source_entity_membership_state(
         &self,
     ) -> PortResult<BTreeMap<String, BTreeMap<String, Option<String>>>> {
@@ -3428,30 +5032,382 @@ impl SqliteStore {
             .collect())
     }
 
-    fn source_placement_membership_state(&self) -> PortResult<BTreeMap<String, BTreeSet<String>>> {
+    /// 本批来源自身的实体成员行（按 `source_path` 索引，只读本批 source）。
+    fn source_entity_membership_state_for_sources(
+        &self,
+        sources: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, BTreeMap<String, Option<String>>>> {
         let conn = self.conn.borrow();
-        let mut stmt = conn
-            .prepare(
-                "SELECT source_path, placement_id
-                 FROM source_placement_membership ORDER BY source_path, placement_id",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(backend)?;
-        let mut state = BTreeMap::<String, BTreeSet<String>>::new();
-        for row in rows {
-            let (source_path, placement_id) = row.map_err(backend)?;
-            state.entry(source_path).or_default().insert(placement_id);
+        let mut state = BTreeMap::<String, BTreeMap<String, Option<String>>>::new();
+        for chunk in chunk_ids(&sources.iter().cloned().collect::<Vec<_>>()) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, message_id, document_id FROM source_membership
+                     WHERE source_path IN ({placeholders}) ORDER BY source_path, message_id"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, entity_id, document_id) = row.map_err(backend)?;
+                state
+                    .entry(source_path)
+                    .or_default()
+                    .insert(entity_id, document_id);
+            }
         }
         Ok(state)
     }
 
+    /// 追加候选实体的跨来源 claim 行。`source_membership` 没有 message_id 索引，
+    /// 只能整表扫描；扫描成本 O(catalog)，但只保留候选行（内存 O(batch)）。
+    fn extend_entity_claims_for_candidates(
+        &self,
+        state: &mut BTreeMap<String, BTreeMap<String, Option<String>>>,
+        candidates: &BTreeSet<String>,
+        scanned: &BTreeSet<String>,
+    ) -> PortResult<()> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare("SELECT source_path, message_id, document_id FROM source_membership")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(backend)?;
+        for row in rows {
+            let (source_path, entity_id, document_id) = row.map_err(backend)?;
+            if scanned.contains(&source_path) || !candidates.contains(&entity_id) {
+                continue;
+            }
+            state
+                .entry(source_path)
+                .or_default()
+                .insert(entity_id, document_id);
+        }
+        Ok(())
+    }
+
+    /// 本批来源自身的 placement 成员行。
+    fn source_placement_membership_state_for_sources(
+        &self,
+        sources: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, BTreeSet<String>>> {
+        let conn = self.conn.borrow();
+        let mut state = BTreeMap::<String, BTreeSet<String>>::new();
+        for chunk in chunk_ids(&sources.iter().cloned().collect::<Vec<_>>()) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, placement_id FROM source_placement_membership
+                     WHERE source_path IN ({placeholders}) ORDER BY source_path, placement_id"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, placement_id) = row.map_err(backend)?;
+                state.entry(source_path).or_default().insert(placement_id);
+            }
+        }
+        Ok(state)
+    }
+
+    /// 追加候选 placement 的跨来源 claim 行（按 placement_id 索引分块查询）。
+    fn extend_placement_claims_for_candidates(
+        &self,
+        state: &mut BTreeMap<String, BTreeSet<String>>,
+        candidates: &BTreeSet<String>,
+        scanned: &BTreeSet<String>,
+    ) -> PortResult<()> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, placement_id FROM source_placement_membership
+                     WHERE placement_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, placement_id) = row.map_err(backend)?;
+                if scanned.contains(&source_path) {
+                    continue;
+                }
+                state.entry(source_path).or_default().insert(placement_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// 本批来源自身的工具活动成员行。
+    fn source_activity_membership_state_for_sources(
+        &self,
+        sources: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, BTreeSet<String>>> {
+        let conn = self.conn.borrow();
+        let mut state = BTreeMap::<String, BTreeSet<String>>::new();
+        for chunk in chunk_ids(&sources.iter().cloned().collect::<Vec<_>>()) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, activity_id FROM tool_activity_membership
+                     WHERE source_path IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, activity_id) = row.map_err(backend)?;
+                state.entry(source_path).or_default().insert(activity_id);
+            }
+        }
+        Ok(state)
+    }
+
+    /// 追加候选活动的跨来源 claim 行（按 activity_id 索引分块查询）。
+    fn extend_activity_claims_for_candidates(
+        &self,
+        state: &mut BTreeMap<String, BTreeSet<String>>,
+        candidates: &BTreeSet<String>,
+        scanned: &BTreeSet<String>,
+    ) -> PortResult<()> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, activity_id FROM tool_activity_membership
+                     WHERE activity_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, activity_id) = row.map_err(backend)?;
+                if scanned.contains(&source_path) {
+                    continue;
+                }
+                state.entry(source_path).or_default().insert(activity_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// 本批来源自身的用量事件成员行。
+    fn source_usage_membership_state_for_sources(
+        &self,
+        sources: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, BTreeSet<String>>> {
+        let conn = self.conn.borrow();
+        let mut state = BTreeMap::<String, BTreeSet<String>>::new();
+        for chunk in chunk_ids(&sources.iter().cloned().collect::<Vec<_>>()) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, usage_id FROM usage_event_membership
+                     WHERE source_path IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, usage_id) = row.map_err(backend)?;
+                state.entry(source_path).or_default().insert(usage_id);
+            }
+        }
+        Ok(state)
+    }
+
+    /// 追加候选用量事件的跨来源 claim 行（按 usage_id 索引分块查询）。
+    fn extend_usage_claims_for_candidates(
+        &self,
+        state: &mut BTreeMap<String, BTreeSet<String>>,
+        candidates: &BTreeSet<String>,
+        scanned: &BTreeSet<String>,
+    ) -> PortResult<()> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, usage_id FROM usage_event_membership
+                     WHERE usage_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (source_path, usage_id) = row.map_err(backend)?;
+                if scanned.contains(&source_path) {
+                    continue;
+                }
+                state.entry(source_path).or_default().insert(usage_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// 只读取候选 id 的关系行（主键分块查询，替代整表加载）。
+    fn stored_placements_for(
+        &self,
+        candidates: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, StoredPlacement>> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        let mut placements = BTreeMap::new();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT placement_id, session_id, document_id, message_id,
+                            source_ordinal, is_sidechain, byte_start, byte_end
+                     FROM message_placements WHERE placement_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (
+                    placement_id,
+                    session_id,
+                    document_id,
+                    message_id,
+                    ordinal,
+                    sidechain,
+                    start,
+                    end,
+                ) = row.map_err(backend)?;
+                let span = match (start, end) {
+                    (None, None) => None,
+                    (Some(start), Some(end)) => Some((
+                        u64::try_from(start).map_err(backend)?,
+                        u64::try_from(end).map_err(backend)?,
+                    )),
+                    _ => {
+                        return Err(PortError::Backend(
+                            "stored placement has a partial span".into(),
+                        ));
+                    }
+                };
+                placements.insert(
+                    placement_id,
+                    StoredPlacement {
+                        session_id,
+                        document_id,
+                        message_id,
+                        source_ordinal: u32::try_from(ordinal).map_err(backend)?,
+                        is_sidechain: sidechain != 0,
+                        span,
+                    },
+                );
+            }
+        }
+        Ok(placements)
+    }
+
+    /// 只读取候选 placement 的边行。
+    fn stored_edges_for(
+        &self,
+        candidates: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, StoredEdge>> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        let mut edges = BTreeMap::new();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT child_placement_id, parent_message_id, parent_native_id, relation
+                     FROM message_edges WHERE child_placement_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (child, parent_message_id, parent_native_id, relation) =
+                    row.map_err(backend)?;
+                edges.insert(
+                    child,
+                    StoredEdge {
+                        parent_message_id,
+                        parent_native_id,
+                        relation,
+                    },
+                );
+            }
+        }
+        Ok(edges)
+    }
+
+    /// 测试专用：整表读取（生产提交路径只读候选 id，见 §Batch-scoped commit state）。
+    #[cfg(test)]
     fn stored_placements(&self) -> PortResult<BTreeMap<String, StoredPlacement>> {
         let conn = self.conn.borrow();
         Self::stored_placements_from(&conn)
+    }
+
+    /// 测试专用：整表读取（生产提交路径只读候选 id）。
+    #[cfg(test)]
+    fn stored_edges(&self) -> PortResult<BTreeMap<String, StoredEdge>> {
+        let conn = self.conn.borrow();
+        Self::stored_edges_from(&conn)
     }
 
     fn stored_placements_from(conn: &Connection) -> PortResult<BTreeMap<String, StoredPlacement>> {
@@ -3507,9 +5463,83 @@ impl SqliteStore {
         Ok(placements)
     }
 
-    fn stored_edges(&self) -> PortResult<BTreeMap<String, StoredEdge>> {
+    fn stored_activities_for(
+        &self,
+        candidates: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, StoredActivity>> {
         let conn = self.conn.borrow();
-        Self::stored_edges_from(&conn)
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        let mut activities = BTreeMap::new();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT activity_id, message_id, kind, actor, name, target, status
+                     FROM tool_activities WHERE activity_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok(StoredActivity {
+                        activity_id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        actor: row.get(3)?,
+                        name: row.get(4)?,
+                        target: row.get(5)?,
+                        status: row.get(6)?,
+                    })
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let activity = row.map_err(backend)?;
+                activities.insert(activity.activity_id.clone(), activity);
+            }
+        }
+        Ok(activities)
+    }
+
+    fn stored_usages_for(
+        &self,
+        candidates: &BTreeSet<String>,
+    ) -> PortResult<BTreeMap<String, StoredUsage>> {
+        let conn = self.conn.borrow();
+        let ids: Vec<String> = candidates.iter().cloned().collect();
+        let mut usages = BTreeMap::new();
+        for chunk in chunk_ids(&ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT usage_id, session_id, message_id, input_tokens, output_tokens,
+                            cache_read_tokens, cache_write_tokens, reasoning_tokens, token_source
+                     FROM usage_events WHERE usage_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        StoredUsage {
+                            usage_id: String::new(),
+                            session_id: row.get(1)?,
+                            message_id: row.get(2)?,
+                            input_tokens: row_u64(row, 3)?,
+                            output_tokens: row_u64(row, 4)?,
+                            cache_read_tokens: row_u64(row, 5)?,
+                            cache_write_tokens: row_u64(row, 6)?,
+                            reasoning_tokens: row_u64(row, 7)?,
+                            token_source: row.get(8)?,
+                        },
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (usage_id, mut usage) = row.map_err(backend)?;
+                usage.usage_id = usage_id.clone();
+                usages.insert(usage_id, usage);
+            }
+        }
+        Ok(usages)
     }
 
     fn stored_edges_from(conn: &Connection) -> PortResult<BTreeMap<String, StoredEdge>> {
@@ -3539,68 +5569,61 @@ impl SqliteStore {
         Ok(edges)
     }
 
-    fn stored_activities(&self) -> PortResult<BTreeMap<String, StoredActivity>> {
-        let conn = self.conn.borrow();
-        Self::stored_activities_from(&conn)
-    }
-
-    fn stored_activities_from(conn: &Connection) -> PortResult<BTreeMap<String, StoredActivity>> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT activity_id, message_id, kind, actor, name, target, status
-                 FROM tool_activities ORDER BY activity_id",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    StoredActivity {
-                        activity_id: String::new(), // 键即 id，行内不重复承载
-                        message_id: row.get(1)?,
-                        kind: row.get(2)?,
-                        actor: row.get(3)?,
-                        name: row.get(4)?,
-                        target: row.get(5)?,
-                        status: row.get(6)?,
-                    },
-                ))
-            })
-            .map_err(backend)?;
-        let mut activities = BTreeMap::new();
-        for row in rows {
-            let (activity_id, mut activity) = row.map_err(backend)?;
-            activity.activity_id = activity_id.clone();
-            activities.insert(activity_id, activity);
-        }
-        Ok(activities)
-    }
-
-    fn source_activity_membership_state(&self) -> PortResult<BTreeMap<String, BTreeSet<String>>> {
-        let conn = self.conn.borrow();
-        let mut stmt = conn
-            .prepare(
-                "SELECT source_path, activity_id
-                 FROM tool_activity_membership ORDER BY source_path, activity_id",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(backend)?;
-        let mut state = BTreeMap::<String, BTreeSet<String>>::new();
-        for row in rows {
-            let (source_path, activity_id) = row.map_err(backend)?;
-            state.entry(source_path).or_default().insert(activity_id);
-        }
-        Ok(state)
-    }
-
     fn regenerate_compatibility_aliases_in_tx(
         tx: &rusqlite::Transaction<'_>,
         batch_sources: &[String],
+        in_memory_payloads: &BTreeMap<&str, &[u8]>,
     ) -> PortResult<()> {
+        // Only entities claimed by this batch's sources can have their
+        // aliases changed; collecting that candidate set up front keeps the
+        // claimer maps proportional to the batch instead of the catalog.
+        let mut candidate_entities = BTreeSet::<String>::new();
+        for chunk in chunk_ids(batch_sources) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT message_id FROM source_membership
+                     WHERE source_path IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(backend)?;
+            for row in rows {
+                candidate_entities.insert(row.map_err(backend)?);
+            }
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT placements.session_id, placements.document_id,
+                            placements.message_id
+                     FROM source_placement_membership AS claims
+                     JOIN message_placements AS placements
+                       ON placements.placement_id = claims.placement_id
+                     WHERE claims.source_path IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (session_id, document_id, message_id) = row.map_err(backend)?;
+                candidate_entities.insert(session_id);
+                candidate_entities.insert(document_id);
+                candidate_entities.insert(message_id);
+            }
+        }
+        if candidate_entities.is_empty() {
+            return Ok(());
+        }
+
         let complete_sources = {
             let mut stmt = tx
                 .prepare("SELECT source_path FROM source_relation_scans")
@@ -3635,6 +5658,9 @@ impl SqliteStore {
                 .map_err(backend)?;
             for row in rows {
                 let (source_path, entity_id, document_id) = row.map_err(backend)?;
+                if !candidate_entities.contains(&entity_id) {
+                    continue;
+                }
                 claimers_by_entity
                     .entry(entity_id.clone())
                     .or_default()
@@ -3672,6 +5698,9 @@ impl SqliteStore {
             for row in rows {
                 let (source_path, session_id, document_id, message_id) = row.map_err(backend)?;
                 for entity_id in [session_id, document_id, message_id] {
+                    if !candidate_entities.contains(&entity_id) {
+                        continue;
+                    }
                     claimers_by_entity
                         .entry(entity_id)
                         .or_default()
@@ -3743,18 +5772,27 @@ impl SqliteStore {
             if !matches!(id.kind(), IdKind::Message | IdKind::Session) {
                 continue;
             }
-            let payload: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT payload FROM catalog WHERE id = ?1",
-                    [&entity_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(backend)?;
+            let owned_payload: Option<Vec<u8>> =
+                if in_memory_payloads.contains_key(entity_id.as_str()) {
+                    None
+                } else {
+                    tx.query_row(
+                        "SELECT payload FROM catalog WHERE id = ?1",
+                        [&entity_id],
+                        |row| row.get::<_, Option<Vec<u8>>>(0),
+                    )
+                    .optional()
+                    .map_err(backend)?
+                    .flatten()
+                };
+            let payload: Option<&[u8]> = match in_memory_payloads.get(entity_id.as_str()) {
+                Some(payload) => Some(*payload),
+                None => owned_payload.as_deref(),
+            };
             let Some(payload) = payload else {
                 continue;
             };
-            let mut map = match serde_json::from_slice::<serde_json::Value>(&payload) {
+            let mut map = match serde_json::from_slice::<serde_json::Value>(payload) {
                 Ok(serde_json::Value::Object(map)) => map,
                 _ => continue,
             };
@@ -3899,15 +5937,23 @@ impl SqliteStore {
             // Skip the write when the rebuilt aliases equal the stored bytes:
             // regeneration must not rewrite the catalog (and inflate the WAL)
             // on every commit once aliases are stable.
-            let stored: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT payload FROM catalog WHERE id = ?1",
-                    [&entity_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(backend)?;
-            if stored.as_deref() != Some(payload.as_slice()) {
+            let stored_owned: Option<Vec<u8>>;
+            let stored: Option<&[u8]> = match in_memory_payloads.get(entity_id.as_str()) {
+                Some(stored) => Some(*stored),
+                None => {
+                    stored_owned = tx
+                        .query_row(
+                            "SELECT payload FROM catalog WHERE id = ?1",
+                            [&entity_id],
+                            |row| row.get::<_, Option<Vec<u8>>>(0),
+                        )
+                        .optional()
+                        .map_err(backend)?
+                        .flatten();
+                    stored_owned.as_deref()
+                }
+            };
+            if stored != Some(payload.as_slice()) {
                 tx.execute(
                     "UPDATE catalog SET payload = ?2 WHERE id = ?1",
                     rusqlite::params![entity_id, payload],
@@ -3922,13 +5968,15 @@ impl SqliteStore {
         &self,
         upserts: &[(StableId, Vec<u8>, String)],
         relations: &RelationManifests,
+        state: &CatalogStateSnapshot<'_>,
     ) -> PortResult<bool> {
         if !self.batch_is_current_with_derived_context(upserts, true)? {
             return Ok(false);
         }
-        let stored_placements = self.stored_placements()?;
-        let stored_edges = self.stored_edges()?;
-        let stored_activities = self.stored_activities()?;
+        let stored_placements = state.placements;
+        let stored_edges = state.edges;
+        let stored_activities = state.activities;
+        let stored_usages = state.usages;
         for upsert in &relations.relation_upserts {
             let current = match upsert {
                 RelationUpsertManifest::Placement(placement) => stored_placements
@@ -3940,6 +5988,9 @@ impl SqliteStore {
                 RelationUpsertManifest::Activity(activity) => stored_activities
                     .get(&activity.activity_id)
                     .is_some_and(|stored| stored.matches(activity)),
+                RelationUpsertManifest::Usage(usage) => stored_usages
+                    .get(&usage.usage_id)
+                    .is_some_and(|stored| stored.matches(usage)),
             };
             if !current {
                 return Ok(false);
@@ -3954,17 +6005,32 @@ impl SqliteStore {
                 RelationDeleteManifest::Activity(activity_id) => {
                     stored_activities.contains_key(activity_id)
                 }
+                RelationDeleteManifest::Usage(usage_id) => stored_usages.contains_key(usage_id),
             };
             if exists {
                 return Ok(false);
             }
         }
 
-        let entity_state = self.source_entity_membership_state()?;
-        let placement_state = self.source_placement_membership_state()?;
-        let activity_state = self.source_activity_membership_state()?;
+        let entity_state = state.entities_by_source;
+        let placement_state = state.placements_by_source;
+        let activity_state = state.activities_by_source;
+        let usage_state = state.usages_by_source;
         let conn = self.conn.borrow();
         for replacement in &relations.source_replacements {
+            if replacement.entity_memberships.is_empty()
+                && replacement.fingerprint.is_none()
+                && replacement.len_bytes.is_none()
+                && Self::assignment_for_source(&conn, &replacement.source_path)?.is_some()
+            {
+                return Ok(false);
+            }
+            if let Some(installation) = &replacement.installation
+                && Self::assignment_for_source(&conn, &replacement.source_path)?.as_ref()
+                    != Some(installation)
+            {
+                return Ok(false);
+            }
             let expected_entities: BTreeMap<String, Option<String>> = replacement
                 .entity_memberships
                 .iter()
@@ -4001,16 +6067,28 @@ impl SqliteStore {
             {
                 return Ok(false);
             }
-            let stored_scan: Option<(Option<i64>, Option<String>, Option<String>)> = conn
+            let expected_usage_ids: BTreeSet<String> =
+                replacement.usage_ids.iter().cloned().collect();
+            if usage_state
+                .get(&replacement.source_path)
+                .cloned()
+                .unwrap_or_default()
+                != expected_usage_ids
+            {
+                return Ok(false);
+            }
+            let stored_scan: Option<StoredSourceScan> = conn
                 .query_row(
-                    "SELECT len_bytes, fingerprint, provider_id
+                    "SELECT len_bytes, fingerprint, provider_id, parser_version
                      FROM source_scans WHERE source_path = ?1",
                     [&replacement.source_path],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(backend)?;
-            let Some((stored_len, stored_fingerprint, stored_provider_id)) = stored_scan else {
+            let Some((stored_len, stored_fingerprint, stored_provider_id, stored_parser_version)) =
+                stored_scan
+            else {
                 return Ok(false);
             };
             // 与 sources_are_current 同口径：指纹缓存参与 no-op 判定。字节已变而
@@ -4018,6 +6096,11 @@ impl SqliteStore {
             if replacement.len_bytes != stored_len
                 || replacement.fingerprint.as_deref() != stored_fingerprint.as_deref()
             {
+                return Ok(false);
+            }
+            // 与 sources_are_current 同口径：解析语义版本落后（升级后未
+            // backfill）同样必须走提交路径写回当前版本，否则版本永不收敛。
+            if stored_parser_version != i64::from(PARSER_SEMANTIC_VERSION) {
                 return Ok(false);
             }
             if let Some(incoming_provider_id) = replacement.provider_id.as_deref()
@@ -4040,9 +6123,15 @@ impl SqliteStore {
             // 与 sources_are_current 同口径：声明变化同样必须走提交路径。
             let stored_resume = stored_resume_claim(&conn, &replacement.source_path)?;
             let expected_resume = replacement
-                .resume_claim
-                .as_ref()
-                .map(StoredResumeClaim::from_claim);
+                .resume_claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.session_id.clone(),
+                        StoredResumeClaim::from_claim(claim),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             if stored_resume != expected_resume {
                 return Ok(false);
             }
@@ -4061,6 +6150,87 @@ impl SqliteStore {
             )
             .map_err(backend)?;
         u64::try_from(g).map_err(backend)
+    }
+
+    /// 读回本库现存投影的索引投影版本（schema v17；见
+    /// [`INDEX_PROJECTION_VERSION`]）。`0` 表示"未知/旧变换写的"——由 v17
+    /// 迁移为投影非空的旧库留下的哨兵值。
+    pub fn index_projection_version(&self) -> PortResult<i64> {
+        let conn = self.conn.borrow();
+        Self::stored_index_projection_version(&conn)
+    }
+
+    /// 现存投影是否由本二进制的投影变换写成。false ⇒ FTS 词元流与查询侧
+    /// 词元不可比，任何 MATCH 结果都不可信（doctor 据此如实报告）。
+    pub fn index_projection_is_current(&self) -> PortResult<bool> {
+        Ok(self.index_projection_version()? == i64::from(INDEX_PROJECTION_VERSION))
+    }
+
+    fn stored_index_projection_version(conn: &Connection) -> PortResult<i64> {
+        conn.query_row(
+            "SELECT index_projection_version FROM store_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    }
+
+    /// FTS 查询前的投影版本闸门（读路径 fail-closed）。
+    ///
+    /// 索引期与查询期的词元变换必须同版本。失配时**绝不返回命中集**——旧词元
+    /// 与新查询词元对不上会静默漏掉真实命中（实测：一个由旧二进制建立的
+    /// 170 468 实体真实库上，中文查询 0 命中而 ASCII 查询正常）。归到
+    /// [`PortError::SchemaIncompatible`]（error catalog `schema_incompatible`，
+    /// operator_action 已是"升级程序或重建派生数据根"），消息给出确切修复命令。
+    fn assert_index_projection_current(conn: &Connection) -> PortResult<()> {
+        let stored = Self::stored_index_projection_version(conn)?;
+        if stored == i64::from(INDEX_PROJECTION_VERSION) {
+            return Ok(());
+        }
+        Err(PortError::SchemaIncompatible(format!(
+            "search index projection version {stored} does not match this binary's \
+             {INDEX_PROJECTION_VERSION}: the stored FTS tokens were written by a different \
+             projection and cannot be matched against this binary's query tokens; run \
+             `index rebuild` to reproject from the catalog (a write-mode `sync` reprojects \
+             automatically)"
+        )))
+    }
+
+    /// 收敛索引投影版本（写路径自愈，[`SqliteStore::open_for_write`] 调用）。
+    ///
+    /// 已是当前版本 → no-op。否则：
+    /// - 投影为空（无 `fts`/`session_fts` 行）→ 没有旧词元可纠正，只标记版本，
+    ///   **不推进 generation、不写 outbox 行**（新库/空库不该因此产生 churn）；
+    /// - 投影非空 → 从权威 catalog 全量重投影（等价 `index rebuild`）。catalog
+    ///   payload 对内容权威，**不需要回到 provider reparse**——这正是本轴与
+    ///   [`PARSER_SEMANTIC_VERSION`] 的区别。重投影推进 generation（投影内容
+    ///   确实变了，旧 cursor 必须失效）。
+    ///
+    /// 自愈的重投影**不重派生 repo 身份投影**（[`RepoIdentityRebuild::Preserve`]）：
+    /// 该投影不可从 catalog 重建，而本方法在 `open_for_write` 内、组合根注入
+    /// 解析器之前就会跑；无条件清表重派生会用一次自愈把整条 repo 维度删空
+    /// 并同时盖上"投影已收敛"的戳。自愈不改变会话集合，保留既有行不产生孤儿。
+    ///
+    /// 返回是否执行了重投影。
+    pub fn ensure_index_projection_current(&self) -> PortResult<bool> {
+        if self.index_projection_is_current()? {
+            return Ok(false);
+        }
+        let projection_is_empty = {
+            let conn = self.conn.borrow();
+            Self::index_projection_is_empty_in_tx(&conn)?
+        };
+        if projection_is_empty {
+            let conn = self.conn.borrow();
+            conn.execute(
+                "UPDATE store_metadata SET index_projection_version = ?1 WHERE singleton = 1",
+                [i64::from(INDEX_PROJECTION_VERSION)],
+            )
+            .map_err(backend)?;
+            return Ok(false);
+        }
+        self.reproject_from_catalog(RepoIdentityRebuild::Preserve)?;
+        Ok(true)
     }
 
     /// 阶段一（durable intent）：写入一条 `building` outbox 行并提交。
@@ -4085,6 +6255,17 @@ impl SqliteStore {
         deletes: &[StableId],
         relations: &RelationManifests,
     ) -> PortResult<PendingIndexBatch> {
+        let manifest = batch_manifest(upserts, deletes, relations)?;
+        self.begin_index_batch_with_manifest(&manifest, upserts, deletes, relations)
+    }
+
+    fn begin_index_batch_with_manifest(
+        &self,
+        manifest: &CanonicalBatchManifest,
+        _upserts: &[(StableId, Vec<u8>, String)],
+        _deletes: &[StableId],
+        _relations: &RelationManifests,
+    ) -> PortResult<PendingIndexBatch> {
         let base = self.active_generation()?;
         let target = base
             .checked_add(1)
@@ -4092,7 +6273,6 @@ impl SqliteStore {
         let target_sql = i64::try_from(target).map_err(backend)?;
         let base_sql = i64::try_from(base).map_err(backend)?;
         let op = operation_id()?;
-        let manifest = batch_manifest(upserts, deletes, relations)?;
         let upsert_json = serde_json::to_string(&manifest.upsert_ids).map_err(backend)?;
         let delete_json = serde_json::to_string(&manifest.delete_ids).map_err(backend)?;
         let conn = self.conn.borrow();
@@ -4101,9 +6281,9 @@ impl SqliteStore {
                  operation_id, base_generation, target_generation, state,
                  operation_digest, upsert_ids_json, delete_ids_json,
                  relation_upserts_json, relation_deletes_json,
-                 source_replacements_json, durable_point, created_at_ms
+                 source_replacements_json, durable_point, created_at_ms, relocation_json
              ) VALUES(
-                 ?1, ?2, ?3, 'building', ?4, ?5, ?6, ?7, ?8, ?9, 'intent', ?10
+                 ?1, ?2, ?3, 'building', ?4, ?5, ?6, ?7, ?8, ?9, 'intent', ?10, ?11
              )",
             rusqlite::params![
                 op,
@@ -4116,6 +6296,7 @@ impl SqliteStore {
                 manifest.relation_deletes_json,
                 manifest.source_replacements_json,
                 unix_ms()?,
+                manifest.relocation_json,
             ],
         )
         .map_err(backend)?;
@@ -4123,7 +6304,7 @@ impl SqliteStore {
             operation_id: op,
             base_generation: base,
             target_generation: target,
-            operation_digest: manifest.operation_digest,
+            operation_digest: manifest.operation_digest.clone(),
         })
     }
 
@@ -4142,12 +6323,9 @@ impl SqliteStore {
         upserts: &[(StableId, Vec<u8>, String)],
         deletes: &[StableId],
     ) -> PortResult<()> {
-        self.commit_index_batch_with_relations(
-            pending,
-            upserts,
-            deletes,
-            &RelationManifests::default(),
-        )
+        let relations = RelationManifests::default();
+        let manifest = batch_manifest(upserts, deletes, &relations)?;
+        self.commit_index_batch_with_relations(pending, upserts, deletes, &relations, &manifest)
     }
 
     /// 事务内校验 pending 句柄仍可安全激活：generation CAS + intent 行状态 + manifest 匹配。
@@ -4157,9 +6335,10 @@ impl SqliteStore {
     fn verify_pending_in_tx(
         tx: &rusqlite::Transaction<'_>,
         pending: &PendingIndexBatch,
-        upserts: &[(StableId, Vec<u8>, String)],
-        deletes: &[StableId],
-        relations: &RelationManifests,
+        _upserts: &[(StableId, Vec<u8>, String)],
+        _deletes: &[StableId],
+        _relations: &RelationManifests,
+        manifest: &CanonicalBatchManifest,
     ) -> PortResult<()> {
         // CAS：活动 generation 必须仍等于 intent 记录的 base，否则中止本批次。
         let current: i64 = tx
@@ -4224,7 +6403,14 @@ impl SqliteStore {
                 pending.operation_id
             )));
         }
-        let actual = batch_manifest(upserts, deletes, relations)?;
+        let declared_relocation: String = tx
+            .query_row(
+                "SELECT relocation_json FROM index_batches WHERE operation_id = ?1",
+                [&pending.operation_id],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let actual = manifest;
         let actual_upserts = serde_json::to_string(&actual.upsert_ids).map_err(backend)?;
         let actual_deletes = serde_json::to_string(&actual.delete_ids).map_err(backend)?;
         let handle_matches = declared_base == pending.base_generation as i64
@@ -4237,6 +6423,7 @@ impl SqliteStore {
             || declared_relation_upserts != actual.relation_upserts_json
             || declared_relation_deletes != actual.relation_deletes_json
             || declared_source_replacements != actual.source_replacements_json
+            || declared_relocation != actual.relocation_json
         {
             return Err(PortError::Backend(format!(
                 "index batch {} payload does not match durable intent",
@@ -4324,6 +6511,159 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// 会话成员消息里第一条 role=user 且 text 非空的正文（placement 成员
+    /// 顺序：timestamp → document → source_ordinal → placement_id），截断到
+    /// `max_chars`（char 边界）。
+    ///
+    /// 注入噪声在 provider parse 层已被过滤（claude/codex user-noise filter，
+    /// feat/noise-filter），不进 catalog——此处读到的第一条即"噪声过滤后"
+    /// 的首条有效 user 消息。无 placement 或无有效 user 消息 → `None`。
+    fn first_user_text_for_session(
+        conn: &Connection,
+        session_wire: &str,
+        max_chars: usize,
+    ) -> PortResult<Option<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT catalog.payload
+                 FROM message_placements
+                 JOIN catalog ON catalog.id = message_placements.message_id
+                 WHERE message_placements.session_id = ?1
+                 ORDER BY asg_instant_sort_key(
+                              CASE WHEN json_valid(catalog.payload)
+                                   THEN json_extract(catalog.payload, '$.timestamp') END
+                          ) IS NULL,
+                          asg_instant_sort_key(
+                              CASE WHEN json_valid(catalog.payload)
+                                   THEN json_extract(catalog.payload, '$.timestamp') END
+                          ),
+                          message_placements.document_id,
+                          message_placements.source_ordinal,
+                          message_placements.placement_id",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([session_wire], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(backend)?;
+        for row in rows {
+            let payload = row.map_err(backend)?;
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload)
+                && value.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                && let Some(text) = value.get("text").and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                return Ok(Some(text.chars().take(max_chars).collect::<String>()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 会话标题派生链（借鉴清单 #6；agent-sessions Session.swift `title` 的
+    /// custom > lightweight > first-user 链 + cc-switch codex.rs 的
+    /// thread-titles > first-user 链）：
+    ///
+    /// 1. custom-title：canonical session payload 的 `title` 字段（用户显式命名）；
+    /// 2. ai-title：canonical session payload 的 `summary` 字段（AI/平台生成摘要）；
+    /// 3. 首条有效 user 消息：噪声过滤后第一条非空 user 文本。
+    ///
+    /// claude-code/codex 的 Canonical payload 目前不携带 `title`/`summary`
+    /// 字段（格式事实：两格式均无该概念），实际一律落到候选 3；候选 1/2 是
+    /// 按格式事实预留的更高优先级来源，provider 未来填充即自动生效。全部
+    /// 候选缺失（含会话不存在）→ `None`（不写行）。所有候选统一 trim +
+    /// ≤[`SESSION_TITLE_MAX_CHARS`] char 边界截断。
+    fn session_title(conn: &Connection, session_wire: &str) -> PortResult<Option<String>> {
+        let payload: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT payload FROM catalog WHERE id = ?1",
+                [session_wire],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(bytes) = payload
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            for key in ["title", "summary"] {
+                if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(Some(
+                            trimmed.chars().take(SESSION_TITLE_MAX_CHARS).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+        Self::first_user_text_for_session(conn, session_wire, SESSION_TITLE_MAX_CHARS)
+    }
+
+    /// Conflict-free resolved resume claim for one canonical Session。
+    ///
+    /// 声明冲突是隐私敏感信号：同一 Session 的 claims 必须逐字段一致，
+    /// 否则 fail closed 返回 None（绝不取任一冲突值）。`session_fts`
+    /// 搜索文本与 `session_repo_slugs`（schema v16）共用同一裁决。
+    fn resolved_session_claim(
+        conn: &Connection,
+        session_wire: &str,
+    ) -> PortResult<Option<StoredResumeClaim>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, provider_id, provider_session_id,
+                        provider_session_id_state, original_working_directory,
+                        original_working_directory_state, pair_observed
+                 FROM source_session_resume_claims
+                 WHERE session_id = ?1",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([session_wire], |row| {
+                Ok(StoredResumeClaim {
+                    session_id: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    provider_session_id: row.get(2)?,
+                    provider_session_id_state: row.get(3)?,
+                    original_working_directory: row.get(4)?,
+                    original_working_directory_state: row.get(5)?,
+                    pair_observed: row.get(6)?,
+                })
+            })
+            .map_err(backend)?;
+        let mut claim: Option<StoredResumeClaim> = None;
+        let mut conflicting = false;
+        for row in rows {
+            let next = row.map_err(backend)?;
+            if claim.as_ref().is_some_and(|current| current != &next) {
+                conflicting = true;
+                break;
+            }
+            claim = Some(next);
+        }
+        if conflicting { Ok(None) } else { Ok(claim) }
+    }
+
+    /// Derive the repo slug for one resolved claim（schema v16）。
+    ///
+    /// 与 `session_fts` 的 cwd 披露同一门禁：provider_session_id 已
+    /// resolved、pair-observed、cwd resolved 且非空；再交给注入的
+    /// [`RepoSlugResolver`]。任一缺失或检测失败 → None（无行，不猜）。
+    /// 纯函数（无 I/O 以外注入的 resolver），失败测试先行锚定。
+    fn session_repo_slug(
+        claim: &StoredResumeClaim,
+        resolver: &dyn RepoSlugResolver,
+    ) -> Option<String> {
+        if claim.provider_session_id_state != "resolved" || !claim.pair_observed {
+            return None;
+        }
+        if claim.original_working_directory_state != "resolved" {
+            return None;
+        }
+        let cwd = claim.original_working_directory.as_deref()?;
+        if cwd.is_empty() {
+            return None;
+        }
+        resolver.resolve(cwd)
+    }
+
     /// Build one Session's bounded search text from authoritative relational
     /// state. A representative placement is required so a metadata match can be
     /// returned as an existing Message `SearchHit` without fabricating an id.
@@ -4339,85 +6679,12 @@ impl SqliteStore {
             return Ok(None);
         }
 
-        let first_user_text = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT catalog.payload
-                     FROM message_placements
-                     JOIN catalog ON catalog.id = message_placements.message_id
-                     WHERE message_placements.session_id = ?1
-                     ORDER BY asg_instant_sort_key(
-                                  CASE WHEN json_valid(catalog.payload)
-                                       THEN json_extract(catalog.payload, '$.timestamp') END
-                              ) IS NULL,
-                              asg_instant_sort_key(
-                                  CASE WHEN json_valid(catalog.payload)
-                                       THEN json_extract(catalog.payload, '$.timestamp') END
-                              ),
-                              message_placements.document_id,
-                              message_placements.source_ordinal,
-                              message_placements.placement_id",
-                )
-                .map_err(backend)?;
-            let rows = stmt
-                .query_map([session_wire], |row| row.get::<_, Vec<u8>>(0))
-                .map_err(backend)?;
-            let mut first_user_text = None;
-            for row in rows {
-                let payload = row.map_err(backend)?;
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload)
-                    && value.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                    && let Some(text) = value.get("text").and_then(serde_json::Value::as_str)
-                    && !text.is_empty()
-                {
-                    first_user_text = Some(
-                        text.chars()
-                            .take(SESSION_SEARCH_FIELD_CHARS)
-                            .collect::<String>(),
-                    );
-                    break;
-                }
-            }
-            first_user_text
-        };
+        let first_user_text =
+            Self::first_user_text_for_session(conn, session_wire, SESSION_SEARCH_FIELD_CHARS)?;
 
         // Claims for one canonical Session must agree exactly. Conflict is
         // privacy-sensitive, so fail closed and index none of their values.
-        let resolved_claim = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT session_id, provider_id, provider_session_id,
-                            provider_session_id_state, original_working_directory,
-                            original_working_directory_state, pair_observed
-                     FROM source_session_resume_claims
-                     WHERE session_id = ?1",
-                )
-                .map_err(backend)?;
-            let rows = stmt
-                .query_map([session_wire], |row| {
-                    Ok(StoredResumeClaim {
-                        session_id: row.get(0)?,
-                        provider_id: row.get(1)?,
-                        provider_session_id: row.get(2)?,
-                        provider_session_id_state: row.get(3)?,
-                        original_working_directory: row.get(4)?,
-                        original_working_directory_state: row.get(5)?,
-                        pair_observed: row.get(6)?,
-                    })
-                })
-                .map_err(backend)?;
-            let mut claim: Option<StoredResumeClaim> = None;
-            let mut conflicting = false;
-            for row in rows {
-                let next = row.map_err(backend)?;
-                if claim.as_ref().is_some_and(|current| current != &next) {
-                    conflicting = true;
-                    break;
-                }
-                claim = Some(next);
-            }
-            if conflicting { None } else { claim }
-        };
+        let resolved_claim = Self::resolved_session_claim(conn, session_wire)?;
 
         let mut fields = Vec::new();
         if let Some(claim) = resolved_claim
@@ -4452,6 +6719,8 @@ impl SqliteStore {
     fn rebuild_session_search_row_in_tx(
         tx: &rusqlite::Transaction<'_>,
         session_wire: &str,
+        resolver: &dyn RepoSlugResolver,
+        repo_identity: RepoIdentityRebuild,
     ) -> PortResult<()> {
         tx.execute(
             "DELETE FROM session_fts
@@ -4469,7 +6738,7 @@ impl SqliteStore {
         if let Some(text) = Self::session_search_text(tx, session_wire)? {
             tx.execute(
                 "INSERT INTO session_fts(session_wire, text) VALUES(?1, ?2)",
-                rusqlite::params![session_wire, bigram_cjk(&text)],
+                rusqlite::params![session_wire, fts_tokens_cjk(&text)],
             )
             .map_err(backend)?;
             tx.execute(
@@ -4478,13 +6747,81 @@ impl SqliteStore {
             )
             .map_err(backend)?;
         }
+        // 标题投影（schema v13）：与 session_fts 同一派生批次。先删旧行，
+        // 再按派生链重投影（custom-title > ai-title > 首条有效 user）；
+        // 派生链无候选 → 无行（读取侧恒得到 None，不写空标题）。
+        tx.execute(
+            "DELETE FROM session_titles WHERE session_wire = ?1",
+            [session_wire],
+        )
+        .map_err(backend)?;
+        if let Some(title) = Self::session_title(tx, session_wire)? {
+            tx.execute(
+                "INSERT INTO session_titles(session_wire, title) VALUES(?1, ?2)",
+                rusqlite::params![session_wire, title],
+            )
+            .map_err(backend)?;
+        }
+        // repo identity 投影（schema v16）：与 session_fts/session_titles
+        // 同一派生批次。先删旧行，派生成功才写新行；session 已退役（不
+        // 在 catalog）、claim 缺失/冲突、门禁不满足或 git 检测失败 →
+        // 无行（诚实降级）。绝对路径绝不落此表——只有三段 slug。
+        if repo_identity == RepoIdentityRebuild::Preserve {
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM session_repo_slugs WHERE session_wire = ?1",
+            [session_wire],
+        )
+        .map_err(backend)?;
+        let session_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM catalog WHERE id = ?1)",
+                [session_wire],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if session_exists
+            && let Some(claim) = Self::resolved_session_claim(tx, session_wire)?
+            && let Some(slug) = Self::session_repo_slug(&claim, resolver)
+        {
+            tx.execute(
+                "INSERT INTO session_repo_slugs(session_wire, repo_slug) VALUES(?1, ?2)",
+                rusqlite::params![session_wire, slug],
+            )
+            .map_err(backend)?;
+        }
         Ok(())
     }
 
-    fn rebuild_all_session_search_in_tx(tx: &rusqlite::Transaction<'_>) -> PortResult<()> {
+    fn rebuild_all_session_search_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resolver: &dyn RepoSlugResolver,
+        repo_identity: RepoIdentityRebuild,
+    ) -> PortResult<()> {
         tx.execute("DELETE FROM session_fts", []).map_err(backend)?;
         tx.execute("DELETE FROM session_fts_ids", [])
             .map_err(backend)?;
+        tx.execute("DELETE FROM session_titles", [])
+            .map_err(backend)?;
+        if repo_identity == RepoIdentityRebuild::Rederive {
+            tx.execute("DELETE FROM session_repo_slugs", [])
+                .map_err(backend)?;
+        } else {
+            // 自愈不重派生 repo slug（它不可从 catalog 重建），但清理历史崩溃/
+            // 旧 bug 遗留的 orphan 行，避免它们继续污染 repo facet。把清理放在
+            // 全量重建入口而不是逐 session 行内，确保空 catalog 也能收敛且只执行一次。
+            tx.execute(
+                "DELETE FROM session_repo_slugs
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM catalog
+                     WHERE catalog.id = session_repo_slugs.session_wire
+                       AND catalog.id LIKE 'ses_v1_%'
+                 )",
+                [],
+            )
+            .map_err(backend)?;
+        }
         let sessions = {
             let mut stmt = tx
                 .prepare("SELECT id FROM catalog WHERE id LIKE 'ses_v1_%' ORDER BY id")
@@ -4499,7 +6836,7 @@ impl SqliteStore {
             sessions
         };
         for session_wire in sessions {
-            Self::rebuild_session_search_row_in_tx(tx, &session_wire)?;
+            Self::rebuild_session_search_row_in_tx(tx, &session_wire, resolver, repo_identity)?;
         }
         Ok(())
     }
@@ -4510,15 +6847,28 @@ impl SqliteStore {
         upserts: &[(StableId, Vec<u8>, String)],
         deletes: &[StableId],
         relations: &RelationManifests,
+        manifest: &CanonicalBatchManifest,
     ) -> PortResult<()> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction().map_err(backend)?;
-        Self::verify_pending_in_tx(&tx, pending, upserts, deletes, relations)?;
+        let mut trace_stages: Vec<(&'static str, std::time::Duration)> = Vec::new();
+        let trace_started = trace::begin();
+        Self::verify_pending_in_tx(&tx, pending, upserts, deletes, relations, manifest)?;
+        if let Some(relocation) = &relations.relocation {
+            Self::apply_relocation_in_tx(&tx, pending, relocation)?;
+        }
+        // Rebinding a historical empty placeholder must be revalidated inside
+        // this write transaction, before the batch replaces the evidence. The
+        // pre-parse reservation alone is never authorization.
+        let authorized_placeholder_rebinds =
+            SqliteStore::authorized_placeholder_rebinds(&tx, &relations.source_replacements)?;
+        trace::add(&mut trace_stages, "verify_outbox", trace_started);
 
         // Session 元数据投影（schema v11）：收集本批触碰的 Session，提交末尾
         // 逐个重建其 `session_fts` 行（删除按 rowid 经边车定位，重插新投影）。
         // 覆盖 upsert/delete 实体、placement 变动（含移动归属的旧主）、以及
         // source replacement 的旧 placement 与 claim 行——与写入路径同事务。
+        let trace_started = trace::begin();
         let mut affected_sessions = BTreeSet::new();
         for id in upserts.iter().map(|(id, _, _)| id).chain(deletes.iter()) {
             match id.kind() {
@@ -4558,7 +6908,7 @@ impl SqliteStore {
         }
         for source in &relations.source_replacements {
             source_paths.push(source.source_path.clone());
-            if let Some(claim) = &source.resume_claim {
+            for claim in &source.resume_claims {
                 affected_sessions.insert(claim.session_id.clone());
             }
             let mut stmt = tx
@@ -4576,6 +6926,7 @@ impl SqliteStore {
         }
         Self::collect_placement_sessions(&tx, &old_placement_ids, &mut affected_sessions)?;
         Self::collect_resume_claim_sessions(&tx, &source_paths, &mut affected_sessions)?;
+        trace::add(&mut trace_stages, "affected_sessions", trace_started);
 
         // 批量写入：同一事务内以多行 VALUES 语句替代逐行 prepared execute
         // （借鉴 hstry bulk_insert_messages_in_tx，MIT，
@@ -4584,6 +6935,7 @@ impl SqliteStore {
         // 5 条语句。Scoped so the borrow ends before the relation/source
         // loops below.
         {
+            let trace_catalog = trace::begin();
             const _: () = assert!(2 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
             for chunk in upserts.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
@@ -4608,7 +6960,12 @@ impl SqliteStore {
             }
             // fts 行与 fts_ids 身份边车的批量维护（含按 rowid 的旧行删除）：
             // 与逐行路径同语义，rowid 显式分配（见 batch_upsert_fts_in_tx）。
+            trace::add(&mut trace_stages, "catalog_upserts", trace_catalog);
+            let trace_fts = trace::begin();
             Self::batch_upsert_fts_in_tx(&tx, upserts)?;
+            trace::add(&mut trace_stages, "fts_projection", trace_fts);
+            let trace_deletes = trace::begin();
+            trace::add(&mut trace_stages, "catalog_deletes", trace_deletes);
             for chunk in deletes.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let ids: Vec<&str> = chunk.iter().map(|id| id.as_str()).collect();
                 let placeholders = in_placeholders(ids.len());
@@ -4635,6 +6992,7 @@ impl SqliteStore {
             }
         }
 
+        let trace_relations = trace::begin();
         for delete in &relations.relation_deletes {
             match delete {
                 RelationDeleteManifest::Edge(placement_id) => {
@@ -4657,6 +7015,10 @@ impl SqliteStore {
                         [activity_id],
                     )
                     .map_err(backend)?;
+                }
+                RelationDeleteManifest::Usage(usage_id) => {
+                    tx.execute("DELETE FROM usage_events WHERE usage_id = ?1", [usage_id])
+                        .map_err(backend)?;
                 }
             }
         }
@@ -4789,6 +7151,42 @@ impl SqliteStore {
             }
         }
 
+        // token 用量事件 upsert（v15）：逐行 upsert。事件行内容寻址
+        // （usage_id），同一事实跨源去重。
+        for upsert in &relations.relation_upserts {
+            if let RelationUpsertManifest::Usage(usage) = upsert {
+                tx.execute(
+                    "INSERT INTO usage_events(
+                         usage_id, session_id, message_id, input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens, reasoning_tokens, token_source
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(usage_id) DO UPDATE SET
+                         session_id = excluded.session_id,
+                         message_id = excluded.message_id,
+                         input_tokens = excluded.input_tokens,
+                         output_tokens = excluded.output_tokens,
+                         cache_read_tokens = excluded.cache_read_tokens,
+                         cache_write_tokens = excluded.cache_write_tokens,
+                         reasoning_tokens = excluded.reasoning_tokens,
+                         token_source = excluded.token_source",
+                    rusqlite::params![
+                        usage.usage_id,
+                        usage.session_id,
+                        usage.message_id,
+                        i64::try_from(usage.input_tokens).map_err(backend)?,
+                        i64::try_from(usage.output_tokens).map_err(backend)?,
+                        i64::try_from(usage.cache_read_tokens).map_err(backend)?,
+                        i64::try_from(usage.cache_write_tokens).map_err(backend)?,
+                        i64::try_from(usage.reasoning_tokens).map_err(backend)?,
+                        usage.token_source,
+                    ],
+                )
+                .map_err(backend)?;
+            }
+        }
+
+        trace::add(&mut trace_stages, "relation_upserts", trace_relations);
+        let trace_sources = trace::begin();
         for source in &relations.source_replacements {
             tx.execute(
                 "DELETE FROM source_membership WHERE source_path = ?1",
@@ -4858,20 +7256,40 @@ impl SqliteStore {
                 )
                 .map_err(backend)?;
             }
+            // token 用量事件成员（v15）：与活动同一生命周期——先清旧声明，
+            // 本批带用量才写新行；无用量的 source 即清除其旧声明。
             tx.execute(
-                "INSERT INTO source_scans(source_path, scanned_at_ms, len_bytes, fingerprint, provider_id)
-                 VALUES(?1, ?2, ?3, ?4, ?5)
+                "DELETE FROM usage_event_membership WHERE source_path = ?1",
+                [&source.source_path],
+            )
+            .map_err(backend)?;
+            for usage_id in &source.usage_ids {
+                tx.execute(
+                    "INSERT INTO usage_event_membership(source_path, usage_id)
+                     VALUES(?1, ?2)",
+                    rusqlite::params![&source.source_path, usage_id],
+                )
+                .map_err(backend)?;
+            }
+            tx.execute(
+                "INSERT INTO source_scans(
+                     source_path, scanned_at_ms, len_bytes, fingerprint, provider_id,
+                     parser_version
+                 )
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(source_path) DO UPDATE SET
                      scanned_at_ms = excluded.scanned_at_ms,
                      len_bytes = excluded.len_bytes,
                      fingerprint = excluded.fingerprint,
-                     provider_id = COALESCE(excluded.provider_id, source_scans.provider_id)",
+                     provider_id = COALESCE(excluded.provider_id, source_scans.provider_id),
+                     parser_version = excluded.parser_version",
                 rusqlite::params![
                     &source.source_path,
                     unix_ms()?,
                     source.len_bytes,
                     source.fingerprint,
                     source.provider_id,
+                    i64::from(PARSER_SEMANTIC_VERSION),
                 ],
             )
             .map_err(backend)?;
@@ -4891,6 +7309,24 @@ impl SqliteStore {
                 )
                 .map_err(backend)?;
             }
+            if source.entity_memberships.is_empty()
+                && source.fingerprint.is_none()
+                && source.len_bytes.is_none()
+            {
+                tx.execute(
+                    "DELETE FROM source_installations WHERE source_path=?1",
+                    [&source.source_path],
+                )
+                .map_err(backend)?;
+            } else if let Some(installation) = &source.installation {
+                Self::persist_installation_in_tx(
+                    &tx,
+                    &source.source_path,
+                    installation,
+                    (self.relocation_clock)()?,
+                    authorized_placeholder_rebinds.contains(&source.source_path),
+                )?;
+            }
             // Source-scoped Resume Metadata 声明（ADR-0009）：随 source replacement
             // 同事务原子替换——先清旧声明，本批带声明才写新行；无声明
             // （source 不再观察/移除）即清除，绝不残留旧声明。
@@ -4899,7 +7335,7 @@ impl SqliteStore {
                 [&source.source_path],
             )
             .map_err(backend)?;
-            if let Some(claim) = &source.resume_claim {
+            for claim in &source.resume_claims {
                 tx.execute(
                     "INSERT INTO source_session_resume_claims(
                          source_path, session_id, provider_id, provider_session_id,
@@ -4921,17 +7357,31 @@ impl SqliteStore {
             }
         }
 
+        trace::add(&mut trace_stages, "source_replacements", trace_sources);
+        let trace_sessions = trace::begin();
         let batch_sources: Vec<String> = relations
             .source_replacements
             .iter()
             .map(|replacement| replacement.source_path.clone())
             .collect();
-        Self::regenerate_compatibility_aliases_in_tx(&tx, &batch_sources)?;
+        let in_memory_payloads: BTreeMap<&str, &[u8]> = upserts
+            .iter()
+            .map(|(id, payload, _)| (id.as_str(), payload.as_slice()))
+            .collect();
+        Self::regenerate_compatibility_aliases_in_tx(&tx, &batch_sources, &in_memory_payloads)?;
+        let resolver: &dyn RepoSlugResolver = &**self.repo_slug_resolver.borrow();
         for session_wire in affected_sessions {
-            Self::rebuild_session_search_row_in_tx(&tx, &session_wire)?;
+            Self::rebuild_session_search_row_in_tx(
+                &tx,
+                &session_wire,
+                resolver,
+                RepoIdentityRebuild::Rederive,
+            )?;
         }
 
         // 本批触碰的关系行：只校验这些 id 的引用完整性。
+        trace::add(&mut trace_stages, "session_projection", trace_sessions);
+        let trace_integrity = trace::begin();
         let mut touched_placements: Vec<String> = Vec::new();
         let mut touched_edges: Vec<String> = Vec::new();
         let mut touched_claims: Vec<String> = Vec::new();
@@ -4951,8 +7401,9 @@ impl SqliteStore {
                 RelationUpsertManifest::Edge(edge) => {
                     touched_edges.push(edge.child_placement_id.as_str().to_string());
                 }
-                // 工具活动不参与 placement/edge 引用完整性校验（独立表）。
-                RelationUpsertManifest::Activity(_) => {}
+                // 工具活动/用量事件不参与 placement/edge 引用完整性校验
+                // （独立表）。
+                RelationUpsertManifest::Activity(_) | RelationUpsertManifest::Usage(_) => {}
             }
         }
         for delete in &relations.relation_deletes {
@@ -4963,7 +7414,7 @@ impl SqliteStore {
                 RelationDeleteManifest::Edge(id) => {
                     touched_edges.push(id.as_str().to_string());
                 }
-                RelationDeleteManifest::Activity(_) => {}
+                RelationDeleteManifest::Activity(_) | RelationDeleteManifest::Usage(_) => {}
             }
         }
         Self::verify_relational_integrity_in_tx(
@@ -4976,7 +7427,12 @@ impl SqliteStore {
         // v7 关系行：被删实体若仍被 message_placements/message_edges 引用，会留下
         // 悬空引用，必须在此拒绝（B2 路径的删除按 claimer 推导，天然无悬空）。
         Self::verify_deleted_entities_unreferenced_in_tx(&tx, deletes)?;
+        if let Some(relocation) = &relations.relocation {
+            relocation.verify_snapshots()?;
+        }
 
+        trace::add(&mut trace_stages, "integrity_checks", trace_integrity);
+        let trace_generation = trace::begin();
         tx.execute(
             "UPDATE store_metadata SET active_generation = ?1 WHERE singleton = 1",
             [pending.target_generation as i64],
@@ -4990,7 +7446,21 @@ impl SqliteStore {
         )
         .map_err(backend)?;
 
+        trace::add(&mut trace_stages, "generation_activate", trace_generation);
+        let trace_commit = trace::begin();
         tx.commit().map_err(backend)?;
+        trace::add(&mut trace_stages, "tx_commit", trace_commit);
+        trace::emit(
+            "adapter:commit",
+            &trace_stages,
+            &format!(
+                "upserts={} deletes={} relation_upserts={} relation_deletes={}",
+                upserts.len(),
+                deletes.len(),
+                relations.relation_upserts.len(),
+                relations.relation_deletes.len()
+            ),
+        );
         Ok(())
     }
 
@@ -5181,7 +7651,7 @@ impl SqliteStore {
     /// `RETURNING rowid` 在 fts5 上不可用（实测返回 -1）。分配从当前
     /// `MAX(rowid)+1` 起顺序递增；本批次每个 wire_id 至多出现一次且旧行
     /// 已先删除，故不会与存量行或同批其他行冲突。索引侧正文与查询侧配对
-    /// 同一 CJK bigram transform（ADR-0007）。
+    /// 同一 CJK n-gram transform（ADR-0007，单字 + bigram）。
     fn batch_upsert_fts_in_tx(
         tx: &rusqlite::Transaction<'_>,
         upserts: &[(StableId, Vec<u8>, String)],
@@ -5190,6 +7660,8 @@ impl SqliteStore {
             return Ok(());
         }
         let mut next_fts_rowid: Option<i64> = None;
+        let mut trace_fts_time = std::time::Duration::ZERO;
+        let mut trace_sidecar_time = std::time::Duration::ZERO;
         let mut allocate_rowid = || -> PortResult<i64> {
             match next_fts_rowid {
                 Some(id) => {
@@ -5208,6 +7680,7 @@ impl SqliteStore {
             }
         };
         for chunk in upserts.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
+            let trace_chunk = trace::begin();
             // StableId 无字符串反解构造器，故存其 serde JSON 以便查询时无损重建
             // （wire 串不含 stability，无法从 as_str() 还原完整身份）。
             let ids: Vec<&str> = chunk.iter().map(|(id, _, _)| id.as_str()).collect();
@@ -5237,7 +7710,13 @@ impl SqliteStore {
                 let id_json = serde_json::to_string(id).map_err(backend)?;
                 if id.kind() == IdKind::Message {
                     let fts_rowid = allocate_rowid()?;
-                    fts_rows.push((fts_rowid, id_json.clone(), bigram_cjk(text)));
+                    // 索引侧强制有界（借鉴清单 #3）：入口已截断的 text 原样通过，
+                    // 未截断的直接写入路径（MCP/单条 index）在此兜底。
+                    fts_rows.push((
+                        fts_rowid,
+                        id_json.clone(),
+                        fts_tokens_cjk(&bounded_index_text(text)),
+                    ));
                     fts_ids_rows.push((id.as_str().to_string(), id_json, Some(fts_rowid)));
                 } else {
                     fts_ids_rows.push((id.as_str().to_string(), id_json, None));
@@ -5261,6 +7740,8 @@ impl SqliteStore {
                 tx.execute(&sql, rusqlite::params_from_iter(params))
                     .map_err(backend)?;
             }
+            trace_fts_time += trace::elapsed(trace_chunk);
+            let trace_sidecar = trace::begin();
             const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
             let sql = format!(
                 "INSERT INTO fts_ids(wire_id, id_json, fts_rowid) VALUES {}",
@@ -5277,7 +7758,16 @@ impl SqliteStore {
                 .collect();
             tx.execute(&sql, rusqlite::params_from_iter(params))
                 .map_err(backend)?;
+            trace_sidecar_time += trace::elapsed(trace_sidecar);
         }
+        trace::emit(
+            "adapter:fts",
+            &[
+                ("fts_projection_rows", trace_fts_time),
+                ("fts_ids_insert", trace_sidecar_time),
+            ],
+            &format!("entities={}", upserts.len()),
+        );
         Ok(())
     }
 
@@ -5305,11 +7795,12 @@ impl SqliteStore {
         tx.execute("DELETE FROM fts_ids WHERE wire_id = ?1", [id.as_str()])
             .map_err(backend)?;
         let fts_rowid = if id.kind() == IdKind::Message {
-            // 索引侧 CJK bigram（ADR-0007）：`SearchIndex::index` 与
-            // `CatalogStore::put` 两条单条写入路径与批量提交共用同一 transform。
+            // 索引侧 CJK n-gram（ADR-0007，单字 + bigram）：`SearchIndex::index`
+            // 与 `CatalogStore::put` 两条单条写入路径与批量提交共用同一 transform；
+            // 先施加有界截断（借鉴清单 #3，与 searchable_text/批量路径同上限）。
             tx.execute(
                 "INSERT INTO fts(id, text) VALUES(?1, ?2)",
-                rusqlite::params![id_json, bigram_cjk(text)],
+                rusqlite::params![id_json, fts_tokens_cjk(&bounded_index_text(text))],
             )
             .map_err(backend)?;
             Some(tx.last_insert_rowid())
@@ -5360,7 +7851,16 @@ impl SqliteStore {
     ///
     /// rebuild 是显式维护命令，即使内容与现有投影一致也照常推进 generation——操作者
     /// 主动请求“干净重建”，不做 no-op 短路。返回重新索引的实体条数。
+    ///
+    /// 显式重建会**重派生** repo 身份投影（重新探测本机 git）；打开时的投影版本
+    /// 自愈走同一实现但保留该投影，见 [`RepoIdentityRebuild`]。
     pub fn rebuild_index(&self) -> PortResult<usize> {
+        self.reproject_from_catalog(RepoIdentityRebuild::Rederive)
+    }
+
+    /// [`rebuild_index`](Self::rebuild_index) 的实现体，`repo_identity` 决定
+    /// 是否重派生 repo 身份投影（见 [`RepoIdentityRebuild`]）。
+    fn reproject_from_catalog(&self, repo_identity: RepoIdentityRebuild) -> PortResult<usize> {
         // 1) 以 catalog 为权威实体集，投影检索正文；身份优先取 fts_ids 保真。
         // 单个 LEFT JOIN 取代逐行 fts_ids 查询(每行一次 prepare+execute 的 N+1)。
         let upserts: Vec<(StableId, Vec<u8>, String)> = {
@@ -5403,14 +7903,18 @@ impl SqliteStore {
         // 3) 单事务：校验句柄 → 整表清空 FTS → 按 catalog 重投影 → 推进 generation → 标记 activated。
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction().map_err(backend)?;
-        Self::verify_pending_in_tx(&tx, &pending, &upserts, &[], &RelationManifests::default())?;
+        let relations = RelationManifests::default();
+        let manifest = batch_manifest(&upserts, &[], &relations)?;
+        Self::verify_pending_in_tx(&tx, &pending, &upserts, &[], &relations, &manifest)?;
 
         tx.execute("DELETE FROM fts", []).map_err(backend)?;
         tx.execute("DELETE FROM fts_ids", []).map_err(backend)?;
         // Session 元数据投影（schema v11）：全量重建 `session_fts`——与消息
         // FTS 同一"catalog + claims 可重建投影"不变量，从声明与目录逐会话
-        // 重投影，绝不从既有 session_fts 内容复制。
-        Self::rebuild_all_session_search_in_tx(&tx)?;
+        // 重投影，绝不从既有 session_fts 内容复制。repo identity（schema
+        // v16）同批重建，解析器来自注入的 [`RepoSlugResolver`]。
+        let resolver: &dyn RepoSlugResolver = &**self.repo_slug_resolver.borrow();
+        Self::rebuild_all_session_search_in_tx(&tx, resolver, repo_identity)?;
         // 与提交路径一致：只有 Message 实体重投影进 fts，且把 fts5 行 rowid 回写
         // 进 fts_ids 边车，删除才能按 rowid 定位（见 ensure_fts_ids_rowid）。
         // 批量多行写入（与提交路径共用 batch_upsert_fts_in_tx；整表清空后
@@ -5420,6 +7924,14 @@ impl SqliteStore {
         tx.execute(
             "UPDATE store_metadata SET active_generation = ?1 WHERE singleton = 1",
             [pending.target_generation as i64],
+        )
+        .map_err(backend)?;
+        // 投影版本戳与重投影同事务（schema v17）：只有"整库从 catalog 重投影"
+        // 才能声明全库投影属于当前变换版本——增量提交路径只覆盖本批实体，
+        // 因此刻意不在那里盖戳。回滚时戳与投影一起回滚，不会谎报已收敛。
+        tx.execute(
+            "UPDATE store_metadata SET index_projection_version = ?1 WHERE singleton = 1",
+            [i64::from(INDEX_PROJECTION_VERSION)],
         )
         .map_err(backend)?;
         tx.execute(
@@ -5470,6 +7982,10 @@ impl SqliteStore {
     }
 
     /// 读回一条 outbox 行（供测试与诊断）。
+    ///
+    /// `detail_format = 'full'` 的行返回完整明细；`aggregated_v1` 行的五个明细
+    /// 向量是占位空值，规模在 [`IndexBatch::detail_summary`]；未知格式
+    /// fail-closed（[`PortError::SchemaIncompatible`]），绝不按猜测格式解释。
     pub fn index_batch(&self, operation_id: &str) -> PortResult<Option<IndexBatch>> {
         let conn = self.conn.borrow();
         let mut stmt = conn
@@ -5477,7 +7993,8 @@ impl SqliteStore {
                 "SELECT operation_id, base_generation, target_generation, state,
                         operation_digest, upsert_ids_json, delete_ids_json,
                         relation_upserts_json, relation_deletes_json,
-                        source_replacements_json, durable_point, error_code
+                        source_replacements_json, durable_point, error_code,
+                        detail_format, detail_summary_json
                  FROM index_batches WHERE operation_id = ?1",
             )
             .map_err(backend)?;
@@ -5490,6 +8007,13 @@ impl SqliteStore {
                 let relation_upserts_json: String = row.get(7).map_err(backend)?;
                 let relation_deletes_json: String = row.get(8).map_err(backend)?;
                 let source_replacements_json: String = row.get(9).map_err(backend)?;
+                let detail_format: String = row.get(12).map_err(backend)?;
+                let detail_summary_json: Option<String> = row.get(13).map_err(backend)?;
+                let detail_summary = decode_aggregated_journal_detail(
+                    operation_id,
+                    &detail_format,
+                    detail_summary_json.as_deref(),
+                )?;
                 Ok(Some(IndexBatch {
                     operation_id: row.get(0).map_err(backend)?,
                     base_generation: u64::try_from(row.get::<_, i64>(1).map_err(backend)?)
@@ -5508,15 +8032,747 @@ impl SqliteStore {
                         .map_err(backend)?,
                     durable_point: row.get(10).map_err(backend)?,
                     error_code: row.get(11).map_err(backend)?,
+                    detail_format,
+                    detail_summary,
                 }))
             }
         }
     }
 }
 
+/// 解码一行的明细布局：`full` → None；`aggregated_v1` → 校验并返回摘要。
+///
+/// 未知格式、缺摘要、摘要不完整一律 [`PortError::SchemaIncompatible`]
+/// （fail-closed）：调用方不得在猜测格式的前提下解释行内容。
+fn decode_aggregated_journal_detail(
+    operation_id: &str,
+    detail_format: &str,
+    detail_summary_json: Option<&str>,
+) -> PortResult<Option<AggregatedJournalDetail>> {
+    match detail_format {
+        JOURNAL_DETAIL_FORMAT_FULL => {
+            if detail_summary_json.is_some() {
+                return Err(PortError::SchemaIncompatible(format!(
+                    "journal batch {operation_id} carries an aggregated summary without the aggregated format"
+                )));
+            }
+            Ok(None)
+        }
+        JOURNAL_DETAIL_FORMAT_AGGREGATED_V1 => {
+            let raw = detail_summary_json.ok_or_else(|| {
+                PortError::SchemaIncompatible(format!(
+                    "journal batch {operation_id} is missing its aggregated detail summary"
+                ))
+            })?;
+            let summary: AggregatedJournalDetail = serde_json::from_str(raw).map_err(|_| {
+                PortError::SchemaIncompatible(format!(
+                    "journal batch {operation_id} has an unreadable aggregated detail summary"
+                ))
+            })?;
+            validate_aggregated_journal_detail(operation_id, &summary)?;
+            Ok(Some(summary))
+        }
+        _ => Err(PortError::SchemaIncompatible(format!(
+            "journal batch {operation_id} has an unsupported detail format"
+        ))),
+    }
+}
+
+/// 明细承诺：域分隔 blake3 覆盖五个可聚合列的原始文本（字节级，不做规范化）。
+fn journal_detail_digest(details: &[String; 5]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, JOURNAL_DETAIL_DIGEST_DOMAIN);
+    for (name, text) in JOURNAL_COMPACTION_FIELDS.iter().zip(details.iter()) {
+        hash_field(&mut hasher, name.as_bytes());
+        hash_field(&mut hasher, text.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// 计划承诺：字段清单 + 逐行身份/代数/明细承诺/规模（行序即 preview 排序）。
+fn journal_plan_digest(items: &[JournalCompactionPreviewItem]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, JOURNAL_COMPACTION_PLAN_DOMAIN);
+    hash_field(&mut hasher, &JOURNAL_COMPACTION_PLAN_VERSION.to_le_bytes());
+    for name in JOURNAL_COMPACTION_FIELDS {
+        hash_field(&mut hasher, name.as_bytes());
+    }
+    for item in items {
+        hash_field(&mut hasher, item.operation_id.as_bytes());
+        hash_field(&mut hasher, item.state.as_bytes());
+        hash_field(&mut hasher, &item.base_generation.to_le_bytes());
+        hash_field(&mut hasher, &item.target_generation.to_le_bytes());
+        hash_field(&mut hasher, item.operation_digest.as_bytes());
+        hash_field(&mut hasher, item.detail_digest.as_bytes());
+        for field in &item.fields {
+            hash_field(&mut hasher, field.field.as_bytes());
+            hash_field(&mut hasher, &field.bytes.to_le_bytes());
+            hash_field(&mut hasher, &field.items.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// 单字段明细的元素个数：durable manifest 的形状是 JSON 数组，别的形状一律拒绝。
+fn journal_detail_item_count(operation_id: &str, field: &str, text: &str) -> PortResult<u64> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
+        PortError::Backend(format!(
+            "journal batch {operation_id} has unreadable {field} detail"
+        ))
+    })?;
+    let array = value.as_array().ok_or_else(|| {
+        PortError::Backend(format!(
+            "journal batch {operation_id} has non-array {field} detail"
+        ))
+    })?;
+    u64::try_from(array.len()).map_err(backend)
+}
+
+/// 聚合摘要（确定性序列化：BTreeMap 键序 + 固定字段序；不含时钟，可精确预算）。
+fn aggregated_journal_summary(
+    compaction_id: &str,
+    item: &JournalCompactionPreviewItem,
+) -> AggregatedJournalDetail {
+    AggregatedJournalDetail {
+        format: JOURNAL_DETAIL_FORMAT_AGGREGATED_V1.to_string(),
+        compaction_id: compaction_id.to_string(),
+        items: item
+            .fields
+            .iter()
+            .map(|field| (field.field.clone(), field.items))
+            .collect(),
+        bytes: item
+            .fields
+            .iter()
+            .map(|field| (field.field.clone(), field.bytes))
+            .collect(),
+        detail_digest: item.detail_digest.clone(),
+    }
+}
+
+fn aggregated_journal_summary_json(
+    compaction_id: &str,
+    item: &JournalCompactionPreviewItem,
+) -> PortResult<String> {
+    serde_json::to_string(&aggregated_journal_summary(compaction_id, item)).map_err(backend)
+}
+
+/// 聚合后单行的明细字节：五个 `[]` 占位（各 2 字节）+ 摘要 JSON。
+fn aggregated_journal_detail_bytes(
+    compaction_id: &str,
+    item: &JournalCompactionPreviewItem,
+) -> PortResult<u64> {
+    let summary = aggregated_journal_summary_json(compaction_id, item)?;
+    u64::try_from(summary.len() + JOURNAL_COMPACTION_FIELDS.len() * 2).map_err(backend)
+}
+
+/// 摘要完整性：字段集合必须与当前二进制支持的聚合字段清单完全一致。
+fn validate_aggregated_journal_detail(
+    operation_id: &str,
+    summary: &AggregatedJournalDetail,
+) -> PortResult<()> {
+    if summary.format != JOURNAL_DETAIL_FORMAT_AGGREGATED_V1 {
+        return Err(PortError::SchemaIncompatible(format!(
+            "journal batch {operation_id} has an unsupported aggregated detail format"
+        )));
+    }
+    let complete = JOURNAL_COMPACTION_FIELDS
+        .iter()
+        .all(|name| summary.items.contains_key(*name) && summary.bytes.contains_key(*name));
+    if !complete
+        || summary.items.len() != JOURNAL_COMPACTION_FIELDS.len()
+        || summary.bytes.len() != JOURNAL_COMPACTION_FIELDS.len()
+    {
+        return Err(PortError::SchemaIncompatible(format!(
+            "journal batch {operation_id} has an incomplete aggregated detail summary"
+        )));
+    }
+    Ok(())
+}
+
+/// preview 之后 journal 已变化的稳定错误（stage/apply 的 CAS 失败）。
+fn stale_journal_compaction() -> PortError {
+    PortError::GenerationMismatch(STALE_JOURNAL_COMPACTION_REASON.to_string())
+}
+
+/// `journal_compactions` 持久化计划的形状（版本化；未知版本 fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct JournalCompactionPlan {
+    version: u32,
+    compaction_id: String,
+    aggregated_fields: Vec<String>,
+    items: Vec<JournalCompactionPreviewItem>,
+}
+
+/// `journal_compactions` 完整行（含 apply 需要的 plan_json）。
+struct StoredJournalCompaction {
+    event: JournalCompactionEvent,
+    plan_json: String,
+}
+
+impl StoredJournalCompaction {
+    fn load(conn: &Connection, compaction_id: &str) -> PortResult<Option<Self>> {
+        conn.query_row(
+            "SELECT compaction_id, state, plan_json, plan_digest, affected_batches,
+                    detail_bytes_before, detail_bytes_after, saved_bytes,
+                    created_at_ms, resolved_at_ms, reason
+             FROM journal_compactions WHERE compaction_id = ?1",
+            [compaction_id],
+            |row| {
+                Ok(StoredJournalCompaction {
+                    plan_json: row.get(2)?,
+                    event: JournalCompactionEvent {
+                        compaction_id: row.get(0)?,
+                        state: row.get(1)?,
+                        plan_digest: row.get(3)?,
+                        affected_batches: row_u64(row, 4)?,
+                        detail_bytes_before: row_u64(row, 5)?,
+                        detail_bytes_after: row_u64(row, 6)?,
+                        saved_bytes: row_u64(row, 7)?,
+                        created_at_ms: row.get(8)?,
+                        resolved_at_ms: row.get(9)?,
+                        reason: row.get(10)?,
+                    },
+                })
+            },
+        )
+        .optional()
+        .map_err(backend)
+    }
+}
+
+impl SqliteStore {
+    /// 为 terminal 批次的重复明细产出保留合同预览——只读，不改任何行。
+    ///
+    /// 预览回答四件事：将被聚合的内容（逐批次状态/代数/明细承诺与逐字段规模）、
+    /// 受影响记录数（`affected_batches`）、预计体积收益（精确到计划写入的字节：
+    /// 摘要是确定性的）、被聚合字段清单（[`JOURNAL_COMPACTION_FIELDS`]）。
+    /// 执行入口分离：[`stage_journal_compaction`](Self::stage_journal_compaction)
+    /// → [`apply_journal_compaction`](Self::apply_journal_compaction)，
+    /// **默认不自动调用**（open 路径不会 compact）。
+    ///
+    /// 未决行（building/search_built/cleanup_pending）不参与聚合；已聚合行幂等
+    /// 跳过；聚合无收益（明细本来就小）的 terminal 行保持 `full`。未知状态或
+    /// 未知 `detail_format` 一律 fail-closed（[`PortError::SchemaIncompatible`]）：
+    /// 绝不按猜测格式解释，也绝不静默跳过。
+    pub fn preview_journal_compaction(&self) -> PortResult<JournalCompactionPreview> {
+        let conn = self.conn.borrow();
+        Self::preview_journal_compaction_in(&conn)
+    }
+
+    fn preview_journal_compaction_in(conn: &Connection) -> PortResult<JournalCompactionPreview> {
+        Self::preview_journal_compaction_with_id(conn, journal_compaction_id()?)
+    }
+
+    fn preview_journal_compaction_with_id(
+        conn: &Connection,
+        compaction_id: String,
+    ) -> PortResult<JournalCompactionPreview> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT operation_id, state, base_generation, target_generation,
+                        operation_digest, detail_format,
+                        upsert_ids_json, delete_ids_json, relation_upserts_json,
+                        relation_deletes_json, source_replacements_json
+                 FROM index_batches
+                 ORDER BY target_generation, operation_id",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut batches = Vec::new();
+        let mut detail_bytes_before = 0u64;
+        let mut estimated_detail_bytes_after = 0u64;
+        for row in rows {
+            let (
+                operation_id,
+                state,
+                base_generation,
+                target_generation,
+                operation_digest,
+                detail_format,
+                upsert_ids_json,
+                delete_ids_json,
+                relation_upserts_json,
+                relation_deletes_json,
+                source_replacements_json,
+            ) = row.map_err(backend)?;
+            // fail-closed 先行：状态与格式的合法性对每一行都判定，未决行与已聚合
+            // 行也不例外——跳过只适用于本二进制认识的组合，未知值绝不静默跳过
+            // （保留合同 §5）。
+            let pending = JOURNAL_RESOLVED_PENDING_STATES.contains(&state.as_str());
+            if !pending && !JOURNAL_TERMINAL_STATES.contains(&state.as_str()) {
+                return Err(PortError::SchemaIncompatible(format!(
+                    "journal batch {operation_id} is in an unsupported state"
+                )));
+            }
+            if detail_format != JOURNAL_DETAIL_FORMAT_FULL
+                && detail_format != JOURNAL_DETAIL_FORMAT_AGGREGATED_V1
+            {
+                return Err(PortError::SchemaIncompatible(format!(
+                    "journal batch {operation_id} has an unsupported detail format"
+                )));
+            }
+            if pending {
+                // 未决行：明细仍参与恢复与 CAS 校验，永久保留。
+                continue;
+            }
+            if detail_format == JOURNAL_DETAIL_FORMAT_AGGREGATED_V1 {
+                // 已按当前格式聚合：幂等跳过。
+                continue;
+            }
+            let details = [
+                upsert_ids_json,
+                delete_ids_json,
+                relation_upserts_json,
+                relation_deletes_json,
+                source_replacements_json,
+            ];
+            let mut fields = Vec::with_capacity(JOURNAL_COMPACTION_FIELDS.len());
+            for (name, text) in JOURNAL_COMPACTION_FIELDS.iter().zip(details.iter()) {
+                fields.push(JournalDetailFieldPreview {
+                    field: (*name).to_string(),
+                    bytes: u64::try_from(text.len()).map_err(backend)?,
+                    items: journal_detail_item_count(&operation_id, name, text)?,
+                });
+            }
+            let item = JournalCompactionPreviewItem {
+                operation_id,
+                state,
+                base_generation: u64::try_from(base_generation).map_err(backend)?,
+                target_generation: u64::try_from(target_generation).map_err(backend)?,
+                operation_digest,
+                detail_digest: journal_detail_digest(&details),
+                fields,
+            };
+            let row_before: u64 = item.fields.iter().map(|field| field.bytes).sum();
+            let row_after = aggregated_journal_detail_bytes(&compaction_id, &item)?;
+            if row_after >= row_before {
+                // 无收益（明细本来就小）：保持 full——聚合只做有约束的减法。
+                continue;
+            }
+            detail_bytes_before += row_before;
+            estimated_detail_bytes_after += row_after;
+            batches.push(item);
+        }
+        let aggregated_fields = JOURNAL_COMPACTION_FIELDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        Ok(JournalCompactionPreview {
+            plan_digest: journal_plan_digest(&batches),
+            affected_batches: u64::try_from(batches.len()).map_err(backend)?,
+            aggregated_fields,
+            detail_bytes_before,
+            estimated_detail_bytes_after,
+            estimated_saved_bytes: detail_bytes_before - estimated_detail_bytes_after,
+            batches,
+            compaction_id,
+        })
+    }
+
+    /// 把一次预览固化为 durable `staged` 计划——写 `journal_compactions`，不碰明细。
+    ///
+    /// 事务内重算当前 `plan_digest` 并与传入预览比对：预览之后 journal 有任何
+    /// 变化（新增批次/状态变化/明细改写）都拒绝（`GenerationMismatch`），要求
+    /// 重新 preview。apply 需要的全部输入（计划 id、逐行指纹与规模）都随本提交
+    /// durable 落盘，因此**这个提交点之后进程被杀也能重入收敛**——见
+    /// [`recover_journal_compactions`](Self::recover_journal_compactions)。
+    pub fn stage_journal_compaction(
+        &self,
+        preview: &JournalCompactionPreview,
+    ) -> PortResult<JournalCompactionStage> {
+        if preview.affected_batches == 0 {
+            return Err(PortError::InvalidRequest(
+                "journal compaction preview covers no aggregatable terminal batches".into(),
+            ));
+        }
+        let expected_fields: Vec<String> = JOURNAL_COMPACTION_FIELDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        if preview.aggregated_fields != expected_fields
+            || u64::try_from(preview.batches.len()).map_err(backend)? != preview.affected_batches
+        {
+            return Err(PortError::InvalidRequest(
+                "journal compaction preview does not match the retention contract".into(),
+            ));
+        }
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(backend)?;
+        let current = Self::preview_journal_compaction_in(&tx)?;
+        if current.plan_digest != preview.plan_digest {
+            return Err(stale_journal_compaction());
+        }
+        let plan = JournalCompactionPlan {
+            version: JOURNAL_COMPACTION_PLAN_VERSION,
+            compaction_id: preview.compaction_id.clone(),
+            aggregated_fields: preview.aggregated_fields.clone(),
+            items: preview.batches.clone(),
+        };
+        let plan_json = serde_json::to_string(&plan).map_err(backend)?;
+        tx.execute(
+            "INSERT INTO journal_compactions(
+                 compaction_id, state, plan_json, plan_digest, affected_batches,
+                 detail_bytes_before, detail_bytes_after, saved_bytes, created_at_ms
+             ) VALUES(?1, 'staged', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                preview.compaction_id.as_str(),
+                plan_json,
+                preview.plan_digest.as_str(),
+                i64::try_from(preview.affected_batches).map_err(backend)?,
+                i64::try_from(preview.detail_bytes_before).map_err(backend)?,
+                i64::try_from(preview.estimated_detail_bytes_after).map_err(backend)?,
+                i64::try_from(preview.estimated_saved_bytes).map_err(backend)?,
+                unix_ms()?,
+            ],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(JournalCompactionStage {
+            compaction_id: preview.compaction_id.clone(),
+            plan_digest: preview.plan_digest.clone(),
+            affected_batches: preview.affected_batches,
+            detail_bytes_before: preview.detail_bytes_before,
+            estimated_saved_bytes: preview.estimated_saved_bytes,
+        })
+    }
+
+    /// 提交一个 staged 计划：单事务内校验 + 聚合 + 标记 committed。
+    ///
+    /// 校验是逐行 CAS：行仍在、状态未变、格式仍是 `full`、明细承诺与计划一致；
+    /// 任一不符 → `GenerationMismatch`，事务回滚、计划保持 `staged`
+    /// （可重新 preview/stage，或交由
+    /// [`recover_journal_compactions`](Self::recover_journal_compactions) 显式放弃）。
+    /// 已 committed 的计划再次调用是幂等空操作。catalog/FTS/关系/活跃 generation
+    /// 都不在本事务的写集合里——compact 只改 journal 明细。
+    pub fn apply_journal_compaction(
+        &self,
+        compaction_id: &str,
+    ) -> PortResult<JournalCompactionOutcome> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(backend)?;
+        let outcome = Self::apply_journal_compaction_in(&tx, compaction_id)?;
+        tx.commit().map_err(backend)?;
+        Ok(outcome)
+    }
+
+    fn apply_journal_compaction_in(
+        tx: &rusqlite::Transaction<'_>,
+        compaction_id: &str,
+    ) -> PortResult<JournalCompactionOutcome> {
+        let stored = StoredJournalCompaction::load(tx, compaction_id)?
+            .ok_or_else(|| PortError::NotFound("journal compaction plan not found".into()))?;
+        match stored.event.state.as_str() {
+            "committed" => {
+                // 幂等重入：不改写任何行，回报计划自带的精确数字。
+                return Ok(JournalCompactionOutcome {
+                    compaction_id: compaction_id.to_string(),
+                    state: "committed".into(),
+                    applied_batches: 0,
+                    already_committed: true,
+                    detail_bytes_before: stored.event.detail_bytes_before,
+                    detail_bytes_after: stored.event.detail_bytes_after,
+                    saved_bytes: stored.event.saved_bytes,
+                });
+            }
+            "abandoned" => {
+                return Err(PortError::InvalidRequest(
+                    "journal compaction plan was abandoned; re-run preview".into(),
+                ));
+            }
+            "staged" => {}
+            _ => {
+                return Err(PortError::SchemaIncompatible(
+                    "journal compaction plan has an unsupported state".into(),
+                ));
+            }
+        }
+        let plan: JournalCompactionPlan =
+            serde_json::from_str(&stored.plan_json).map_err(|_| {
+                PortError::SchemaIncompatible(
+                    "journal compaction plan is unreadable by this binary".into(),
+                )
+            })?;
+        let expected_fields: Vec<String> = JOURNAL_COMPACTION_FIELDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        if plan.version != JOURNAL_COMPACTION_PLAN_VERSION
+            || plan.compaction_id != compaction_id
+            || plan.aggregated_fields != expected_fields
+        {
+            return Err(PortError::SchemaIncompatible(
+                "journal compaction plan is not supported by this binary".into(),
+            ));
+        }
+        let mut applied = 0u64;
+        for item in &plan.items {
+            let stored_row = tx
+                .query_row(
+                    "SELECT state, detail_format, detail_summary_json,
+                            operation_digest, target_generation,
+                            upsert_ids_json, delete_ids_json, relation_upserts_json,
+                            relation_deletes_json, source_replacements_json
+                     FROM index_batches WHERE operation_id = ?1",
+                    [item.operation_id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row_u64(row, 4)?,
+                            [
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                                row.get::<_, String>(8)?,
+                                row.get::<_, String>(9)?,
+                            ],
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(backend)?;
+            let Some((
+                state,
+                detail_format,
+                summary_json,
+                operation_digest,
+                target_generation,
+                details,
+            )) = stored_row
+            else {
+                return Err(stale_journal_compaction());
+            };
+            match detail_format.as_str() {
+                JOURNAL_DETAIL_FORMAT_FULL => {
+                    // 永久保留字段也必须与计划逐项一致：状态、批次摘要与代数边界
+                    // 是计划身份的一部分，任一漂移都整批拒绝（零改写）。
+                    if state != item.state
+                        || operation_digest != item.operation_digest
+                        || target_generation != item.target_generation
+                        || journal_detail_digest(&details) != item.detail_digest
+                    {
+                        return Err(stale_journal_compaction());
+                    }
+                    let summary_json = aggregated_journal_summary_json(&plan.compaction_id, item)?;
+                    let updated = tx
+                        .execute(
+                            "UPDATE index_batches
+                             SET detail_format = ?2, detail_summary_json = ?3,
+                                 upsert_ids_json = '[]', delete_ids_json = '[]',
+                                 relation_upserts_json = '[]', relation_deletes_json = '[]',
+                                 source_replacements_json = '[]'
+                             WHERE operation_id = ?1 AND detail_format = ?4",
+                            rusqlite::params![
+                                item.operation_id.as_str(),
+                                JOURNAL_DETAIL_FORMAT_AGGREGATED_V1,
+                                summary_json,
+                                JOURNAL_DETAIL_FORMAT_FULL,
+                            ],
+                        )
+                        .map_err(backend)?;
+                    if updated != 1 {
+                        return Err(stale_journal_compaction());
+                    }
+                    applied += 1;
+                }
+                JOURNAL_DETAIL_FORMAT_AGGREGATED_V1 => {
+                    // 事务内重入修复：本计划已聚合过该行——只校验承诺一致，不重复改写。
+                    let summary_json = summary_json.ok_or_else(stale_journal_compaction)?;
+                    let summary: AggregatedJournalDetail = serde_json::from_str(&summary_json)
+                        .map_err(|_| stale_journal_compaction())?;
+                    validate_aggregated_journal_detail(&item.operation_id, &summary)?;
+                    if summary.compaction_id != plan.compaction_id
+                        || summary.detail_digest != item.detail_digest
+                    {
+                        return Err(stale_journal_compaction());
+                    }
+                }
+                _ => {
+                    return Err(PortError::SchemaIncompatible(format!(
+                        "journal batch {} has an unsupported detail format",
+                        item.operation_id
+                    )));
+                }
+            }
+        }
+        let marked = tx
+            .execute(
+                "UPDATE journal_compactions
+                 SET state = 'committed', resolved_at_ms = ?2
+                 WHERE compaction_id = ?1 AND state = 'staged'",
+                rusqlite::params![compaction_id, unix_ms()?],
+            )
+            .map_err(backend)?;
+        if marked != 1 {
+            return Err(PortError::Backend(
+                "journal compaction plan could not be marked committed".into(),
+            ));
+        }
+        Ok(JournalCompactionOutcome {
+            compaction_id: compaction_id.to_string(),
+            state: "committed".into(),
+            applied_batches: applied,
+            already_committed: false,
+            detail_bytes_before: stored.event.detail_bytes_before,
+            detail_bytes_after: stored.event.detail_bytes_after,
+            saved_bytes: stored.event.saved_bytes,
+        })
+    }
+
+    /// 崩溃恢复：收敛仍 `staged` 的计划（重入；open 路径不会自动调用）。
+    ///
+    /// - 仍匹配的计划 → 提交（`committed`）；
+    /// - 已提交的计划 → 幂等确认（`already_committed`）；
+    /// - 已漂移（行消失/状态或明细变化）的计划 → 显式 `abandoned` 并记录原因
+    ///   （不改写任何明细行）；
+    /// - 未知格式/不可读计划 → fail-closed 向上报错（不放弃、不改写）。
+    pub fn recover_journal_compactions(&self) -> PortResult<JournalCompactionRecovery> {
+        let staged: Vec<String> = {
+            let conn = self.conn.borrow();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT compaction_id FROM journal_compactions
+                     WHERE state = 'staged'
+                     ORDER BY created_at_ms, compaction_id",
+                )
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)?
+        };
+        let mut report = JournalCompactionRecovery::default();
+        for compaction_id in staged {
+            match self.apply_journal_compaction(&compaction_id) {
+                Ok(outcome) if outcome.already_committed => {
+                    report.already_committed += 1;
+                }
+                Ok(_) => {
+                    report.committed += 1;
+                }
+                Err(PortError::GenerationMismatch(_)) => {
+                    // 漂移已确定：显式放弃（只写审计行），不改写任何明细。
+                    self.abandon_journal_compaction(&compaction_id)?;
+                    report.abandoned += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        report.staged_remaining = self.staged_journal_compaction_count()?;
+        Ok(report)
+    }
+
+    /// 读回一条聚合计划/审计行（供 doctor 与测试）。
+    pub fn journal_compaction_event(
+        &self,
+        compaction_id: &str,
+    ) -> PortResult<Option<JournalCompactionEvent>> {
+        let conn = self.conn.borrow();
+        Ok(StoredJournalCompaction::load(&conn, compaction_id)?.map(|stored| stored.event))
+    }
+
+    /// 显式放弃一个 staged 计划（漂移已确定）：只写审计行，不碰任何明细。
+    fn abandon_journal_compaction(&self, compaction_id: &str) -> PortResult<()> {
+        let conn = self.conn.borrow();
+        let updated = conn
+            .execute(
+                "UPDATE journal_compactions
+                 SET state = 'abandoned', resolved_at_ms = ?2, reason = ?3
+                 WHERE compaction_id = ?1 AND state = 'staged'",
+                rusqlite::params![compaction_id, unix_ms()?, STALE_JOURNAL_COMPACTION_REASON],
+            )
+            .map_err(backend)?;
+        if updated != 1 {
+            return Err(PortError::Backend(
+                "journal compaction plan was not staged when abandoned".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 仍 staged 的计划数（恢复收敛证据）。
+    fn staged_journal_compaction_count(&self) -> PortResult<u64> {
+        let conn = self.conn.borrow();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal_compactions WHERE state = 'staged'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        u64::try_from(count).map_err(backend)
+    }
+}
+
 /// Canonical relation projection version stored in `source_relation_scans`.
 /// Resume-claim schema changes do not change relation completeness semantics.
 const RELATION_SCHEMA_VERSION: i64 = 7;
+
+/// 解析语义版本：任何改变已索引内容的解析语义升级都必须 +1（provider 解析层
+/// 变化——如噪声过滤规则、字符串形态支持、投影字段语义——都属于；纯 schema
+/// 结构变化不在此列，那走 [`SCHEMA_VERSION`] 迁移）。
+///
+/// 借鉴 Recall 的 parser_version 增量同步（usage/event parser_version 三层
+/// 判断）：sync 的 unchanged 判定把 `source_scans.parser_version` 纳入比较，
+/// 已存版本落后于该常量的源即使字节未变也走 targeted backfill（重跑 parse +
+/// commit），并在重新 commit 时写回当前版本。单测（lib.rs
+/// `stale_parser_version_forces_reparse_and_converges`）锁住该语义。
+pub const PARSER_SEMANTIC_VERSION: u32 = 3;
+
+/// 索引投影版本：任何改变 **FTS 词元流或派生投影文本** 的变化都必须 +1。
+///
+/// 与 [`PARSER_SEMANTIC_VERSION`] 正交——后者管"从 provider 源解析出的
+/// canonical payload 语义"（变化 → 按源 reparse），本常量管"从权威 catalog
+/// 投影出的检索索引形态"（变化 → 从 catalog 重投影，**不需要 reparse**）。
+/// 两者都是"索引期与查询期必须一致"的契约，但失配后的修复动作不同。
+///
+/// 必须 +1 的变化（非穷举，但覆盖已知全部投影输入）：
+/// - CJK 分词变换（[`agent_session_grep_application::fts_tokens_cjk`]）产出的
+///   词元流——unigram/bigram 规则、汉字分类、运行分隔规则；
+/// - 保留分级上限（[`agent_session_grep_application::MESSAGE_FTS_MAX_CHARS`]）
+///   与 [`bounded_index_text`] 的截断规则——它改变被索引的正文；
+/// - [`searchable_text`] 的 payload → 检索正文投影规则；
+/// - `session_fts` 字段构成（[`SqliteStore::session_search_text`] 取哪些
+///   字段、`SESSION_SEARCH_FIELD_CHARS` 上限）；
+/// - `session_titles` 派生链与 [`SESSION_TITLE_MAX_CHARS`]——与 `session_fts`
+///   同属 `rebuild_index` 一次重投影覆盖的派生投影，规则变化后旧行同样滞留。
+///
+/// **半覆盖**：`session_repo_slugs` 的 slug 派生规则同样属于"投影规则变了"，
+/// 但该投影不可从 catalog 重建（slug 只能现场探测本机 git），所以只有显式
+/// `index rebuild` 会重派生它；打开时的投影版本自愈刻意保留既有行
+/// （见 [`RepoIdentityRebuild`]）。slug 规则变化的收敛动作因此是显式 rebuild，
+/// 不要指望写路径打开时自动收敛。
+///
+/// **不**属于本轴：`message_vec` 语义向量（自带 model_id/dimension 归属，
+/// 换模型即失效）、`tool_activities`/`usage_events`（claims 派生，随
+/// `PARSER_SEMANTIC_VERSION` 的 reparse 收敛）、纯 schema 结构变化
+/// （走 [`SCHEMA_VERSION`] 迁移）。
+///
+/// 存储镜像是 `store_metadata.index_projection_version`（schema v17，库级
+/// singleton，不是 per-source）。失配处理：写路径打开时自动从 catalog 重投影
+/// （[`SqliteStore::ensure_index_projection_current`]），读路径的 FTS 查询
+/// fail-closed 报 [`PortError::SchemaIncompatible`]——**绝不静默返回一个
+/// 用旧词元匹配新查询得到的错误命中集**。
+pub const INDEX_PROJECTION_VERSION: u32 = 1;
 
 /// 当前 catalog schema 版本。每次结构变更 +1 并在 [`SqliteStore::migrate`] 追加步骤。
 ///
@@ -5540,7 +8796,55 @@ const RELATION_SCHEMA_VERSION: i64 = 7;
 /// 观察投影，content-addressed activity_id 跨 source 去重，生命周期镜像
 /// `message_placements`（complete-scan replace、incomplete-scan union、
 /// claims tombstone）；随 rebuild 或后续 source 提交填充。
-pub const SCHEMA_VERSION: i64 = 12;
+///
+/// v13：新增 `session_titles`——会话标题显示投影（借鉴清单 #6）。派生链
+/// custom-title（session payload `title`）> ai-title（`summary`）> 首条有效
+/// user 消息（provider parse 层噪声过滤后第一条非空 user 文本，≤80 字符
+/// char 边界截断）；无候选 → 无行。与 `session_fts` 同一重建批次，随
+/// affected-session 提交与 rebuild 同事务维护；旧库迁到 v13 后表为空。
+///
+/// v14：`source_scans` 增加 `parser_version INTEGER NOT NULL DEFAULT 0`
+/// 列——解析语义版本（见 [`PARSER_SEMANTIC_VERSION`]，借鉴 Recall 的
+/// parser_version 增量同步）。sync 的 unchanged 判定把该列纳入比较：
+/// 解析语义升级后版本落后的源即使字节未变也会 targeted backfill（重跑
+/// parse + commit）。旧行 DEFAULT 0 保证迁移后第一次 sync 自动 backfill；
+/// 新库在 v5 建表 DDL 已带本列（v9 provider_id 同一模式）。
+///
+/// v15：新增 `usage_events` 与 `usage_event_membership`——token 用量只读
+/// 投影，五桶非负、`token_source` 只允许 observed/derived（覆盖标记：
+/// 行存在 = provider 报过用量，真 0 与未知可区分）。
+///
+/// v16：新增 `session_repo_slugs`——repo identity 投影（借鉴 Recall 的
+/// repo_identity 与 sessiongrep 的 find_repo_root）。每行存会话的
+/// pair-observed working directory 经本机 git 检测（rev-parse
+/// --show-toplevel + remote get-url origin，由注入的
+/// [`RepoSlugResolver`] 执行）派生的 `host/owner/name` 三段 slug；
+/// **绝不落绝对路径**。行存在 = 检测成功；无行 = 未知/未派生（诚实
+/// 降级，不猜）。生命周期与 `session_fts` 同一重建批次（affected-session
+/// commit + rebuild 同事务），session 退役时同事务删除。旧库迁到 v16
+/// 后表为空，由 rebuild 或后续 affected source 提交回填。
+///
+/// v17：`store_metadata` 增加 `index_projection_version INTEGER NOT NULL
+/// DEFAULT 0` 列——索引投影版本（见 [`INDEX_PROJECTION_VERSION`]）。它是
+/// **库级** singleton 事实（"现存 FTS 词元流与派生投影是哪个变换写的"），
+/// 与 `active_generation` 同表；刻意不做成 per-source 列——一次重投影重写
+/// 整库每一行，per-source 记录在部分迁移状态下没有自洽答案。迁移期按可观测
+/// 事实标记：投影为空（`fts` 与 `session_fts` 都无行）→ 直接标记当前版本，
+/// 新库不会在第一次打开就被判失配；投影非空的旧库保持 DEFAULT 0（0 永不
+/// 等于当前版本 ≥1）→ 写路径打开时自动从 catalog 重投影，读路径的 FTS
+/// 查询 fail-closed 报 `schema_incompatible`，绝不静默返回错误命中集。
+///
+/// v18：持久化 installation namespace/location/source binding 与迁移回执；
+/// durable intent 增加 relocation manifest，保留所有既有 canonical ID。
+///
+/// v19：journal 保留合同——`index_batches` 增加 `detail_format`
+/// （`full` / `aggregated_v1`）与 `detail_summary_json`，新增
+/// `journal_compactions` 计划/审计表。terminal 批次的重复明细可被**显式**
+/// compact 为可验证摘要（preview → stage → apply 三段式，默认不自动执行）；
+/// 未决行（building/search_built/cleanup_pending）的明细永久保留；旧行迁移时
+/// 回填 `full`，未知格式 fail-closed。catalog/FTS/关系与活跃 generation 水位、
+/// 恢复/重放/冲突检测语义都不因 compact 改变。
+pub const SCHEMA_VERSION: i64 = 19;
 
 impl CatalogStore for SqliteStore {
     fn get(&self, id: &StableId) -> PortResult<Option<Vec<u8>>> {
@@ -5617,12 +8921,89 @@ impl CatalogStore for SqliteStore {
         Self::list_filtered(&self.conn, Some(IdKind::Session), limit)
     }
 
+    fn session_titles(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.borrow();
+        let wires: Vec<&str> = session_ids.iter().map(|id| id.as_str()).collect();
+        // 批量读取，分块在 SQLite 变量上限之下；绝不逐条查询（N+1）。
+        let mut titles: BTreeMap<String, String> = BTreeMap::new();
+        for chunk in chunk_ids(&wires) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT session_wire, title FROM session_titles
+                     WHERE session_wire IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (wire, title) = row.map_err(backend)?;
+                titles.insert(wire, title);
+            }
+        }
+        // 保序：与 `session_ids` 同序；无投影行的 id → None。
+        Ok(session_ids
+            .iter()
+            .map(|id| titles.get(id.as_str()).cloned())
+            .collect())
+    }
+
+    fn session_repo_slugs(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.borrow();
+        let wires: Vec<&str> = session_ids.iter().map(|id| id.as_str()).collect();
+        // 批量读取 repo 投影（schema v16），分块在 SQLite 变量上限之下；
+        // 与 `session_titles` 同一模式，绝不逐条查询（N+1）。
+        let mut slugs: BTreeMap<String, String> = BTreeMap::new();
+        for chunk in chunk_ids(&wires) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT session_wire, repo_slug FROM session_repo_slugs
+                     WHERE session_wire IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (wire, slug) = row.map_err(backend)?;
+                slugs.insert(wire, slug);
+            }
+        }
+        // 保序：与 `session_ids` 同序；无 repo 身份的会话 → None（未知 ≠ 匹配）。
+        Ok(session_ids
+            .iter()
+            .map(|id| slugs.get(id.as_str()).cloned())
+            .collect())
+    }
+
     fn count(&self) -> PortResult<u64> {
         let conn = self.conn.borrow();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM catalog", [], |row| row.get(0))
             .map_err(backend)?;
         u64::try_from(count).map_err(backend)
+    }
+
+    fn usage_totals(&self) -> PortResult<Option<UsageTotals>> {
+        // 委托给 inherent 实现（同一方法体；覆盖默认 None）。
+        SqliteStore::usage_totals(self)
+    }
+
+    fn repo_totals(&self) -> PortResult<Vec<RepoTotals>> {
+        // 委托给 inherent 实现（同一方法体；覆盖默认空列表）。
+        SqliteStore::repo_totals(self)
     }
 
     fn active_generation(&self) -> PortResult<u64> {
@@ -6118,7 +9499,7 @@ impl ContextGraphStore for SqliteStore {
 impl SqliteStore {
     /// 把 Session 元数据命中（`session_fts MATCH`）并进既有消息命中列表。
     ///
-    /// 查询侧先做与消息路径同一的 CJK bigram 前置变换 + 字面量化；候选按
+    /// 查询侧先做与消息路径同一的 CJK n-gram 前置变换 + 字面量化；候选按
     /// `bm25(session_fts)` 排序后取前 `limit` 条。每条命中以"首个非系统
     /// 消息"作代表（保既有 SearchHit 形状，不臆造 id）；无非系统消息的
     /// Session（metadata-only）直接以 canonical Session 身份返回。已由匹配
@@ -6135,114 +9516,63 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(());
         }
-        let mut sql = String::from(
-            "SELECT
-                 COALESCE(
-                     (SELECT fi.id_json
-                        FROM fts_ids fi
-                      WHERE fi.wire_id = (
-                          SELECT representative.message_id
-                            FROM message_placements representative
-                            JOIN catalog representative_message
-                              ON representative_message.id = representative.message_id
-                           WHERE representative.session_id = sfi.session_wire
-                             AND COALESCE(
-                                     CASE WHEN json_valid(representative_message.payload)
-                                          THEN json_extract(
-                                              representative_message.payload,
-                                              '$.role'
-                                          ) END,
-                                     ''
-                                 ) NOT IN ('system', 'developer')
-                           ORDER BY representative.document_id,
-                                    representative.source_ordinal,
-                                    representative.placement_id
-                           LIMIT 1
-                      )),
-                     (SELECT fi.id_json
-                        FROM fts_ids fi
-                       WHERE fi.wire_id = sfi.session_wire)
-                 ),
-                 (SELECT representative.message_id
-                    FROM message_placements representative
-                    JOIN catalog representative_message
-                      ON representative_message.id = representative.message_id
-                   WHERE representative.session_id = sfi.session_wire
-                     AND COALESCE(
-                             CASE WHEN json_valid(representative_message.payload)
-                                  THEN json_extract(representative_message.payload, '$.role') END,
-                             ''
-                         ) NOT IN ('system', 'developer')
-                   ORDER BY representative.document_id,
-                            representative.source_ordinal,
-                            representative.placement_id
-                   LIMIT 1),
-                 sfi.session_wire,
-                 bm25(session_fts)
-             FROM session_fts
-             JOIN session_fts_ids sfi ON sfi.session_wire = session_fts.session_wire
-             WHERE session_fts MATCH ?1",
-        );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query.to_string())];
-        for message_wire in message_wires {
-            sql.push_str(
-                " AND NOT EXISTS (
-                SELECT 1 FROM message_placements excluded_placement
-                JOIN catalog excluded_message
-                  ON excluded_message.id = excluded_placement.message_id
-                WHERE excluded_placement.session_id = sfi.session_wire
-                  AND excluded_placement.message_id = ?
-                  AND COALESCE(
-                          CASE WHEN json_valid(excluded_message.payload)
-                               THEN json_extract(excluded_message.payload, '$.role') END,
-                          ''
-                      ) NOT IN ('system', 'developer')
-            )",
-            );
-            params.push(Box::new(message_wire.clone()));
+        let mut representative = String::from(
+            "SELECT representative.message_id FROM message_placements representative
+             WHERE representative.session_id = sfi.session_wire",
+        );
+        // A metadata hit must project a Message satisfying the same predicates,
+        // not a different (possibly out-of-window) Message from that Session.
+        append_message_predicates(
+            &mut representative,
+            &mut params,
+            "representative.message_id",
+            filters,
+            &SearchFacets::default(),
+            false,
+        );
+        representative.push_str(
+            " ORDER BY representative.document_id,
+            representative.source_ordinal, representative.placement_id LIMIT 1",
+        );
+        let mut sql = format!(
+            "SELECT COALESCE(
+                 (SELECT fi.id_json FROM fts_ids fi WHERE fi.wire_id = ({representative})),
+                 (SELECT fi.id_json FROM fts_ids fi WHERE fi.wire_id = sfi.session_wire)
+             ), ({representative}), sfi.session_wire, bm25(session_fts)
+             FROM session_fts JOIN session_fts_ids sfi ON sfi.session_wire = session_fts.session_wire
+             WHERE session_fts MATCH ?1"
+        );
+        if !message_wires.is_empty() {
+            params.push(Box::new(
+                serde_json::to_string(message_wires).map_err(backend)?,
+            ));
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM message_placements ep
+                 JOIN catalog em ON em.id = ep.message_id
+                 WHERE ep.session_id = sfi.session_wire
+                 AND ep.message_id IN (SELECT value FROM json_each(?{}))
+                 AND COALESCE(CASE WHEN json_valid(em.payload)
+                     THEN json_extract(em.payload, '$.role') END, '') NOT IN ('system', 'developer'))",
+                params.len()
+            ));
         }
         if !filters.providers.is_empty() || filters.since.is_some() || filters.until.is_some() {
-            sql.push_str(
-                " AND EXISTS (
-                     SELECT 1 FROM message_placements filtered_placement
-                     JOIN catalog filtered_document
-                       ON filtered_document.id = filtered_placement.document_id
-                     JOIN catalog filtered_message
-                       ON filtered_message.id = filtered_placement.message_id
-                     WHERE filtered_placement.session_id = sfi.session_wire",
-            );
-            if !filters.providers.is_empty() {
-                sql.push_str(
-                    " AND CASE WHEN json_valid(filtered_document.payload)
-                              THEN json_extract(filtered_document.payload, '$.provider') END IN (",
-                );
-                for (index, provider) in filters.providers.iter().enumerate() {
-                    if index > 0 {
-                        sql.push(',');
-                    }
-                    sql.push('?');
-                    params.push(Box::new(provider.as_str()));
-                }
-                sql.push(')');
-            }
-            if let Some(since) = filters.since {
-                sql.push_str(
-                    " AND asg_instant_sort_key(CASE WHEN json_valid(filtered_message.payload)
-                                                     THEN json_extract(filtered_message.payload, '$.timestamp') END) >= ?",
-                );
-                params.push(Box::new(since.sort_key().to_vec()));
-            }
-            if let Some(until) = filters.until {
-                sql.push_str(
-                    " AND asg_instant_sort_key(CASE WHEN json_valid(filtered_message.payload)
-                                                     THEN json_extract(filtered_message.payload, '$.timestamp') END) < ?",
-                );
-                params.push(Box::new(until.sort_key().to_vec()));
-            }
-            sql.push(')');
+            sql.push_str(&format!(" AND ({representative}) IS NOT NULL"));
         }
-        sql.push_str(" ORDER BY bm25(session_fts), sfi.session_wire LIMIT ?");
-        params.push(Box::new(limit as i64));
+        if let Some(repo) = &filters.repo {
+            params.push(Box::new(repo.clone()));
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM session_repo_slugs rs
+                WHERE rs.session_wire = sfi.session_wire AND rs.repo_slug = ?{})",
+                params.len()
+            ));
+        }
+        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        sql.push_str(&format!(
+            " ORDER BY bm25(session_fts), sfi.session_wire LIMIT ?{}",
+            params.len()
+        ));
 
         let mut stmt = conn.prepare(&sql).map_err(backend)?;
         let params_ref: Vec<&dyn rusqlite::ToSql> =
@@ -6297,149 +9627,7 @@ impl SearchIndex for SqliteStore {
     }
 
     fn query_filtered(&self, query: SearchQuery<'_>, limit: usize) -> PortResult<Vec<SearchHit>> {
-        let conn = self.conn.borrow();
-        // 查询侧先做与索引侧同一的 CJK bigram transform（ADR-0007），再字面量化：
-        // bigram 输出里的单个空格就是词元分隔符，顺序敏感——先字面量化会把
-        // bigram 输出的空格包进引号，变成整段 bigram 连写的短语，无法匹配。
-        // cursor digest 绑定的是 Application 侧的原始用户查询，此处变换不影响。
-        // 用户查询按字面量分词：冒号/点号/连字符等是 FTS5 语法保留字符，直接
-        // MATCH 会泄漏 `fts5: syntax error near "."` 之类的底层报错（10 角色
-        // 体验测试缺陷）。把每个词用引号包裹成短语查询，保留词内特殊字符的字面
-        // 含义，同时保持原来的空格 AND 语义。
-        let safe_query = safe_fts_query(&bigram_cjk(query.text));
-        if safe_query.is_empty() {
-            // 空查询（全标点/空白）无词可查：返回空而非让 FTS5 报语法错误。
-            return Ok(Vec::new());
-        }
-        let filters = query.filters;
-        if filters.is_empty() {
-            // 无 filter：保持原有 SQL 形状逐字节不变，结果与排序与旧路径一致。
-            let mut hits = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, bm25(fts) FROM fts WHERE fts MATCH ?1
-                         ORDER BY bm25(fts), id LIMIT ?2",
-                    )
-                    .map_err(backend)?;
-                let rows = stmt
-                    .query_map(rusqlite::params![&safe_query, limit as i64], |row| {
-                        let id_json: String = row.get(0)?;
-                        let bm25: f64 = row.get(1)?;
-                        Ok((id_json, bm25))
-                    })
-                    .map_err(backend)?;
-                collect_hits(rows)?
-            };
-            let message_wires: Vec<String> =
-                hits.iter().map(|hit| hit.id.as_str().to_string()).collect();
-            Self::append_session_metadata_hits(
-                &conn,
-                &safe_query,
-                filters,
-                &message_wires,
-                limit,
-                &mut hits,
-            )?;
-            hits.sort_by(|left, right| {
-                right
-                    .score
-                    .total_cmp(&left.score)
-                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-            });
-            hits.truncate(limit);
-            return Ok(hits);
-        }
-
-        // Filtered path：谓词全部下推到同一条 prepared query，在 LIMIT 之前
-        // 约束候选集（R：分页窗口只切已过滤的钉住排序，绝不先截页后过滤）。
-        // FTS5 规定 MATCH 谓词里的表引用必须是表名本体（别名会报
-        // "no such column"），故查询与 bm25 用裸表名，其余列引用走别名。
-        //
-        // provider 维度（OR）：任一 placement 的 source document payload
-        // `provider` 命中规范化 id 集合。时间维度（AND，[since, until) 半开）：
-        // 消息自身 catalog payload 的 `timestamp`（权威事实源，Codex 现代的
-        // null 与任何无法解析的值经 asg_instant_sort_key → NULL 而被排除）。
-        let mut sql = String::from(
-            "SELECT f.id, bm25(fts) FROM fts AS f
-             WHERE fts MATCH ?1",
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query.clone())];
-        if !filters.providers.is_empty() {
-            let mut clause = String::from(
-                " AND EXISTS (
-                     SELECT 1 FROM message_placements mp
-                     JOIN catalog doc ON doc.id = mp.document_id
-                     WHERE mp.message_id = (
-                         SELECT wire_id FROM fts_ids WHERE id_json = f.id
-                     )
-                     AND json_extract(doc.payload, '$.provider') IN (",
-            );
-            for (index, provider) in filters.providers.iter().enumerate() {
-                if index > 0 {
-                    clause.push(',');
-                }
-                clause.push('?');
-                params.push(Box::new(provider.as_str()));
-            }
-            clause.push_str("))");
-            sql.push_str(&clause);
-        }
-        if filters.since.is_some() || filters.until.is_some() {
-            sql.push_str(
-                " AND EXISTS (
-                     SELECT 1 FROM catalog msg
-                     WHERE msg.id = (
-                         SELECT wire_id FROM fts_ids WHERE id_json = f.id
-                     )",
-            );
-            if let Some(since) = filters.since {
-                sql.push_str(
-                    " AND asg_instant_sort_key(json_extract(msg.payload, '$.timestamp')) >= ?",
-                );
-                params.push(Box::new(since.sort_key().to_vec()));
-            }
-            if let Some(until) = filters.until {
-                sql.push_str(
-                    " AND asg_instant_sort_key(json_extract(msg.payload, '$.timestamp')) < ?",
-                );
-                params.push(Box::new(until.sort_key().to_vec()));
-            }
-            sql.push(')');
-        }
-        sql.push_str(" ORDER BY bm25(fts), f.id LIMIT ?");
-        params.push(Box::new(limit as i64));
-
-        let (mut hits, safe_query) = {
-            let mut stmt = conn.prepare(&sql).map_err(backend)?;
-            let params_ref: Vec<&dyn rusqlite::ToSql> =
-                params.iter().map(std::convert::AsRef::as_ref).collect();
-            let rows = stmt
-                .query_map(&*params_ref, |row| {
-                    let id_json: String = row.get(0)?;
-                    let bm25: f64 = row.get(1)?;
-                    Ok((id_json, bm25))
-                })
-                .map_err(backend)?;
-            (collect_hits(rows)?, safe_query)
-        };
-        let message_wires: Vec<String> =
-            hits.iter().map(|hit| hit.id.as_str().to_string()).collect();
-        Self::append_session_metadata_hits(
-            &conn,
-            &safe_query,
-            filters,
-            &message_wires,
-            limit,
-            &mut hits,
-        )?;
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
-        hits.truncate(limit);
-        Ok(hits)
+        self.query_with_policy(query, limit, &SearchFacets::default(), true)
     }
 
     fn query_faceted(
@@ -6448,123 +9636,161 @@ impl SearchIndex for SqliteStore {
         limit: usize,
         facets: &SearchFacets,
     ) -> PortResult<Vec<SearchHit>> {
-        if facets.is_default() {
-            return self.query_filtered(query, limit);
-        }
+        self.query_with_policy(query, limit, facets, true)
+    }
+
+    fn query_with_policy(
+        &self,
+        query: SearchQuery<'_>,
+        limit: usize,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
         let conn = self.conn.borrow();
-        let safe_query = safe_fts_query(&bigram_cjk(query.text));
-        if safe_query.is_empty() {
+        Self::assert_index_projection_current(&conn)?;
+        let safe_query = safe_fts_query(&fts_tokens_cjk(query.text));
+        if safe_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        // 带 facet 的钉住排序查询：与 query_filtered 同基座（filter 谓词全部下推），
-        // 再叠加索引列上的 EXISTS 探针。每个谓词都走索引（fts_ids.id_json UNIQUE +
-        // message_placements_message / tool_activities_message 等），无全表扫描；
-        // kind/name 只用等值比较。sidechain 语义（确定性）：MainOnly = 无任何
-        // sidechain placement；SubagentOnly = 至少一个 sidechain placement。
-        let mut sql = String::from(
-            "SELECT f.id, bm25(fts) FROM fts AS f
-             WHERE fts MATCH ?1",
+        let mut sql = String::from("SELECT f.id, bm25(fts) FROM fts AS f WHERE fts MATCH ?1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query.clone())];
+        append_message_predicates(
+            &mut sql,
+            &mut params,
+            "(SELECT wire_id FROM fts_ids WHERE id_json = f.id)",
+            query.filters,
+            facets,
+            include_system,
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query)];
-        if !query.filters.providers.is_empty() {
-            let mut clause = String::from(
-                " AND EXISTS (
-                     SELECT 1 FROM message_placements mp
-                     JOIN catalog doc ON doc.id = mp.document_id
-                     WHERE mp.message_id = (
-                         SELECT wire_id FROM fts_ids WHERE id_json = f.id
-                     )
-                     AND json_extract(doc.payload, '$.provider') IN (",
-            );
-            for (index, provider) in query.filters.providers.iter().enumerate() {
-                if index > 0 {
-                    clause.push(',');
-                }
-                clause.push('?');
-                params.push(Box::new(provider.as_str()));
-            }
-            clause.push_str("))");
-            sql.push_str(&clause);
-        }
-        if query.filters.since.is_some() || query.filters.until.is_some() {
-            sql.push_str(
-                " AND EXISTS (
-                     SELECT 1 FROM catalog msg
-                     WHERE msg.id = (
-                         SELECT wire_id FROM fts_ids WHERE id_json = f.id
-                     )",
-            );
-            if let Some(since) = query.filters.since {
-                sql.push_str(
-                    " AND asg_instant_sort_key(json_extract(msg.payload, '$.timestamp')) >= ?",
-                );
-                params.push(Box::new(since.sort_key().to_vec()));
-            }
-            if let Some(until) = query.filters.until {
-                sql.push_str(
-                    " AND asg_instant_sort_key(json_extract(msg.payload, '$.timestamp')) < ?",
-                );
-                params.push(Box::new(until.sort_key().to_vec()));
-            }
-            sql.push(')');
-        }
-        match facets.sidechain {
-            SidechainFacet::Include => {}
-            SidechainFacet::MainOnly => {
-                sql.push_str(
-                    " AND NOT EXISTS(
-                         SELECT 1 FROM fts_ids fi2
-                         JOIN message_placements mp ON mp.message_id = fi2.wire_id
-                         WHERE fi2.id_json = f.id AND mp.is_sidechain = 1
-                     )",
-                );
-            }
-            SidechainFacet::SubagentOnly => {
-                sql.push_str(
-                    " AND EXISTS(
-                         SELECT 1 FROM fts_ids fi2
-                         JOIN message_placements mp ON mp.message_id = fi2.wire_id
-                         WHERE fi2.id_json = f.id AND mp.is_sidechain = 1
-                     )",
-                );
-            }
-        }
-        if let Some(kind) = &facets.tool_kind {
-            params.push(Box::new(kind.clone()));
-            let index = params.len();
-            sql.push_str(&format!(
-                " AND EXISTS(
-                     SELECT 1 FROM fts_ids fi2
-                     JOIN tool_activities ta ON ta.message_id = fi2.wire_id
-                     WHERE fi2.id_json = f.id AND ta.kind = ?{index}
-                 )",
-            ));
-        }
-        if let Some(name) = &facets.tool_name {
-            params.push(Box::new(name.clone()));
-            let index = params.len();
-            sql.push_str(&format!(
-                " AND EXISTS(
-                     SELECT 1 FROM fts_ids fi2
-                     JOIN tool_activities ta ON ta.message_id = fi2.wire_id
-                     WHERE fi2.id_json = f.id AND ta.name = ?{index}
-                 )",
-            ));
-        }
-        sql.push_str(" ORDER BY bm25(fts), f.id LIMIT ?");
-        params.push(Box::new(limit as i64));
-
+        sql.push_str(
+            " ORDER BY bm25(fts),
+             (SELECT wire_id FROM fts_ids WHERE id_json = f.id) LIMIT ?",
+        );
+        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
         let mut stmt = conn.prepare(&sql).map_err(backend)?;
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(std::convert::AsRef::as_ref).collect();
         let rows = stmt
-            .query_map(&*params_ref, |row| {
-                let id_json: String = row.get(0)?;
-                let bm25: f64 = row.get(1)?;
-                Ok((id_json, bm25))
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(backend)?;
-        collect_hits(rows)
+        let mut hits = collect_hits(rows)?;
+        for (rank, hit) in hits.iter_mut().enumerate() {
+            hit.score = 1.0 / (60.0 + (rank + 1) as f32);
+        }
+        if facets.is_default() {
+            let message_wires: Vec<String> =
+                hits.iter().map(|hit| hit.id.as_str().to_owned()).collect();
+            let mut metadata_hits = Vec::new();
+            Self::append_session_metadata_hits(
+                &conn,
+                &safe_query,
+                query.filters,
+                &message_wires,
+                limit,
+                &mut metadata_hits,
+            )?;
+            // Scores from separate FTS corpora are incomparable. Fuse their
+            // ordinal ranks with k=60, preserving stable wire-id tie breaks.
+            let mut merged: BTreeMap<String, SearchHit> = hits
+                .into_iter()
+                .map(|hit| (hit.id.as_str().to_owned(), hit))
+                .collect();
+            for (rank, mut hit) in metadata_hits.into_iter().enumerate() {
+                hit.score = 1.0 / (60.0 + (rank + 1) as f32);
+                merged
+                    .entry(hit.id.as_str().to_owned())
+                    .and_modify(|existing| existing.score += hit.score)
+                    .or_insert(hit);
+            }
+            hits = merged.into_values().collect();
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+            });
+            hits.truncate(limit);
+        }
+        Ok(hits)
+    }
+}
+
+/// Shared lexical/semantic metadata predicates. The message expression is
+/// generated only by this adapter; all user values remain bound parameters.
+fn append_message_predicates(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    message: &str,
+    filters: &agent_session_grep_ports::SearchFilters,
+    facets: &SearchFacets,
+    include_system: bool,
+) {
+    if !filters.providers.is_empty() {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM message_placements mp
+             JOIN catalog doc ON doc.id = mp.document_id
+             WHERE mp.message_id = {message}
+             AND CASE WHEN json_valid(doc.payload) THEN json_extract(doc.payload, '$.provider') END IN ("
+        ));
+        for (index, provider) in filters.providers.iter().enumerate() {
+            if index != 0 {
+                sql.push(',');
+            }
+            params.push(Box::new(provider.as_str()));
+            sql.push_str(&format!("?{}", params.len()));
+        }
+        sql.push_str("))");
+    }
+    if filters.since.is_some() || filters.until.is_some() || !include_system {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM catalog msg WHERE msg.id = {message}"
+        ));
+        for (instant, operator) in [(filters.since, ">="), (filters.until, "<")] {
+            if let Some(instant) = instant {
+                params.push(Box::new(instant.sort_key().to_vec()));
+                sql.push_str(&format!(
+                    " AND asg_instant_sort_key(CASE WHEN json_valid(msg.payload)
+                      THEN json_extract(msg.payload, '$.timestamp') END) {operator} ?{}",
+                    params.len()
+                ));
+            }
+        }
+        if !include_system {
+            sql.push_str(
+                " AND COALESCE(CASE WHEN json_valid(msg.payload)
+                THEN json_extract(msg.payload, '$.role') END, '') NOT IN ('system', 'developer')",
+            );
+        }
+        sql.push(')');
+    }
+    if let Some(repo) = &filters.repo {
+        params.push(Box::new(repo.clone()));
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM message_placements rp
+             JOIN session_repo_slugs rs ON rs.session_wire = rp.session_id
+             WHERE rp.message_id = {message} AND rs.repo_slug = ?{})",
+            params.len()
+        ));
+    }
+    if facets.sidechain != SidechainFacet::Include {
+        let negate = if facets.sidechain == SidechainFacet::MainOnly {
+            "NOT "
+        } else {
+            ""
+        };
+        sql.push_str(&format!(
+            " AND {negate}EXISTS (SELECT 1 FROM message_placements mp
+            WHERE mp.message_id = {message} AND mp.is_sidechain = 1)"
+        ));
+    }
+    for (value, column) in [(&facets.tool_kind, "kind"), (&facets.tool_name, "name")] {
+        if let Some(value) = value {
+            params.push(Box::new(value.clone()));
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM tool_activities ta
+                WHERE ta.message_id = {message} AND ta.{column} = ?{})",
+                params.len()
+            ));
+        }
     }
 }
 
@@ -6579,15 +9805,18 @@ impl SearchIndex for SqliteStore {
 /// 语义检索不可用，Application 必须显式降级到 lexical_fallback。
 impl SemanticIndex for SqliteStore {
     fn index_embedding(&self, id: &StableId, embedding: &[f32]) -> PortResult<()> {
-        if embedding.is_empty() {
-            return Err(PortError::Backend("embedding must not be empty".into()));
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            return Err(PortError::Backend(
+                "embedding must contain finite values and not be empty".into(),
+            ));
         }
         let model_id = self.semantic_model_id.borrow().clone().ok_or_else(|| {
             PortError::Backend("semantic model id not set; call set_semantic_model first".into())
         })?;
         let blob = f32_slice_to_bytes(embedding);
-        let conn = self.conn.borrow();
-        conn.execute(
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(backend)?;
+        tx.execute(
             "INSERT INTO message_vec(wire_id, model_id, dimension, embedding)
              VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(wire_id) DO UPDATE SET
@@ -6597,10 +9826,24 @@ impl SemanticIndex for SqliteStore {
             rusqlite::params![id.as_str(), model_id, embedding.len() as i64, blob],
         )
         .map_err(backend)?;
+        Self::advance_generation_in_tx(&tx)?;
+        tx.commit().map_err(backend)?;
         Ok(())
     }
 
-    fn query_semantic(&self, query_embedding: &[f32], limit: usize) -> PortResult<Vec<SearchHit>> {
+    fn query_semantic_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        filters: &agent_session_grep_ports::SearchFilters,
+        facets: &SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
+        if query_embedding.iter().any(|value| !value.is_finite()) {
+            return Err(PortError::Backend(
+                "query embedding contains non-finite values".into(),
+            ));
+        }
         if query_embedding.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -6608,60 +9851,78 @@ impl SemanticIndex for SqliteStore {
             return Ok(Vec::new());
         };
         let conn = self.conn.borrow();
-        // 只取与查询同模型同维度的向量：维度不符的行是换模型残留，跳过而非
-        // 截断比较（截断会产出看似合理却无意义的相似度）。
-        let mut stmt = conn
-            .prepare(
-                "SELECT mv.wire_id, fi.id_json, mv.embedding
-                 FROM message_vec mv
-                 LEFT JOIN fts_ids fi ON fi.wire_id = mv.wire_id
-                 WHERE mv.model_id = ?1 AND mv.dimension = ?2",
-            )
-            .map_err(backend)?;
+        let floor = self.semantic_similarity_floor.get();
+        let mut sql = String::from(
+            "SELECT mv.wire_id, fi.id_json, mv.embedding
+             FROM message_vec mv
+             JOIN catalog live_message ON live_message.id = mv.wire_id
+             LEFT JOIN fts_ids fi ON fi.wire_id = mv.wire_id
+             WHERE mv.model_id = ?1 AND mv.dimension = ?2",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(model_id),
+            Box::new(i64::try_from(query_embedding.len()).map_err(backend)?),
+        ];
+        append_message_predicates(
+            &mut sql,
+            &mut params,
+            "mv.wire_id",
+            filters,
+            facets,
+            include_system,
+        );
+        let mut stmt = conn.prepare(&sql).map_err(backend)?;
         let rows = stmt
-            .query_map(
-                rusqlite::params![model_id, query_embedding.len() as i64],
-                |row| {
-                    let wire: String = row.get(0)?;
-                    let id_json: Option<String> = row.get(1)?;
-                    let blob: Vec<u8> = row.get(2)?;
-                    Ok((wire, id_json, blob))
-                },
-            )
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
             .map_err(backend)?;
-
-        let mut scored: Vec<(f32, StableId)> = Vec::new();
+        // Retain at most k identities, not every scored row in the corpus.
+        let mut top = std::collections::BinaryHeap::new();
         for row in rows {
             let (wire, id_json, blob) = row.map_err(backend)?;
+            if blob.len() != query_embedding.len() * 4 {
+                return Err(PortError::Backend(
+                    "stored embedding has an invalid dimension".into(),
+                ));
+            }
             let vector = bytes_to_f32_vec(&blob);
-            if vector.len() != query_embedding.len() {
-                continue;
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err(PortError::Backend(
+                    "stored embedding contains non-finite values".into(),
+                ));
             }
             let score = cosine_similarity(query_embedding, &vector);
-            // 身份优先取 fts_ids 的保真 id_json（含 kind+stability）；缺失回退
-            // wire（降级为 Unstable，与 rebuild 同一约定）。
+            if !score.is_finite() {
+                return Err(PortError::Backend("semantic score is non-finite".into()));
+            }
+            // 证据门（B4）：低于相似度下限的候选不占用 top-k 名额，也不进入
+            // hybrid 的 RRF 融合。过滤在堆插入之前（filter-before-topk），
+            // 与既有谓词过滤同一取数窗口。
+            if score < floor {
+                continue;
+            }
             let id = match id_json {
                 Some(json) => serde_json::from_str(&json).map_err(backend)?,
-                None => match StableId::from_wire(&wire) {
-                    Some(id) => id,
-                    None => continue,
-                },
+                None => StableId::from_wire(&wire).ok_or_else(|| {
+                    PortError::Backend("stored embedding has an invalid identity".into())
+                })?,
             };
-            scored.push((score, id));
+            top.push(SemanticCandidate { score, id });
+            if top.len() > limit {
+                top.pop();
+            }
         }
-        // 相似度降序；同分按 wire id 升序，保证分页顺序确定（与 FTS 路径的
-        // bm25+id tiebreak 同一约定）。
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.as_str().cmp(b.1.as_str()))
-        });
-        scored.truncate(limit);
-        Ok(scored
+        Ok(top
+            .into_sorted_vec()
             .into_iter()
-            .map(|(score, id)| SearchHit {
-                id,
-                score,
+            .map(|candidate| SearchHit {
+                id: candidate.id,
+                score: candidate.score,
                 session_id: None,
                 text: None,
                 why_matched: Vec::new(),
@@ -6672,18 +9933,47 @@ impl SemanticIndex for SqliteStore {
             .collect())
     }
 
-    fn is_ready(&self) -> bool {
+    fn is_ready(&self) -> PortResult<bool> {
         let Some(model_id) = self.semantic_model_id.borrow().clone() else {
-            return false;
+            return Ok(false);
         };
         let conn = self.conn.borrow();
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_vec WHERE model_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM message_vec mv
+             JOIN catalog c ON c.id = mv.wire_id WHERE mv.model_id = ?1)",
             [model_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, bool>(0),
         )
-        .map(|exists| exists == 1)
-        .unwrap_or(false)
+        .map_err(backend)
+    }
+
+    fn semantic_model_id(&self) -> PortResult<Option<String>> {
+        Ok(self.semantic_model_id.borrow().clone())
+    }
+}
+
+/// Heap order puts the worst retained candidate at the root.
+struct SemanticCandidate {
+    score: f32,
+    id: StableId,
+}
+impl PartialEq for SemanticCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for SemanticCandidate {}
+impl PartialOrd for SemanticCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SemanticCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.id.as_str().cmp(other.id.as_str()))
     }
 }
 
@@ -6699,19 +9989,21 @@ fn f32_slice_to_bytes(values: &[f32]) -> Vec<u8> {
 /// Read a little-endian f32 BLOB back into a vector. A trailing partial float
 /// is dropped rather than reconstructed from padding.
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    let (chunks, _) = bytes.as_chunks::<4>();
+    chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
 /// Cosine similarity of two equal-length vectors. Zero-norm inputs score 0
 /// (no direction to compare) rather than producing NaN.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
     for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
         dot += x * y;
         norm_a += x * x;
         norm_b += y * y;
@@ -6719,7 +10011,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
-    dot / (norm_a.sqrt() * norm_b.sqrt())
+    (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
 }
 
 impl ResumeClaimsStore for SqliteStore {
@@ -6817,11 +10109,13 @@ impl SqliteStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT mp.session_id,
-                            MAX(json_extract(c.payload, '$.timestamp')) AS latest
+                            MAX(CASE WHEN json_valid(c.payload)
+                                     THEN json_extract(c.payload, '$.timestamp') END) AS latest
                      FROM message_placements mp
                      JOIN catalog c ON c.id = mp.message_id
                      WHERE mp.session_id IN ({placeholders})
-                       AND json_extract(c.payload, '$.timestamp') IS NOT NULL
+                       AND CASE WHEN json_valid(c.payload)
+                                THEN json_extract(c.payload, '$.timestamp') END IS NOT NULL
                      GROUP BY mp.session_id"
                 ))
                 .map_err(backend)?;
@@ -6880,7 +10174,7 @@ where
 /// 纯空白/纯标点输入返回空串。
 ///
 /// 参考 hstry `sanitize_fts_query`（MIT，hstry/crates/hstry-core/src/db.rs:3177）
-/// 的逐 token 引号化 + 引号外前缀 `*` 模式；本项目保留 CJK bigram 前置变换
+/// 的逐 token 引号化 + 引号外前缀 `*` 模式；本项目保留 CJK n-gram 前置变换
 /// （ADR-0007）与全标点词跳过。
 fn safe_fts_query(query: &str) -> String {
     let mut words: Vec<String> = Vec::new();
@@ -7099,6 +10393,101 @@ mod filtered_query_tests {
     }
 
     #[test]
+    fn semantic_and_hybrid_apply_provider_time_repo_and_facets_before_limit() {
+        use agent_session_grep_application::{App, AppRequest, AppResponse, ResponseBudget};
+        use agent_session_grep_ports::{NoResumeClaims, RetrievalMode};
+        let fixture = filter_fixture();
+        let store = &fixture.store;
+        store.set_semantic_model("filter-model");
+        let ids = [
+            &fixture.claude_early,
+            &fixture.claude_mid,
+            &fixture.codex_late,
+            &fixture.null_ts,
+            &fixture.codex_mid,
+        ];
+        for (rank, id) in ids.iter().enumerate() {
+            store.index_embedding(id, &[1.0, rank as f32]).unwrap();
+        }
+        let filters = SearchFilters {
+            providers: vec![SearchProvider::Codex],
+            since: Some(instant(1_785_196_800)),
+            until: Some(instant(1_786_320_000)),
+            repo: Some("example.test/team/project".into()),
+        };
+        {
+            let conn = store.conn.borrow();
+            conn.execute("INSERT INTO session_repo_slugs(session_wire,repo_slug) SELECT DISTINCT session_id,'example.test/team/project' FROM message_placements", []).unwrap();
+            conn.execute(
+                "UPDATE message_placements SET is_sidechain=1 WHERE message_id=?1",
+                [fixture.codex_mid.as_str()],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO tool_activities(activity_id,message_id,kind,actor,name,target,status) VALUES('act_v1_filter',?1,'command','main','Shell',NULL,'success')", [fixture.codex_mid.as_str()]).unwrap();
+        }
+        let facets = SearchFacets {
+            sidechain: SidechainFacet::SubagentOnly,
+            tool_kind: Some("command".into()),
+            tool_name: Some("Shell".into()),
+        };
+        let app = App::with_resume_semantic(store, store, NoResumeClaims, store);
+        for mode in [
+            RetrievalMode::Lexical,
+            RetrievalMode::Semantic,
+            RetrievalMode::Hybrid,
+        ] {
+            let AppResponse::Search { hits, .. } = app
+                .handle(AppRequest::Search {
+                    query: "shared-token".into(),
+                    filters: filters.clone(),
+                    facets: facets.clone(),
+                    limit: 1,
+                    cursor: None,
+                    budget: ResponseBudget::default(),
+                    include_system: false,
+                    group_by_session: false,
+                    mode,
+                    query_embedding: Some(vec![1.0, 0.0]),
+                })
+                .unwrap()
+            else {
+                panic!("search")
+            };
+            assert_eq!(
+                hits.iter().map(|hit| &hit.id).collect::<Vec<_>>(),
+                vec![&fixture.codex_mid]
+            );
+        }
+        for facets in [
+            SearchFacets {
+                tool_name: Some("NoSuchTool".into()),
+                ..facets.clone()
+            },
+            SearchFacets {
+                sidechain: SidechainFacet::MainOnly,
+                ..facets.clone()
+            },
+        ] {
+            assert!(
+                store
+                    .query_semantic_filtered(&[1.0, 0.0], 1, &filters, &facets, false)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let filters = SearchFilters {
+            repo: Some("example.test/other/project".into()),
+            ..filters
+        };
+        assert!(
+            store
+                .query_semantic_filtered(&[1.0, 0.0], 1, &filters, &facets, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn empty_filters_match_unfiltered_query_results() {
         let fixture = filter_fixture();
         let unfiltered: Vec<String> = fixture
@@ -7149,6 +10538,7 @@ mod filtered_query_tests {
             providers: Vec::new(),
             since: Some(instant(1_785_196_800)), // 2026-07-28T00:00:00Z
             until: Some(instant(1_786_320_000)), // 2026-08-10T00:00:00Z
+            repo: None,
         };
         let mut hits = search_filtered(&fixture.store, "shared-token", &window);
         hits.sort();
@@ -7164,6 +10554,7 @@ mod filtered_query_tests {
             providers: Vec::new(),
             since: Some(instant(1_785_196_800)),
             until: None,
+            repo: None,
         };
         let hits = search_filtered(&fixture.store, "shared-token", &since_only);
         assert_eq!(hits.len(), 3);
@@ -7174,6 +10565,7 @@ mod filtered_query_tests {
             providers: Vec::new(),
             since: None,
             until: Some(instant(1_786_320_000)),
+            repo: None,
         };
         let hits = search_filtered(&fixture.store, "shared-token", &until_only);
         assert_eq!(hits.len(), 3);
@@ -7187,6 +10579,7 @@ mod filtered_query_tests {
             providers: vec![SearchProvider::Codex],
             since: Some(instant(1_785_196_800)),
             until: Some(instant(1_786_320_000)),
+            repo: None,
         };
         let hits = search_filtered(&fixture.store, "shared-token", &filters);
         assert_eq!(hits, vec![fixture.codex_mid.as_str().to_string()]);
@@ -7199,12 +10592,14 @@ mod filtered_query_tests {
             providers: vec![SearchProvider::Claude],
             since: Some(instant(1_786_320_000)), // late window: codex only
             until: None,
+            repo: None,
         };
         assert!(search_filtered(&fixture.store, "shared-token", &no_provider_overlap).is_empty());
         let empty_window = SearchFilters {
             providers: Vec::new(),
             since: Some(instant(1_800_000_000)),
             until: Some(instant(1_800_100_000)),
+            repo: None,
         };
         assert!(search_filtered(&fixture.store, "shared-token", &empty_window).is_empty());
     }
@@ -7248,8 +10643,10 @@ mod filtered_query_tests {
             "claude rows must be excluded before LIMIT"
         );
         assert_eq!(
-            statements, 2,
-            "filtered message and session metadata candidates each use one prepared statement"
+            statements, 3,
+            "filtered message and session metadata candidates each use one prepared \
+             statement, plus one constant-cost index-projection-version gate read \
+             (singleton row; not per-row — the N+1 invariant this pins is unchanged)"
         );
     }
 
@@ -7286,8 +10683,8 @@ mod filtered_query_tests {
 mod tests {
     use super::*;
     use agent_session_grep_domain::{
-        EvidenceSpan, IdKind, MessageRelation, Stability, ToolActivity, ToolActivityActor,
-        ToolActivityKind, ToolActivityStatus,
+        EvidenceSpan, IdKind, MessageRelation, Stability, TokenSource, ToolActivity,
+        ToolActivityActor, ToolActivityKind, ToolActivityStatus,
     };
     use agent_session_grep_ports::SearchFilters;
 
@@ -7302,15 +10699,475 @@ mod tests {
         Option<i64>,
     );
 
+    /// Test migrations independently of write-open recovery/reprojection, while
+    /// retaining the same exclusive lease required by production migrations.
+    fn open_migration_fixture(path: &str) -> SqliteStore {
+        let lease = WriterLease::try_acquire(Path::new(path).parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        SqliteStore::init(&conn).unwrap();
+        SqliteStore {
+            conn: RefCell::new(conn),
+            _lease: Some(lease),
+            semantic_model_id: RefCell::new(None),
+            semantic_similarity_floor: Cell::new(SEMANTIC_SIMILARITY_FLOOR_DEFAULT),
+            repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
+            pending_installations: RefCell::new(BTreeMap::new()),
+            relocation_clock: unix_ms,
+        }
+    }
+
     pub(crate) fn sid(kind: IdKind, fact: &[u8]) -> StableId {
         StableId::derive(kind, Stability::Reconstructed, &[fact])
+    }
+
+    #[test]
+    fn semantic_vectors_reject_nonfinite_and_corrupt_storage() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("finite-model");
+        let id = sid(IdKind::Message, b"finite");
+        store.put(&id, b"{}").unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(store.index_embedding(&id, &[bad, 1.0]).is_err());
+            assert!(store.query_semantic(&[bad, 1.0], 1).is_err());
+        }
+        assert!(!store.is_ready().unwrap());
+        store.index_embedding(&id, &[f32::MAX, f32::MAX]).unwrap();
+        let hits = store.query_semantic(&[f32::MAX, f32::MAX], 1).unwrap();
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-6,
+            "finite extremes do not overflow f32 accumulators"
+        );
+        store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE message_vec SET embedding = ?1",
+                [f32_slice_to_bytes(&[f32::NAN, 1.0])],
+            )
+            .unwrap();
+        assert!(store.query_semantic(&[1.0, 0.0], 1).is_err());
+        store
+            .conn
+            .borrow()
+            .execute("UPDATE message_vec SET embedding = X'0000'", [])
+            .unwrap();
+        assert!(store.query_semantic(&[1.0, 0.0], 1).is_err());
+        store
+            .conn
+            .borrow()
+            .execute("DROP TABLE message_vec", [])
+            .unwrap();
+        assert!(matches!(store.is_ready(), Err(PortError::Backend(_))));
+    }
+
+    #[test]
+    fn semantic_noise_filter_preserves_later_pages_and_deleted_rows_are_hidden() {
+        use agent_session_grep_application::{App, AppRequest, AppResponse, ResponseBudget};
+        use agent_session_grep_ports::{NoResumeClaims, RetrievalMode};
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("page-model");
+        let mut visible = Vec::new();
+        for (index, role) in ["user", "system", "developer", "system", "user"]
+            .iter()
+            .enumerate()
+        {
+            let id = StableId::native(IdKind::Message, &format!("page-{index}"));
+            store
+                .commit_batch(&[(
+                    id.clone(),
+                    serde_json::json!({"text":"needle", "role":role})
+                        .to_string()
+                        .into_bytes(),
+                    "needle".into(),
+                )])
+                .unwrap();
+            store
+                .index_embedding(&id, &[1.0, index as f32 / 5.0])
+                .unwrap();
+            if *role == "user" {
+                visible.push(id);
+            }
+        }
+        let app = App::with_resume_semantic(&store, &store, NoResumeClaims, &store);
+        let mut token = None;
+        let mut actual = Vec::new();
+        for _ in 0..4 {
+            let response = app
+                .handle(AppRequest::Search {
+                    query: "needle".into(),
+                    filters: SearchFilters::EMPTY,
+                    facets: SearchFacets::default(),
+                    limit: 1,
+                    cursor: token.take(),
+                    budget: ResponseBudget::default(),
+                    include_system: false,
+                    group_by_session: false,
+                    mode: RetrievalMode::Semantic,
+                    query_embedding: Some(vec![1.0, 0.0]),
+                })
+                .unwrap();
+            let AppResponse::Search {
+                hits, next_cursor, ..
+            } = response
+            else {
+                panic!("search")
+            };
+            actual.extend(hits.into_iter().map(|hit| hit.id));
+            token = next_cursor;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(token.is_none());
+        assert_eq!(actual, visible);
+        store
+            .conn
+            .borrow()
+            .execute("DELETE FROM catalog WHERE id = ?1", [visible[0].as_str()])
+            .unwrap();
+        assert!(
+            store
+                .query_semantic(&[1.0, 0.0], 10)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.id != visible[0])
+        );
+    }
+
+    #[test]
+    fn semantic_top_k_is_exact_over_a_representative_scan() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("scan-model");
+        {
+            let mut conn = store.conn.borrow_mut();
+            let tx = conn.transaction().unwrap();
+            for index in 0..2048 {
+                let id = StableId::native(IdKind::Message, &format!("scan-{index:04}"));
+                tx.execute(
+                    "INSERT INTO catalog(id,payload) VALUES(?1,?2)",
+                    rusqlite::params![id.as_str(), b"{}".as_slice()],
+                )
+                .unwrap();
+                tx.execute("INSERT INTO message_vec(wire_id,model_id,dimension,embedding) VALUES(?1,'scan-model',2,?2)",
+                    rusqlite::params![id.as_str(), f32_slice_to_bytes(&[1.0, index as f32 / 2048.0])]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let started = std::time::Instant::now();
+        let hits = store.query_semantic(&[1.0, 1.0], 17).unwrap();
+        assert_eq!(hits.len(), 17);
+        // Independently sort all similarities to verify top-k and tie order.
+        let mut expected: Vec<_> = (0..2048)
+            .map(|index| {
+                (
+                    cosine_similarity(&[1.0, 1.0], &[1.0, index as f32 / 2048.0]),
+                    format!("msg_v1_scan-{index:04}"),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .take(17)
+                .map(|item| item.1.as_str())
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "semantic exact scan: rows=2048 dimensions=2 retained=17 elapsed={:?}; candidate heap bounded to k+1, work remains O(N*d + N*log(k))",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn semantic_evidence_floor_default_is_the_holdout_choice() {
+        // 默认门必须等于 holdout 阈值扫描与冻结 100-query 回归交叉校验
+        // 选出的值（0.2）。改动该常量必须重新跑扫描并同步报告。
+        assert_eq!(SEMANTIC_SIMILARITY_FLOOR_DEFAULT, 0.2);
+    }
+
+    #[test]
+    fn semantic_evidence_gate_filters_below_floor_before_top_k() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("floor-model");
+        let aligned = sid(IdKind::Message, b"floor-aligned");
+        let diagonal = sid(IdKind::Message, b"floor-diagonal");
+        let orthogonal = sid(IdKind::Message, b"floor-orthogonal");
+        let inverted = sid(IdKind::Message, b"floor-inverted");
+        for id in [&aligned, &diagonal, &orthogonal, &inverted] {
+            store.put(id, b"{}").unwrap();
+        }
+        // 与查询 [1, 0] 的余弦相似度：1.0 / ~0.707 / 0.0 / -1.0。
+        store.index_embedding(&aligned, &[1.0, 0.0]).unwrap();
+        store.index_embedding(&diagonal, &[1.0, 1.0]).unwrap();
+        store.index_embedding(&orthogonal, &[0.0, 1.0]).unwrap();
+        store.index_embedding(&inverted, &[-1.0, 0.0]).unwrap();
+
+        let ids = |hits: Vec<SearchHit>| -> Vec<String> {
+            hits.into_iter()
+                .map(|hit| hit.id.as_str().to_string())
+                .collect()
+        };
+
+        // 显式下限 0.5：正交与反向候选在堆插入之前被淘汰。
+        store.set_semantic_similarity_floor(0.5).unwrap();
+        assert_eq!(
+            ids(store.query_semantic(&[1.0, 0.0], 10).unwrap()),
+            vec![aligned.as_str().to_string(), diagonal.as_str().to_string()],
+            "candidates below the floor must not be retained"
+        );
+        // limit=1：名额给最高分准入者（被过滤候选不占 top-k 名额）。
+        let top = store.query_semantic(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].id.as_str(), aligned.as_str());
+
+        // 防御路径 floor=0.0：仅负相似度被排除，正交 0.0 保留。
+        store.set_semantic_similarity_floor(0.0).unwrap();
+        let kept = ids(store.query_semantic(&[1.0, 0.0], 10).unwrap());
+        assert!(kept.contains(&orthogonal.as_str().to_string()));
+        assert!(!kept.contains(&inverted.as_str().to_string()));
+        assert_eq!(store.semantic_similarity_floor(), 0.0);
+
+        // 非有限下限显式报错，不静默换值。
+        assert!(store.set_semantic_similarity_floor(f32::NAN).is_err());
+        assert_eq!(store.semantic_similarity_floor(), 0.0);
+    }
+
+    #[test]
+    fn hybrid_rrf_cannot_admit_a_zero_similarity_semantic_candidate() {
+        use agent_session_grep_application::{App, AppRequest, AppResponse, ResponseBudget};
+        use agent_session_grep_ports::{NoResumeClaims, RetrievalMode};
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("gate-model");
+        let relevant = sid(IdKind::Message, b"gate-relevant");
+        let orthogonal = sid(IdKind::Message, b"gate-orthogonal");
+        // 两条消息都有 payload；只有 relevant 含查询词（lexical 证据）。
+        // orthogonal 不参与 lexical 检索，只能靠向量名次进入 hybrid——
+        // 其相似度为 0.0，即"无语义证据"。
+        store
+            .put(
+                &relevant,
+                br#"{"text":"gategolden needletoken body","timestamp":"2026-08-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+        store
+            .put(
+                &orthogonal,
+                br#"{"text":"unrelated envelope text","timestamp":"2026-08-02T00:00:00Z"}"#,
+            )
+            .unwrap();
+        store
+            .index(&relevant, "gategolden needletoken body")
+            .unwrap();
+        store.index(&orthogonal, "unrelated envelope text").unwrap();
+        store.index_embedding(&relevant, &[1.0, 0.0]).unwrap();
+        store.index_embedding(&orthogonal, &[0.0, 1.0]).unwrap();
+
+        let app = App::with_resume_semantic(&store, &store, NoResumeClaims, &store);
+        let run = |mode: RetrievalMode| -> Vec<String> {
+            let AppResponse::Search { hits, .. } = app
+                .handle(AppRequest::Search {
+                    query: "needletoken".into(),
+                    filters: SearchFilters::default(),
+                    facets: agent_session_grep_ports::SearchFacets::default(),
+                    limit: 10,
+                    cursor: None,
+                    budget: ResponseBudget::default(),
+                    include_system: true,
+                    group_by_session: false,
+                    mode,
+                    query_embedding: Some(vec![1.0, 0.0]),
+                })
+                .unwrap()
+            else {
+                panic!("search expected");
+            };
+            hits.into_iter()
+                .map(|hit| hit.id.as_str().to_string())
+                .collect()
+        };
+
+        // 门开（floor=0.0 防御路径）：0 相似度候选仅凭 semantic 榜的 RRF 名次分
+        // 进入结果——即 D3 边界 2 记录的缺陷形态；这一步同时证明下一步的拒绝
+        // 来自证据门而不是别的过滤。
+        store.set_semantic_similarity_floor(0.0).unwrap();
+        let ungated = run(RetrievalMode::Hybrid);
+        assert!(
+            ungated.contains(&orthogonal.as_str().to_string()),
+            "with the floor open the 0-similarity candidate is admitted by RRF rank"
+        );
+
+        // 证据门（显式 0.5）：0 相似度语义候选在融合之前被淘汰。
+        store.set_semantic_similarity_floor(0.5).unwrap();
+        let gated = run(RetrievalMode::Hybrid);
+        assert!(gated.contains(&relevant.as_str().to_string()));
+        assert!(
+            !gated.contains(&orthogonal.as_str().to_string()),
+            "0-similarity semantic candidate must be rejected by the evidence gate"
+        );
+
+        // lexical 路径不受证据门影响：结果集与门开闭无关。
+        store.set_semantic_similarity_floor(0.0).unwrap();
+        assert_eq!(
+            run(RetrievalMode::Lexical),
+            vec![relevant.as_str().to_string()]
+        );
+    }
+
+    thread_local! { static SEARCH_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; }
+
+    #[test]
+    fn lexical_rrf_ties_use_wire_id_before_limit_across_identity_tiers() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut ids = [
+            StableId::native(IdKind::Message, "z-native"),
+            StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"tie"]),
+            StableId::from_wire("msg_v1_a-unstable").unwrap(),
+        ];
+        let entries: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    br#"{"role":"user","text":"needle"}"#.to_vec(),
+                    "needle".to_owned(),
+                )
+            })
+            .collect();
+        store.commit_batch(&entries).unwrap();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for limit in [1, ids.len()] {
+            for facets in [
+                SearchFacets::default(),
+                SearchFacets {
+                    sidechain: SidechainFacet::MainOnly,
+                    ..Default::default()
+                },
+            ] {
+                let hits = store
+                    .query_with_policy(
+                        SearchQuery {
+                            text: "needle",
+                            filters: &SearchFilters::EMPTY,
+                        },
+                        limit,
+                        &facets,
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    hits.iter().map(|hit| &hit.id).collect::<Vec<_>>(),
+                    ids.iter().take(limit).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn separate_fts_corpora_merge_by_rrf_rank_not_raw_bm25() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = StableId::native(IdKind::Message, "rrf-a");
+        let second = StableId::native(IdKind::Message, "rrf-b");
+        let session = StableId::native(IdKind::Session, "rrf-session");
+        store
+            .commit_batch(&[
+                (
+                    first.clone(),
+                    br#"{"role":"user","text":"needle needle"}"#.to_vec(),
+                    "needle needle".into(),
+                ),
+                (
+                    second.clone(),
+                    br#"{"role":"user","text":"needle other"}"#.to_vec(),
+                    "needle other".into(),
+                ),
+                (session.clone(), b"{}".to_vec(), String::new()),
+            ])
+            .unwrap();
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "INSERT INTO session_fts(session_wire,text) VALUES(?1,'needle')",
+                [session.as_str()],
+            )
+            .unwrap();
+            let rowid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_fts_ids(session_wire,fts_rowid) VALUES(?1,?2)",
+                rusqlite::params![session.as_str(), rowid],
+            )
+            .unwrap();
+        }
+        let hits = store.query("needle", 10).unwrap();
+        assert_eq!(hits.len(), 3);
+        let score = |id: &StableId| hits.iter().find(|hit| hit.id == *id).unwrap().score;
+        assert_eq!(score(&first), 1.0 / 61.0);
+        assert_eq!(score(&session), 1.0 / 61.0);
+        assert_eq!(score(&second), 1.0 / 62.0);
+    }
+
+    #[test]
+    fn metadata_sql_has_bounded_shape_and_indexed_session_probes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let entries: Vec<_> = (0..1100)
+            .map(|index| {
+                (
+                    StableId::native(IdKind::Message, &format!("bulk-{index}")),
+                    br#"{"role":"user","text":"needle"}"#.to_vec(),
+                    "needle".to_owned(),
+                )
+            })
+            .collect();
+        store.commit_batch(&entries).unwrap();
+        SEARCH_SQL.with(|sql| sql.borrow_mut().clear());
+        store.conn.borrow().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+                    && sql.contains("FROM session_fts JOIN")
+                {
+                    SEARCH_SQL.with(|queries| queries.borrow_mut().push(sql.to_owned()));
+                }
+            }),
+        );
+        assert_eq!(store.query("needle", 1100).unwrap().len(), 1100);
+        store
+            .conn
+            .borrow()
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let sql = SEARCH_SQL.with(|queries| queries.borrow()[0].clone());
+        assert_eq!(
+            sql.matches("json_each(").count(),
+            1,
+            "one bound exclusion set, not one clause per message"
+        );
+        assert!(sql.len() < 3000);
+        let conn = store.conn.borrow();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("message_placements_session_order")),
+            "{plan:?}"
+        );
+        eprintln!(
+            "metadata SQL: message exclusions=1100 sql_bytes={} plan={plan:?}",
+            sql.len()
+        );
     }
 
     #[test]
     fn semantic_index_is_not_ready_without_model_or_vectors() {
         let store = SqliteStore::open_in_memory().unwrap();
         // 未设模型：未就绪，查询空，写入报错（不写无归属向量）。
-        assert!(!store.is_ready());
+        assert!(!store.is_ready().unwrap());
         assert!(store.query_semantic(&[0.1, 0.2], 5).unwrap().is_empty());
         assert!(
             store
@@ -7319,7 +11176,7 @@ mod tests {
         );
         // 设了模型但表空：仍未就绪，Application 必须降级为 lexical_fallback。
         store.set_semantic_model("test-model");
-        assert!(!store.is_ready());
+        assert!(!store.is_ready().unwrap());
     }
 
     #[test]
@@ -7328,29 +11185,43 @@ mod tests {
         store.set_semantic_model("test-model");
         let near = sid(IdKind::Message, b"near");
         let far = sid(IdKind::Message, b"far");
+        store.put(&near, b"{}").unwrap();
+        store.put(&far, b"{}").unwrap();
         // near 与查询同向；far 正交。
         store.index_embedding(&near, &[1.0, 0.0, 0.0]).unwrap();
         store.index_embedding(&far, &[0.0, 1.0, 0.0]).unwrap();
-        assert!(store.is_ready());
+        assert!(store.is_ready().unwrap());
 
+        // 证据门（B4）之前的行为：把门槛开到 0.0（防御路径）后按纯余弦排序，
+        // 正交候选保留在 top-k 里。
+        store.set_semantic_similarity_floor(0.0).unwrap();
         let hits = store.query_semantic(&[1.0, 0.0, 0.0], 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id.as_str(), near.as_str());
         assert!(hits[0].score > hits[1].score);
         assert!((hits[0].score - 1.0).abs() < 1e-5);
         assert!(hits[1].score.abs() < 1e-5);
+
+        // 默认门生效：0 相似度候选在 top-k 之前被拒绝，只剩同向候选。
+        store
+            .set_semantic_similarity_floor(SEMANTIC_SIMILARITY_FLOOR_DEFAULT)
+            .unwrap();
+        let gated = store.query_semantic(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].id.as_str(), near.as_str());
     }
 
     #[test]
     fn semantic_query_skips_other_models_and_dimensions() {
         let store = SqliteStore::open_in_memory().unwrap();
         store.set_semantic_model("model-a");
+        store.put(&sid(IdKind::Message, b"a"), b"{}").unwrap();
         store
             .index_embedding(&sid(IdKind::Message, b"a"), &[1.0, 0.0])
             .unwrap();
         // 换模型：旧向量因 model_id 不匹配被排除，不参与相似度。
         store.set_semantic_model("model-b");
-        assert!(!store.is_ready());
+        assert!(!store.is_ready().unwrap());
         assert!(store.query_semantic(&[1.0, 0.0], 10).unwrap().is_empty());
         // 同模型但维度不同的查询也不匹配（避免截断比较产出无意义分数）。
         store.set_semantic_model("model-a");
@@ -7366,6 +11237,8 @@ mod tests {
     fn semantic_index_upserts_and_clear_removes_only_that_model() {
         let store = SqliteStore::open_in_memory().unwrap();
         let id = sid(IdKind::Message, b"m");
+        store.put(&id, b"{}").unwrap();
+        store.put(&sid(IdKind::Message, b"n"), b"{}").unwrap();
         store.set_semantic_model("model-a");
         store.index_embedding(&id, &[1.0, 0.0]).unwrap();
         // 同 id 重写是 upsert，不是第二行。
@@ -7378,9 +11251,104 @@ mod tests {
         store
             .index_embedding(&sid(IdKind::Message, b"n"), &[1.0, 0.0])
             .unwrap();
+        let generation = store.active_generation().unwrap();
         assert_eq!(store.clear_embeddings("model-a").unwrap(), 1);
+        assert_eq!(store.active_generation().unwrap(), generation + 1);
+        assert_eq!(store.clear_embeddings("model-a").unwrap(), 0);
+        assert_eq!(store.active_generation().unwrap(), generation + 1);
         // model-b 的向量不受影响。
-        assert!(store.is_ready());
+        assert!(store.is_ready().unwrap());
+    }
+
+    #[test]
+    fn embedding_rebuild_keyset_batches_visit_each_message_once() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("batch-model");
+        for ordinal in 0..5 {
+            store
+                .put(
+                    &StableId::native(IdKind::Message, &format!("batch-{ordinal}")),
+                    b"{}",
+                )
+                .unwrap();
+        }
+        store
+            .put(&sid(IdKind::Session, b"skip-session"), b"{}")
+            .unwrap();
+        store
+            .index_embedding(&sid(IdKind::Message, b"orphan"), &[1.0, 0.0])
+            .unwrap();
+        let generation = store.active_generation().unwrap();
+        let mut seen = Vec::new();
+        let statements = counted_statements(&store, || {
+            let counts = store
+                .rebuild_embeddings_from_catalog("batch-model", 2, 2, |entry| {
+                    assert_eq!(entry.id.kind(), IdKind::Message);
+                    seen.push(entry.id.as_str().to_string());
+                    Ok((!entry.id.as_str().ends_with('4')).then_some(vec![0.0, 1.0]))
+                })
+                .unwrap();
+            assert_eq!(counts, (4, 2, 1));
+        });
+        // BEGIN/DELETE + four keyset reads (three batches and EOF) + four
+        // inserts + generation UPDATE/COMMIT. Ignoring the batch cap fails.
+        assert_eq!(statements, 12);
+        assert_eq!(
+            seen,
+            (0..5)
+                .map(|ordinal| format!("msg_v1_batch-{ordinal}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(store.query_semantic(&[0.0, 1.0], 10).unwrap().len(), 4);
+        assert_eq!(store.active_generation().unwrap(), generation + 1);
+        let plan: String = store.conn.borrow().query_row(
+            "EXPLAIN QUERY PLAN SELECT id, payload FROM catalog WHERE id > ?1 ORDER BY id LIMIT ?2",
+            rusqlite::params!["msg_v1_batch-1", 2],
+            |row| row.get(3),
+        ).unwrap();
+        assert!(plan.contains("SEARCH") && plan.contains("id>?"), "{plan}");
+    }
+
+    #[test]
+    fn embedding_rebuild_failure_rolls_back_vectors_and_generation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_semantic_model("batch-model");
+        for raw in ["a", "b"] {
+            let id = StableId::native(IdKind::Message, raw);
+            store.put(&id, b"{}").unwrap();
+            store.index_embedding(&id, &[1.0, 0.0]).unwrap();
+        }
+        let generation = store.active_generation().unwrap();
+        let mut calls = 0;
+        let result = store.rebuild_embeddings_from_catalog("batch-model", 2, 1, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err(PortError::Backend("synthetic encoder failure".into()))
+            } else {
+                Ok(Some(vec![0.0, 1.0]))
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        let hits = store.query_semantic(&[1.0, 0.0], 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.score == 1.0));
+        assert_eq!(store.active_generation().unwrap(), generation);
+        for vector in [vec![f32::NAN, 0.0], vec![1.0], vec![]] {
+            assert!(
+                store
+                    .rebuild_embeddings_from_catalog("batch-model", 2, 1, |_| Ok(Some(
+                        vector.clone()
+                    )))
+                    .is_err()
+            );
+            assert_eq!(store.active_generation().unwrap(), generation);
+        }
+        assert!(
+            store
+                .rebuild_embeddings_from_catalog("batch-model", 2, 513, |_| Ok(None))
+                .is_err()
+        );
     }
 
     #[test]
@@ -7389,8 +11357,18 @@ mod tests {
         let bytes = f32_slice_to_bytes(&values);
         assert_eq!(bytes.len(), 12);
         assert_eq!(bytes_to_f32_vec(&bytes), values);
-        // 截断的尾部字节不被当成一个 float 复原。
-        assert_eq!(bytes_to_f32_vec(&bytes[..10]).len(), 2);
+        assert_eq!(bytes_to_f32_vec(&[0x00, 0x00, 0xC0, 0x3F]), [1.5]);
+        assert!(bytes_to_f32_vec(&[]).is_empty());
+
+        // A partial trailing float is ignored regardless of its byte length.
+        for tail_len in 1..=3 {
+            let mut with_partial_tail = bytes.clone();
+            with_partial_tail.extend_from_slice(&[0xAA, 0xBB, 0xCC][..tail_len]);
+            assert_eq!(bytes_to_f32_vec(&with_partial_tail), values);
+        }
+
+        // Truncating a complete float also drops its remaining bytes.
+        assert_eq!(bytes_to_f32_vec(&bytes[..10]), values[..2]);
     }
 
     #[test]
@@ -7404,7 +11382,7 @@ mod tests {
     fn schema_v10_creates_message_vec_table() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 19);
         let conn = store.conn.borrow();
         let count: i64 = conn
             .query_row(
@@ -7723,11 +11701,12 @@ mod tests {
             placements,
             edges,
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         }
     }
 
@@ -7739,6 +11718,73 @@ mod tests {
                 row.get(0)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn source_no_op_rejects_duplicate_facts_without_advancing_generation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = sid(IdKind::Message, b"noop-message");
+        let session = sid(IdKind::Session, b"noop-session");
+        let document = sid(IdKind::Document, b"noop-document");
+        let p = placement(&session, &document, &message, 0, false, None);
+        let mut batch = source_batch(
+            "noop.jsonl",
+            vec![
+                typed_message_entry(&message, "no-op body"),
+                (
+                    session.clone(),
+                    br#"{"documents":[],"messages":[]}"#.to_vec(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+            ],
+            vec![p],
+            Vec::new(),
+            true,
+        );
+        batch
+            .resume_claims
+            .push(SourceResumeClaim::from_observation(
+                "claude-code",
+                session.as_str(),
+                &agent_session_grep_ports::ProviderSessionObservation::default(),
+            ));
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        for (id, payload, _) in &mut batch.entries {
+            *payload = store.get(id).unwrap().unwrap();
+        }
+        assert!(store.sources_are_current(&[&batch]).unwrap());
+        let generation = store.active_generation().unwrap();
+        for duplicate_placement in [false, true] {
+            let mut invalid = batch.clone();
+            if duplicate_placement {
+                invalid.placements.push(invalid.placements[0].clone());
+            } else {
+                invalid.entries.push(invalid.entries[0].clone());
+            }
+            assert!(store.commit_source_batches_if_changed(&[invalid]).is_err());
+            assert_eq!(store.active_generation().unwrap(), generation);
+        }
+        let mut duplicate_claim = batch.clone();
+        duplicate_claim
+            .resume_claims
+            .push(duplicate_claim.resume_claims[0].clone());
+        assert!(store.sources_are_current(&[&duplicate_claim]).unwrap());
+        assert!(
+            store
+                .commit_source_batches_if_changed(&[duplicate_claim])
+                .is_err()
+        );
+        assert_eq!(store.active_generation().unwrap(), generation);
+        for claim_session in [message.as_str(), "ses_v1_foreign-session"] {
+            let mut invalid = batch.clone();
+            invalid.resume_claims[0].session_id = claim_session.to_owned();
+            assert!(store.commit_source_batches_if_changed(&[invalid]).is_err());
+            assert_eq!(store.active_generation().unwrap(), generation);
+        }
+        assert!(!store.commit_source_batches_if_changed(&[batch]).unwrap());
     }
 
     fn source_placement_claims(store: &SqliteStore, source_path: &str) -> Vec<String> {
@@ -8119,8 +12165,8 @@ mod tests {
     #[test]
     fn cjk_bigram_recall_hits_two_char_queries_in_longer_sentences() {
         // R1.4：双字查询"配置"/"数据库"命中包含它们的长句。索引侧与查询侧
-        // 同一 bigram transform：整段汉字从 1 个 FTS 词元变成相邻两字 bigram
-        // 词元（"配置数据库迁移" → "配置 置数 数据 据库 库迁 迁移"）。
+        // 同一 transform：整段汉字从 1 个 FTS 词元变成单字 + 相邻两字 bigram
+        // 词元（"配置数据库迁移" → "配 置 数 据 库 迁 移 配置 置数 数据 据库 库迁 迁移"）。
         let store = SqliteStore::open_in_memory().unwrap();
         let id = sid(IdKind::Message, b"cjk-m1");
         store
@@ -8131,13 +12177,40 @@ mod tests {
             assert_eq!(hits.len(), 1, "query {query:?} must recall the message");
             assert_eq!(hits[0].id, id);
         }
-        // 多字查询按 bigram 并集 AND 匹配。
+        // 多字查询按单字 + bigram 并集 AND 匹配。
         assert_eq!(store.query("数据库迁移", 10).unwrap().len(), 1);
         // 不存在的双字组合不命中。
         assert!(store.query("翻墙", 10).unwrap().is_empty());
-        // 单字 CJK 查询仍弱（已知边界，ADR-0007 §后果）：transform 后为空串，
-        // 无结果且不触发 FTS 语法错误。
-        assert!(store.query("了", 10).unwrap().is_empty());
+        // 单字 CJK 查询由同一索引流中的 unigram 词元覆盖，不再落空。
+        assert_eq!(store.query("了", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cjk_unigram_tokens_recall_single_char_queries() {
+        // 单字查询增强：FTS 索引流除 bigram 外还为每个汉字产出单字词元，
+        // "了"/"配"这类单字查询不再 transform 成空串，命中含该字的句子。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let id = sid(IdKind::Message, b"cjk-uni");
+        store
+            .index(&id, "我们已经在生产环境配置了数据库迁移，备份策略也更新了")
+            .unwrap();
+        for query in ["我", "了", "配", "置", "迁", "移", "备", "新"] {
+            let hits = store.query(query, 10).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "single-char query {query:?} must recall the message"
+            );
+            assert_eq!(hits[0].id, id);
+        }
+        // 夹在 ASCII 之间的单字汉字运行（bigram 产不出词元）同样命中。
+        let mixed = sid(IdKind::Message, b"cjk-uni-mixed");
+        store.index(&mixed, "用cargo测试").unwrap();
+        assert_eq!(store.query("用", 10).unwrap().len(), 1);
+        assert_eq!(store.query("测", 10).unwrap().len(), 1);
+        assert_eq!(store.query("cargo", 10).unwrap().len(), 1);
+        // 未出现的单字不命中。
+        assert!(store.query("丙", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -8175,7 +12248,7 @@ mod tests {
         assert_eq!(store.query("配置文件", 10).unwrap().len(), 1);
 
         // 内容级 no-op：再次同步同一源不推进 generation——current 判定对 fts
-        // 存储的 bigram 正文与同一 transform 后的 batch text 比较（若只比原文，
+        // 存储的 transform 后正文与同一 transform 后的 batch text 比较（若只比原文，
         // 已同步的源每次重同步都会被误判为 not-current 而反复推进 generation）。
         let generation = store.active_generation().unwrap();
         let again = store
@@ -8190,8 +12263,9 @@ mod tests {
         // R1.2：rebuild 从权威 catalog 重投影 FTS（searchable_text + 同一索引侧
         // transform），无 schema 变更、无 catalog 迁移；重建推进 generation
         // （旧 cursor 因此失效——正常契约行为）。
-        // 词元增长：消息正文"今天把数据库备份到了新目录"（11 字）从 1 个整段
-        // 词元变为 10 个 bigram 词元——纯 CJK 文本约 2x 最坏增长（ADR-0007 §后果）。
+        // 词元增长：消息正文"今天把数据库备份到了新目录"（13 字）从 1 个整段
+        // 词元变为 25 个单字 + bigram 词元——纯 CJK 文本约 4x 最坏增长
+        // （ADR-0007 §后果）。
         let store = SqliteStore::open_in_memory().unwrap();
         let session = sid(IdKind::Session, b"rebuild-ses");
         let document = sid(IdKind::Document, b"rebuild-doc");
@@ -8233,9 +12307,229 @@ mod tests {
         assert_eq!(store.query("新目录", 10).unwrap().len(), 1);
     }
 
+    // ─── 索引投影版本（schema v17 / INDEX_PROJECTION_VERSION）───
+
+    /// 把库改写成"旧投影"状态：FTS 正文用**上一版**纯 bigram 变换重写
+    /// （`bigram_cjk`，即 `fts_tokens_cjk` 加入单字词元之前的形态），投影版本戳
+    /// 回落为 0——精确复刻由旧二进制建立、迁到 v17 后的真实库。
+    fn downgrade_projection_to_legacy_bigrams(store: &SqliteStore) {
+        let conn = store.conn.borrow();
+        // 消息 FTS：从权威 catalog payload 重投影后施加旧变换。
+        let rows: Vec<(i64, Vec<u8>)> = conn
+            .prepare(
+                "SELECT f.rowid, c.payload FROM fts f
+                 JOIN fts_ids fi ON fi.id_json = f.id
+                 JOIN catalog c ON c.id = fi.wire_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!rows.is_empty(), "夹具必须先有消息 FTS 行");
+        for (rowid, payload) in rows {
+            conn.execute(
+                "UPDATE fts SET text = ?1 WHERE rowid = ?2",
+                rusqlite::params![
+                    agent_session_grep_application::bigram_cjk(&searchable_text(&payload)),
+                    rowid
+                ],
+            )
+            .unwrap();
+        }
+        // Session 元数据 FTS 同属本轴：同一旧变换重写。
+        let sessions: Vec<(i64, String)> = conn
+            .prepare("SELECT fts_rowid, session_wire FROM session_fts_ids")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (rowid, wire) in sessions {
+            let text = SqliteStore::session_search_text(&conn, &wire)
+                .unwrap()
+                .expect("fixture session must project search text");
+            conn.execute(
+                "UPDATE session_fts SET text = ?1 WHERE rowid = ?2",
+                rusqlite::params![agent_session_grep_application::bigram_cjk(&text), rowid],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE store_metadata SET index_projection_version = 0 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// 一条含中文的真实 ingest 批次（session + document + message）。
+    fn cjk_projection_fixture(store: &SqliteStore, tag: &[u8], text: &str) -> StableId {
+        let session = sid(IdKind::Session, &[tag, b"-ses"].concat());
+        let document = sid(IdKind::Document, &[tag, b"-doc"].concat());
+        let message = sid(IdKind::Message, &[tag, b"-msg"].concat());
+        let source = source_batch(
+            &format!("{}.jsonl", String::from_utf8_lossy(tag)),
+            vec![
+                entity_entry(&session),
+                entity_entry(&document),
+                typed_message_entry(&message, text),
+            ],
+            vec![placement(
+                &session,
+                &document,
+                &message,
+                0,
+                false,
+                Some((0, 4)),
+            )],
+            Vec::new(),
+            true,
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&source))
+                .unwrap()
+        );
+        message
+    }
+
+    #[test]
+    fn stale_index_projection_refuses_instead_of_returning_wrong_cjk_hits() {
+        // 实测缺陷复现（真实 170 468 实体库上通过 MCP search_sessions 观察到）：
+        // 旧二进制写下的纯 bigram 词元流 + 新二进制的 unigram+bigram 查询词元
+        // ⇒ 中文查询静默 0 命中，ASCII 查询照常命中。这是错误结果而非报错，
+        // 最坏的失败类。修复后读路径必须 fail-closed。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = cjk_projection_fixture(&store, b"stale-proj", "请帮我做配置备份 clippy");
+        assert_eq!(store.query("配置备份", 10).unwrap().len(), 1);
+        assert_eq!(store.query("备份", 10).unwrap().len(), 1);
+        assert_eq!(store.query("clippy", 10).unwrap().len(), 1);
+        assert!(store.index_projection_is_current().unwrap());
+
+        downgrade_projection_to_legacy_bigrams(&store);
+        assert_eq!(store.index_projection_version().unwrap(), 0);
+        assert!(!store.index_projection_is_current().unwrap());
+
+        // 修复前：下面三个查询分别返回 Ok([])、Ok([]) 与 Ok([hit])——中文静默
+        // 落空、ASCII 照常命中，调用方无从察觉。修复后：三者一律 fail-closed。
+        for query in ["配置备份", "备份", "clippy"] {
+            let error = store.query(query, 10).unwrap_err();
+            assert!(
+                matches!(&error, PortError::SchemaIncompatible(message)
+                    if message.contains("index rebuild")),
+                "query {query:?} 必须 fail-closed 并给出修复命令，实际 {error:?}"
+            );
+        }
+        // facet 路径同闸门。
+        let error = store
+            .query_faceted(
+                SearchQuery {
+                    text: "备份",
+                    filters: &SearchFilters::EMPTY,
+                },
+                10,
+                &SearchFacets {
+                    sidechain: SidechainFacet::MainOnly,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, PortError::SchemaIncompatible(_)));
+
+        // catalog 是权威事实源，不受投影失配影响——get 仍返回原 payload。
+        assert!(store.get(&message).unwrap().is_some());
+    }
+
+    #[test]
+    fn write_open_reprojects_stale_projection_from_catalog_without_reparse() {
+        // 方案 A（自愈）：写路径打开时检测失配 → 从权威 catalog 重投影。
+        // 源文件**不存在于磁盘**，证明重投影无需回到 provider reparse。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.db");
+        let p = path.to_string_lossy().into_owned();
+        let generation_before;
+        {
+            let store = SqliteStore::open_for_write(&p).unwrap();
+            cjk_projection_fixture(&store, b"heal-proj", "今天把配置备份到了新目录");
+            assert_eq!(store.query("配置备份", 10).unwrap().len(), 1);
+            downgrade_projection_to_legacy_bigrams(&store);
+            generation_before = store.active_generation().unwrap();
+        }
+        // 只读打开：不写、不自愈，如实报告失配（doctor 走这条路）。
+        {
+            let store = SqliteStore::open(&p).unwrap();
+            assert_eq!(store.index_projection_version().unwrap(), 0);
+            assert!(store.query("配置备份", 10).is_err());
+            assert_eq!(store.active_generation().unwrap(), generation_before);
+        }
+        // 写路径打开：自动重投影并收敛版本。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert!(store.index_projection_is_current().unwrap());
+        assert_eq!(
+            store.active_generation().unwrap(),
+            generation_before + 1,
+            "重投影改变了投影内容，必须推进 generation 以失效旧 cursor"
+        );
+        assert_eq!(store.query("配置备份", 10).unwrap().len(), 1);
+        assert_eq!(store.query("备份", 10).unwrap().len(), 1);
+        assert_eq!(store.query("配", 10).unwrap().len(), 1);
+        // 幂等：再次打开不再重投影、不再推进 generation。
+        drop(store);
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(store.active_generation().unwrap(), generation_before + 1);
+        assert!(!store.ensure_index_projection_current().unwrap());
+    }
+
+    #[test]
+    fn empty_projection_is_stamped_current_without_rebuild_churn() {
+        // 新库/空库：没有任何旧词元可纠正 → 只标记版本，不推进 generation、
+        // 不写 outbox 行（否则每个新 data root 一打开就产生 churn）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        let p = path.to_string_lossy().into_owned();
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert!(store.index_projection_is_current().unwrap());
+        assert_eq!(store.active_generation().unwrap(), 0);
+        assert_eq!(store.interrupted_batch_count().unwrap(), 0);
+        assert_eq!(table_count(&store, "index_batches"), 0);
+
+        // 人为把戳打回 0（空投影）：收敛只盖戳，不重投影。
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE store_metadata SET index_projection_version = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(!store.ensure_index_projection_current().unwrap());
+        assert!(store.index_projection_is_current().unwrap());
+        assert_eq!(store.active_generation().unwrap(), 0);
+        assert_eq!(table_count(&store, "index_batches"), 0);
+    }
+
+    #[test]
+    fn incremental_commit_does_not_claim_whole_store_projection_currency() {
+        // 增量提交只覆盖本批实体，不能声明全库投影已收敛——否则一次 sync
+        // 就会把"其余 17 万条仍是旧词元"的库标记为当前，缺陷原地复活。
+        let store = SqliteStore::open_in_memory().unwrap();
+        cjk_projection_fixture(&store, b"partial-a", "第一批配置备份");
+        downgrade_projection_to_legacy_bigrams(&store);
+        cjk_projection_fixture(&store, b"partial-b", "第二批配置备份");
+        assert_eq!(
+            store.index_projection_version().unwrap(),
+            0,
+            "增量提交不得盖投影版本戳"
+        );
+        // 只有整库重投影才盖戳。
+        store.rebuild_index().unwrap();
+        assert!(store.index_projection_is_current().unwrap());
+        assert_eq!(store.query("配置备份", 10).unwrap().len(), 2);
+    }
+
     #[test]
     fn cjk_bigram_keeps_ascii_path_and_punctuation_literals_unchanged() {
-        // R1.3（ADR-0003）：纯 ASCII/路径/标点输入不含汉字，bigram_cjk 原样
+        // R1.3（ADR-0003）：纯 ASCII/路径/标点输入不含汉字，transform 原样
         // 返回——字面量化语义与之前逐字节一致，FTS 词元不变。
         let store = SqliteStore::open_in_memory().unwrap();
         let id = sid(IdKind::Message, b"literal");
@@ -8256,6 +12550,72 @@ mod tests {
         store.index(&mixed, "使用配置v2.0备份").unwrap();
         assert_eq!(store.query("配置v2.0", 10).unwrap().len(), 1);
         assert_eq!(store.query("v2.0", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn message_fts_body_is_capped_at_char_boundary_on_index() {
+        // 借鉴清单 #3：单条消息正文超过 MESSAGE_FTS_MAX_CHARS 时，FTS 只索引前
+        // MESSAGE_FTS_MAX_CHARS 字符——上限之后的词不可检索，上限内的词仍可检索。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let id = sid(IdKind::Message, b"index-long-body");
+        let full = format!(
+            "head-needle {}\n tail-needle",
+            "f".repeat(agent_session_grep_application::MESSAGE_FTS_MAX_CHARS)
+        );
+        store.index(&id, &full).unwrap();
+        assert_eq!(store.query("head-needle", 10).unwrap().len(), 1);
+        assert!(
+            store.query("tail-needle", 10).unwrap().is_empty(),
+            "beyond-cap text must not be indexed"
+        );
+    }
+
+    #[test]
+    fn catalog_put_and_rebuild_project_capped_fts_body() {
+        // put 与 rebuild 都按 searchable_text(payload) 重投影：catalog 保留全文
+        // （THREAT-MODEL：Catalog 不在索引期改写原文），FTS 投影有界。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let id = sid(IdKind::Message, b"put-long-body");
+        let full = format!(
+            "early-needle {}\n late-needle",
+            "f".repeat(agent_session_grep_application::MESSAGE_FTS_MAX_CHARS)
+        );
+        let payload = serde_json::json!({ "role": "user", "text": full })
+            .to_string()
+            .into_bytes();
+        store.put(&id, &payload).unwrap();
+        assert_eq!(
+            store.get(&id).unwrap().unwrap(),
+            payload,
+            "catalog 保留原文全文"
+        );
+        assert_eq!(store.query("early-needle", 10).unwrap().len(), 1);
+        assert!(store.query("late-needle", 10).unwrap().is_empty());
+
+        store.rebuild_index().unwrap();
+        assert_eq!(store.query("early-needle", 10).unwrap().len(), 1);
+        assert!(store.query("late-needle", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_commit_with_bounded_entry_text_stays_current() {
+        // 生产 CLI 构造三元组时已把 text 截断到 MESSAGE_FTS_MAX_CHARS（与索引侧
+        // 同一常量）：同样的有界 batch 重提交必须判 current，重同步幂等不被截断破坏。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let id = sid(IdKind::Message, b"bounded-current");
+        let full = format!(
+            "stable-head {}",
+            "f".repeat(agent_session_grep_application::MESSAGE_FTS_MAX_CHARS)
+        );
+        let payload = serde_json::json!({ "role": "user", "text": full })
+            .to_string()
+            .into_bytes();
+        let text = agent_session_grep_application::bounded_index_text(&full);
+        let entries = [(id.clone(), payload, text)];
+        assert!(store.commit_batch_if_changed(&entries).unwrap());
+        let generation = store.active_generation().unwrap();
+        assert!(!store.commit_batch_if_changed(&entries).unwrap());
+        assert_eq!(store.active_generation().unwrap(), generation);
     }
 
     #[test]
@@ -8306,6 +12666,35 @@ mod tests {
     }
 
     #[test]
+    fn read_open_never_creates_or_migrates_and_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read.db");
+        let p = path.to_str().unwrap();
+        assert!(SqliteStore::open(p).is_err());
+        assert!(!path.exists());
+        let legacy = Connection::open(p).unwrap();
+        legacy
+            .execute_batch("PRAGMA user_version=1; CREATE TABLE marker(value);")
+            .unwrap();
+        drop(legacy);
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            SqliteStore::open(p),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let current = dir.path().join("current.db");
+        let writer = SqliteStore::open_for_write(current.to_str().unwrap()).unwrap();
+        let reader = SqliteStore::open(current.to_str().unwrap()).unwrap();
+        assert!(
+            reader
+                .put(&sid(IdKind::Message, b"write"), b"denied")
+                .is_err()
+        );
+        drop(writer);
+    }
+
+    #[test]
     fn reopen_preserves_data_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catalog.db");
@@ -8313,11 +12702,11 @@ mod tests {
         // 用 Message id：非 Message 实体不进 fts 全文表（kind 门，见 index/put）。
         let id = sid(IdKind::Message, b"s1");
         {
-            let store = SqliteStore::open(&p).unwrap();
+            let store = SqliteStore::open_for_write(&p).unwrap();
             store.put(&id, b"persisted").unwrap();
             store.index(&id, "persisted body").unwrap();
         }
-        // 重开：migration 幂等（IF NOT EXISTS 已换成版本门控），数据与版本不变。
+        // Reopen through the read-only path; data and schema remain unchanged.
         let store = SqliteStore::open(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.get(&id).unwrap().unwrap(), b"persisted");
@@ -8330,7 +12719,7 @@ mod tests {
         let path = dir.path().join("future.db");
         let p = path.to_string_lossy().into_owned();
         // 先正常建库，再把 user_version 拨到未来版本，模拟更新的二进制写过的库。
-        SqliteStore::open(&p).unwrap();
+        SqliteStore::open_for_write(&p).unwrap();
         {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
@@ -8343,7 +12732,7 @@ mod tests {
             Ok(_) => panic!("expected newer schema to be rejected"),
         };
         assert!(
-            matches!(err, PortError::SchemaIncompatible(m) if m.contains("newer than supported"))
+            matches!(err, PortError::SchemaIncompatible(m) if m.contains("differs from supported"))
         );
     }
 
@@ -8387,7 +12776,7 @@ mod tests {
             .unwrap();
         }
 
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let id = StableId::from_wire("msg_v1_legacy").unwrap();
         assert_eq!(store.get(&id).unwrap().unwrap(), payload);
@@ -8513,6 +12902,81 @@ mod tests {
                 "relation_upserts_json" | "relation_deletes_json" | "source_replacements_json"
             )
         }));
+    }
+
+    #[test]
+    fn injected_v18_to_v19_failure_rolls_back_journal_retention_schema() {
+        // v18 形状：v6 fixture 顺序迁移到 v18，再对 v18→v19 注入事务内失败。
+        let conn = Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+        SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+        SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+        SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+        SqliteStore::migrate_v15_to_v16(&conn).unwrap();
+        SqliteStore::migrate_v16_to_v17(&conn).unwrap();
+        SqliteStore::migrate_v17_to_v18(&conn).unwrap();
+
+        let error = SqliteStore::migrate_v18_to_v19_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(error, PortError::Backend(message) if message.contains("injected v18-to-v19"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 18);
+        // 注入失败不留半成品：v19 的列与表都必须回滚。
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(index_batches)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|name| name == "detail_format"));
+        assert!(!columns.iter().any(|name| name == "detail_summary_json"));
+        let compact_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'journal_compactions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compact_table, 0);
+
+        // 旧行（v18 形状的 terminal 行）迁移后按 full 读——旧格式可读。
+        conn.execute(
+            "INSERT INTO index_batches(
+                 operation_id, base_generation, target_generation, state,
+                 operation_digest, upsert_ids_json, delete_ids_json,
+                 durable_point, created_at_ms, committed_at_ms
+             ) VALUES('legacy-op', 0, 1, 'activated', 'legacy-digest',
+                      '[\"msg_v1_legacy\"]', '[]', 'activated', 1, 2)",
+            [],
+        )
+        .unwrap();
+        SqliteStore::migrate_v18_to_v19(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 19);
+        let (format, summary): (String, Option<String>) = conn
+            .query_row(
+                "SELECT detail_format, detail_summary_json FROM index_batches
+                 WHERE operation_id = 'legacy-op'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(format, JOURNAL_DETAIL_FORMAT_FULL);
+        assert!(summary.is_none());
     }
 
     #[test]
@@ -8665,7 +13129,7 @@ mod tests {
         };
         assert_eq!(catalog_payloads(&store_a), catalog_payloads(&store_b));
 
-        // fts 正文逐实体相等（fts 存 id_json + bigram 正文）。
+        // fts 正文逐实体相等（fts 存 id_json + transform 后正文）。
         let fts_rows = |store: &SqliteStore| -> BTreeMap<String, String> {
             let conn = store.conn.borrow();
             let mut stmt = conn
@@ -10095,11 +14559,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: messages
                 .iter()
                 .enumerate()
@@ -10197,11 +14662,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: messages
                 .iter()
                 .enumerate()
@@ -10271,7 +14737,7 @@ mod tests {
             )
             .unwrap();
         }
-        let store = SqliteStore::open(&p).unwrap();
+        let store = open_migration_fixture(&p);
         let conn = store.conn.borrow();
         let mismatch: i64 = conn
             .query_row(
@@ -10294,6 +14760,9 @@ mod tests {
         drop(conn);
 
         // 回填后按 wire 别名删除能定位到旧 fts 行（无 fts 残留）。
+        // 断言直接查投影行数而非走 FTS MATCH：这个手工 v7 夹具的词元由"旧
+        // 二进制"写下，迁到 v17 后投影版本戳为 0，查询路径按契约 fail-closed
+        // （见 stale_index_projection_refuses_instead_of_returning_wrong_cjk_hits）。
         let wire_id = StableId::from_wire(legacy.as_str()).unwrap();
         let entries: [(StableId, Vec<u8>, String); 0] = [];
         let pending = store
@@ -10302,7 +14771,7 @@ mod tests {
         store
             .commit_index_batch(&pending, &entries, &[wire_id])
             .unwrap();
-        assert!(store.query("legacy fts body", 10).unwrap().is_empty());
+        assert_eq!(table_count(&store, "fts"), 0, "旧 fts 行必须被删除");
         assert_eq!(store.count().unwrap(), 0);
     }
 
@@ -10316,11 +14785,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (a.clone(), b"a".to_vec(), "keep alpha".into()),
                 (b.clone(), b"b".to_vec(), "remove beta".into()),
@@ -10339,11 +14809,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(a.clone(), b"a".to_vec(), "keep alpha".into())],
         };
         assert!(
@@ -10366,11 +14837,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(a, b"payload".to_vec(), "same text".into())],
         };
         assert!(
@@ -10412,7 +14884,7 @@ mod tests {
             )
             .unwrap();
         }
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let conn = rusqlite::Connection::open(&p).unwrap();
         let exists: i64 = conn
@@ -10465,7 +14937,7 @@ mod tests {
             )
             .unwrap();
         }
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         // 旧数据完整保留。
         let id = StableId::from_wire("msg_v1_legacy").unwrap();
@@ -10495,11 +14967,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (msg.clone(), b"m".to_vec(), "unique searchable body".into()),
                 (ses.clone(), b"s".to_vec(), "unique searchable body".into()),
@@ -10545,11 +15018,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (
                     msg.clone(),
@@ -10592,11 +15066,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (msg.clone(), b"m".to_vec(), "text".into()),
                 (ses.clone(), b"s".to_vec(), String::new()),
@@ -10623,11 +15098,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![],
         };
         store
@@ -10651,11 +15127,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m1.clone(), b"m1".to_vec(), "one text".into()),
                     (shared.clone(), b"d".to_vec(), String::new()),
@@ -10666,11 +15143,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m2.clone(), b"m2".to_vec(), "two text".into()),
                     (shared.clone(), b"d".to_vec(), String::new()),
@@ -10685,11 +15163,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![],
         };
         store
@@ -10749,11 +15228,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m1.clone(), b"m1".to_vec(), "first half".into()),
                     (
@@ -10769,11 +15249,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m2.clone(), b"m2".to_vec(), "second half".into()),
                     (
@@ -10815,11 +15296,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (m1.clone(), b"m1".to_vec(), "batch a".into()),
                 (
@@ -10841,11 +15323,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (m2.clone(), b"m2".to_vec(), "batch b".into()),
                 (
@@ -10886,11 +15369,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m1.clone(), b"m1".to_vec(), "noop a".into()),
                     (
@@ -10906,11 +15390,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![
                     (m2.clone(), b"m2".to_vec(), "noop b".into()),
                     (
@@ -10953,11 +15438,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (m1.clone(), b"m1".to_vec(), "legacy a".into()),
                 (ses.clone(), legacy_payload, String::new()),
@@ -10975,11 +15461,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (m2.clone(), b"m2".to_vec(), "legacy b".into()),
                 (
@@ -11016,11 +15503,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), b"first projection".to_vec(), "one".into())],
             },
             SourceBatch {
@@ -11028,11 +15516,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), b"second projection".to_vec(), "two".into())],
             },
         ];
@@ -11110,11 +15599,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), old, "one".into())],
             },
             SourceBatch {
@@ -11122,11 +15612,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), new, "two".into())],
             },
         ];
@@ -11169,11 +15660,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), null_payload, "one".into())],
             },
             SourceBatch {
@@ -11181,11 +15673,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(msg.clone(), string_payload, "two".into())],
             },
         ];
@@ -11215,11 +15708,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload_with_span("ses_v1_aaa", "same body", "doc_v1_aaa", 0, 929),
@@ -11231,11 +15725,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload_with_span("ses_v1_bbb", "same body", "doc_v1_bbb", 512, 1322),
@@ -11278,11 +15773,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_aaa", "shared body"),
@@ -11294,11 +15790,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_bbb", "shared body"),
@@ -11338,11 +15835,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_aaa", "original body"),
@@ -11354,11 +15852,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_aaa", "a much longer rewritten body"),
@@ -11399,11 +15898,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_aaa", "the long body that must stay searchable"),
@@ -11415,11 +15915,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(
                     msg.clone(),
                     message_payload("ses_v1_aaa", "short body"),
@@ -11473,11 +15974,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(
                 msg.clone(),
                 message_payload("ses_v1_aaa", "stable body"),
@@ -11496,11 +15998,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(
                 msg.clone(),
                 message_payload("ses_v1_bbb", "stable body"),
@@ -11541,11 +16044,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(10),
             fingerprint: Some(fingerprint.to_string()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(a.clone(), b"payload".to_vec(), "same text".into())],
         };
         assert!(
@@ -11571,7 +16075,76 @@ mod tests {
             .unwrap();
         assert_eq!(
             fingerprints.get("fingerprint.jsonl"),
-            Some(&(Some(10), Some("bbb".to_string())))
+            Some(&(
+                Some(10),
+                Some("bbb".to_string()),
+                i64::from(PARSER_SEMANTIC_VERSION)
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_parser_version_forces_reparse_and_converges() {
+        // 借鉴 Recall 的 parser_version 增量同步：解析语义升级
+        // （PARSER_SEMANTIC_VERSION 递增）后，字节未变的源也必须 targeted
+        // backfill（重跑 parse + commit），而不是滞留旧解析结果直到手动
+        // `index rebuild` 或源文件变化。回归场景：旧库已存行版本落后、
+        // len/fingerprint 完全相同——旧逻辑判 unchanged 永不复解析。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a = sid(IdKind::Message, b"parser-version-msg");
+        let source = SourceBatch {
+            source_path: "parser-version.jsonl".into(),
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: Some(10),
+            fingerprint: Some("aaa".to_string()),
+            provider_id: None,
+            resume_claims: Vec::new(),
+            entries: vec![(a.clone(), b"payload".to_vec(), "same text".into())],
+        };
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&source))
+                .unwrap()
+        );
+        // 模拟解析语义升级后的旧库：把已存行的 parser_version 拨回旧值（0），
+        // 字节与内容均未变（len/fingerprint 相同）。
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE source_scans SET parser_version = 0
+                 WHERE source_path = 'parser-version.jsonl'",
+                [],
+            )
+            .unwrap();
+        }
+        // 版本落后 + 字节未变：必须走提交路径重写 source_scans（targeted
+        // backfill），否则重解析结果与库一致时 no-op 短路会让版本永不收敛。
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&source))
+                .unwrap(),
+            "stale parser_version must force a re-scan commit even with unchanged bytes"
+        );
+        // 版本已写回当前值 → 再次重同步是 no-op，缓存收敛（零 churn）。
+        assert!(
+            !store
+                .commit_source_batches_if_changed(std::slice::from_ref(&source))
+                .unwrap()
+        );
+        let caches = store
+            .source_fingerprints(&["parser-version.jsonl".to_string()])
+            .unwrap();
+        assert_eq!(
+            caches.get("parser-version.jsonl"),
+            Some(&(
+                Some(10),
+                Some("aaa".to_string()),
+                i64::from(PARSER_SEMANTIC_VERSION)
+            ))
         );
     }
 
@@ -11720,11 +16293,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(
                 msg.clone(),
                 message_payload("ses_v1_aaa", "old body"),
@@ -11797,11 +16371,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(
                 msg.clone(),
                 message_payload("ses_v1_aaa", "body"),
@@ -11818,11 +16393,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(
                 msg.clone(),
                 message_payload("ses_v1_bbb", "body"),
@@ -11854,11 +16430,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(shared.clone(), b"p".to_vec(), "shared text".into())],
             },
             SourceBatch {
@@ -11866,11 +16443,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(shared.clone(), b"p".to_vec(), "shared text".into())],
             },
         ];
@@ -11881,11 +16459,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: Vec::new(),
             },
             SourceBatch {
@@ -11893,11 +16472,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(shared.clone(), b"p".to_vec(), "shared text".into())],
             },
         ];
@@ -11916,11 +16496,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(moved.clone(), b"p".to_vec(), "moved text".into())],
         };
         store
@@ -11933,11 +16514,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: Vec::new(),
             },
             SourceBatch {
@@ -11945,11 +16527,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(moved.clone(), b"p".to_vec(), "moved text".into())],
             },
         ];
@@ -11984,11 +16567,12 @@ mod tests {
                     placements: Vec::new(),
                     edges: Vec::new(),
                     activities: Vec::new(),
+                    usage_events: Vec::new(),
                     relation_complete: true,
                     len_bytes: None,
                     fingerprint: None,
                     provider_id: None,
-                    resume_claim: None,
+                    resume_claims: Vec::new(),
                     entries: vec![
                         (moved.clone(), b"m".to_vec(), "moved text".into()),
                         (removed.clone(), b"r".to_vec(), "removed text".into()),
@@ -11999,11 +16583,12 @@ mod tests {
                     placements: Vec::new(),
                     edges: Vec::new(),
                     activities: Vec::new(),
+                    usage_events: Vec::new(),
                     relation_complete: true,
                     len_bytes: None,
                     fingerprint: None,
                     provider_id: None,
-                    resume_claim: None,
+                    resume_claims: Vec::new(),
                     entries: vec![(kept.clone(), b"k".to_vec(), "kept text".into())],
                 },
             ];
@@ -12015,11 +16600,12 @@ mod tests {
                     placements: Vec::new(),
                     edges: Vec::new(),
                     activities: Vec::new(),
+                    usage_events: Vec::new(),
                     relation_complete: true,
                     len_bytes: None,
                     fingerprint: None,
                     provider_id: None,
-                    resume_claim: None,
+                    resume_claims: Vec::new(),
                     entries: Vec::new(),
                 }),
                 Some(SourceBatch {
@@ -12027,11 +16613,12 @@ mod tests {
                     placements: Vec::new(),
                     edges: Vec::new(),
                     activities: Vec::new(),
+                    usage_events: Vec::new(),
                     relation_complete: true,
                     len_bytes: None,
                     fingerprint: None,
                     provider_id: None,
-                    resume_claim: None,
+                    resume_claims: Vec::new(),
                     entries: vec![(moved, b"m".to_vec(), "moved text".into())],
                 }),
                 Some(SourceBatch {
@@ -12039,11 +16626,12 @@ mod tests {
                     placements: Vec::new(),
                     edges: Vec::new(),
                     activities: Vec::new(),
+                    usage_events: Vec::new(),
                     relation_complete: true,
                     len_bytes: None,
                     fingerprint: None,
                     provider_id: None,
-                    resume_claim: None,
+                    resume_claims: Vec::new(),
                     entries: vec![(kept, b"k".to_vec(), "kept text".into())],
                 }),
             ];
@@ -12079,11 +16667,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(id.clone(), b"p".to_vec(), "will disappear".into())],
         };
         store
@@ -12094,11 +16683,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: Vec::new(),
         };
         store
@@ -12117,11 +16707,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: Vec::new(),
             },
             SourceBatch {
@@ -12129,11 +16720,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: Vec::new(),
             },
         ];
@@ -12153,11 +16745,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![
                 (id.clone(), b"p".to_vec(), "text".into()),
                 (id, b"p".to_vec(), "text".into()),
@@ -12169,7 +16762,7 @@ mod tests {
         let PortError::Backend(message) = err else {
             panic!("expected backend error");
         };
-        assert!(message.contains("duplicate message ids"));
+        assert!(message.contains("duplicate entity ids"));
         assert!(!message.contains(private_path));
     }
 
@@ -12187,11 +16780,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(reconstructed, b"p".to_vec(), "same text".into())],
             },
             SourceBatch {
@@ -12199,11 +16793,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities: Vec::new(),
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
                 entries: vec![(unstable, b"p".to_vec(), "same text".into())],
             },
         ];
@@ -12226,11 +16821,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(reconstructed, b"p".to_vec(), "same text".into())],
         };
         assert!(
@@ -12245,11 +16841,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
             entries: vec![(unstable, b"p".to_vec(), "same text".into())],
         };
         let err = store
@@ -12358,6 +16955,7 @@ mod tests {
             relation_upserts: vec![RelationUpsertManifest::Placement(message_placement)],
             ..RelationManifests::default()
         };
+        let manifest = batch_manifest(&[], &[], &relations).unwrap();
         let pending = store
             .begin_index_batch_with_relations(&[], &[], &relations)
             .unwrap();
@@ -12372,7 +16970,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .commit_index_batch_with_relations(&pending, &[], &[], &relations)
+            .commit_index_batch_with_relations(&pending, &[], &[], &relations, &manifest)
             .unwrap_err();
         assert!(
             matches!(err, PortError::Backend(message) if message.contains("does not match durable intent"))
@@ -12390,17 +16988,20 @@ mod tests {
         let relations = RelationManifests {
             source_replacements: vec![SourceReplacementManifest {
                 source_path: "manifest-source.jsonl".into(),
+                installation: None,
                 entity_memberships: Vec::new(),
                 placement_ids: Vec::new(),
                 activity_ids: Vec::new(),
+                usage_ids: Vec::new(),
                 relation_complete: true,
                 len_bytes: None,
                 fingerprint: None,
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
             }],
             ..RelationManifests::default()
         };
+        let manifest = batch_manifest(&[], &[], &relations).unwrap();
         let pending = store
             .begin_index_batch_with_relations(&[], &[], &relations)
             .unwrap();
@@ -12415,7 +17016,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .commit_index_batch_with_relations(&pending, &[], &[], &relations)
+            .commit_index_batch_with_relations(&pending, &[], &[], &relations, &manifest)
             .unwrap_err();
         assert!(
             matches!(err, PortError::Backend(message) if message.contains("does not match durable intent"))
@@ -12718,7 +17319,7 @@ mod tests {
             .unwrap();
         }
         // 新二进制打开：自动迁到 v2，数据保留，generation 从 0 起步。
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.active_generation().unwrap(), 0);
         let id = StableId::from_wire("msg_v1_legacy").unwrap();
@@ -12750,7 +17351,7 @@ mod tests {
                 .unwrap();
             assert_eq!(table_exists, 0, "v7 尚无 resume claims 表");
         }
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         // 无声明/legacy：批量解析恒不可恢复（re-sync 前）。
         let legacy = sid(IdKind::Session, b"v7-legacy-ses");
@@ -12840,7 +17441,7 @@ mod tests {
             assert!(!cols.iter().any(|c| c == "provider_id"));
         }
         // 重新打开：触发 v8→v9 迁移。
-        let store = SqliteStore::open(&p).unwrap();
+        let store = SqliteStore::open_for_write(&p).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let conn = rusqlite::Connection::open(&p).unwrap();
         let cols: Vec<String> = conn
@@ -12886,7 +17487,12 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let conn = store.conn.borrow();
-        for table in ["session_fts", "session_fts_ids"] {
+        for table in [
+            "session_fts",
+            "session_fts_ids",
+            "session_titles",
+            "session_repo_slugs",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master
@@ -12905,6 +17511,837 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(columns, vec!["session_wire", "fts_rowid"]);
+        // 标题投影（v13）：两列形状固定，读取侧按 (session_wire, title) 批量投影。
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(session_titles)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(columns, vec!["session_wire", "title"]);
+    }
+
+    // ---- 会话标题投影（schema v13）：派生链/截断/降级/增量/迁移 ----
+
+    /// 提交一个含单条 user 消息的会话（标题派生测试的种子）。
+    fn titled_session_batch(
+        tag: &[u8],
+        session_extra: Option<(&str, &str)>,
+        user_text: &str,
+    ) -> (StableId, SourceBatch) {
+        let session = sid(IdKind::Session, tag);
+        let document = sid(IdKind::Document, tag);
+        let message = sid(IdKind::Message, tag);
+        let mut session_value = serde_json::json!({ "messages": [message.as_str()] });
+        if let Some((key, value)) = session_extra {
+            session_value[key] = serde_json::json!(value);
+        }
+        let batch = SourceBatch {
+            source_path: format!("title-seed-{}.jsonl", String::from_utf8_lossy(tag)),
+            entries: vec![
+                (
+                    session.clone(),
+                    session_value.to_string().into_bytes(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+                typed_message_entry(&message, user_text),
+            ],
+            placements: vec![placement(
+                &session,
+                &document,
+                &message,
+                0,
+                false,
+                Some((0, 5)),
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        (session, batch)
+    }
+
+    #[test]
+    fn session_title_prefers_custom_then_ai_then_first_valid_user_message() {
+        // 派生优先级链（借鉴清单 #6）：custom-title（session payload `title`）
+        // > ai-title（`summary`）> 首条有效 user 消息。claude-code/codex 的
+        // Canonical payload 不带 title/summary（格式事实），实际落到第 3 候选；
+        // 字段由 provider 未来填充时自动优先。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (custom, custom_batch) = titled_session_batch(
+            b"title-custom",
+            Some(("title", "custom rename")),
+            "first user fallback",
+        );
+        let (ai, ai_batch) = titled_session_batch(
+            b"title-ai",
+            Some(("summary", "ai summary")),
+            "first user fallback",
+        );
+        let (plain, plain_batch) = titled_session_batch(b"title-plain", None, "plain first body");
+        store
+            .commit_source_batches_if_changed(&[custom_batch, ai_batch, plain_batch])
+            .unwrap();
+        let titles = store.session_titles(&[custom, ai, plain]).unwrap();
+        assert_eq!(
+            titles,
+            vec![
+                Some("custom rename".to_string()),
+                Some("ai summary".to_string()),
+                Some("plain first body".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_title_truncates_to_80_chars_on_char_boundary() {
+        // 上限（≤80 字符，char 边界）：100 个三字节汉字，截断恰好停在 80 字符
+        // 处——按字节截会 panic 或产出非法 UTF-8。custom/ai 候选同样截断。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let long_user = "界".repeat(100);
+        let (session, batch) = titled_session_batch(b"title-trunc", None, &long_user);
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let title = store
+            .session_titles(std::slice::from_ref(&session))
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("derived title");
+        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert_eq!(title, "界".repeat(SESSION_TITLE_MAX_CHARS));
+
+        let long_custom = "🏷️".repeat(100);
+        let (custom, custom_batch) = titled_session_batch(
+            b"title-trunc-custom",
+            Some(("title", &long_custom)),
+            "fallback",
+        );
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&custom_batch))
+            .unwrap();
+        let title = store
+            .session_titles(std::slice::from_ref(&custom))
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("derived title");
+        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert!(
+            long_custom.starts_with(&title),
+            "prefix kept, tail cut: {title}"
+        );
+    }
+
+    #[test]
+    fn session_title_skips_non_user_roles_and_empty_text() {
+        // 派生只认 role=user 且 text 非空的消息：assistant 与空文本用户被跳过。
+        // 注入噪声（伪 user 封套）在 provider parse 层已过滤（feat/noise-filter
+        // 的 claude/codex user-noise filter 测试守卫），catalog 中不存在——
+        // 派生链读到的第一条 user 即"噪声过滤后"的首条有效请求。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"title-skip");
+        let document = sid(IdKind::Document, b"title-skip");
+        let assistant = sid(IdKind::Message, b"title-skip-a");
+        let empty_user = sid(IdKind::Message, b"title-skip-e");
+        let real_user = sid(IdKind::Message, b"title-skip-r");
+        let role_payload = |role: &str, text: &str| {
+            serde_json::json!({
+                "role": role,
+                "text": text,
+                "timestamp": "2026-07-28T00:00:00Z",
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let session_value = serde_json::json!({
+            "messages": [
+                assistant.as_str(),
+                empty_user.as_str(),
+                real_user.as_str(),
+            ],
+        });
+        let batch = SourceBatch {
+            source_path: "title-skip-source.jsonl".into(),
+            entries: vec![
+                (
+                    session.clone(),
+                    session_value.to_string().into_bytes(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+                (
+                    assistant.clone(),
+                    role_payload("assistant", "answer"),
+                    String::new(),
+                ),
+                (empty_user.clone(), role_payload("user", ""), String::new()),
+                (
+                    real_user.clone(),
+                    role_payload("user", "real prompt"),
+                    String::new(),
+                ),
+            ],
+            placements: vec![
+                placement(&session, &document, &assistant, 0, false, Some((0, 3))),
+                placement(&session, &document, &empty_user, 1, false, Some((3, 6))),
+                placement(&session, &document, &real_user, 2, false, Some((6, 9))),
+            ],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let title = store
+            .session_titles(std::slice::from_ref(&session))
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten();
+        assert_eq!(title.as_deref(), Some("real prompt"));
+    }
+
+    #[test]
+    fn session_title_is_none_without_valid_user_message() {
+        // 派生链无候选（无 user 消息、无 placement、会话不存在）→ 无投影行，
+        // 批量读取返回 None——绝不写空标题或臆造。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"title-none");
+        let document = sid(IdKind::Document, b"title-none");
+        let assistant = sid(IdKind::Message, b"title-none-a");
+        let session_value = serde_json::json!({ "messages": [assistant.as_str()] });
+        let batch = SourceBatch {
+            source_path: "title-none-source.jsonl".into(),
+            entries: vec![
+                (
+                    session.clone(),
+                    session_value.to_string().into_bytes(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+                (
+                    assistant.clone(),
+                    serde_json::json!({ "role": "assistant", "text": "answer" })
+                        .to_string()
+                        .into_bytes(),
+                    String::new(),
+                ),
+            ],
+            placements: vec![placement(
+                &session,
+                &document,
+                &assistant,
+                0,
+                false,
+                Some((0, 3)),
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let ghost = sid(IdKind::Session, b"title-none-ghost");
+        let titles = store.session_titles(&[session, ghost]).unwrap();
+        assert_eq!(titles, vec![None, None]);
+    }
+
+    #[test]
+    fn session_title_projection_is_incremental_and_rebuildable() {
+        // 投影与 session_fts 同一重建批次：affected 提交增量重投影（更早的
+        // 新 user 消息成为新标题），rebuild_index 全量重投影得到同一派生链结果。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"title-incr");
+        let document = sid(IdKind::Document, b"title-incr");
+        let first = sid(IdKind::Message, b"title-incr-first");
+        let zeroth = sid(IdKind::Message, b"title-incr-zeroth");
+        let user_payload = |text: &str| {
+            serde_json::json!({
+                "role": "user",
+                "text": text,
+                "timestamp": "2026-07-28T00:00:00Z",
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let session_value = serde_json::json!({ "messages": [first.as_str(), zeroth.as_str()] });
+        let batch = SourceBatch {
+            source_path: "title-incr-source.jsonl".into(),
+            entries: vec![
+                (
+                    session.clone(),
+                    session_value.to_string().into_bytes(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+                (first.clone(), user_payload("first request"), String::new()),
+                (
+                    zeroth.clone(),
+                    user_payload("zeroth request"),
+                    String::new(),
+                ),
+            ],
+            placements: vec![
+                placement(&session, &document, &first, 0, false, Some((0, 3))),
+                placement(&session, &document, &zeroth, 1, false, Some((3, 6))),
+            ],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let title_of = |store: &SqliteStore| {
+            store
+                .session_titles(std::slice::from_ref(&session))
+                .unwrap()
+                .into_iter()
+                .next()
+                .flatten()
+        };
+        assert_eq!(title_of(&store).as_deref(), Some("first request"));
+        // 同 source 重扫：zeroth 提到 ordinal 0——complete-scan replace 后
+        // 派生链按新成员顺序取 "zeroth request"。
+        let moved = SourceBatch {
+            placements: vec![
+                placement(&session, &document, &zeroth, 0, false, Some((0, 3))),
+                placement(&session, &document, &first, 1, false, Some((3, 6))),
+            ],
+            ..batch
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&moved))
+            .unwrap();
+        assert_eq!(title_of(&store).as_deref(), Some("zeroth request"));
+        // 全量 rebuild：清空后按 catalog + 关系重投影，标题不变。
+        {
+            let conn = store.conn.borrow();
+            conn.execute("DELETE FROM session_titles", []).unwrap();
+        }
+        store.rebuild_index().unwrap();
+        assert_eq!(title_of(&store).as_deref(), Some("zeroth request"));
+    }
+
+    #[test]
+    fn v12_catalog_migrates_to_v13_adding_session_titles_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v12.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 12);
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'session_titles'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 0, "v12 尚无 session_titles 表");
+        }
+        // 重新打开：触发 v12→v13 迁移。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = store.conn.borrow();
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_titles'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_titles", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "v13 迁移后标题表必须为空，等待 rebuild/提交回填");
+    }
+
+    #[test]
+    fn injected_v12_to_v13_failure_rolls_back_schema_and_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+
+        let err = SqliteStore::migrate_v12_to_v13_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, PortError::Backend(message) if message.contains("injected v12-to-v13"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_titles'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 0);
+    }
+
+    #[test]
+    fn v13_catalog_migrates_to_v14_adding_parser_version_column() {
+        // 旧库迁到 v14 后 source_scans 带 parser_version 列，既有行 DEFAULT 0
+        // ——0 永不等于当前 PARSER_SEMANTIC_VERSION（≥1），因此迁移后第一次
+        // sync 自动 targeted backfill 全部已扫源，无需手动 rebuild。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v13.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO source_scans(source_path, scanned_at_ms, len_bytes, fingerprint)
+                 VALUES('legacy.jsonl', 1, 100, 'ff')",
+                [],
+            )
+            .unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 13);
+            let has_parser_version: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('source_scans')
+                     WHERE name = 'parser_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_parser_version, 0, "v13 尚无 parser_version 列");
+        }
+        // 重新打开：触发 v13→v14 迁移。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = store.conn.borrow();
+        let has_parser_version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('source_scans')
+                 WHERE name = 'parser_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_parser_version, 1);
+        let stored_version: i64 = conn
+            .query_row(
+                "SELECT parser_version FROM source_scans WHERE source_path = 'legacy.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_version, 0,
+            "迁移后旧行 parser_version 必须为 DEFAULT 0，驱动下次 sync 自动 backfill"
+        );
+    }
+
+    #[test]
+    fn injected_v13_to_v14_failure_rolls_back_schema_and_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+        SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+
+        let err = SqliteStore::migrate_v13_to_v14_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, PortError::Backend(message) if message.contains("injected v13-to-v14"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+        let has_parser_version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('source_scans')
+                 WHERE name = 'parser_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_parser_version, 0);
+    }
+
+    #[test]
+    fn v14_catalog_migrates_to_v15_adding_usage_projection() {
+        // 旧库迁到 v15 后 usage_events / usage_event_membership 表存在且为空；
+        // usage_totals 返回 Some（有投影）且 sessions == 0——覆盖标记：
+        // "有投影但零事实" 与 "无投影（None）" 必须可区分。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v14.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+            SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'usage_events'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 0, "v14 尚无 usage_events 表");
+        }
+        // 重新打开：触发 v14→v15 迁移。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = store.conn.borrow();
+        for table in ["usage_events", "usage_event_membership"] {
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 1, "{table} 必须随 v15 迁移创建");
+        }
+        let totals = store.usage_totals().unwrap();
+        assert_eq!(
+            totals.map(|t| t.sessions),
+            Some(0),
+            "有投影但零事实必须是 Some(sessions=0)，不是 None"
+        );
+    }
+
+    #[test]
+    fn injected_v14_to_v15_failure_rolls_back_schema_and_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+        SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+        SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+
+        let err = SqliteStore::migrate_v14_to_v15_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, PortError::Backend(message) if message.contains("injected v14-to-v15"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'usage_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 0);
+    }
+
+    #[test]
+    fn v15_catalog_migrates_to_v16_with_empty_repo_projection() {
+        // 旧库（停在 v15）重开：v15→v16 迁移建表；投影为空——repo_totals
+        // 返回空列表（未知 ≠ 零），由 rebuild 或后续 affected source 提交回填。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v15.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+            SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+            SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'session_repo_slugs'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 0, "v15 尚无 session_repo_slugs 表");
+        }
+        // 重新打开：触发 v15→v16 迁移。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = store.conn.borrow();
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_repo_slugs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "session_repo_slugs 必须随 v16 迁移创建");
+        drop(conn);
+        assert!(
+            store.repo_totals().unwrap().is_empty(),
+            "迁移后投影为空：空列表（未知），不是伪造的零行聚合"
+        );
+    }
+
+    #[test]
+    fn injected_v15_to_v16_failure_rolls_back_schema_and_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+        SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+        SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+        SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+
+        let err = SqliteStore::migrate_v15_to_v16_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, PortError::Backend(message) if message.contains("injected v15-to-v16"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_repo_slugs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 0);
+    }
+
+    #[test]
+    fn v16_catalog_migrates_to_v17_stamping_projection_version_honestly() {
+        // 投影**非空**的旧 v16 库：迁到 v17 后戳留在 DEFAULT 0——0 永不等于当前
+        // INDEX_PROJECTION_VERSION（≥1），因此读路径 fail-closed、写路径自动
+        // 重投影。绝不因为"迁移刚跑过"就谎报投影已收敛。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v16.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+            SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+            SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+            SqliteStore::migrate_v15_to_v16(&conn).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 16);
+            let has_column: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('store_metadata')
+                     WHERE name = 'index_projection_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_column, 0, "v16 尚无 index_projection_version 列");
+            // 旧二进制写下的投影行（内容形态无关，只要非空）。
+            conn.execute(
+                "INSERT INTO fts(id, text) VALUES('\"legacy\"', '配置 置备 备份')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = open_migration_fixture(&p);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store.index_projection_version().unwrap(),
+            0,
+            "投影非空的旧库迁移后必须留 0，驱动重投影"
+        );
+        assert!(!store.index_projection_is_current().unwrap());
+    }
+
+    #[test]
+    fn v16_catalog_with_empty_projection_migrates_to_v17_as_current() {
+        // 投影为空的旧库（含全新库）：没有任何旧变换写下的词元 → 迁移期直接
+        // 标记当前版本，第一次打开不会被判失配、不产生 rebuild churn。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v16-empty.db");
+        let p = path.to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            create_v6_schema(&conn);
+            SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+            SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+            SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+            SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+            SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+            SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+            SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+            SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+            SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+            SqliteStore::migrate_v15_to_v16(&conn).unwrap();
+        }
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert_eq!(
+            store.index_projection_version().unwrap(),
+            i64::from(INDEX_PROJECTION_VERSION)
+        );
+        assert!(store.index_projection_is_current().unwrap());
+    }
+
+    #[test]
+    fn injected_v16_to_v17_failure_rolls_back_schema_and_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_v6_schema(&conn);
+        SqliteStore::migrate_v6_to_v7(&conn).unwrap();
+        SqliteStore::migrate_v7_to_v8(&conn).unwrap();
+        SqliteStore::migrate_v8_to_v9(&conn).unwrap();
+        SqliteStore::migrate_v9_to_v10(&conn).unwrap();
+        SqliteStore::migrate_v10_to_v11(&conn).unwrap();
+        SqliteStore::migrate_v11_to_v12(&conn).unwrap();
+        SqliteStore::migrate_v12_to_v13(&conn).unwrap();
+        SqliteStore::migrate_v13_to_v14(&conn).unwrap();
+        SqliteStore::migrate_v14_to_v15(&conn).unwrap();
+        SqliteStore::migrate_v15_to_v16(&conn).unwrap();
+
+        let err = SqliteStore::migrate_v16_to_v17_inner(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, PortError::Backend(message) if message.contains("injected v16-to-v17"))
+        );
+        assert!(conn.is_autocommit());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 16);
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('store_metadata')
+                 WHERE name = 'index_projection_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 0, "回滚后加法列不得残留");
+    }
+
+    #[test]
+    fn usage_token_source_check_constraint_rejects_unknown_kinds() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.borrow();
+        let err = conn
+            .execute(
+                "INSERT INTO usage_events(
+                     usage_id, session_id, input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens, reasoning_tokens, token_source
+                 ) VALUES('use_x', 'ses_x', 1, 0, 0, 0, 0, 'estimated')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "token_source 闭集外取值必须被 CHECK 拒绝: {err}"
+        );
+    }
+
+    #[test]
+    fn fresh_schema_creates_source_scans_with_parser_version_column() {
+        // 新库 v5 建表 DDL 直接带 parser_version 列（v9 provider_id 同一模式），
+        // v14 迁移对新库短路，不再补 ALTER。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.borrow();
+        let has_parser_version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('source_scans')
+                 WHERE name = 'parser_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_parser_version, 1);
     }
 
     #[test]
@@ -12939,11 +18376,12 @@ mod tests {
             )],
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: Some(claim),
+            resume_claims: vec![claim],
         };
 
         store
@@ -13026,6 +18464,477 @@ mod tests {
         );
     }
 
+    /// 测试用确定性解析器：按 cwd 逐字查表；未列出的 cwd → None（模拟
+    /// "git 检测失败"）。解析调用次数可数（生命周期测试断言按需探测）。
+    struct MapRepoSlugResolver {
+        map: std::collections::HashMap<String, Option<String>>,
+        calls: RefCell<usize>,
+    }
+
+    impl RepoSlugResolver for MapRepoSlugResolver {
+        fn resolve(&self, cwd: &str) -> Option<String> {
+            *self.calls.borrow_mut() += 1;
+            self.map.get(cwd).and_then(|slug| slug.clone())
+        }
+    }
+
+    fn repo_slug_rows(store: &SqliteStore, session_wire: &str) -> Vec<String> {
+        let conn = store.conn.borrow();
+        let mut stmt = conn
+            .prepare("SELECT repo_slug FROM session_repo_slugs WHERE session_wire = ?1")
+            .unwrap();
+        stmt.query_map([session_wire], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn repo_claim(
+        session: &StableId,
+        native: &str,
+        cwd: Option<&str>,
+        pair_observed: bool,
+    ) -> StoredResumeClaim {
+        StoredResumeClaim {
+            session_id: session.as_str().into(),
+            provider_id: "synthetic".into(),
+            provider_session_id: Some(native.into()),
+            provider_session_id_state: "resolved".into(),
+            original_working_directory: cwd.map(str::to_string),
+            original_working_directory_state: "resolved".into(),
+            pair_observed,
+        }
+    }
+
+    /// [`StoredResumeClaim`] → [`SourceResumeClaim`]（字段同构的端口类型转换，
+    /// 仅测试装配 SourceBatch 用）。
+    fn source_repo_claim(claim: &StoredResumeClaim) -> SourceResumeClaim {
+        SourceResumeClaim {
+            provider_id: claim.provider_id.clone(),
+            session_id: claim.session_id.clone(),
+            provider_session_id: claim.provider_session_id.clone(),
+            provider_session_id_state: claim.provider_session_id_state.clone(),
+            original_working_directory: claim.original_working_directory.clone(),
+            original_working_directory_state: claim.original_working_directory_state.clone(),
+            pair_observed: claim.pair_observed,
+        }
+    }
+
+    // ---- 每参数门禁：session_repo_slug 纯函数 ----
+
+    #[test]
+    fn session_repo_slug_gates_every_claim_parameter() {
+        let resolver = MapRepoSlugResolver {
+            map: std::collections::HashMap::from([(
+                "Z:/projects/app".into(),
+                Some("github.com/o/app".into()),
+            )]),
+            calls: RefCell::new(0),
+        };
+        let base = repo_claim(
+            &sid(IdKind::Session, b"gate"),
+            "native",
+            Some("Z:/projects/app"),
+            true,
+        );
+        assert_eq!(
+            SqliteStore::session_repo_slug(&base, &resolver).as_deref(),
+            Some("github.com/o/app")
+        );
+        // provider_session_id 未 resolved → 不派生。
+        let mut claim = repo_claim(
+            &sid(IdKind::Session, b"gate"),
+            "native",
+            Some("Z:/projects/app"),
+            true,
+        );
+        claim.provider_session_id_state = "missing".into();
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+        // 未 pair 观测 → 不派生（cwd 未披露即不派生身份）。
+        let claim = repo_claim(
+            &sid(IdKind::Session, b"gate"),
+            "native",
+            Some("Z:/projects/app"),
+            false,
+        );
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+        // cwd 未 resolved → 不派生。
+        let mut claim = repo_claim(
+            &sid(IdKind::Session, b"gate"),
+            "native",
+            Some("Z:/projects/app"),
+            true,
+        );
+        claim.original_working_directory_state = "missing".into();
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+        // cwd 缺失/空 → 不派生。
+        let claim = repo_claim(&sid(IdKind::Session, b"gate"), "native", None, true);
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+        let claim = repo_claim(&sid(IdKind::Session, b"gate"), "native", Some(""), true);
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+        // 解析器检测失败 → 诚实 None，不猜。
+        let claim = repo_claim(
+            &sid(IdKind::Session, b"gate"),
+            "native",
+            Some("Z:/deleted-project"),
+            true,
+        );
+        assert_eq!(SqliteStore::session_repo_slug(&claim, &resolver), None);
+    }
+
+    // ---- 投影生命周期：随 session 重建批派生/更新/清除 ----
+
+    #[test]
+    fn repo_slug_projection_follows_session_rebuild_batch() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_repo_slug_resolver(Box::new(MapRepoSlugResolver {
+            map: std::collections::HashMap::from([(
+                "Z:/projects/app".into(),
+                Some("github.com/o/app".into()),
+            )]),
+            calls: RefCell::new(0),
+        }));
+        let session = sid(IdKind::Session, b"repo-session");
+        let document = sid(IdKind::Document, b"repo-document");
+        let message = sid(IdKind::Message, b"repo-message");
+        let batch = |claim: SourceResumeClaim| SourceBatch {
+            source_path: "repo-source.jsonl".into(),
+            entries: vec![
+                entity_entry(&session),
+                typed_document_entry(&document),
+                typed_message_entry(&message, "repo filter body"),
+            ],
+            placements: vec![placement(
+                &session,
+                &document,
+                &message,
+                0,
+                false,
+                Some((0, 5)),
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: vec![claim],
+        };
+
+        // 无投影行（默认 no-op 解析器 + 空库）：repo filter 诚实返回空。
+        let filters = SearchFilters {
+            repo: Some("github.com/o/app".into()),
+            ..SearchFilters::default()
+        };
+        assert!(
+            store
+                .query_filtered(
+                    SearchQuery {
+                        text: "repo",
+                        filters: &filters,
+                    },
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        // 首次提交：affected-session 重建派生 slug 行。
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch(source_repo_claim(
+                &repo_claim(&session, "repo-native", Some("Z:/projects/app"), true),
+            ))))
+            .unwrap();
+        assert_eq!(
+            repo_slug_rows(&store, session.as_str()),
+            vec!["github.com/o/app".to_string()]
+        );
+        let hits = store
+            .query_filtered(
+                SearchQuery {
+                    text: "repo",
+                    filters: &filters,
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, message);
+        // store 层消息命中不装配 session_id（Application 层批量装配）；
+        // 会话元数据命中因该消息已代表会话被去重（R3），无重复返回。
+        // 其它 slug 不命中。
+        let other = SearchFilters {
+            repo: Some("gitlab.com/team/other".into()),
+            ..SearchFilters::default()
+        };
+        assert!(
+            store
+                .query_filtered(
+                    SearchQuery {
+                        text: "repo",
+                        filters: &other,
+                    },
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        // 全量 rebuild：投影可重建（先清后派生）。
+        {
+            let conn = store.conn.borrow();
+            conn.execute("DELETE FROM session_repo_slugs", []).unwrap();
+        }
+        store.rebuild_index().unwrap();
+        assert_eq!(
+            repo_slug_rows(&store, session.as_str()),
+            vec!["github.com/o/app".to_string()]
+        );
+
+        // claim 被替换（仓库检测失败）：重建后无行——诚实降级。
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch(source_repo_claim(
+                &repo_claim(
+                    &session,
+                    "repo-native-two",
+                    Some("Z:/deleted-project"),
+                    true,
+                ),
+            ))))
+            .unwrap();
+        assert!(repo_slug_rows(&store, session.as_str()).is_empty());
+    }
+
+    #[test]
+    fn conflicting_claims_fail_closed_without_slug_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_repo_slug_resolver(Box::new(MapRepoSlugResolver {
+            map: std::collections::HashMap::from([
+                ("Z:/projects/app".into(), Some("github.com/o/app".into())),
+                (
+                    "Z:/projects/other".into(),
+                    Some("github.com/o/other".into()),
+                ),
+            ]),
+            calls: RefCell::new(0),
+        }));
+        let session = sid(IdKind::Session, b"conflict-session");
+        let document = sid(IdKind::Document, b"conflict-document");
+        let message = sid(IdKind::Message, b"conflict-message");
+        let claim_a = source_repo_claim(&repo_claim(
+            &session,
+            "conflict-native",
+            Some("Z:/projects/app"),
+            true,
+        ));
+        let claim_b = source_repo_claim(&repo_claim(
+            &session,
+            "conflict-native",
+            Some("Z:/projects/other"),
+            true,
+        ));
+        // 两个 source 对同一会话给出不同 cwd：冲突必须 fail closed。
+        let batch = |source_path: &str, claim: SourceResumeClaim| SourceBatch {
+            source_path: source_path.into(),
+            entries: vec![
+                entity_entry(&session),
+                typed_document_entry(&document),
+                typed_message_entry(&message, "conflict body"),
+            ],
+            placements: vec![placement(
+                &session,
+                &document,
+                &message,
+                0,
+                false,
+                Some((0, 5)),
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: vec![claim],
+        };
+        store
+            .commit_source_batches_if_changed(&[
+                batch("conflict-a.jsonl", claim_a),
+                batch("conflict-b.jsonl", claim_b),
+            ])
+            .unwrap();
+        assert!(repo_slug_rows(&store, session.as_str()).is_empty());
+    }
+
+    #[test]
+    fn repo_totals_aggregates_by_slug_with_deterministic_order() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_repo_slug_resolver(Box::new(MapRepoSlugResolver {
+            map: std::collections::HashMap::from([
+                (
+                    "Z:/projects/shared".into(),
+                    Some("github.com/o/shared".into()),
+                ),
+                ("Z:/projects/solo".into(), Some("github.com/o/solo".into())),
+            ]),
+            calls: RefCell::new(0),
+        }));
+        // 两个会话同 slug + 一个会话另一 slug：会话数降序、slug 升序。
+        let batches: Vec<SourceBatch> = ["a", "b", "c"]
+            .iter()
+            .map(|tag| {
+                let session = sid(IdKind::Session, tag.as_bytes());
+                let document = sid(IdKind::Document, tag.as_bytes());
+                let message = sid(IdKind::Message, tag.as_bytes());
+                let cwd = if *tag == "c" {
+                    "Z:/projects/solo"
+                } else {
+                    "Z:/projects/shared"
+                };
+                SourceBatch {
+                    source_path: format!("repo-{tag}.jsonl"),
+                    entries: vec![
+                        entity_entry(&session),
+                        typed_document_entry(&document),
+                        typed_message_entry(&message, "totals body"),
+                    ],
+                    placements: vec![placement(
+                        &session,
+                        &document,
+                        &message,
+                        0,
+                        false,
+                        Some((0, 5)),
+                    )],
+                    edges: Vec::new(),
+                    activities: Vec::new(),
+                    usage_events: Vec::new(),
+                    relation_complete: true,
+                    len_bytes: None,
+                    fingerprint: None,
+                    provider_id: None,
+                    resume_claims: vec![source_repo_claim(&repo_claim(
+                        &session,
+                        "totals-native",
+                        Some(cwd),
+                        true,
+                    ))],
+                }
+            })
+            .collect();
+        store.commit_source_batches_if_changed(&batches).unwrap();
+        let totals = store.repo_totals().unwrap();
+        assert_eq!(
+            totals,
+            vec![
+                RepoTotals {
+                    repo_slug: "github.com/o/shared".into(),
+                    sessions: 2,
+                },
+                RepoTotals {
+                    repo_slug: "github.com/o/solo".into(),
+                    sessions: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_totals_empty_when_no_projection_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.repo_totals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_repo_slugs_batch_read_preserves_order_and_reports_unknown_as_none() {
+        // ranking 的当前仓库偏好读的是这条投影：与入参同序、无行即 None
+        // （未知 ≠ 匹配），空入参不查库。
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.session_repo_slugs(&[]).unwrap().is_empty());
+        store.set_repo_slug_resolver(Box::new(MapRepoSlugResolver {
+            map: std::collections::HashMap::from([
+                (
+                    "Z:/projects/shared".into(),
+                    Some("github.com/o/shared".into()),
+                ),
+                ("Z:/projects/solo".into(), Some("github.com/o/solo".into())),
+            ]),
+            calls: RefCell::new(0),
+        }));
+        let batches: Vec<SourceBatch> = ["a", "b", "c"]
+            .iter()
+            .map(|tag| {
+                let session = sid(IdKind::Session, tag.as_bytes());
+                let document = sid(IdKind::Document, tag.as_bytes());
+                let message = sid(IdKind::Message, tag.as_bytes());
+                let cwd = if *tag == "c" {
+                    "Z:/projects/solo"
+                } else {
+                    "Z:/projects/shared"
+                };
+                SourceBatch {
+                    source_path: format!("slug-read-{tag}.jsonl"),
+                    entries: vec![
+                        entity_entry(&session),
+                        typed_document_entry(&document),
+                        typed_message_entry(&message, "slug read body"),
+                    ],
+                    placements: vec![placement(
+                        &session,
+                        &document,
+                        &message,
+                        0,
+                        false,
+                        Some((0, 5)),
+                    )],
+                    edges: Vec::new(),
+                    activities: Vec::new(),
+                    usage_events: Vec::new(),
+                    relation_complete: true,
+                    len_bytes: None,
+                    fingerprint: None,
+                    provider_id: None,
+                    resume_claims: vec![source_repo_claim(&repo_claim(
+                        &session,
+                        "slug-read-native",
+                        Some(cwd),
+                        true,
+                    ))],
+                }
+            })
+            .collect();
+        store.commit_source_batches_if_changed(&batches).unwrap();
+
+        let shared = sid(IdKind::Session, b"a");
+        let also_shared = sid(IdKind::Session, b"b");
+        let solo = sid(IdKind::Session, b"c");
+        let unknown = sid(IdKind::Session, b"missing");
+        // 顺序、重复 id 与"无投影行"三件事一起钉住。
+        let slugs = store
+            .session_repo_slugs(&[
+                solo.clone(),
+                unknown.clone(),
+                shared.clone(),
+                also_shared,
+                shared,
+            ])
+            .unwrap();
+        assert_eq!(
+            slugs,
+            vec![
+                Some("github.com/o/solo".to_string()),
+                None,
+                Some("github.com/o/shared".to_string()),
+                Some("github.com/o/shared".to_string()),
+                Some("github.com/o/shared".to_string()),
+            ]
+        );
+        // 未派生 repo 身份的会话恒 None，绝不回落成任意 slug。
+        assert_eq!(store.session_repo_slugs(&[unknown]).unwrap(), vec![None]);
+    }
+
     #[test]
     fn metadata_search_indexes_claim_without_user_message_or_placement() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -13045,11 +18954,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: Some(claim),
+            resume_claims: vec![claim],
         };
 
         store
@@ -13091,11 +19001,12 @@ mod tests {
             placements: vec![placement(&session, &document, &message, 0, false, None)],
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim: Some(claim(native)),
+            resume_claims: vec![claim(native)],
         };
         store
             .commit_source_batches_if_changed(&[
@@ -13146,11 +19057,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(7),
             fingerprint: Some("fp-claude".into()),
             provider_id: Some("claude-code".into()),
-            resume_claim: Some(SourceResumeClaim {
+            resume_claims: vec![SourceResumeClaim {
                 provider_id: "claude-code".into(),
                 session_id: ses.as_str().to_string(),
                 provider_session_id: Some("claude-native".into()),
@@ -13158,7 +19070,7 @@ mod tests {
                 original_working_directory: None,
                 original_working_directory_state: "missing".into(),
                 pair_observed: false,
-            }),
+            }],
         };
         let codex_batch = SourceBatch {
             source_path: codex_path.into(),
@@ -13169,11 +19081,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(6),
             fingerprint: Some("fp-codex".into()),
             provider_id: Some("codex".into()),
-            resume_claim: Some(SourceResumeClaim {
+            resume_claims: vec![SourceResumeClaim {
                 provider_id: "codex".into(),
                 session_id: ses.as_str().to_string(),
                 provider_session_id: Some("codex-native".into()),
@@ -13181,7 +19094,7 @@ mod tests {
                 original_working_directory: None,
                 original_working_directory_state: "missing".into(),
                 pair_observed: false,
-            }),
+            }],
         };
         store
             .commit_source_batches_if_changed(&[claude_batch, codex_batch])
@@ -13213,11 +19126,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(7),
             fingerprint: Some("backfill-fp".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         assert!(
             store
@@ -13267,11 +19181,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(7),
             fingerprint: Some("backfill-fp".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         store
             .commit_source_batches_if_changed(std::slice::from_ref(&batch))
@@ -13300,11 +19215,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(7),
             fingerprint: Some("recovery-fp".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         store
             .commit_source_batches_if_changed(std::slice::from_ref(&batch))
@@ -13328,11 +19244,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: false,
             len_bytes: Some(7),
             fingerprint: Some("recovery-incomplete-fp".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         store
             .commit_source_batches_if_changed(std::slice::from_ref(&batch))
@@ -13365,11 +19282,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: None,
             fingerprint: None,
             provider_id: None,
-            resume_claim,
+            resume_claims: resume_claim.into_iter().collect(),
             entries,
         };
         let populated = batch(
@@ -13390,7 +19308,10 @@ mod tests {
             let conn = store.conn.borrow();
             assert_eq!(
                 stored_resume_claim(&conn, "resume.jsonl").unwrap(),
-                Some(StoredResumeClaim::from_claim(&claim("native-1"))),
+                BTreeMap::from([(
+                    ses.as_str().to_string(),
+                    StoredResumeClaim::from_claim(&claim("native-1"))
+                )]),
             );
         }
         // 同一批次重提交（声明未变）：内容级 no-op，不推进 generation。
@@ -13419,7 +19340,10 @@ mod tests {
             let conn = store.conn.borrow();
             assert_eq!(
                 stored_resume_claim(&conn, "resume.jsonl").unwrap(),
-                Some(StoredResumeClaim::from_claim(&claim("native-2"))),
+                BTreeMap::from([(
+                    ses.as_str().to_string(),
+                    StoredResumeClaim::from_claim(&claim("native-2"))
+                )]),
             );
         }
 
@@ -13435,7 +19359,10 @@ mod tests {
         );
         {
             let conn = store.conn.borrow();
-            assert_eq!(stored_resume_claim(&conn, "resume.jsonl").unwrap(), None);
+            assert_eq!(
+                stored_resume_claim(&conn, "resume.jsonl").unwrap(),
+                BTreeMap::new()
+            );
         }
 
         // source 移除（空 scan）：声明随 tombstone 同事务清除。
@@ -13458,7 +19385,10 @@ mod tests {
         );
         {
             let conn = store.conn.borrow();
-            assert_eq!(stored_resume_claim(&conn, "resume.jsonl").unwrap(), None);
+            assert_eq!(
+                stored_resume_claim(&conn, "resume.jsonl").unwrap(),
+                BTreeMap::new()
+            );
         }
         assert_eq!(store.count().unwrap(), 0);
     }
@@ -13747,11 +19677,12 @@ mod tests {
                     },
                 },
             }],
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(1),
             fingerprint: Some(source_path.into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         }
     }
 
@@ -13843,6 +19774,43 @@ mod tests {
     }
 
     #[test]
+    fn repeated_identical_activity_in_one_source_dedupes_instead_of_failing() {
+        // 真实 transcript 回归：一条消息里两次完全相同的工具调用（同
+        // kind/actor/name/target/status，例如连续读同一文件，或长 target 截断后
+        // 相同）派生同一内容寻址 id。这是同一检索面事实的重复观察，必须按 id
+        // 去重；此前批校验把它当作 duplicate activity ids 拒绝，导致整批 sync
+        // 以 catalog_error（exit 6）失败。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = sid(IdKind::Message, b"activity-dup");
+        let mut source = tool_activity_batch(
+            "dup.jsonl",
+            &message,
+            "Read",
+            "file",
+            Some("src/lib.rs"),
+            "success",
+        );
+        let repeated = source.activities[0].clone();
+        source.activities.push(repeated);
+        assert!(store.commit_source_batches_if_changed(&[source]).unwrap());
+        let rows = activity_rows(&store);
+        assert_eq!(rows.len(), 1, "重复观察折叠为一行");
+        assert_eq!(rows[0].3, "Read");
+        assert_eq!(rows[0].4.as_deref(), Some("src/lib.rs"));
+        // claim 也只有一条：activity_ids 由去重后的集合派生。
+        let claims: i64 = store
+            .conn
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM tool_activity_membership WHERE source_path = 'dup.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 1);
+    }
+
+    #[test]
     fn activity_target_is_bounded_before_storage() {
         let store = SqliteStore::open_in_memory().unwrap();
         let message = sid(IdKind::Message, b"activity-bound");
@@ -13874,11 +19842,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities,
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: Some(1),
                 fingerprint: Some("rescan-fp".into()),
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
             }
         };
         let activity = |message_id: &StableId, name: &str| SourceActivity {
@@ -13925,11 +19894,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities,
+                usage_events: Vec::new(),
                 relation_complete: complete,
                 len_bytes: Some(1),
                 fingerprint: Some("inc-fp".into()),
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
             }
         };
         let activity = |message_id: &StableId, name: &str| SourceActivity {
@@ -14000,11 +19970,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(0),
             fingerprint: Some("empty-a".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         assert!(store.commit_source_batches_if_changed(&[empty]).unwrap());
         assert_eq!(activity_rows(&store).len(), 1);
@@ -14016,11 +19987,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(0),
             fingerprint: Some("empty-b".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         assert!(store.commit_source_batches_if_changed(&[empty_b]).unwrap());
         assert!(activity_rows(&store).is_empty());
@@ -14116,11 +20088,12 @@ mod tests {
             placements: Vec::new(),
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(0),
             fingerprint: Some("empty".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         assert!(store.commit_source_batches_if_changed(&[empty]).unwrap());
         assert!(store.get(&message).unwrap().is_none(), "消息随 source 退役");
@@ -14385,11 +20358,12 @@ mod tests {
                 placements: Vec::new(),
                 edges: Vec::new(),
                 activities,
+                usage_events: Vec::new(),
                 relation_complete: true,
                 len_bytes: Some(1),
                 fingerprint: Some("facet-two-fp".into()),
                 provider_id: None,
-                resume_claim: None,
+                resume_claims: Vec::new(),
             }
         };
         let activity = |message_id: &StableId, kind: ToolActivityKind, name: &str| SourceActivity {
@@ -14493,11 +20467,12 @@ mod tests {
             placements: vec![main_placement, side_placement],
             edges: Vec::new(),
             activities: Vec::new(),
+            usage_events: Vec::new(),
             relation_complete: true,
             len_bytes: Some(1),
             fingerprint: Some("facet-sidechain-fp".into()),
             provider_id: None,
-            resume_claim: None,
+            resume_claims: Vec::new(),
         };
         store.commit_source_batches_if_changed(&[source]).unwrap();
 
@@ -14551,6 +20526,22 @@ mod tests {
                      active_generation INTEGER NOT NULL
                  );
                  INSERT INTO store_metadata(singleton, active_generation) VALUES(1, 3);
+                 CREATE TABLE index_batches (
+                     operation_id TEXT PRIMARY KEY,
+                     base_generation INTEGER NOT NULL,
+                     target_generation INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     operation_digest TEXT NOT NULL,
+                     upsert_ids_json TEXT NOT NULL,
+                     delete_ids_json TEXT NOT NULL,
+                     relation_upserts_json TEXT NOT NULL DEFAULT '[]',
+                     relation_deletes_json TEXT NOT NULL DEFAULT '[]',
+                     source_replacements_json TEXT NOT NULL DEFAULT '[]',
+                     durable_point TEXT NOT NULL,
+                     created_at_ms INTEGER NOT NULL,
+                     committed_at_ms INTEGER,
+                     error_code TEXT
+                 );
                  CREATE TABLE fts_ids (wire_id TEXT PRIMARY KEY, id_json TEXT NOT NULL UNIQUE);
                  CREATE TABLE source_membership (
                      source_path TEXT NOT NULL,
@@ -14568,7 +20559,7 @@ mod tests {
             )
             .unwrap();
         }
-        let store = SqliteStore::open(&p).unwrap();
+        let store = open_migration_fixture(&p);
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.active_generation().unwrap(), 3);
         // 活动表已建好且可写（直接 SQL 写入验证，不依赖完整 v7 关系提交路径）。
@@ -14585,5 +20576,636 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         drop(conn);
+    }
+
+    // ---- token 用量事件（v15）：提交/去重/tombstone/聚合/孤儿 ----
+
+    fn usage_obs(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: u64,
+        source: TokenSource,
+    ) -> UsageObservation {
+        UsageObservation {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: reasoning,
+            token_source: source,
+        }
+    }
+
+    fn usage_batch(
+        source_path: &str,
+        session_id: &StableId,
+        entries: Vec<(StableId, Vec<u8>, String)>,
+        message_id: Option<&StableId>,
+        usage: UsageObservation,
+    ) -> SourceBatch {
+        SourceBatch {
+            source_path: source_path.into(),
+            entries,
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: vec![SourceUsage {
+                session_id: session_id.clone(),
+                message_id: message_id.cloned(),
+                usage,
+            }],
+            relation_complete: true,
+            len_bytes: Some(1),
+            fingerprint: Some(source_path.into()),
+            provider_id: None,
+            resume_claims: Vec::new(),
+        }
+    }
+
+    struct UsageRow {
+        session_id: String,
+        message_id: Option<String>,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+        token_source: String,
+    }
+
+    fn usage_rows(store: &SqliteStore) -> Vec<UsageRow> {
+        store
+            .conn
+            .borrow()
+            .prepare(
+                "SELECT session_id, message_id, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, reasoning_tokens, token_source
+                 FROM usage_events ORDER BY usage_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok(UsageRow {
+                    session_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    input: row.get(2)?,
+                    output: row.get(3)?,
+                    cache_read: row.get(4)?,
+                    cache_write: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    token_source: row.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn commit_usage_events_stores_anchored_and_session_scoped_rows() {
+        // 消息锚定事件（Claude Code message.usage 形态）与 session 级事件
+        // （Codex token_count 形态，message_id NULL）同表共存；五桶逐列。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"usage-session");
+        let message = sid(IdKind::Message, b"usage-message");
+        let entries = vec![entity_entry(&session), entity_entry(&message)];
+        let anchored = usage_batch(
+            "claude.jsonl",
+            &session,
+            entries.clone(),
+            Some(&message),
+            usage_obs(100, 50, 30, 20, 0, TokenSource::Observed),
+        );
+        let session_scoped = usage_batch(
+            "codex.jsonl",
+            &session,
+            entries,
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(&[anchored, session_scoped])
+                .unwrap()
+        );
+
+        let rows = usage_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.session_id == session.as_str()
+                && row.message_id.as_deref() == Some(message.as_str())
+                && row.input == 100
+                && row.output == 50
+                && row.cache_read == 30
+                && row.cache_write == 20
+                && row.reasoning == 0
+                && row.token_source == "observed"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.session_id == session.as_str()
+                && row.message_id.is_none()
+                && row.input == 8
+                && row.reasoning == 1
+                && row.token_source == "derived"
+        }));
+
+        // 聚合：会话数 1，五桶求和，事件按来源分列。
+        let totals = store.usage_totals().unwrap().expect("v15 投影必须存在");
+        assert_eq!(totals.sessions, 1);
+        assert_eq!(totals.input_tokens, 108);
+        assert_eq!(totals.output_tokens, 53);
+        assert_eq!(totals.cache_read_tokens, 32);
+        assert_eq!(totals.cache_write_tokens, 20);
+        assert_eq!(totals.reasoning_tokens, 1);
+        assert_eq!(totals.observed_events, 1);
+        assert_eq!(totals.derived_events, 1);
+    }
+
+    #[test]
+    fn commit_usage_events_dedupes_across_sources() {
+        // 同一事实跨两个源（副本文件）：内容寻址 id 去重为一行，claims 计数 2。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"usage-dedup-session");
+        let entries = vec![entity_entry(&session)];
+        let first = usage_batch(
+            "copy-a.jsonl",
+            &session,
+            entries.clone(),
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        let second = usage_batch(
+            "copy-b.jsonl",
+            &session,
+            entries,
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(&[first, second])
+                .unwrap()
+        );
+        assert_eq!(usage_rows(&store).len(), 1, "跨源副本必须去重为一行");
+        let claims: i64 = store
+            .conn
+            .borrow()
+            .query_row("SELECT COUNT(*) FROM usage_event_membership", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(claims, 2);
+    }
+
+    #[test]
+    fn commit_usage_events_noop_resync_reports_unchanged() {
+        // 同批重放：usage 投影参与 no-op 判定，返回 false 且不推进 generation。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"usage-noop-session");
+        let entries = vec![entity_entry(&session)];
+        let batch = usage_batch(
+            "noop.jsonl",
+            &session,
+            entries,
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+                .unwrap()
+        );
+        let generation = store.active_generation().unwrap();
+        assert!(
+            !store.commit_source_batches_if_changed(&[batch]).unwrap(),
+            "字节未变的源必须 no-op"
+        );
+        assert_eq!(store.active_generation().unwrap(), generation);
+        assert_eq!(usage_rows(&store).len(), 1);
+    }
+
+    #[test]
+    fn commit_usage_events_tombstones_when_source_rescan_drops_them() {
+        // 完整重扫不再观察该用量事件 → claim 移除 → 无其它 claimer → 行删除。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"usage-tomb-session");
+        let entries = vec![entity_entry(&session)];
+        let with_usage = usage_batch(
+            "tomb.jsonl",
+            &session,
+            entries.clone(),
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(&[with_usage])
+                .unwrap()
+        );
+        assert_eq!(usage_rows(&store).len(), 1);
+
+        let without_usage = SourceBatch {
+            source_path: "tomb.jsonl".into(),
+            entries,
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: Some(2),
+            fingerprint: Some("tomb.jsonl-v2".into()),
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        assert!(
+            store
+                .commit_source_batches_if_changed(&[without_usage])
+                .unwrap()
+        );
+        assert!(usage_rows(&store).is_empty(), "无 claimer 的事件行必须退役");
+        let totals = store.usage_totals().unwrap().expect("投影仍在");
+        assert_eq!(totals.sessions, 0, "退役后回到零事实（未知 ≠ 零行）");
+    }
+
+    #[test]
+    fn commit_usage_events_rejects_wrong_kind_anchors() {
+        // 会话锚点必须是 Session 种类、消息锚点必须是 Message 种类——fail-closed。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = sid(IdKind::Message, b"usage-bad-anchor");
+        let batch = usage_batch(
+            "bad-anchor.jsonl",
+            &message, // 错误：不是 Session 种类
+            vec![entity_entry(&message)],
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        let err = store
+            .commit_source_batches_if_changed(&[batch])
+            .unwrap_err();
+        assert!(
+            matches!(&err, PortError::Backend(message) if message.contains("wrong kind")),
+            "got {err:?}"
+        );
+
+        let session = sid(IdKind::Session, b"usage-bad-message-anchor");
+        let batch = usage_batch(
+            "bad-anchor-2.jsonl",
+            &session,
+            vec![entity_entry(&session)],
+            Some(&session), // 错误：消息锚点是 Session 种类
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        let err = store
+            .commit_source_batches_if_changed(&[batch])
+            .unwrap_err();
+        assert!(
+            matches!(&err, PortError::Backend(message) if message.contains("wrong kind")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn orphaned_usage_counts_and_purge_remove_drift_rows() {
+        // 会话退役后的漂移残余：孤儿事件行（无 catalog 会话）+ 悬空 claim；
+        // `index purge-activities` 同事务清理，绝不触碰仍锚定的合法行。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"usage-orphan-session");
+        let entries = vec![entity_entry(&session)];
+        let batch = usage_batch(
+            "orphan.jsonl",
+            &session,
+            entries,
+            None,
+            usage_obs(8, 3, 2, 0, 1, TokenSource::Derived),
+        );
+        assert!(store.commit_source_batches_if_changed(&[batch]).unwrap());
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "INSERT INTO usage_events(
+                     usage_id, session_id, input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens, reasoning_tokens, token_source
+                 ) VALUES('use_v1_orphan', 'ses_v1_deadbeefdeadbeef', 1, 1, 0, 0, 0, 'derived')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_event_membership(source_path, usage_id)
+                 VALUES('ghost.jsonl', 'use_v1_ghostclaim')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.orphaned_usage_counts().unwrap(), (1, 1));
+
+        let (removed_activities, removed_memberships) = store.purge_orphaned_activities().unwrap();
+        assert_eq!((removed_activities, removed_memberships), (0, 0));
+        assert_eq!(
+            store.orphaned_usage_counts().unwrap(),
+            (0, 0),
+            "修剪后 usage 孤儿行清零"
+        );
+        // 合法行不受影响。
+        assert_eq!(usage_rows(&store).len(), 1);
+        let totals = store.usage_totals().unwrap().unwrap();
+        assert_eq!(totals.sessions, 1);
+        assert_eq!(totals.input_tokens, 8);
+    }
+
+    #[test]
+    fn unchanged_batch_with_container_entities_takes_the_fast_current_path() {
+        // 回归：`sources_are_current` 曾对**全部** entries 比较 fts 正文，而
+        // session/document 容器实体按设计没有 fts 行（见 batch_upsert_fts_in_tx）
+        // → 每个真实 ingest 批次（必含 session + document）都被判 not-current，
+        // O(batch) 快路径永远不生效，未变源的重同步退化为加载全库
+        // membership/placements/activities/usage。内容级 no-op 仍由
+        // source_batches_are_current 兜住，缺陷不改变结果、只静默改变成本，
+        // 因此必须直接锚定快路径本身。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"fast-ses");
+        let document = sid(IdKind::Document, b"fast-doc");
+        let message = sid(IdKind::Message, b"fast-msg");
+        let placements = vec![placement(
+            &session,
+            &document,
+            &message,
+            0,
+            false,
+            Some((0, 4)),
+        )];
+        let batch = source_batch(
+            "fast.jsonl",
+            vec![
+                entity_entry(&session),
+                typed_document_entry(&document),
+                typed_message_entry(&message, "fast path body"),
+            ],
+            placements.clone(),
+            Vec::new(),
+            true,
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+                .unwrap()
+        );
+
+        // 第二次扫描：未变字节重解析得到 store 已持有的规范 payload（生产
+        // payload 已带由 v7 关系派生的上下文别名，与 regenerate 后的字节一致）。
+        let rescan_entries: Vec<(StableId, Vec<u8>, String)> = batch
+            .entries
+            .iter()
+            .map(|(id, _, text)| (id.clone(), store.get(id).unwrap().unwrap(), text.clone()))
+            .collect();
+        let rescan = source_batch(
+            "fast.jsonl",
+            rescan_entries,
+            placements.clone(),
+            Vec::new(),
+            true,
+        );
+        assert!(
+            store.sources_are_current(&[&rescan]).unwrap(),
+            "未变化批次必须被快路径识别"
+        );
+        assert!(
+            !store
+                .commit_source_batches_if_changed(std::slice::from_ref(&rescan))
+                .unwrap()
+        );
+
+        // 判定不是恒 true：消息正文变化必须离开快路径。
+        let mut edited = rescan.clone();
+        for entry in &mut edited.entries {
+            if entry.0.kind() == IdKind::Message {
+                entry.2 = "fast path body edited".into();
+            }
+        }
+        assert!(!store.sources_are_current(&[&edited]).unwrap());
+    }
+
+    #[test]
+    fn non_json_catalog_payload_does_not_error_json_projected_reads() {
+        // 回归：catalog 里合法存在非 JSON payload——生产命令
+        // `index <fact> <text>`（cli `index_one` → `commit_batch`）把裸文本
+        // 直接写进 catalog，切片期的旧行同样如此。三处读路径当时缺
+        // `json_valid` 门（message_facts_for 的 role、query_filtered /
+        // query_faceted 的 provider+时间谓词、latest_activity_ymd 的
+        // timestamp），SQLite 的 json_extract 对非 JSON 输入**报错**而非返回
+        // NULL，于是"库里存在一条裸文本消息"就让每一次带时间过滤的搜索整体
+        // 失败为 Backend("malformed JSON")。修复后非 JSON payload 一律折叠成
+        // NULL（诚实排除），合法 JSON 行照常参与。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"nonjson-ses");
+        let document = sid(IdKind::Document, b"nonjson-doc");
+        let bare_member = sid(IdKind::Message, b"nonjson-msg");
+        let json_member = sid(IdKind::Message, b"nonjson-json-msg");
+        let batch = source_batch(
+            "nonjson.jsonl",
+            vec![
+                entity_entry(&session),
+                typed_document_entry(&document),
+                (
+                    bare_member.clone(),
+                    b"bare legacy text".to_vec(),
+                    "bareword".into(),
+                ),
+                typed_message_entry(&json_member, "jsonword"),
+            ],
+            vec![
+                placement(&session, &document, &bare_member, 0, false, Some((0, 4))),
+                placement(&session, &document, &json_member, 1, false, Some((0, 4))),
+            ],
+            Vec::new(),
+            true,
+        );
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+                .unwrap()
+        );
+        // `index_one` 形状：裸文本消息，无 placement，但仍进 fts。
+        let lonely = sid(IdKind::Message, b"nonjson-bare");
+        store
+            .commit_batch(&[(
+                lonely.clone(),
+                b"lonely bare body".to_vec(),
+                "lonelyword".into(),
+            )])
+            .unwrap();
+
+        // 会话最近活动：只认可解析的 timestamp，裸文本行诚实缺席而不报错。
+        let latest = store
+            .latest_activity_ymd_for_sessions(std::slice::from_ref(&session))
+            .unwrap();
+        assert_eq!(
+            latest.get(session.as_str()).map(String::as_str),
+            Some("2026-07-28")
+        );
+
+        // role 事实：非 JSON payload → 'unknown'，不报错。
+        let facts = store
+            .message_facts_for(&[bare_member.clone(), json_member.clone()])
+            .unwrap();
+        let bare_role = facts
+            .iter()
+            .find(|(id, _, _)| id == bare_member.as_str())
+            .map(|(_, role, _)| role.as_str());
+        assert_eq!(bare_role, Some("unknown"));
+        let json_role = facts
+            .iter()
+            .find(|(id, _, _)| id == json_member.as_str())
+            .map(|(_, role, _)| role.as_str());
+        assert_eq!(json_role, Some("user"));
+
+        // 时间过滤：裸文本行既不报错也不被谎报为命中；合法 JSON 行照常命中。
+        let filters = SearchFilters {
+            since: Some(agent_session_grep_ports::SearchInstant::from_unix_millis(0)),
+            ..SearchFilters::default()
+        };
+        for (text, expected) in [
+            ("bareword", None),
+            ("lonelyword", None),
+            ("jsonword", Some(json_member.as_str().to_string())),
+        ] {
+            let hits = store
+                .query_filtered(
+                    SearchQuery {
+                        text,
+                        filters: &filters,
+                    },
+                    10,
+                )
+                .unwrap();
+            let ids: Vec<String> = hits.iter().map(|hit| hit.id.as_str().to_string()).collect();
+            match expected {
+                Some(id) => assert_eq!(ids, vec![id], "query {text:?}"),
+                None => assert!(ids.is_empty(), "query {text:?} -> {ids:?}"),
+            }
+        }
+        // facet 路径同一门。
+        let faceted = store
+            .query_faceted(
+                SearchQuery {
+                    text: "bareword",
+                    filters: &filters,
+                },
+                10,
+                &SearchFacets {
+                    sidechain: SidechainFacet::MainOnly,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(faceted.is_empty());
+    }
+
+    /// 生成本测试用的 repo-slug 解析器（`Z:/projects/app` → 三段 slug）。
+    fn app_repo_resolver() -> Box<dyn RepoSlugResolver> {
+        Box::new(MapRepoSlugResolver {
+            map: std::collections::HashMap::from([(
+                "Z:/projects/app".into(),
+                Some("github.com/o/app".into()),
+            )]),
+            calls: RefCell::new(0),
+        })
+    }
+
+    #[test]
+    fn write_open_self_heal_keeps_the_repo_identity_projection() {
+        // 回归：`open_for_write` 在返回之前就跑投影版本自愈
+        // （ensure_index_projection_current → 整库重投影），而重投影当时无条件
+        // `DELETE FROM session_repo_slugs` + 按注入的解析器重派生。解析器只能
+        // 在 open 返回之后注入（CLI 正是那么做的），因此自愈时它仍是 Noop：
+        // repo 投影被整表删空，同时 index_projection_version 被盖成当前——
+        // `search --repo` 从此恒 0 命中、`status` 恒无仓库，且再没有任何信号
+        // 会报告这次丢失。git 不在 PATH 时即使先注入真实解析器也一样删空。
+        // 修复：repo 身份投影不可从 catalog 重建，自愈路径保留既有行
+        // （RepoIdentityRebuild::Preserve）；重派生只属于显式 `index rebuild`。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repo-heal.db");
+        let p = path.to_string_lossy().into_owned();
+        let session = sid(IdKind::Session, b"heal-repo-ses");
+        let document = sid(IdKind::Document, b"heal-repo-doc");
+        let message = sid(IdKind::Message, b"heal-repo-msg");
+        let orphan_session = sid(IdKind::Session, b"heal-repo-orphan");
+        {
+            let store = SqliteStore::open_for_write(&p).unwrap();
+            store.set_repo_slug_resolver(app_repo_resolver());
+            let batch = SourceBatch {
+                source_path: "heal-repo.jsonl".into(),
+                entries: vec![
+                    entity_entry(&session),
+                    typed_document_entry(&document),
+                    typed_message_entry(&message, "今天把配置备份到了新目录"),
+                ],
+                placements: vec![placement(
+                    &session,
+                    &document,
+                    &message,
+                    0,
+                    false,
+                    Some((0, 4)),
+                )],
+                edges: Vec::new(),
+                activities: Vec::new(),
+                usage_events: Vec::new(),
+                relation_complete: true,
+                len_bytes: None,
+                fingerprint: None,
+                provider_id: None,
+                resume_claims: vec![source_repo_claim(&repo_claim(
+                    &session,
+                    "heal-native",
+                    Some("Z:/projects/app"),
+                    true,
+                ))],
+            };
+            assert!(
+                store
+                    .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+                    .unwrap()
+            );
+            assert_eq!(
+                repo_slug_rows(&store, session.as_str()),
+                vec!["github.com/o/app".to_string()]
+            );
+            {
+                let conn = store.conn.borrow();
+                conn.execute(
+                    "INSERT INTO session_repo_slugs(session_wire, repo_slug)
+                     VALUES(?1, ?2)",
+                    rusqlite::params![orphan_session.as_str(), "github.com/o/orphan"],
+                )
+                .unwrap();
+            }
+            downgrade_projection_to_legacy_bigrams(&store);
+        }
+        // 重开写路径（CLI 顺序：先 open，解析器随后注入）：自愈跑在注入之前，
+        // repo 投影必须原样留存。
+        let store = SqliteStore::open_for_write(&p).unwrap();
+        assert!(store.index_projection_is_current().unwrap());
+        assert_eq!(
+            repo_slug_rows(&store, session.as_str()),
+            vec!["github.com/o/app".to_string()],
+            "自愈重投影后 repo 身份投影必须仍在"
+        );
+        assert!(
+            repo_slug_rows(&store, orphan_session.as_str()).is_empty(),
+            "自愈必须清理 catalog 已不存在的 repo slug 孤儿"
+        );
+        // 词元流也确实收敛了（自愈本身仍然生效，不是被整体跳过）。
+        assert_eq!(store.query("配置备份", 10).unwrap().len(), 1);
+        assert_eq!(store.query("配", 10).unwrap().len(), 1);
+        // 显式 rebuild 仍然重派生（解析器缺席 ⇒ 诚实降级为无行），语义未被削弱。
+        store.rebuild_index().unwrap();
+        assert!(repo_slug_rows(&store, session.as_str()).is_empty());
+        store.set_repo_slug_resolver(app_repo_resolver());
+        store.rebuild_index().unwrap();
+        assert_eq!(
+            repo_slug_rows(&store, session.as_str()),
+            vec!["github.com/o/app".to_string()]
+        );
     }
 }

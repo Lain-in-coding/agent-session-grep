@@ -22,8 +22,8 @@ adapted carry the following attributions:
 
 | Source project | License | Used for | Classification |
 |---|---|---|---|
-| ctx (ctxrs) | Apache-2.0 | WAL PRAGMA group, doctor integrity_check; CJK bigram tokenization (adapted); hybrid RRF k=60 reference (adapted) | direct-copy / adapt |
-| agf | MIT | bounded reader (read_head_tail / char_prefix); shell quoting / PowerShell wrapper | direct-copy |
+| ctx (ctxrs) | Apache-2.0 | WAL PRAGMA group (adapted); CJK bigram tokenization (adapted); hybrid RRF k=60 reference (adapted) | adapt |
+| agf | MIT | bounded-reader and shell-quoting approach (idea-only; no upstream code present in this tree) | idea-only |
 | sessiongrep | Apache-2.0 | two-stage retrieval shape: FTS recall of bm25-ranked candidates, then rerank in Rust (adapted) | adapt |
 | Recall (samzong) | MIT | tool-activity target priority chain (adapted); Candle E5 embedding pipeline shape (adapted: BertModel + mean pooling + L2 + query:/passage: prefixes) | adapt |
 | fast-resume | MIT | jsonl_health source classification (adapted, retains upstream copyright line in code); opencode schema queries; pi/grok/kimi extraction approach | adapt |
@@ -32,14 +32,14 @@ adapted carry the following attributions:
 | agentsview | MIT | aider line-prefix role reconstruction | adapt |
 | claude-historian-mcp | MIT | codex/claude prefilter (skip non-dialogue records) | adapt |
 | AgentRecall | MIT | codebuddy idea-level filter; agent-sessions index-time redaction idea | adapt / idea-only |
+| Contributor Covenant | CC BY 4.0 | `CODE_OF_CONDUCT.md` text (adapted, v2.1) | adapt |
 
 Where upstream code comments carry a specific copyright line (for example the
-fast-resume adaptation in `crates/agent-session-grep-cli/src/main.rs`), that
+fast-resume adaptation in `crates/agent-session-grep-cli/src/lib.rs`), that
 line is retained in the source file.
 
 `coding_agent_session_search` (cass) is referenced idea-only under a
-clean-room boundary because its LICENSE contains a restricted-party rider; no
-cass source is copied or read by implementers (see REUSE-LICENSE-AUDIT §2).
+clean-room boundary because its LICENSE contains a restricted-party rider; no cass source or fixture is copied into this project (see REUSE-LICENSE-AUDIT §2).
 
 ## Optional semantic model weights
 
@@ -66,5 +66,5 @@ tool itself; operators import a verified local bundle with
 | blake3 | CC0-1.0 OR Apache-2.0 | hashing |
 | ratatui / crossterm | MIT | TUI |
 
-The full resolved graph with per-package declared licenses ships in every
-release archive as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`.
+The full resolved graph with declared licenses ships in binary bundles produced by this packaging workflow
+as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`, not in GitHub-generated source archives.

@@ -1,0 +1,589 @@
+name: governance
+
+"on":
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      base: ${{ steps.resolve.outputs.base }}
+      head: ${{ steps.resolve.outputs.head }}
+      repository_id: ${{ steps.resolve.outputs.repository_id }}
+      event: ${{ steps.resolve.outputs.event }}
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+      - name: Resolve event data before any checkout
+        id: resolve
+        shell: python {0}
+        env:
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          def commit_id(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("invalid-commit-id")
+              return value
+
+          def resolve_event(event, kind, repository, repository_id):
+              try:
+                  if not re.fullmatch(r"[1-9][0-9]*", repository_id):
+                      raise ValueError("invalid-repository-id")
+                  identity = event["repository"]
+                  if (type(identity["id"]) is not int or identity["id"] != int(repository_id)
+                          or identity["full_name"] != repository):
+                      raise ValueError("wrong-repository")
+                  if kind == "pull_request":
+                      pr = event["pull_request"]
+                      if (event["action"] not in ("opened", "synchronize", "reopened", "edited")
+                              or type(event["number"]) is not int or event["number"] <= 0
+                              or type(pr["number"]) is not int or pr["number"] != event["number"]
+                              or pr["base"]["ref"] != "main"
+                              or type(pr["base"]["repo"]["id"]) is not int
+                              or pr["base"]["repo"]["id"] != identity["id"]):
+                          raise ValueError("invalid-pr-event")
+                      base, head = pr["base"]["sha"], pr["head"]["sha"]
+                  elif kind == "push":
+                      if event["ref"] != "refs/heads/main" or event.get("deleted") is not False:
+                          raise ValueError("invalid-push-event")
+                      base, head = event["before"], event["after"]
+                  else:
+                      raise ValueError("unsupported-event")
+                  return {"base": commit_id(base), "head": commit_id(head),
+                          "repository_id": repository_id, "event": kind}
+              except (KeyError, TypeError):
+                  raise ValueError("incomplete-event") from None
+
+          def main():
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
+              result = resolve_event(event, os.environ["GITHUB_EVENT_NAME"],
+                                     os.environ["GITHUB_REPOSITORY"], os.environ["EXPECTED_REPOSITORY_ID"])
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  for key, value in result.items():
+                      output.write(f"{key}={value}\n")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("governance event rejected; no raw event logged")
+                  raise SystemExit(1)
+
+  metadata:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      BASE_SHA: ${{ needs.prepare.outputs.base }}
+      HEAD_SHA: ${{ needs.prepare.outputs.head }}
+      REPOSITORY_ID: ${{ needs.prepare.outputs.repository_id }}
+      EVENT_KIND: ${{ needs.prepare.outputs.event }}
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          path: base
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select complete base tooling or explicit reviewed bootstrap
+        id: select-trusted
+        shell: python {0}
+        env:
+          GOVERNANCE_BOOTSTRAP_SHA: ${{ vars.GOVERNANCE_BOOTSTRAP_SHA }}
+        run: |
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          REQUIRED = tuple("scripts/governance/" + name for name in (
+              "check_commit.py", "check_pr.py", "common.py", "credential_scan.py",
+              "gitleaks.toml", "local_hook.py", "policy.json", "policy.py",
+              "provision_gitleaks.py", "reviewed_sqlite.json", "scan_credentials.py", "scan_paths.py")) + (
+              "scripts/evidence/privacy_scan.py", "scripts/release/export_public_tree.py")
+
+          def immutable(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("explicit-immutable-revision-required")
+              return value
+
+          def git(repo, *args):
+              result = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), *args],
+                                      capture_output=True, timeout=120, check=False)
+              if result.returncode:
+                  raise ValueError("unavailable-git-evidence")
+              return result.stdout
+
+          def checkout_identity(repo, revision):
+              immutable(revision)
+              if (git(repo, "rev-parse", "HEAD").strip().decode() != revision
+                      or git(repo, "rev-parse", "--is-shallow-repository").strip() != b"false"):
+                  raise ValueError("wrong-or-incomplete-checkout")
+
+          def verify_checkout(repo, revision):
+              checkout_identity(repo, revision)
+              entries = {}
+              for record in git(repo, "ls-tree", "-rz", "--full-tree", revision, "--", "scripts").split(b"\0"):
+                  if record:
+                      header, path = record.split(b"\t", 1)
+                      mode, kind, _ = header.split()
+                      entries[path.decode("utf-8")] = (mode, kind)
+              if any(entries.get(path) not in ((b"100644", b"blob"), (b"100755", b"blob")) for path in REQUIRED):
+                  raise ValueError("incomplete-trusted-tooling")
+
+          def choose_source(repo, base, bootstrap):
+              checkout_identity(repo, base)
+              entry = git(repo, "ls-tree", "-z", "--full-tree", base, "--", "scripts/governance")
+              if not entry:
+                  return immutable(bootstrap), "bootstrap"
+              verify_checkout(repo, base)
+              return base, "base"
+
+          def main():
+              control = Path(os.environ["RUNNER_TEMP"]) / "governance-control.py"
+              if os.environ.get("GOVERNANCE_CONTROL_PHASE") == "verify":
+                  verify_checkout(Path("trusted"), os.environ["TRUSTED_SHA"])
+                  print("trusted tooling revision and inventory verified")
+                  return
+              source, mode = choose_source(Path("base"), os.environ["BASE_SHA"],
+                                           os.environ.get("GOVERNANCE_BOOTSTRAP_SHA", ""))
+              # Only this reviewed workflow control block is reused, never PR code.
+              control.write_bytes(Path(__file__).read_bytes())
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"source={source}\nmode={mode}\n")
+              print("tooling mode: " + mode + "; installation evidence is not enforced protection")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("trusted tooling unavailable; no candidate fallback")
+                  raise SystemExit(1)
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ steps.select-trusted.outputs.source }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify selected tooling without importing candidate code
+        id: verify-trusted
+        shell: python {0}
+        env:
+          GOVERNANCE_CONTROL_PHASE: verify
+          TRUSTED_SHA: ${{ steps.select-trusted.outputs.source }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          def main():
+              path = Path(os.environ["RUNNER_TEMP"]) / "governance-control.py"
+              result = subprocess.run([sys.executable, str(path)], capture_output=True, timeout=150)
+              if result.returncode:
+                  raise ValueError("selected-tooling-rejected")
+              print("selected trusted tooling verified")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("selected trusted tooling rejected")
+                  raise SystemExit(1)
+      - name: Bind current PR API metadata to the triggering event
+        id: fresh-pr
+        if: github.event_name == 'pull_request'
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_EVIDENCE_PHASE: capture
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import urllib.request
+
+          def api_url(repository, number):
+              if (not isinstance(repository, str)
+                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+", repository)
+                      or repository.split("/")[1] in (".", "..")
+                      or type(number) is not int or number <= 0):
+                  raise ValueError("invalid-api-target")
+              return f"https://api.github.com/repos/{repository}/pulls/{number}"
+
+          def bind_current_event(trigger, current, base, head, repository, identity):
+              from check_pr import event_fields
+              old = event_fields(trigger)
+              if (trigger["repository"]["full_name"] != repository
+                      or old["repository_id"] != int(identity)
+                      or old["base"] != base or old["head"] != head):
+                  raise ValueError("stale-or-wrong-trigger")
+              fresh = dict(trigger)
+              fresh["pull_request"] = current
+              now = event_fields(fresh)
+              if (current["state"] != "open" or current["base"]["ref"] != "main"
+                      or current["base"]["repo"]["full_name"] != repository):
+                  raise ValueError("closed-or-wrong-pr")
+              for key in ("repository_id", "number", "base", "head", "title", "body"):
+                  if now[key] != old[key]:
+                      raise ValueError("stale-pr-event")
+              return fresh
+
+          def preserve_event(fresh, event_file, phase, expected):
+              from common import digest, parse_json, read_bytes
+              observed = digest(fresh)
+              if phase == "capture":
+                  with event_file.open("x", encoding="utf-8") as output:
+                      output.write(json.dumps(fresh, ensure_ascii=True))
+                  event_file.chmod(0o600)
+                  return observed
+              if phase != "recheck" or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                  raise ValueError("validated-full-event-binding-required")
+              if digest(parse_json(read_bytes(event_file))) != expected or observed != expected:
+                  raise ValueError("full-pr-event-changed")
+              return expected
+
+          def main():
+              tools = Path("trusted").resolve()
+              sys.path.insert(0, str(tools / "scripts/governance"))
+              from common import MAX_INPUT, parse_json, read_bytes
+              from check_pr import event_fields
+              trigger = parse_json(read_bytes(os.environ["GITHUB_EVENT_PATH"]))
+              fields = event_fields(trigger)
+              repository = os.environ["GITHUB_REPOSITORY"]
+              url = api_url(repository, fields["number"])
+              if (trigger["repository"]["full_name"] != repository
+                      or fields["repository_id"] != int(os.environ["REPOSITORY_ID"])):
+                  raise ValueError("wrong-api-target")
+              token = os.environ.get("GH_TOKEN")
+              if not token:
+                  raise ValueError("read-only-api-token-unavailable")
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      return None
+              request = urllib.request.Request(url, headers={
+                  "Accept": "application/vnd.github+json", "Authorization": "Bearer " + token,
+                  "X-GitHub-Api-Version": "2022-11-28", "Cache-Control": "no-cache"})
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+              with opener.open(request, timeout=60) as response:
+                  raw = response.read(MAX_INPUT + 1)
+              if len(raw) > MAX_INPUT:
+                  raise ValueError("api-response-too-large")
+              directory = Path(os.environ["RUNNER_TEMP"])
+              raw_file = directory / "governance-current-pr-api.json"
+              raw_file.write_bytes(raw)
+              raw_file.chmod(0o600)
+              current = parse_json(raw)
+              fresh = bind_current_event(trigger, current, os.environ["BASE_SHA"], os.environ["HEAD_SHA"],
+                                         repository, os.environ["REPOSITORY_ID"])
+              event_file = directory / "governance-current-pr-event.json"
+              phase = os.environ.get("PR_EVIDENCE_PHASE")
+              event_hash = preserve_event(fresh, event_file, phase, os.environ.get("VALIDATED_EVENT_SHA256"))
+              if phase == "recheck":
+                  print("complete validated PR event digest unchanged; frozen event preserved")
+                  return
+              # Reuse only this workflow-owned API control, never candidate code.
+              control = directory / "governance-pr-freshness.py"
+              control.write_bytes(Path(__file__).read_bytes())
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("base=" + current["base"]["sha"] + "\n")
+                  output.write("head=" + current["head"]["sha"] + "\n")
+                  output.write("event_file=" + str(event_file) + "\n")
+                  output.write("event_sha256=" + event_hash + "\n")
+              print("current PR metadata matches triggering event; raw API data retained privately")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("current PR API evidence unavailable or stale; no raw response logged")
+                  raise SystemExit(1)
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate trusted metadata and separate privacy gates
+        id: validate
+        shell: python {0}
+        env:
+          TOOLING_MODE: ${{ steps.select-trusted.outputs.mode }}
+          FRESH_BASE_SHA: ${{ steps.fresh-pr.outputs.base }}
+          FRESH_HEAD_SHA: ${{ steps.fresh-pr.outputs.head }}
+          FRESH_EVENT_FILE: ${{ steps.fresh-pr.outputs.event_file }}
+          FRESH_EVENT_SHA256: ${{ steps.fresh-pr.outputs.event_sha256 }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          def commands(python, tools, repo, base, head, identity, event, kind, archive):
+              def command(name, *args):
+                  return [python, str(tools / "scripts/governance" / name), *map(str, args)]
+              result = [command("check_commit.py", "--repo", repo, "--base", base, "--head", head)]
+              if kind == "pull_request":
+                  result.append(command("check_pr.py", "--event-file", event, "--repo", repo,
+                                        "--expected-base", base, "--expected-head", head,
+                                        "--repository-id", identity))
+              paths = command("scan_paths.py", "--repo", repo, "--base", base, "--head", head)
+              credentials = command("scan_credentials.py", "--repo", repo, "--base", base, "--head", head,
+                                    "--gitleaks-archive", archive, "--platform", "linux_x64")
+              if kind == "pull_request":
+                  paths += ["--event-file", event, "--repository-id", identity]
+                  credentials += ["--event-file", event, "--repository-id", identity]
+              return result + [paths, credentials]
+
+          def main():
+              tools, candidate = Path("trusted").resolve(), Path("candidate").resolve()
+              sys.path.insert(0, str(tools / "scripts/governance"))
+              from common import GitRepo, digest, parse_json, read_bytes, run, sha
+              base, head = sha(os.environ["BASE_SHA"]), sha(os.environ["HEAD_SHA"])
+              kind, identity = os.environ["EVENT_KIND"], os.environ["REPOSITORY_ID"]
+              event_file = os.environ["GITHUB_EVENT_PATH"]
+              event_hash = None
+              if kind == "pull_request":
+                  live_base, live_head = sha(os.environ["FRESH_BASE_SHA"]), sha(os.environ["FRESH_HEAD_SHA"])
+                  if (live_base, live_head) != (base, head):
+                      raise ValueError("stale-api-range")
+                  base, head = live_base, live_head
+                  event_file = os.environ["FRESH_EVENT_FILE"]
+                  if not event_file:
+                      raise ValueError("fresh-event-required")
+                  event_hash = os.environ["FRESH_EVENT_SHA256"]
+                  if (not re.fullmatch(r"[0-9a-f]{64}", event_hash)
+                          or digest(parse_json(read_bytes(event_file))) != event_hash):
+                      raise ValueError("fresh-full-event-binding-mismatch")
+              repo = GitRepo(candidate)
+              if repo.git("rev-parse", "HEAD").strip().decode() != head:
+                  raise ValueError("candidate-sha-mismatch")
+              current_main = repo.git("rev-parse", "refs/remotes/origin/main").strip().decode()
+              if current_main != (base if kind == "pull_request" else head):
+                  raise ValueError("stale-main-evidence")
+              archive_dir = Path(os.environ["RUNNER_TEMP"]) / "governance-trusted-scanner"
+              provision = [sys.executable, str(tools / "scripts/governance/provision_gitleaks.py"),
+                           "--output-dir", str(archive_dir), "--platform", "linux_x64"]
+              code, output = run(provision, timeout=300)
+              if code or parse_json(output).get("status") != "provisioned":
+                  raise ValueError("trusted-scanner-provisioning-failed")
+              archive = archive_dir / "gitleaks_8.30.1_linux_x64.tar.gz"
+              metadata_hash = None
+              for argv in commands(sys.executable, tools, candidate, base, head, identity,
+                                   event_file, kind, archive):
+                  code, output = run(argv, timeout=900)
+                  if code:
+                      raise ValueError("required-helper-rejected")
+                  result = parse_json(output)
+                  if result.get("status") != "passed":
+                      raise ValueError("missing-helper-success")
+                  if result.get("scope") == "pr-and-range":
+                      metadata_hash = result.get("metadata_sha256")
+              if kind == "pull_request" and (not isinstance(metadata_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", metadata_hash)):
+                  raise ValueError("missing-metadata-binding")
+              if kind == "pull_request":
+                  if digest(parse_json(read_bytes(event_file))) != event_hash:
+                      raise ValueError("validated-full-event-changed")
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("event_sha256=" + event_hash + "\n")
+              print(json.dumps({"status": "passed", "base": base, "head": head,
+                                "tooling_mode": os.environ["TOOLING_MODE"], "metadata_sha256": metadata_hash,
+                                "event_sha256": event_hash, "path_privacy": "passed", "credentials": "passed",
+                                "human_review_required": True}))
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("governance metadata/privacy rejected; raw helper output remains private")
+                  raise SystemExit(1)
+
+      - name: Reject PR metadata changes during the checks
+        id: recheck-pr
+        if: github.event_name == 'pull_request'
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_EVIDENCE_PHASE: recheck
+          VALIDATED_EVENT_SHA256: ${{ steps.validate.outputs.event_sha256 }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          def main():
+              control = Path(os.environ["RUNNER_TEMP"]) / "governance-pr-freshness.py"
+              result = subprocess.run([sys.executable, str(control)], capture_output=True, timeout=90)
+              if result.returncode:
+                  raise ValueError("pr-changed-during-validation")
+              print("full validated PR event unchanged at final API observation")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("PR freshness recheck rejected; raw response remains private")
+                  raise SystemExit(1)
+
+  checker-tests:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+      - name: Independently provision pinned offline test archive
+        id: fixture
+        shell: python {0}
+        run: |
+          import hashlib
+          import io
+          import os
+          from pathlib import Path
+          import tarfile
+          import urllib.request
+
+          ARCHIVE = "gitleaks_8.30.1_linux_x64.tar.gz"
+          SHA256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          URL = "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/" + ARCHIVE
+          LIMIT = 50 * 1024 * 1024
+
+          def verified_archive(data):
+              if len(data) > LIMIT or hashlib.sha256(data).hexdigest() != SHA256:
+                  raise ValueError("offline-fixture-hash-mismatch")
+              with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                  licenses = [item for item in archive if item.name == "LICENSE"]
+                  if len(licenses) != 1 or not licenses[0].isfile() or not 0 < licenses[0].size <= 1024 * 1024:
+                      raise ValueError("missing-fixture-license")
+                  return archive.extractfile(licenses[0]).read()
+
+          def main():
+              class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      if not newurl.startswith("https://"):
+                          raise ValueError("unsafe-fixture-redirect")
+                      return super().redirect_request(req, fp, code, msg, headers, newurl)
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), HTTPSRedirect())
+              with opener.open(URL, timeout=120) as response:
+                  data = response.read(LIMIT + 1)
+              license_text = verified_archive(data)
+              directory = Path(os.environ["RUNNER_TEMP"]) / "governance-offline-fixture"
+              directory.mkdir(mode=0o700, exist_ok=False)
+              archive = directory / ARCHIVE
+              archive.write_bytes(data)
+              (directory / "LICENSE").write_bytes(license_text)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+                  output.write("GOVERNANCE_TEST_ARCHIVE=" + str(archive) + "\n")
+              print("verified offline fixture archive and MIT license retained")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("required offline fixture unavailable; tests cannot be skipped")
+                  raise SystemExit(1)
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run candidate self-tests without secrets or trusted-job state
+        id: self-tests
+        shell: python {0}
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          TEST_RUNNER = (
+              "import unittest, sys; "
+              "suite = unittest.defaultTestLoader.discover('scripts/governance', pattern='test_*.py'); "
+              "result = unittest.TextTestRunner(verbosity=2).run(suite) if suite.countTestCases() else None; "
+              "sys.exit(0 if result is not None and result.testsRun > 0 and result.wasSuccessful() "
+              "and not result.skipped and not result.expectedFailures else 1)"
+          )
+
+          def main():
+              archive = os.environ.get("GOVERNANCE_TEST_ARCHIVE")
+              if not archive or not Path(archive).is_file():
+                  raise ValueError("required-offline-fixture-missing")
+              head = subprocess.run(["git", "-C", "candidate", "rev-parse", "HEAD"], capture_output=True, timeout=30)
+              if head.returncode or head.stdout.strip().decode() != os.environ["HEAD_SHA"]:
+                  raise ValueError("candidate-sha-mismatch")
+              with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+                  result = subprocess.run([sys.executable, "-c", TEST_RUNNER], cwd="candidate",
+                                          stdout=output, stderr=errors, timeout=1500)
+              if result.returncode:
+                  raise ValueError("candidate-self-tests-failed")
+              print("candidate self-tests passed; not trusted enforcement evidence")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("candidate self-tests rejected; no raw output published")
+                  raise SystemExit(1)
+
+  gate:
+    needs: [metadata, checker-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require actual success from every mandatory dependency
+        id: aggregate
+        shell: python {0}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          import json
+          import os
+
+          def accepted(results):
+              required = {"metadata", "checker-tests"}
+              return (isinstance(results, dict) and set(results) == required
+                      and all(isinstance(results[name], dict) and results[name].get("result") == "success"
+                              for name in required))
+
+          def main():
+              if not accepted(json.loads(os.environ["NEEDS_JSON"])):
+                  raise ValueError("mandatory-job-not-successful")
+              print("governance gate passed for this run")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  print("governance gate rejected: every mandatory job must actually succeed")
+                  raise SystemExit(1)

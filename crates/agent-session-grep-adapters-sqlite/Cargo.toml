@@ -15,7 +15,9 @@ agent-session-grep-ports = { path = "../agent-session-grep-ports" }
 # 从而从 release 图里剔除 hashlink/hashbrown-0.17/foldhash-0.2 重复依赖。
 # "trace" 仅供测试的 SQL 语句计数守卫使用(sqlite3_trace_v2 钩子),归入 dev-dependencies。
 # "functions" 供时间过滤谓词的 ISO-8601 → sort-key 标量函数注册。
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "functions"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "functions", "backup", "hooks"] }
+tempfile = "3"
+serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 # 与 spikes/data-root-locking 同一原语：OS 独占文件锁作 writer lease 权威。
@@ -23,5 +25,7 @@ blake3.workspace = true
 fs4 = "0.13"
 
 [dev-dependencies]
-tempfile = "3"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "trace"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "trace"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

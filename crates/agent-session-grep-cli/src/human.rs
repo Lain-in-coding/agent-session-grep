@@ -16,6 +16,9 @@ const CONTEXT_TEXT_CHARS: usize = 80;
 /// `search` 命中正文预览的最大字符数（10 角色体验测试缺陷修复：命中只有
 /// UUID+score 时新手无从判断哪条有用）。
 const SNIPPET_PREVIEW_CHARS: usize = 120;
+/// `search` 命中预览在命中起点左侧保留的上下文字符数。Application 的 `text`
+/// 窗口默认 2000 字符、锚点约在 1/3 处，纯前缀预览仍会看不到命中。
+const SNIPPET_ANCHOR_LEFT_CONTEXT: usize = 40;
 
 /// 把成功结果渲染为人类可读行（无 envelope、无颜色）。
 ///
@@ -24,6 +27,7 @@ const SNIPPET_PREVIEW_CHARS: usize = 120;
 /// 提示以 `data.truncation` 与 `page` 为权威。
 pub fn render_success(command: &str, outcome: Outcome, data: &Value, page: &Page) -> Vec<String> {
     match command {
+        command if command.starts_with("journal.") => render_journal(data),
         "search" => {
             let mut lines = render_search(data);
             push_footer(&mut lines, outcome, data, page);
@@ -56,6 +60,35 @@ pub fn render_success(command: &str, outcome: Outcome, data: &Value, page: &Page
         }
         _ => kv_lines(data),
     }
+}
+
+/// Maintenance control state must not imply that a too-late cancellation was
+/// accepted, or that an unacknowledged catalog commit definitely did not happen.
+fn render_journal(data: &Value) -> Vec<String> {
+    let mut lines = kv_lines(data);
+    let jobs = data.get("job").into_iter().chain(
+        data.get("jobs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten(),
+    );
+    for job in jobs {
+        if job.get("cancellation_closed").and_then(Value::as_bool) == Some(true) {
+            lines.push(
+                "Cancellation is too late: cleanup is committed; finish or retry cleanup.".into(),
+            );
+        }
+        if job
+            .get("logical_compaction_committed")
+            .is_some_and(Value::is_null)
+        {
+            lines.push(
+                "logical_compaction_committed: unknown (awaiting catalog audit reconciliation)"
+                    .into(),
+            );
+        }
+    }
+    lines
 }
 
 /// `providers`：每个 provider 用两行展示成熟度/路线目标及完整逐字段能力。
@@ -138,11 +171,18 @@ fn render_resume(data: &Value) -> Vec<String> {
         return lines;
     }
 
+    // `available: true` 但 command 为 null 只有一个来因：预览串里的 token
+    // （transcript 提供的工作目录或会话 id）含 shell 元字符，无法在任一常见
+    // shell 下安全展示，resume.rs 的 `format_command` 因此 fail-closed。如实
+    // 说明，不要渲染成一个看不懂的 "?"。
     let command = data
         .get("command")
         .and_then(Value::as_str)
         .map(sanitize)
-        .unwrap_or_else(|| "?".into());
+        .unwrap_or_else(|| {
+            "—（无法安全展示：工作目录或会话 id 含 shell 元字符；请手动 cd 后再执行 provider 命令）"
+                .into()
+        });
     lines.push(format!("命令：{command}"));
     if let Some(dir) = data.get("working_directory").and_then(Value::as_str) {
         lines.push(format!("工作目录：{}", sanitize(dir)));
@@ -329,10 +369,12 @@ fn render_search(data: &Value) -> Vec<String> {
                     .to_string(),
             })
             .collect();
-        return render_session_resume_table(&rows)
+        let mut lines: Vec<String> = render_session_resume_table(&rows)
             .lines()
             .map(str::to_string)
             .collect();
+        lines.extend(next_step_hint(data));
+        return lines;
     }
     let hits = data
         .get("hits")
@@ -364,13 +406,23 @@ fn render_search(data: &Value) -> Vec<String> {
         lines.push(format!("  {}. {id}  score {score}", index + 1));
         // 正文预览：命中是否有用一瞥即知。取不到 preview 的命中不补行。
         // ADR-0008 后摘要统一由命中对象的 `text` 字段承载（application 装配，
-        // 按 max_snippet_chars 截前缀）；`snippet` 是旧字段名，为兼容旧形状
-        // 仍作为回退读取。两者都不存在则省略该行。
+        // 按 max_snippet_chars 构建命中窗口）；`snippet` 是旧字段名，为兼容旧
+        // 形状仍作为回退读取。两者都不存在则省略该行。窗口可能远长于预览上限
+        // （默认 2000 字符、锚点约 1/3 处），因此按 why_matched 字面词元把预览
+        // 挪到最早命中上（无词元/未命中/正文更短时保持既有前缀行为）。
         if let Some(text) = hit
             .get("snippet")
             .or_else(|| hit.get("text"))
             .and_then(Value::as_str)
-            .map(|text| preview(text, SNIPPET_PREVIEW_CHARS))
+            .map(|text| {
+                anchored_preview(
+                    text,
+                    hit.get("why_matched")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice),
+                    SNIPPET_PREVIEW_CHARS,
+                )
+            })
             && !text.is_empty()
         {
             lines.push(format!("     {text}"));
@@ -379,8 +431,40 @@ fn render_search(data: &Value) -> Vec<String> {
     lines
 }
 
+/// 冻结的五列会话表之后的"下一步"提示。
+///
+/// 表里的 `Session ID` 是 **provider 原生** id（resume 要用的那个），任何
+/// `context`/`show`/`get-message` 都不接受它——`context <原生 id>` 直接 exit 2
+/// `not a valid session id`。而 `--help` 承诺的数据流是
+/// `search → show <msg_id> → context <ses_id>`：human 模式若只出表格，这条路
+/// 就断在第一步。故在表后补一行可直接复制的 wire-id 命令（取最相关命中，
+/// 与表格的相关度排序同源）。缺 wire id 的响应不补提示，不臆造 id。
+fn next_step_hint(data: &Value) -> Vec<String> {
+    let Some(top) = data
+        .get("hits")
+        .and_then(Value::as_array)
+        .and_then(|hits| hits.first())
+    else {
+        return Vec::new();
+    };
+    let session = top.get("session_id").and_then(Value::as_str).map(sanitize);
+    let message = top.get("id").and_then(Value::as_str).map(sanitize);
+    let mut lines = Vec::new();
+    if session.is_some() || message.is_some() {
+        lines.push("下一步（表中 Session ID 供 resume 用；展开正文请用下面的 wire id）：".into());
+    }
+    if let Some(session) = session {
+        lines.push(format!("  context {session}"));
+    }
+    if let Some(message) = message {
+        lines.push(format!("  show {message}"));
+    }
+    lines
+}
+
 /// `list`：头行 `N entrie(s) (generation G)` + 每条 `  <id>  <payload 预览>`；
-/// 零条目给措辞 `catalog is empty`。
+/// 携带派生标题（#6）的会话条目改为 `  <id>  <title>`；零条目给措辞
+/// `catalog is empty`。
 fn render_list(data: &Value) -> Vec<String> {
     let entries = data
         .get("entries")
@@ -401,6 +485,12 @@ fn render_list(data: &Value) -> Vec<String> {
             .and_then(Value::as_str)
             .map(sanitize)
             .unwrap_or_else(|| "?".into());
+        // 派生标题（#6，schema v13）：有标题的会话条目直接展示标题（比原始
+        // payload 预览更适合人读）；无标题键保持既有 payload 预览行不变。
+        if let Some(title) = entry.get("title").and_then(Value::as_str).map(sanitize) {
+            lines.push(format!("  {id}  {title}"));
+            continue;
+        }
         let payload = entry
             .get("payload")
             .and_then(Value::as_str)
@@ -537,12 +627,43 @@ fn render_context(data: &Value) -> Vec<String> {
     lines
 }
 
-/// `status`：`entities: N` + `generation: G` 两行。
+/// `status`：`entities: N` + `generation: G` 两行；usage 投影存在时追加一行
+/// 用量汇总（覆盖标记：无 usage 行 = 库中没有任何 provider 用量事实）；
+/// repos 键存在时追加仓库聚合（空列表 = 无 repo 身份记录，未知 ≠ 零）。
 fn render_status(data: &Value) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         format!("entities: {}", number_text(data, "catalog_count")),
         format!("generation: {}", number_text(data, "generation")),
-    ]
+    ];
+    if let Some(usage) = data.get("usage") {
+        let sessions = usage.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+        if sessions == 0 {
+            lines.push("usage: 无 provider 用量记录（0 个会话携带 usage 事实）".into());
+        } else {
+            let sum = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+            lines.push(format!(
+                "usage: {} 个会话 input {} output {} cache_read {}（derived {} 事件）",
+                sessions,
+                sum("input_tokens"),
+                sum("output_tokens"),
+                sum("cache_read_tokens"),
+                sum("derived_events"),
+            ));
+        }
+    }
+    if let Some(repos) = data.get("repos").and_then(Value::as_array) {
+        if repos.is_empty() {
+            lines.push("repos: 无仓库身份记录（0 个会话派生 repo slug）".into());
+        } else {
+            lines.push(format!("repos: {} 个仓库", repos.len()));
+            for repo in repos {
+                let slug = repo.get("repo_slug").and_then(Value::as_str).unwrap_or("");
+                let sessions = repo.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+                lines.push(format!("  {slug}  {sessions} 个会话"));
+            }
+        }
+    }
+    lines
 }
 
 /// `sync`/`ingest`：字段统计 + 一句人话总结。unchanged 是消息条数而非文件数，
@@ -562,10 +683,34 @@ fn render_sync(data: &Value) -> Vec<String> {
     ];
     let unchanged = data.get("unchanged").and_then(Value::as_u64);
     let emitted = data.get("emitted").and_then(Value::as_u64);
-    match (emitted, unchanged) {
-        (Some(0), Some(_)) => lines.push("总结：没有新增消息（源文件未变化）。".into()),
-        (Some(e), Some(_)) => lines.push(format!("总结：新增 {e} 条消息。")),
-        _ => {}
+    // retained/deferred 只在非零时出现：两者都表示"这个源本次故意没入库"，
+    // 沉默会让用户以为自己的会话丢了。零值不占版面。
+    if let Some(retained) = data
+        .get("retained")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        lines.push(format!(
+            "retained: {retained}（源文件尾部被截断，正在被写入；保留上次索引，未重新入库）"
+        ));
+    }
+    if let Some(deferred) = data
+        .get("deferred")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        lines.push(format!(
+            "deferred: {deferred}（源文件在读取期间发生变化，本次跳过；已有索引不变，写完后再 sync）"
+        ));
+    }
+    // sources == 0（`sync --discover` 零发现）时不能说"源文件未变化"：本次没有
+    // 任何源被扫描；"需要显式指定源"的指引由 warnings 行给出，结论行保持沉默。
+    if data.get("sources").and_then(Value::as_u64) != Some(0) {
+        match (emitted, unchanged) {
+            (Some(0), Some(_)) => lines.push("总结：没有新增消息（源文件未变化）。".into()),
+            (Some(e), Some(_)) => lines.push(format!("总结：新增 {e} 条消息。")),
+            _ => {}
+        }
     }
     lines
 }
@@ -664,6 +809,73 @@ fn preview(text: &str, max: usize) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(max)
         .collect()
+}
+
+/// 命中摘要（Application 装配的 `text` 窗口）可能远长于 `SNIPPET_PREVIEW_CHARS`：
+/// 直接取前缀会把命中切掉（窗口按 2 右 : 1 左 居中，锚点约在 1/3 处）。这里按
+/// `why_matched` 的字面词元找到 `text` 内最早命中，把 ≤ `max` 字符的预览窗口挪到
+/// 命中上：命中起点左侧约 [`SNIPPET_ANCHOR_LEFT_CONTEXT`] 个字符，词元长于 `max`
+/// 时右移到能容纳词元结尾为止；无词元、无命中或 `text` 不超 `max` 时保持
+/// [`preview`] 的既有前缀语义。控制字符单行化规则与 [`preview`] 相同。
+///
+/// 词元来自 Application 的 `why_matched`（字面证据，无正则/FTS 语法），命中判定
+/// 与 Application 的窗口锚点同一规则：逐字符小写展开并回映到原字符边界（如
+/// `İ`），绝不按展开串偏移切片。
+fn anchored_preview(text: &str, why_matched: Option<&[Value]>, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return preview(text, max);
+    }
+    let terms: Vec<&str> = why_matched
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let Some((anchor_start, anchor_end)) = earliest_term_span(&chars, &terms) else {
+        return preview(text, max);
+    };
+    let start = anchor_start
+        .saturating_sub(SNIPPET_ANCHOR_LEFT_CONTEXT)
+        .max(anchor_end.saturating_sub(max));
+    let end = (start + max).min(chars.len());
+    chars[start..end]
+        .iter()
+        .map(|value| if value.is_control() { ' ' } else { *value })
+        .collect()
+}
+
+/// `why_matched` 词元在 `text` 原字符上的最早命中（半开区间）：起点最小，平局
+/// 按词元顺序。与 Application 命中窗口的锚点同一规则（逐字符小写展开并回映到
+/// 原字符边界）。
+fn earliest_term_span(chars: &[char], terms: &[&str]) -> Option<(usize, usize)> {
+    let mut lower = Vec::new();
+    let mut origins = Vec::new();
+    for (index, ch) in chars.iter().enumerate() {
+        for folded in ch.to_lowercase() {
+            lower.push(folded);
+            origins.push(index);
+        }
+    }
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (term_index, term) in terms.iter().enumerate() {
+        let needle: Vec<char> = term.chars().flat_map(char::to_lowercase).collect();
+        if needle.is_empty() || needle.len() > lower.len() {
+            continue;
+        }
+        let Some(offset) = lower
+            .windows(needle.len())
+            .position(|candidate| candidate == needle.as_slice())
+        else {
+            continue;
+        };
+        let start = origins[offset];
+        let end = origins[offset + needle.len() - 1] + 1;
+        let found = (start, term_index, end);
+        if best.is_none_or(|current| found < current) {
+            best = Some(found);
+        }
+    }
+    best.map(|(start, _, end)| (start, end))
 }
 
 /// 仅单行化、不截断。
@@ -892,26 +1104,74 @@ fn take_display_suffix(text: &str, max_width: usize) -> String {
     suffix.into_iter().rev().collect()
 }
 
-/// 字符串显示宽度：CJK（统一表意文字、假名、谚文、全角形式等）按 2 列计。
+/// 字符串显示宽度：宽字符（CJK、emoji 等）按 2 列，零宽字符按 0 列。
 fn display_width(text: &str) -> usize {
     text.chars().map(char_display_width).sum()
 }
 
-/// 单字符显示宽度：CJK 及其兼容形式按 2 列计，其余按 1 列计。
+/// 零宽字符：终端不占列，但仍是一个 `char`。按 1 列计会让含变体选择符的
+/// emoji（`⚠\u{FE0F}`）或组合重音的拉丁文把列宽算多，同样撑歪表格。
+fn is_zero_width(code: u32) -> bool {
+    (0x0300..=0x036F).contains(&code) // 组合附加符号
+        || (0x200B..=0x200F).contains(&code) // 零宽空格/连接符/方向标记
+        || (0xFE00..=0xFE0F).contains(&code) // 变体选择符（emoji presentation）
+        || code == 0xFEFF // BOM / 零宽不换行空格
+        || (0xE0100..=0xE01EF).contains(&code) // 变体选择符补充
+}
+
+/// emoji 与其它按 2 列渲染的符号（UAX #11 East_Asian_Width=W 中的非 CJK 部分）。
+///
+/// AI 编程会话正文里 ✅ ❌ 🚀 🎉 ⭐ 极常见；按 1 列计会让 `search` 的五列
+/// 会话表在含 emoji 的行整体右移，用户看到的是错位而不是表格。
+fn is_wide_symbol(code: u32) -> bool {
+    matches!(code,
+        0x231A..=0x231B      // ⌚⌛
+        | 0x2329..=0x232A    // 〈〉
+        | 0x23E9..=0x23EC | 0x23F0 | 0x23F3
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267F | 0x2693 | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE | 0x26D4 | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5 | 0x26FA | 0x26FD
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728 | 0x274C | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27B0 | 0x27BF
+        | 0x2B1B..=0x2B1C
+        | 0x2B50 | 0x2B55
+        | 0x1F000..=0x1FAFF  // 麻将/牌/emoji 各区段
+    )
+}
+
+/// 单字符显示宽度：宽字符 2 列、零宽字符 0 列，其余 1 列。
 fn char_display_width(c: char) -> usize {
     let code = c as u32;
+    if is_zero_width(code) {
+        return 0;
+    }
     if (0x1100..=0x115F).contains(&code) // 谚文字母
         || (0x2E80..=0x303E).contains(&code) // CJK 部首与标点
         || (0x3041..=0x33FF).contains(&code) // 假名、CJK 兼容
         || (0x3400..=0x4DBF).contains(&code) // CJK 扩展 A
         || (0x4E00..=0x9FFF).contains(&code) // CJK 统一表意文字
         || (0xA000..=0xA4CF).contains(&code) // 彝文
+        || (0xA960..=0xA97F).contains(&code) // 谚文字母扩展 A
         || (0xAC00..=0xD7A3).contains(&code) // 谚文音节
         || (0xF900..=0xFAFF).contains(&code) // CJK 兼容表意文字
+        || (0xFE10..=0xFE19).contains(&code) // 竖排形式
         || (0xFE30..=0xFE4F).contains(&code) // CJK 兼容形式
         || (0xFF00..=0xFF60).contains(&code) // 全角形式
-        || (0xFFE0..=0xFFE6).contains(&code)
-    // 全角符号
+        || (0xFFE0..=0xFFE6).contains(&code) // 全角符号
+        || (0x20000..=0x3FFFD).contains(&code) // CJK 扩展 B 及以后
+        || is_wide_symbol(code)
     {
         2
     } else {
@@ -923,6 +1183,14 @@ fn char_display_width(c: char) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn journal_reports_unknown_commit_and_closed_cancellation_explicitly() {
+        let lines = render_success("journal.cancel", Outcome::Success, &json!({"job": {"cancellation_closed": true, "logical_compaction_committed": null, "cancel_requested": false}}), &Page::default()).join("\n");
+        assert!(lines.contains("Cancellation is too late"));
+        assert!(lines.contains("logical_compaction_committed: unknown"));
+        assert!(!lines.contains("cancellation accepted"));
+    }
 
     fn page_more(token: &str) -> Page {
         Page {
@@ -1245,6 +1513,99 @@ mod tests {
         );
     }
 
+    /// 渲染一条带 `text` 的命中，返回片段预览行（测试固定：预览行是最后一行）。
+    fn rendered_preview_line(text: &str, why_matched: Option<Value>) -> String {
+        let mut hit = json!({ "id": "msg_v1_aaaa", "score": 2.0, "text": text });
+        if let Some(terms) = why_matched {
+            hit["why_matched"] = terms;
+        }
+        let data = json!({
+            "hits": [hit],
+            "generation": 3,
+            "truncation": { "truncated": false, "reason": null },
+        });
+        let lines = render_success("search", Outcome::Success, &data, &Page::default());
+        lines.last().expect("preview line").clone()
+    }
+
+    #[test]
+    fn search_preview_recenters_on_late_literal_term() {
+        // Application 的 text 窗口默认 2000 字符、锚点约在 1/3 处；≤120 字符的
+        // human 预览必须挪到命中上（大小写不敏感），否则长窗口命中在 CLI 不可见。
+        let text = format!("{} NEEDLE {}", "x".repeat(300), "y".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["needle"])));
+        assert_eq!(
+            line,
+            format!("     {} NEEDLE {}", "x".repeat(39), "y".repeat(73))
+        );
+    }
+
+    #[test]
+    fn search_preview_keeps_term_at_text_start() {
+        // 命中就在正文开头：左侧无可取上下文，预览等于既有前缀。
+        let text = format!("needle {}", "x".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["needle"])));
+        assert_eq!(line, format!("     needle {}", "x".repeat(113)));
+    }
+
+    #[test]
+    fn search_preview_keeps_term_at_text_end() {
+        // 命中在正文末尾：右侧无上下文，预览在文本尾部收口。
+        let text = format!("{}needle", "x".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["needle"])));
+        assert_eq!(line, format!("     {}needle", "x".repeat(40)));
+    }
+
+    #[test]
+    fn search_preview_falls_back_to_prefix_without_terms() {
+        // 无 why_matched 或词元未命中 → 既有前缀行为不变。
+        let text = format!("{}needle", "x".repeat(300));
+        let prefix = format!("     {}", "x".repeat(120));
+        assert_eq!(rendered_preview_line(&text, None), prefix);
+        assert_eq!(
+            rendered_preview_line(&text, Some(json!(["absent"]))),
+            prefix
+        );
+    }
+
+    #[test]
+    fn search_preview_sanitizes_control_characters_around_the_term() {
+        // 窗口挪到命中上后，控制字符仍走 preview 的单行化规则（换成空格）。
+        let text = format!("{}\tneedle\n{}", "x".repeat(300), "y".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["needle"])));
+        assert_eq!(
+            line,
+            format!("     {} needle {}", "x".repeat(39), "y".repeat(73))
+        );
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn search_preview_keeps_short_text_unchanged() {
+        // 正文不超预览上限：整体输出，不做任何位移。
+        let line = rendered_preview_line("short needle text", Some(json!(["needle"])));
+        assert_eq!(line, "     short needle text");
+    }
+
+    #[test]
+    fn search_preview_prefers_earliest_position_over_term_order() {
+        // 锚点由正文位置决定：命中更早的词元胜出，与 why_matched 顺序无关。
+        let text = format!("{}first{}second", "x".repeat(300), "y".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["second", "first"])));
+        assert!(line.contains("first"), "{line}");
+        assert!(!line.contains("second"), "{line}");
+    }
+
+    #[test]
+    fn search_preview_maps_expansion_offsets_to_original_characters() {
+        // İ 的小写展开是 i + U+0307：按展开偏移切片会切碎原字符，预览必须
+        // 回映到原字符边界（与 Application 命中窗口同一规则）。
+        let text = format!("{}İSTANBUL tail", "x".repeat(300));
+        let line = rendered_preview_line(&text, Some(json!(["i\u{307}stan"])));
+        assert!(line.contains("İSTAN"), "{line}");
+        assert!(text.contains(line.trim_start()), "{line:?}");
+    }
+
     #[test]
     fn cursor_hint_requires_both_has_more_and_token() {
         let data = json!({
@@ -1324,6 +1685,33 @@ mod tests {
         });
         let lines = render_success("list", Outcome::Success, &data, &Page::default());
         assert_eq!(lines, ["catalog is empty"]);
+    }
+
+    #[test]
+    fn list_renders_title_instead_of_payload_preview_when_present() {
+        // 派生标题（#6）：会话条目带 title 键时展示标题；无标题键保持
+        // payload 预览行（字节兼容既有输出）。
+        let data = json!({
+            "entries": [
+                {
+                    "id": "ses_v1_bbbb",
+                    "payload": "{\"document\":\"doc_v1_x\"}",
+                    "title": "修复数据库连接超时",
+                },
+                { "id": "ses_v1_cccc", "payload": "{\"document\":\"doc_v1_y\"}" },
+            ],
+            "generation": 4,
+            "truncation": { "truncated": false, "reason": null },
+        });
+        let lines = render_success("list", Outcome::Success, &data, &Page::default());
+        assert_eq!(
+            lines,
+            [
+                "2 entries (generation 4)".to_string(),
+                "  ses_v1_bbbb  修复数据库连接超时".to_string(),
+                "  ses_v1_cccc  {\"document\":\"doc_v1_y\"}".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1567,9 +1955,97 @@ mod tests {
     }
 
     #[test]
+    fn status_renders_usage_line_when_projection_present() {
+        // usage 投影存在且有事实时追加汇总行；sessions==0 是"无事实"（未知），
+        // 不是"用量为零"——两种措辞必须区分。
+        let data = json!({
+            "catalog_count": 5,
+            "generation": 2,
+            "usage": {
+                "sessions": 2,
+                "input_tokens": 108,
+                "output_tokens": 53,
+                "cache_read_tokens": 32,
+                "cache_write_tokens": 20,
+                "reasoning_tokens": 1,
+                "observed_events": 1,
+                "derived_events": 1,
+            },
+        });
+        let lines = render_success("status", Outcome::Success, &data, &Page::default());
+        assert_eq!(
+            lines,
+            [
+                "entities: 5",
+                "generation: 2",
+                "usage: 2 个会话 input 108 output 53 cache_read 32（derived 1 事件）",
+            ]
+        );
+
+        let empty = json!({
+            "catalog_count": 5,
+            "generation": 2,
+            "usage": {
+                "sessions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "observed_events": 0,
+                "derived_events": 0,
+            },
+        });
+        let lines = render_success("status", Outcome::Success, &empty, &Page::default());
+        assert_eq!(
+            lines,
+            [
+                "entities: 5",
+                "generation: 2",
+                "usage: 无 provider 用量记录（0 个会话携带 usage 事实）",
+            ]
+        );
+    }
+
+    #[test]
     fn status_missing_fields_degrade_to_placeholders() {
         let lines = render_success("status", Outcome::Success, &json!({}), &Page::default());
         assert_eq!(lines, ["entities: ?", "generation: ?"]);
+    }
+
+    #[test]
+    fn status_renders_repo_aggregation_lines() {
+        // 有 repo 事实：每仓库一行（slug + 会话数），顺序与后端聚合一致。
+        let data = json!({
+            "catalog_count": 5,
+            "generation": 2,
+            "repos": [
+                {"repo_slug": "github.com/o/shared", "sessions": 2},
+                {"repo_slug": "github.com/o/solo", "sessions": 1},
+            ],
+        });
+        let lines = render_success("status", Outcome::Success, &data, &Page::default());
+        assert_eq!(
+            lines,
+            [
+                "entities: 5",
+                "generation: 2",
+                "repos: 2 个仓库",
+                "  github.com/o/shared  2 个会话",
+                "  github.com/o/solo  1 个会话",
+            ]
+        );
+        // 空列表 = 无 repo 身份记录（未知 ≠ 零）。
+        let empty = json!({ "catalog_count": 5, "generation": 2, "repos": [] });
+        let lines = render_success("status", Outcome::Success, &empty, &Page::default());
+        assert_eq!(
+            lines,
+            [
+                "entities: 5",
+                "generation: 2",
+                "repos: 无仓库身份记录（0 个会话派生 repo slug）",
+            ]
+        );
     }
 
     #[test]
@@ -1728,6 +2204,65 @@ mod tests {
     }
 
     #[test]
+    fn search_table_appends_wire_id_next_step_commands() {
+        // 2026-08-29 审计：human search 只出五列表，表里的 Session ID 是 provider
+        // 原生 id，`context <它>` 会 exit 2；`--help` 承诺的
+        // search → show <msg_id> → context <ses_id> 因此断在第一步。
+        // 表后必须补可直接复制的 wire-id 命令。
+        let data = json!({
+            "generation": 3,
+            "hits": [{
+                "id": "msg_v1_m1",
+                "session_id": "ses_v1_s1",
+                "score": 1.0,
+                "text": "hit body",
+            }],
+            "session_resume_rows": [{
+                "date": "2026-08-14",
+                "provider": "claude-code",
+                "title": "hit body",
+                "working_directory": "C:/dev/x",
+                // provider 原生 id：任何 wire-id 命令都不接受它
+                "session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            }],
+        });
+        let lines = render_success("search", Outcome::Success, &data, &Page::default());
+        assert!(
+            lines.iter().any(|line| line.contains("会话标题")),
+            "冻结的五列表头必须保留: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "  context ses_v1_s1"),
+            "缺少可复制的 context wire-id 命令: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "  show msg_v1_m1"),
+            "缺少可复制的 show wire-id 命令: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn search_table_without_hit_ids_fabricates_no_next_step() {
+        // 没有 wire id 就不出提示，绝不臆造 id。
+        let data = json!({
+            "generation": 3,
+            "hits": [],
+            "session_resume_rows": [{
+                "date": "2026-08-14",
+                "provider": "claude-code",
+                "title": "t",
+                "working_directory": "C:/dev/x",
+                "session_id": "native-id",
+            }],
+        });
+        let lines = render_success("search", Outcome::Success, &data, &Page::default());
+        assert!(
+            !lines.iter().any(|line| line.contains("下一步")),
+            "无 hits 时不得出下一步提示: {lines:?}"
+        );
+    }
+
+    #[test]
     fn resume_table_renders_five_columns_in_contract_order() {
         let rows = [resume_row(
             "2026-08-14",
@@ -1859,6 +2394,79 @@ mod tests {
         assert!(
             body.contains(&format!("{expected_title} |")),
             "title not truncated by display width: {body:?}"
+        );
+    }
+
+    #[test]
+    fn display_width_counts_emoji_and_astral_cjk_as_two_columns() {
+        // emoji 在终端占 2 列；按 1 列计会撑歪 search 的五列会话表。
+        assert_eq!(display_width("🚀"), 2);
+        assert_eq!(display_width("✅❌"), 4);
+        assert_eq!(display_width("⭐✨"), 4);
+        // CJK 扩展 B（U+20000 起）同样是宽字符。
+        assert_eq!(display_width("\u{20000}"), 2);
+        // 变体选择符与组合附加符号零宽，不额外占列。
+        assert_eq!(display_width("\u{26A0}\u{FE0F}"), 1);
+        assert_eq!(display_width("e\u{0301}"), 1);
+        // BMP 拉丁与既有 CJK 行为不变。
+        assert_eq!(display_width("ok"), 2);
+        assert_eq!(display_width("会话"), 4);
+    }
+
+    #[test]
+    fn resume_table_keeps_columns_aligned_across_emoji_ascii_and_cjk_titles() {
+        // 同一列在三种标题（emoji / ASCII / CJK）下必须落在同一显示列；
+        // 回归 2026-08-29 审计：emoji 标题曾让工作目录与 Session ID 右移。
+        let rows = [
+            resume_row(
+                "2026-08-14",
+                "claude-code",
+                Some("wprobe 🚀🚀"),
+                Some("C:/a"),
+                "ses_v1_abc",
+            ),
+            resume_row(
+                "2026-08-14",
+                "claude-code",
+                Some("wprobe AAAA"),
+                Some("C:/a"),
+                "ses_v1_abc",
+            ),
+            resume_row(
+                "2026-08-14",
+                "claude-code",
+                Some("wprobe 中中"),
+                Some("C:/a"),
+                "ses_v1_abc",
+            ),
+        ];
+        let output = render_session_resume_table(&rows);
+        let widths: Vec<usize> = output.lines().map(display_width).collect();
+        assert_eq!(
+            widths
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "所有行的显示宽度必须一致（列对齐）: {widths:?}\n{output}"
+        );
+    }
+
+    #[test]
+    fn resume_table_truncates_emoji_title_by_display_width() {
+        // 标题列 19：10 个 emoji（20 列）→ 只能放 9 个（18 列）+ `…`。
+        let rows = [resume_row(
+            "2026-08-14",
+            "claude-code",
+            Some(&"🚀".repeat(10)),
+            Some("C:/a"),
+            "ses_v1_abc",
+        )];
+        let output = render_session_resume_table(&rows);
+        let body = output.lines().nth(1).unwrap();
+        assert!(
+            body.contains(&format!("{}…", "🚀".repeat(9))),
+            "emoji title not truncated by display width: {body:?}"
         );
     }
 

@@ -83,7 +83,10 @@
 - **控制**：loopback-only 绑定（127.0.0.1）+ 每会话 CSPRNG token + Host/Origin
   fail-closed 校验 + GET-only（POST 变更 501）+ `frame-ancestors 'none'` CSP +
   常量时间 token 比较 + bounded worker pool/请求头/请求体。
-- **残余风险**：同机恶意进程可读 loopback 端口；token 打印在 stderr 上。
+- **残余风险**：同机恶意进程可读 loopback 端口；token 打印在 stderr 上
+  （缓解：URL 以 fragment 携带 token，fragment 永不发给服务器，不进请求日志
+  与 `Referer`；页面读入后转 `Authorization` header 并从可见 URL 抹除。
+  stderr 打印本身仍由 terminal/日志归属方管理）。
 
 ### 6.2 Hook 输出
 
@@ -113,7 +116,58 @@
 
 1. ~~密钥检测/脱敏在索引期做还是仅在输出期做？（agent-sessions 在索引期脱敏可借鉴）~~ **已裁定（2026-08-13，ADR-0004；跨边界规则由 ADR-0009 补充）**：Catalog 不在索引期改写原文；Human CLI/TUI search 输出按 ADR-0004 保持有界正文片段。Robot/MCP/Web/HTTP/Handoff 始终按 ADR-0009 默认脱敏，不以“未来有网络”作为启用条件。
 2. 是否需要一个"隐私模式"配置项，进一步隐藏 project path 片段？
-3. 网络文件系统作为 data-root 的拒绝/降级策略（data-root-locking spike 已确认 lease 不支持 NFS）。
+3. 网络文件系统作为 data-root 的拒绝/降级策略。
+
+### 7.1 未决项 2 的事实基础与建议（待 owner 签署）
+
+**当前实测行为**（2026-08-29 审计）：
+
+- 跨边界 redaction 的规则集是**密钥形状的保守子集**——AWS / GitHub /
+  OpenAI / Anthropic / xAI / Bearer / PEM 加 secret-key-name
+  （`crates/agent-session-grep-ports/src/redact.rs`，`RULESET_VERSION = v1.1`）。
+  **其中没有任何路径规则**，所以绝对路径不被视为敏感值。
+- `get_session_resume` 的固定形状**已刻意不含** `source_path` /
+  `transcript_path`（由 `crates/agent-session-grep-cli/src/mcp.rs` 的
+  `get_session_resume_returns_fixed_read_only_metadata_shape` 钉住其缺席），
+  但保留 `original_working_directory`。
+- 该字段与整个 payload 一起过 `redact_value`（`mcp.rs:320-321`），但因规则集
+  无路径规则，它**逐字穿过**每一个机器边界（MCP / Robot / Web / Handoff），
+  其中通常含操作系统账号名。
+- 因此 §4 的"默认隐藏绝对 Source Path"对 **source path** 成立，对
+  **original working directory** 不成立——两者是不同字段，文档此前未区分。
+
+**建议裁定**：需要隐私模式，但必须 opt-in，且不得静默破坏 resume。
+`original_working_directory` 是**功能承载**字段——resume 必须切到该目录，
+默认脱敏会让功能失效，属于"看似可用实则不可用"的静默降级，与 `--lan` 直接
+`capability_not_supported` 的既有立场相反。建议形态：
+
+- 显式开关（flag + config key），只作用于**跨边界投影**，永不改写 catalog；
+- 命中 user home 前缀时替换为稳定占位（`~`），保留相对结构以便人读；
+- `resume` dry-run 打印占位，真正执行时用真实路径；
+- fail-closed：占位无法计算（解析不出 home）时整字段脱敏，不得退回逐字输出；
+- `doctor` 如实上报隐私模式是否开启，使被分享的 doctor 输出无歧义。
+
+未实现前不得宣称有此能力——当前事实是逐字输出。
+
+### 7.2 未决项 3 的事实基础与建议（待 owner 签署）
+
+**证据纠正**：本节此前写作"data-root-locking spike 已确认 lease 不支持
+NFS"。spike 并未确认这一点。`spikes/data-root-locking/EVIDENCE.md:75` 的
+原话是"只在单机 Windows x64 实测……网络文件系统也未验证"，
+`SPIKE-CARD.md:61` 同样把网络文件系统行为列为仍需正式 fault-injection E2E
+的项目。真实证据状态是**未验证**，不是"已确认不支持"——把未验证写成已确认
+恰好是本项目其余部分明令禁止的那类宣称。
+
+**当前实测行为**（2026-08-29 审计）：`crates/` 内**没有任何**网络文件系统
+检测——NFS / SMB / CIFS 魔数、Windows `DRIVE_REMOTE`、UNC 路径判定一概不存在。
+data-root 落在网络位置时既不拒绝也不告警，行为未知。
+
+**建议裁定**：在 data-root 解析处 fail-closed 拒绝，理由随结构化错误一起返回，
+与 `--lan` 的处理立场一致（宁可明确拒绝，不做静默降级）——因为 writer lease
+的权威是 OS 独占句柄，而网络文件系统上该语义是否成立**未经验证**，静默降级
+会把"锁形同虚设"藏在正常返回码后面。检测本身是平台特定的，实现前需要各平台
+实测证据（`EVIDENCE.md:75` 已把它列为 CI 待补项），因此在实现之前，诚实表述
+是"未强制任何策略，网络 data-root 行为未验证"。
 
 ## 8. 借鉴与反模式
 

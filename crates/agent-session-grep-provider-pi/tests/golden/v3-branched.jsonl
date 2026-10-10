@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"sess-v3","cwd":"/home/user/proj","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"model_change","id":"aa000001","parentId":null,"timestamp":"2026-01-01T00:00:01Z","provider":"synthetic-provider","modelId":"synthetic-model"}
+{"type":"message","id":"aa000002","parentId":"aa000001","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"root question"}}
+{"type":"message","id":"aa000003","parentId":"aa000002","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"kept"},{"type":"text","text":"answer"}]}}
+{"type":"message","id":"aa000004","parentId":"aa000002","timestamp":"2026-01-01T00:00:04Z","message":{"role":"assistant","content":"abandoned branch answer"}}
+{"type":"message","id":"aa000005","parentId":"aa000004","timestamp":"2026-01-01T00:00:05Z","message":{"role":"user","content":"被放弃分支上的中文追问"}}
+{"type":"session_info","id":"aa000006","parentId":"aa000003","timestamp":"2026-01-01T00:00:06Z","name":"synthetic v3 session"}

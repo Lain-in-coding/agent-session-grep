@@ -1,5 +1,13 @@
 # ADR-0009:跨边界输出默认脱敏(修订 ADR-0004 适用范围)
 
+> **编号冲突警告**:本仓库有**两个** ADR 声明 `decision_id: ADR-0009`——本文件
+> (跨边界输出默认脱敏,status **Proposed**)与
+> `ADR-0009-session-resume-metadata.md`(会话恢复信息双 ID 与渐进披露,status
+> **Accepted**)。两者的决策内容与状态都不同,因此裸引用「ADR-0009」是歧义的:
+> 核对引用时必须看上下文——谈脱敏/Robot/MCP/Web 输出边界的指本文件,谈
+> resume/双 ID/`get_session_resume` 的指另一份。改号需要同步约 90 处引用(含 20 个
+> 源码文件的注释),属 owner 决策,未执行前保留本警告。
+
 > 治理记录(Governance Record)
 >
 > - decision_id: ADR-0009

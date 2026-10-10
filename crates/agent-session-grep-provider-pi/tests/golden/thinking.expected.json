@@ -1,0 +1,48 @@
+{
+  "fixture_blake3": "2b6c6a48af61d06094b5a06e0095d2a997d0671f010fd513cd2fc3c2ccb786e5",
+  "session_native_id": "11111111-2222-4333-8444-555555555555",
+  "committed": 4,
+  "skipped": 0,
+  "messages": [
+    {
+      "seq": 0,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "user",
+      "text": "pi thinking golden：ask for reasoning.",
+      "timestamp": "2026-01-03T00:00:01.000Z",
+      "is_sidechain": false,
+      "span": { "start": 143, "end": 335 }
+    },
+    {
+      "seq": 1,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "合成推理正文：只含 thinking 块的记录。",
+      "timestamp": "2026-01-03T00:00:02.000Z",
+      "is_sidechain": false,
+      "span": { "start": 336, "end": 616 }
+    },
+    {
+      "seq": 2,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "第二段合成推理（emoji：🧠）。\n回答正文跟在推理之后。",
+      "timestamp": "2026-01-03T00:00:03.000Z",
+      "is_sidechain": false,
+      "span": { "start": 617, "end": 1100 }
+    },
+    {
+      "seq": 3,
+      "native_id": "",
+      "parent_native_id": null,
+      "role": "assistant",
+      "text": "空白 thinking 不产出空片段。",
+      "timestamp": "2026-01-03T00:00:04.000Z",
+      "is_sidechain": false,
+      "span": { "start": 1101, "end": 1395 }
+    }
+  ]
+}

@@ -18,6 +18,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_agent-session-grep");
 fn temp_db(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(format!("{tag}.db"));
+    // The MCP server opens an existing catalog read-only. Fixture creation is
+    // an explicit writer operation, not a side effect of protocol startup.
+    drop(
+        agent_session_grep_adapters_sqlite::SqliteStore::open_for_write(&path.to_string_lossy())
+            .expect("initialize MCP catalog fixture"),
+    );
     (dir, path)
 }
 
@@ -40,6 +46,11 @@ fn session_wire_for_message(db: &Path, message_wire: &str) -> String {
         .expect("message must have a canonical Session placement")
 }
 
+/// 固定应用时钟（`ASG_CLOCK_MS`，2026-08-25T00:00:00Z 的 Unix 毫秒）：
+/// 与 e2e.rs 同值——rank signals 时效衰减随注入时钟确定，MCP 会话同样
+/// 注入该值保持排序/得分确定性。
+const E2E_CLOCK_MS: &str = "1787616000000";
+
 /// 以 robot 模式跑一次 CLI：仅用于测试前置的数据准备（ingest 夹具），不涉 MCP。
 fn run_cli(db: &Path, args: &[&str]) -> Output {
     Command::new(BIN)
@@ -47,6 +58,7 @@ fn run_cli(db: &Path, args: &[&str]) -> Output {
         .arg(db)
         .arg("--robot")
         .args(args)
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
         .output()
         .expect("failed to spawn agent-session-grep binary")
 }
@@ -65,6 +77,7 @@ fn mcp_session_raw_stderr(db: &Path, lines: &[&str]) -> (Vec<Value>, String) {
         .arg("--db")
         .arg(db)
         .arg("mcp")
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -102,6 +115,38 @@ fn mcp_session(db: &Path, inputs: &[Value]) -> Vec<Value> {
     let lines: Vec<String> = inputs.iter().map(|input| input.to_string()).collect();
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     mcp_session_raw(db, &refs)
+}
+
+/// 原始字节版会话：整段 stdin 由调用方给出（含非 UTF-8 字节），退出码原样返回。
+///
+/// 与 [`mcp_session_raw_stderr`] 不同，本 helper 不断言 exit 0——退出语义本身
+/// 就是被测对象。stdout 纯净性仍然强制：每一行必须是完整 JSON frame。
+fn mcp_session_bytes(db: &Path, payload: &[u8]) -> (Vec<Value>, String, Option<i32>) {
+    let mut child = Command::new(BIN)
+        .arg("--db")
+        .arg(db)
+        .arg("mcp")
+        .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn agent-session-grep mcp");
+    {
+        let mut stdin = child.stdin.take().expect("child stdin must be piped");
+        stdin.write_all(payload).expect("write stdin bytes");
+    }
+    let out = child.wait_with_output().expect("wait for mcp server");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let frames = stdout(&out)
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("stdout not pure JSON-RPC: {error}\nline: {line}\nstderr: {stderr}")
+            })
+        })
+        .collect();
+    (frames, stderr, out.status.code())
 }
 
 /// 按 JSON-RPC id 取响应帧：通知没有响应，按位置对齐不可靠。
@@ -1331,7 +1376,19 @@ fn tool_schemas_publish_string_and_array_bounds() {
     assert_eq!(properties["cursor"]["maxLength"], 512, "{search}");
     assert_eq!(properties["since"]["maxLength"], 64, "{search}");
     assert_eq!(properties["until"]["maxLength"], 64, "{search}");
-    assert_eq!(properties["providers"]["maxItems"], 2, "{search}");
+    // All implemented provider IDs and aliases share the registry's bounds.
+    let provider_values = agent_session_grep_ports::capability::search_provider_filter_values();
+    assert_eq!(
+        properties["providers"]["maxItems"],
+        provider_values.len(),
+        "{search}"
+    );
+    assert_eq!(
+        properties["providers"]["items"]["enum"],
+        json!(provider_values),
+        "{search}"
+    );
+    assert_eq!(properties["tool_name"]["maxLength"], 128, "{search}");
     let context = tools
         .iter()
         .find(|tool| tool["name"] == "get_session_context")
@@ -1420,6 +1477,40 @@ fn status_doctor_and_providers_return_real_data() {
         .collect();
     assert!(ids.contains(&"claude-code"), "{ids:?}");
     assert!(ids.contains(&"codex"), "{ids:?}");
+}
+
+#[test]
+fn mcp_doctor_data_matches_the_cli_doctor_envelope_field_for_field() {
+    // 跨入口一致性（release 一致性 harness 只比对 search 一个操作，doctor 从未
+    // 被比对过）：MCP doctor 曾比 CLI `doctor --db` 少 6 个字段——offline /
+    // semantic_feature / tool_activity_storage / usage_storage /
+    // orphaned_usage_events / orphaned_usage_memberships。AI 客户端靠 doctor
+    // 判断"为什么语义检索退化""为什么 usage 是空的"，经 MCP 问会得到严格更弱
+    // 的答案。期望值取自真实 CLI 输出，不是手抄清单。
+    let (dir, db) = temp_db("mcp-doctor-parity");
+    let (fixture_path, _anchor_message) = write_context_fixture(dir.path());
+    let out = run_cli(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+
+    let out = run_cli(&db, &["doctor"]);
+    assert!(out.status.success(), "cli doctor failed: {}", stdout(&out));
+    let cli: Value = serde_json::from_str(stdout(&out).trim())
+        .unwrap_or_else(|error| panic!("cli doctor envelope must be JSON: {error}"));
+    let cli_data = &cli["data"];
+
+    let frames = mcp_session(
+        &db,
+        &[
+            initialize_request(1, "2025-06-18"),
+            initialized_notification(),
+            tool_call(2, "doctor", json!({})),
+        ],
+    );
+    let mcp_data = &frame_by_id(&frames, 2)["result"]["structuredContent"]["data"];
+    assert_eq!(
+        mcp_data, cli_data,
+        "MCP doctor 与 CLI doctor 的 data 投影必须逐字段一致"
+    );
 }
 
 // ─── search-match-guidance：MCP search 命中携带追加 guidance 字段 ─────────────
@@ -1630,11 +1721,57 @@ fn search_sessions_schema_publishes_provider_and_time_filters() {
     assert_eq!(properties["providers"]["type"], "array", "{search}");
     assert_eq!(
         properties["providers"]["items"]["enum"],
-        json!(["claude", "claude-code", "codex"]),
+        json!(agent_session_grep_ports::capability::search_provider_filter_values()),
         "{search}"
     );
     assert_eq!(properties["since"]["type"], "string", "{search}");
     assert_eq!(properties["until"]["type"], "string", "{search}");
+}
+
+#[test]
+fn semantic_and_hybrid_mcp_search_use_vectors_and_keep_cli_filters() {
+    let (_dir, db) = filter_db("mcp-semantic-filters");
+    let before: Value = serde_json::from_str(&stdout(&run_cli(&db, &["status"]))).unwrap();
+    let indexed = run_cli(&db, &["index", "embeddings"]);
+    assert!(indexed.status.success(), "{}", stdout(&indexed));
+    let after: Value = serde_json::from_str(&stdout(&run_cli(&db, &["status"]))).unwrap();
+    assert_eq!(
+        after["data"]["generation"].as_u64().unwrap(),
+        before["data"]["generation"].as_u64().unwrap() + 1,
+        "a complete rebuild must advance generation once, not once per vector"
+    );
+    for mode in ["semantic", "hybrid"] {
+        let cli = run_cli(
+            &db,
+            &[
+                "search",
+                "mcpfilter",
+                "--mode",
+                mode,
+                "--provider",
+                "claude-code",
+                "--since",
+                "2026-07-28T00:00:00Z",
+            ],
+        );
+        assert!(cli.status.success(), "{}", stdout(&cli));
+        let cli: Value = serde_json::from_str(&stdout(&cli)).unwrap();
+        let (matching, excluded) = two_searches(
+            &db,
+            json!({"query":"mcpfilter", "mode":mode, "providers":["claude"], "since":"2026-07-28T00:00:00Z"}),
+            json!({"query":"mcpfilter", "mode":mode, "providers":["claude"], "since":"2026-08-01T00:00:00Z"}),
+        );
+        assert_eq!(
+            matching["structuredContent"]["data"]["retrieval_mode"], mode,
+            "{matching}"
+        );
+        assert_eq!(hit_texts(&matching), ["mcpfilter mid note"], "{matching}");
+        assert!(hit_texts(&excluded).is_empty(), "{excluded}");
+        assert_eq!(
+            matching["structuredContent"]["data"]["hits"],
+            cli["data"]["hits"]
+        );
+    }
 }
 
 #[test]
@@ -1854,6 +1991,94 @@ fn list_sessions_zero_limit_is_protocol_error_like_search() {
     assert_eq!(frame_by_id(&frames, 2)["error"]["code"], -32602);
 }
 
+// ─── Peek Bundle（#7，hstry 借用）：list_sessions 条目附分诊预览 ─────────────
+
+#[test]
+fn list_sessions_entries_carry_peek_with_first_and_last_user_text() {
+    // 真实 ingest 后的 list_sessions：每条会话条目附 peek，首/尾用户消息按
+    // member 顺序抽取（sidechain 用户轮同样计入——member 顺序是唯一事实源）。
+    let (dir, db) = temp_db("mcp-list-peek");
+    let (fixture_path, _anchor) = write_context_fixture(dir.path());
+    let out = run_cli(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+
+    let frames = mcp_session(
+        &db,
+        &[
+            initialize_request(1, "2025-06-18"),
+            initialized_notification(),
+            tool_call(2, "list_sessions", json!({ "limit": 10 })),
+        ],
+    );
+    let result = &frame_by_id(&frames, 2)["result"];
+    assert_eq!(result["isError"], false, "list_sessions 应成功: {result}");
+    let entries = result["structuredContent"]["data"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(entries.len(), 1, "fixture ingests exactly one session");
+    let peek = &entries[0]["peek"];
+    assert!(peek.is_object(), "peek key must be present: {entries:?}");
+    assert_eq!(
+        peek["first_user_text"], "ctx root question",
+        "first user turn: {peek}"
+    );
+    assert_eq!(
+        peek["last_user_text"], "ctx sidechain probe",
+        "last user turn (sidechain included): {peek}"
+    );
+    // 预览必须是小对象：序列化 ≤1 KiB（per-session 预算常量）。
+    let serialized = serde_json::to_string(peek).expect("peek serializes");
+    assert!(
+        serialized.len() <= 1024,
+        "peek over budget: {serialized} bytes"
+    );
+}
+
+// ─── 会话标题派生链（#6）：list_sessions 条目附派生标题 ─────────────────────
+
+#[test]
+fn list_sessions_entries_carry_title_skipping_injected_noise() {
+    // 真实 ingest：首条 user 消息是注入噪声封套（`<system-reminder>`，parse 层
+    // 过滤，feat/noise-filter 已合 main）→ 标题派生链跳过它，取第二条有效
+    // user 消息；条目在 peek 旁附 title 字段。
+    let (dir, db) = temp_db("mcp-list-title");
+    let fixture = dir.path().join("title-noise.jsonl");
+    std::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"user","uuid":"d0000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"ddee1234-5678-4abc-8def-001122334455","timestamp":"2026-07-26T01:00:00.000Z","message":{"role":"user","content":"<system-reminder>"#,
+            r#"\ninjected context noise\n</system-reminder>"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"d0000000-0000-4000-8000-000000000002","parentUuid":"d0000000-0000-4000-8000-000000000001","sessionId":"ddee1234-5678-4abc-8def-001122334455","timestamp":"2026-07-26T01:01:00.000Z","message":{"role":"user","content":"real title prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"d0000000-0000-4000-8000-000000000003","parentUuid":"d0000000-0000-4000-8000-000000000002","sessionId":"ddee1234-5678-4abc-8def-001122334455","message":{"role":"assistant","content":"answer"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write title fixture");
+    let out = run_cli(&db, &["ingest", &fixture.to_string_lossy()]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+
+    let frames = mcp_session(
+        &db,
+        &[
+            initialize_request(1, "2025-06-18"),
+            initialized_notification(),
+            tool_call(2, "list_sessions", json!({ "limit": 10 })),
+        ],
+    );
+    let result = &frame_by_id(&frames, 2)["result"];
+    assert_eq!(result["isError"], false, "list_sessions 应成功: {result}");
+    let entries = result["structuredContent"]["data"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(entries.len(), 1, "fixture ingests exactly one session");
+    assert_eq!(
+        entries[0]["title"], "real title prompt",
+        "派生标题必须跳过注入噪声、取首条有效 user: {entries:?}"
+    );
+}
+
 // ─── stderr 隐私（E2）：协议错误不落 stderr ─────────────────────────────────
 
 #[test]
@@ -1885,6 +2110,108 @@ fn mcp_stderr_stays_clean_on_protocol_errors() {
         ],
     );
     assert!(stderr.is_empty(), "参数错误不得写入 stderr: {stderr}");
+}
+
+#[test]
+fn all_tool_results_carry_the_redaction_block() {
+    // ADR-0009：跨边界脱敏状态必须随
+    // 每个成功工具结果上报。曾经 MCP 只做脱敏、丢弃状态，调用方拿到
+    // "[redacted:...]" 无法区分服务端涂红与原文逐字如此。真实夹具上覆盖全部
+    // 9 个工具（含需要关系行的 context/message/handoff）。
+    let (dir, db) = temp_db("mcp-redaction-block");
+    let (fixture_path, anchor_message) = write_context_fixture(dir.path());
+    let out = run_cli(&db, &["ingest", &fixture_path]);
+    assert!(out.status.success(), "ingest failed: {}", stdout(&out));
+    let session_wire = session_wire_for_message(&db, &anchor_message);
+
+    let calls = [
+        ("doctor", json!({})),
+        ("get_status", json!({})),
+        ("list_providers", json!({})),
+        ("search_sessions", json!({ "query": "ctx" })),
+        ("list_sessions", json!({ "limit": 5 })),
+        ("generate_handoff", json!({ "query": "ctx" })),
+        (
+            "get_session_context",
+            json!({ "session_id": session_wire.as_str() }),
+        ),
+        (
+            "get_session_resume",
+            json!({ "session_id": session_wire.as_str() }),
+        ),
+        (
+            "get_message",
+            json!({ "message_id": anchor_message.as_str(), "around": 1 }),
+        ),
+    ];
+    let mut inputs = vec![
+        initialize_request(1, "2025-06-18"),
+        initialized_notification(),
+    ];
+    for (index, (name, arguments)) in calls.iter().enumerate() {
+        inputs.push(tool_call(index as i64 + 10, name, arguments.clone()));
+    }
+    let frames = mcp_session(&db, &inputs);
+
+    for (index, (name, _)) in calls.iter().enumerate() {
+        let result = &frame_by_id(&frames, index as i64 + 10)["result"];
+        assert_eq!(result["isError"], false, "{name} 应成功: {result}");
+        let payload = &result["structuredContent"];
+        let redaction = &payload["redaction"];
+        assert!(redaction.is_object(), "{name} 缺少 redaction 块: {payload}");
+        assert_eq!(redaction["mode"], "default", "{name}: {redaction}");
+        assert_eq!(redaction["status"], "none", "{name}: {redaction}");
+        assert_eq!(redaction["redacted_count"], 0, "{name}: {redaction}");
+        assert!(
+            redaction["ruleset_version"].is_string(),
+            "{name}: {redaction}"
+        );
+        assert!(redaction["audit_id"].is_null(), "{name}: {redaction}");
+        // 双载体同形：状态进两个载体，不只进 structuredContent。
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        let parsed: Value = serde_json::from_str(text).expect("content.text is JSON");
+        assert_eq!(&parsed, payload, "{name} 双载体漂移");
+    }
+}
+
+#[test]
+fn non_utf8_line_is_a_parse_error_and_the_server_keeps_serving() {
+    // 曾经 `serve` 用 `BufRead::lines()` 读 stdin：一行非法 UTF-8 字节让迭代器
+    // 返回 Err，`?` 直接把它当 source_io 抛出整个进程（exit 5）。待答请求与其后
+    // 所有请求全部无声消失——客户端只能等到超时，而正确答复是 -32700。
+    let (_dir, db) = temp_db("mcp-non-utf8");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(initialize_request(1, "2025-06-18").to_string().as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(initialized_notification().to_string().as_bytes());
+    payload.push(b'\n');
+    // 0xFF 0xFE 不是合法 UTF-8 序列。
+    payload.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"ping","x":""#);
+    payload.extend_from_slice(&[0xFF, 0xFE]);
+    payload.extend_from_slice(br#""}"#);
+    payload.push(b'\n');
+    payload.extend_from_slice(
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" })
+            .to_string()
+            .as_bytes(),
+    );
+    payload.push(b'\n');
+
+    let (frames, stderr, code) = mcp_session_bytes(&db, &payload);
+    assert_eq!(code, Some(0), "EOF 必须干净停机；stderr: {stderr}");
+    // 坏字节那一行得到 -32700（id 无法回显 → null）。
+    let parse_errors: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["error"]["code"] == json!(-32700))
+        .collect();
+    assert_eq!(parse_errors.len(), 1, "{frames:?}");
+    assert!(parse_errors[0]["id"].is_null(), "{frames:?}");
+    // 其后的请求照常应答——这是回归的核心。
+    assert_eq!(frame_by_id(&frames, 3)["result"], json!({}), "{frames:?}");
+    assert!(
+        !stderr.contains(&db.to_string_lossy().to_string()),
+        "stderr 泄露 db 路径: {stderr}"
+    );
 }
 
 // ─── design §4 场景补充：search_sessions facet 参数（structured activity）──
@@ -1963,4 +2290,48 @@ fn search_sessions_facet_params_filter_and_validate() {
     // 非法 tool_kind 是协议层 -32602。
     let error = &frame_by_id(&frames, 4)["error"];
     assert_eq!(error["code"], -32602, "{error}");
+}
+
+#[test]
+fn relocation_is_described_as_cli_only_and_rejected_as_an_mcp_mutation() {
+    let (_dir, db) = temp_db("mcp-relocation-boundary");
+    let before = std::fs::read(&db).unwrap();
+    let cli = run_cli(&db, &["providers"]);
+    assert!(cli.status.success());
+    let providers: Value = serde_json::from_str(&stdout(&cli)).unwrap();
+    assert_eq!(
+        providers["data"]["relocation"]["interfaces"],
+        json!(["cli"])
+    );
+    let frames = mcp_session(
+        &db,
+        &[
+            initialize_request(1, "2025-06-18"),
+            initialized_notification(),
+            tool_call(2, "list_providers", json!({})),
+            tool_call(
+                3,
+                "relocate",
+                json!({
+                    "provider": "claude-code", "from": "/private/retired-root",
+                    "to": "/private/new-root", "apply": true, "plan": "private-plan",
+                    "backup": "/private/backup.db",
+                }),
+            ),
+            tool_call(4, "relocate.apply", json!({})),
+        ],
+    );
+    assert!(frame_by_id(&frames, 2)["result"]["structuredContent"]["data"]["providers"].is_array());
+    for id in [3, 4] {
+        let frame = frame_by_id(&frames, id);
+        assert_eq!(frame["error"]["code"], -32602);
+        assert!(frame["result"].is_null());
+        assert!(!frame.to_string().contains("/private/"));
+        assert!(!frame.to_string().contains("private-plan"));
+    }
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "MCP cannot mutate relocation state"
+    );
 }

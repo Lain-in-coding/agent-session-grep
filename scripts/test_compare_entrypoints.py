@@ -64,6 +64,31 @@ class CompareEntrypointsTests(unittest.TestCase):
     def test_all_entry_points_are_declared_implemented(self) -> None:
         self.assertEqual(compare.IMPLEMENTED_ENTRY_POINTS, compare.ENTRY_POINTS)
 
+    def test_empty_hits_everywhere_is_not_a_pass(self) -> None:
+        """Agreement on nothing is not consistency: an empty hit list is
+        identical across every entry point, so a broken fixture, ingest, or
+        query path must not be reported as agreement."""
+        empty = {"outcome": "success", "data": {"hits": []}, "page": {"has_more": False}}
+        results = {entry_point: dict(empty) for entry_point in compare.ENTRY_POINTS}
+        result = compare.compare_canonical("search", results)
+        self.assertEqual(result["verdict"], "vacuous")
+        self.assertEqual(
+            [entry["field"] for entry in result["divergences"]], ["data.hits[*].id"]
+        )
+
+    def test_field_absent_from_every_projection_is_not_a_pass(self) -> None:
+        absent = {"data": {"hits": [{"id": "msg_v1_a"}]}, "page": {"has_more": False}}
+        results = {entry_point: dict(absent) for entry_point in compare.ENTRY_POINTS}
+        result = compare.compare_canonical("search", results)
+        self.assertEqual(result["verdict"], "vacuous")
+        self.assertEqual([entry["field"] for entry in result["divergences"]], ["outcome"])
+
+    def test_overall_verdict_names_the_failing_verdict(self) -> None:
+        report = compare.build_report(
+            "synthetic-binary", [{"verdict": "vacuous", "operation": "search"}]
+        )
+        self.assertEqual(report["overall_verdict"], "vacuous")
+
 
 if __name__ == "__main__":
     unittest.main()

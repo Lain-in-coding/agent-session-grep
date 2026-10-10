@@ -78,7 +78,7 @@ impl ProviderAdapter for CodeBuddyAdapter {
             &[
                 "the root startup-keyword user message (content: \"code\") is filtered out",
                 "no working-directory pair observation (no separate cwd-bearing header record)",
-                "native message ids are not preserved (synthetic codebuddy-msg-{seq})",
+                "native message ids are not preserved (ids are derived, not native)",
             ],
         )
     }
@@ -307,8 +307,9 @@ impl ProviderAdapter for CodeBuddyAdapter {
 
             let timestamp = rec.timestamp.as_deref();
             sink.emit_message(MessageEvent {
+                session: None,
                 seq,
-                native_id: &format!("codebuddy-msg-{seq}"),
+                native_id: "",
                 parent_native_id: None,
                 role,
                 text: &text,
@@ -497,6 +498,35 @@ mod tests {
         let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
         assert_eq!(report.committed, 3);
         assert!(sink.texts.iter().any(|t| t == "code"));
+    }
+
+    #[test]
+    fn parse_passes_noise_shaped_user_text_through_verbatim() {
+        // 钉住测试：CodeBuddy 格式没有 system-reminder / AGENTS.md / 环境上下文
+        // 等注入概念（本格式唯一的内容过滤是根消息的启动关键词 "code"）。
+        // 形似噪声的 user 文本必须逐字透传，防止将来把别家格式的过滤规则
+        // 盲目搬来造成 silent drift。
+        let adapter = CodeBuddyAdapter::new();
+        let fixture = r##"{"type":"message","role":"user","content":"real question","sessionId":"s1"}
+{"type":"message","role":"user","content":"<system-reminder>reminder text</system-reminder>","sessionId":"s1"}
+{"type":"message","role":"user","content":"# AGENTS.md instructions","sessionId":"s1"}
+"##;
+        let mut sink = CountSink {
+            count: 0,
+            texts: vec![],
+            roles: vec![],
+        };
+        let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
+        assert_eq!(report.committed, 3);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "real question".to_string(),
+                "<system-reminder>reminder text</system-reminder>".to_string(),
+                "# AGENTS.md instructions".to_string(),
+            ]
+        );
     }
 
     #[test]

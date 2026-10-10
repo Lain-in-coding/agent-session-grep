@@ -1,0 +1,113 @@
+{
+  "committed": 9,
+  "diagnostics": [
+    "cursorDiskKV: messages report no adopted native id (`bubbleId` is a composer-scoped storage-key component and Cursor's private storage has no official versioned contract), so the composition root derives document-scoped ids; verbatim composer/bubble ids appear only as observations in these diagnostics",
+    "cursorDiskKV composer `cmp:雪/#%_é`: 15 header slot(s), 7 message(s) emitted, 8 slot(s) skipped; states: ok=7 invalid_header=1 unknown_role=1 missing_row=1 null_value=1 invalid_utf8=1 malformed_json=1 invalid_bubble_shape=1 empty_bubble=1",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 6 (`bubbleId:cmp:雪/#%_é:bad:json/雪#%`): malformed_json",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 7 (`bubbleId:cmp:雪/#%_é:missing`): missing_row",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 8 (`bubbleId:cmp:雪/#%_é:null`): null_value",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 9 (`bubbleId:cmp:雪/#%_é:array`): invalid_bubble_shape",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 10 (`bubbleId:cmp:雪/#%_é:utf8`): invalid_utf8",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 11: invalid_header",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 12 (`bubbleId:cmp:雪/#%_é:unknown-role`): unknown_role",
+    "cursorDiskKV composer `cmp:雪/#%_é`: header slot 13 (`bubbleId:cmp:雪/#%_é:blank`): empty_bubble"
+  ],
+  "fixture_blake3": "62f266422cf76f08d5fc42eb0030a4d711d959d386c3d0f9c5481ad788d35051",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "user",
+      "seq": 0,
+      "session": "cmp-2",
+      "span": null,
+      "text": "second session 雪",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 1,
+      "session": "cmp-2",
+      "span": null,
+      "text": "second session assistant",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "user",
+      "seq": 2,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "  first 雪 é  ",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 3,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "synthetic duplicate slot",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 4,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "synthetic duplicate slot",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 5,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "{\"path\":\"synthetic/雪\"}",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 6,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "{\"path\":\"synthetic/params\"}",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 7,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "not a command: synthetic",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 8,
+      "session": "cmp:雪/#%_é",
+      "span": null,
+      "text": "null",
+      "timestamp": null
+    }
+  ],
+  "multi_session": true,
+  "session_native_id": "cmp-2",
+  "shuffled_fixture_blake3": "182e1430b59edcdc66fe8b2eadccba5662f6895eed2c847366988fd4b1dba7ce",
+  "skipped": 8,
+  "variant_id": "cursor/disk-kv-v1"
+}

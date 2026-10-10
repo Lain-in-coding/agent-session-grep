@@ -1,13 +1,18 @@
 //! Testkit：跨 crate 复用的测试构件，包括 fixture builder、只读断言和 fake Provider。
 //!
 //! 本 crate 只被其他 crate 的 `[dev-dependencies]` 依赖，绝不进入生产依赖图。
-//! 提供四类构件：
+//! 提供五类构件：
 //! 1. [`SessionBuilder`] —— 合成合法的 Canonical 会话，省去每个测试手搓样板；
 //! 2. [`InMemoryStore`] —— 同时实现 `CatalogStore` + `SearchIndex` 的内存后端；
 //! 3. [`FakeProvider`] —— 可配置的 `ProviderAdapter`，用于脱离真实格式测 ingestion；
-//! 4. [`assert_read_only`] —— 只读断言：包裹一段操作，断言目标字节未被改写。
+//! 4. [`assert_read_only`] —— 只读断言：包裹一段操作，断言目标字节未被改写；
+//! 5. [`golden`] —— Provider 适配器 golden 契约测试的共享脚手架：全字段捕获 sink、
+//!    fixture 读取与 BLAKE3 校验、canonical JSON 投影。消除 14 个适配器 golden.rs
+//!    里逐字复制的 `CollectingSink`/`Captured`/`read_expected`/`canonical_json`。
 //!
 //! 所有合成数据一律用非真实内容，符合 R0 fixture 脱敏规范。
+
+pub mod golden;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -294,6 +299,37 @@ impl SearchIndex for InMemoryStore {
         hits.truncate(limit);
         Ok(hits)
     }
+    fn query_with_policy(
+        &self,
+        query: SearchQuery<'_>,
+        limit: usize,
+        facets: &agent_session_grep_ports::SearchFacets,
+        include_system: bool,
+    ) -> PortResult<Vec<SearchHit>> {
+        if !facets.is_default() {
+            return Err(PortError::Backend(
+                "InMemoryStore does not support facets".into(),
+            ));
+        }
+        let mut hits = self.query_filtered(query, usize::MAX)?;
+        if !include_system {
+            let catalog = self.catalog.borrow();
+            hits.retain(|hit| {
+                !catalog
+                    .get(hit.id.as_str())
+                    .and_then(|payload| serde_json::from_slice::<serde_json::Value>(payload).ok())
+                    .and_then(|value| {
+                        value
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|role| role == "system" || role == "developer")
+            });
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
 }
 
 impl ContextGraphStore for InMemoryStore {
@@ -521,6 +557,7 @@ impl ProviderAdapter for FakeProvider {
         let mut report = ParseReport::default();
         for (seq, (role, text)) in self.messages.iter().enumerate() {
             sink.emit_message(MessageEvent {
+                session: None,
                 seq: seq as u32,
                 native_id: "",
                 parent_native_id: None,

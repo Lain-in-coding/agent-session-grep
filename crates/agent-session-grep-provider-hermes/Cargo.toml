@@ -10,6 +10,10 @@ publish = false
 agent-session-grep-ports = { path = "../agent-session-grep-ports" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Same pinned SQLite the other SQLite-reading providers use (already in the
+# workspace lockfile and vendored registry): the `state.db` variant opens its
+# private snapshot copy with `rusqlite`.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]
 agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }

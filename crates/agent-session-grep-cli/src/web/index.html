@@ -1,264 +1,1033 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
-<title>agent-session-grep / local observatory</title>
+<!-- `frame-ancestors` is defined to be ignored in a meta-delivered policy, and
+     the browser logs a CSP error for it on every page load. serve.rs sends the
+     same policy as an HTTP response header, where the directive *is* honoured,
+     so the framing protection is kept by leaving it out of the meta tag. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'">
+<!-- With no icon declared the browser probes /favicon.ico on its own. That path
+     is not the UI page, so it needs a bearer token the probe never carries: a
+     401 in the console on every load. An inline empty icon stops the request
+     (and `img-src ... data:` already permits it). -->
+<link rel="icon" href="data:,">
+<title>agent-session-grep</title>
 <style>
+/* ─── Design tokens (Geist-inspired neutral scale, light + dark) ───────────
+   Layout grammar: chrome and body share one background, regions are cut by
+   1px borders (no separate chrome tint); primary buttons are neutral
+   inversion (light: black on white, dark: white on black); accent color is
+   reserved for tiny highlights only. */
 :root {
+  --bg: hsl(0 0% 100%);
+  --surface-2: hsl(0 0% 98%);
+  --surface-hover: hsl(0 0% 95%);
+  --surface-active: hsl(0 0% 92%);
+  --line: hsl(0 0% 92%);
+  --line-strong: hsl(0 0% 79%);
+  --text: hsl(0 0% 9%);
+  --text-dim: hsl(0 0% 30%);
+  --text-mute: hsl(0 0% 56%);
+  --accent: hsl(0 0% 9%);
+  --on-accent: hsl(0 0% 100%);
+  --link: hsl(212 100% 48%);
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.08);
+  --ok: #047857;
+  --user-bubble: #f5f5f5;
+  --code-bg: hsl(0 0% 97%);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --titlebar-h: 40px;
+  --sidebar-w: 248px;
+  --font-ui-size: 14px;
+  --font-code-size: 12px;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
+}
+:root.theme-dark {
+  --bg: hsl(0 0% 4%);
+  --surface-2: hsl(0 0% 0%);
+  --surface-hover: hsl(0 0% 10%);
+  --surface-active: hsl(0 0% 12%);
+  --line: hsl(0 0% 16%);
+  --line-strong: hsl(0 0% 27%);
+  --text: hsl(0 0% 93%);
+  --text-dim: hsl(0 0% 63%);
+  --text-mute: hsl(0 0% 53%);
+  --accent: hsl(0 0% 93%);
+  --on-accent: hsl(0 0% 4%);
+  --link: hsl(210 100% 66%);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.14);
+  --ok: #10b981;
+  --user-bubble: hsl(0 0% 10%);
+  --code-bg: hsl(0 0% 8%);
   color-scheme: dark;
-  --ink: #e5edf4;
-  --muted: #8ea2b5;
-  --line: #263646;
-  --panel: #101a24;
-  --panel-raised: #152535;
-  --canvas: #081018;
-  --signal: #73e6c1;
-  --signal-dim: #2d846f;
-  --warning: #f2bf6b;
-  --danger: #ef847e;
-  --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--canvas); color: var(--ink); font-family: var(--sans); }
-body::before { content: ""; display: block; height: 4px; background: linear-gradient(90deg, var(--signal-dim), var(--signal), transparent 72%); }
-.shell { max-width: 1320px; margin: 0 auto; padding: 28px 24px 48px; }
-.masthead { display: flex; justify-content: space-between; gap: 24px; align-items: flex-end; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
-.eyebrow { color: var(--signal); font: 600 0.72rem/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; }
-h1 { margin: 8px 0 0; font: 650 clamp(1.8rem, 4vw, 3.6rem)/0.95 var(--sans); letter-spacing: -0.06em; }
-.subtitle { max-width: 30rem; margin: 8px 0 0; color: var(--muted); font-size: 0.92rem; }
-.status { min-width: 15rem; padding: 12px 14px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); font: 0.78rem/1.35 var(--mono); }
-.status.ok { color: var(--signal); border-color: var(--signal-dim); }
+/* `[hidden]` is only a UA-stylesheet `display: none`, so any author `display`
+   rule silently defeats it. `.gate` (grid) and `.shell` (flex) both set one,
+   which left the token gate and the app shell visible at the same time — the
+   gate looked unresponsive because hiding it changed nothing. Author-level
+   `!important` is the fix that keeps `hidden` meaning hidden everywhere. */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text); font: var(--font-ui-size)/1.5 var(--sans); }
+button { font: inherit; color: inherit; }
+
+/* ─── Token gate (shown before authentication) ─────────────────────────── */
+.gate { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.gate-card { width: min(26rem, 100%); padding: 28px; background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: var(--radius-lg); }
+.gate-card h1 { margin: 0 0 6px; font-size: 1.15rem; letter-spacing: -0.01em; }
+.gate-card p { margin: 0 0 18px; color: var(--text-dim); font-size: 0.88rem; }
+.gate-error { margin: 0 0 14px; padding: 9px 12px; border-radius: var(--radius-sm);
+  background: var(--danger-soft); color: var(--danger); font-size: 0.85rem; display: none; }
+.gate-error.show { display: block; }
+.gate-row { display: flex; gap: 8px; }
+.gate-row input[type="text"] { flex: 1; min-width: 0; }
+.gate-hint { margin: 14px 0 0; color: var(--text-mute); font: var(--font-code-size)/1.6 var(--mono); word-break: break-all; }
+
+/* ─── Shell / topbar ────────────────────────────────────────────────────── */
+.shell { display: flex; flex-direction: column; height: 100vh; }
+.topbar { height: var(--titlebar-h); flex: none; display: flex; align-items: center; gap: 12px;
+  padding: 0 12px; border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -0.01em; flex: none; }
+.brand svg { display: block; color: var(--brand-dot, var(--text)); }
+.searchwrap { flex: 1; max-width: 560px; display: flex; align-items: center; gap: 8px;
+  height: 36px; padding: 0 10px; background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: var(--radius-md); }
+.searchwrap:focus-within { border-color: var(--line-strong); outline: 2px solid var(--link); outline-offset: 2px; }
+.searchwrap svg { flex: none; color: var(--text-mute); }
+.searchwrap input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--text); font: inherit; outline: none; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.searchwrap kbd { flex: none; color: var(--text-mute); font: 10px var(--mono);
+  border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.topbar-spacer { flex: 1; }
+.status { flex: none; max-width: 22rem; color: var(--text-mute); font: var(--font-code-size) var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status.ok { color: var(--ok); }
 .status.error { color: var(--danger); }
-.toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 10px; margin: 24px 0 14px; }
-input, select, button { border: 1px solid var(--line); border-radius: 3px; color: var(--ink); background: var(--panel); font: inherit; }
-input, select { min-height: 40px; padding: 0 11px; }
-input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-button { min-height: 40px; padding: 0 14px; cursor: pointer; }
-button.primary { color: #06110e; background: var(--signal); border-color: var(--signal); font-weight: 700; }
-button.quiet { color: var(--signal); }
-button:disabled { opacity: 0.42; cursor: not-allowed; }
-.filters { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: var(--muted); font-size: 0.78rem; }
-.filters label { display: flex; align-items: center; gap: 7px; }
-.filters input, .filters select { min-height: 32px; font-size: 0.8rem; }
-.filters input[type="number"] { width: 76px; }
-.filters input[type="checkbox"] { accent-color: var(--signal); }
-.rule { height: 1px; margin: 22px 0; background: var(--line); }
-.meta-row { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font: 0.76rem var(--mono); }
-.retrieval { color: var(--signal); }
-.results { display: grid; gap: 10px; margin-top: 14px; }
-.hit { display: block; width: 100%; padding: 16px; text-align: left; background: var(--panel); border-color: var(--line); transition: border-color 140ms ease, transform 140ms ease; }
-.hit:hover { border-color: var(--signal-dim); transform: translateX(3px); }
-.hit-head { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font: 0.74rem var(--mono); }
-.hit-score { color: var(--signal); }
-.hit-text { margin-top: 9px; color: var(--ink); line-height: 1.55; }
-.hit-session { margin-top: 9px; color: var(--muted); font: 0.76rem var(--mono); }
-.empty { padding: 38px 16px; border: 1px dashed var(--line); color: var(--muted); text-align: center; }
-.actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 16px; }
-#contextPanel { display: none; margin-top: 30px; padding: 20px; border: 1px solid var(--line); background: var(--panel); }
-#contextPanel.open { display: block; }
-.context-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
-.context-head h2 { margin: 0; font-size: 1.05rem; }
-.context-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-.context-controls select { min-height: 32px; font-size: 0.8rem; }
-.message { padding: 13px 0; border-top: 1px solid var(--line); }
-.message-meta { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font: 0.72rem var(--mono); }
-.message-body { margin: 8px 0 0; white-space: pre-wrap; line-height: 1.55; }
-.message button { min-height: 28px; padding: 0 8px; color: var(--muted); font: 0.7rem var(--mono); }
-pre { max-height: 20rem; overflow: auto; padding: 13px; border: 1px solid var(--line); background: var(--canvas); color: var(--muted); font: 0.75rem/1.5 var(--mono); white-space: pre-wrap; }
-@media (max-width: 760px) {
-  .shell { padding: 20px 14px 36px; }
-  .masthead { display: block; }
-  .status { margin-top: 18px; }
-  .toolbar { grid-template-columns: 1fr 1fr; }
-  .toolbar input { grid-column: 1 / -1; }
+.icon-btn { flex: none; display: grid; place-items: center; width: 36px; height: 36px;
+  border: 0; border-radius: var(--radius-sm); background: transparent; cursor: pointer; color: var(--text-dim); }
+.icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+.icon-btn svg { display: block; }
+#langToggle { flex: none; height: 36px; padding: 0 10px; border: 0; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-dim); font: 600 12px var(--sans); cursor: pointer; }
+#langToggle:hover { background: var(--surface-hover); color: var(--text); }
+:root.theme-dark #themeSun { display: block; }
+:root.theme-dark #themeMoon { display: none; }
+:root:not(.theme-dark) #themeSun { display: none; }
+:root:not(.theme-dark) #themeMoon { display: block; }
+
+/* ─── Two-pane layout: hits sidebar + detail ────────────────────────────── */
+.layout { flex: 1; display: flex; min-height: 0; }
+.sidebar { flex: none; width: var(--sidebar-w); display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--line); }
+.sidebar-head { flex: none; display: flex; align-items: baseline; justify-content: space-between;
+  padding: 12px 14px 8px; }
+.sidebar-title { font-size: 0.78rem; font-weight: 650; color: var(--text-dim); letter-spacing: 0.04em; }
+.sidebar-meta { font: var(--font-code-size) var(--mono); color: var(--text-mute); }
+.sidebar-controls { flex: 0 1 auto; min-height: 0; max-height: 60%; overflow-y: auto; display: grid; gap: 6px; padding: 0 12px 10px; }
+/* `.ctl-row label` sets `flex: none` (it beats `.ctl-row > *` on specificity),
+   so the three filter controls could not shrink: they needed 308px inside the
+   248px sidebar and the page-size input was sliced in half at the sidebar
+   edge. Wrapping keeps every control whole at any label length or locale. */
+.ctl-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.ctl-row > * { flex: 1; min-width: 0; }
+.ctl-select { display: grid; gap: 3px; min-width: 0; color: var(--text-mute); font-size: 0.72rem; }
+.ctl-select select { width: 100%; }
+.ctl-row label { flex: none; display: flex; align-items: center; gap: 6px;
+  color: var(--text-mute); font-size: 0.78rem; cursor: pointer; }
+.ctl-row .ctl-select { flex: 1 1 100%; display: grid; }
+.ctl-row input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+input[type="text"], input[type="number"], select {
+  min-height: 36px; padding: 0 8px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text); font-size: 0.82rem; outline: none; }
+input:focus-visible, select:focus-visible, button:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--link); outline-offset: 2px; }
+input[type="number"] { width: 76px; }
+.search-filters { border-top: 1px solid var(--line); padding-top: 7px; }
+.search-filters summary { min-height: 36px; display: flex; align-items: center; cursor: pointer;
+  color: var(--text-dim); font-size: 0.8rem; font-weight: 600; }
+.filter-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding: 4px 0 2px; }
+.filter-field { display: grid; gap: 3px; min-width: 0; color: var(--text-mute); font-size: 0.72rem; }
+.filter-field input, .filter-field select { width: 100%; min-width: 0; }
+.filter-hint { grid-column: 1 / -1; margin: 0; color: var(--text-mute); font-size: 0.7rem; line-height: 1.4; }
+.feedback { padding: 0 2px; color: var(--text-mute); font-size: 0.75rem; line-height: 1.4; }
+.feedback:empty { display: none; }
+.feedback.error { color: var(--danger); }
+.btn:disabled { cursor: not-allowed; opacity: 0.55; }
+.hit-list { flex: 1; overflow-y: auto; padding: 2px 8px 8px; }
+.hit { display: block; width: 100%; text-align: left; padding: 10px 12px; margin-bottom: 4px;
+  border: 0; border-radius: var(--radius-md); background: transparent; cursor: pointer; }
+.hit:hover { background: var(--surface-hover); }
+.hit.active { background: var(--surface-active); }
+.hit-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  font: var(--font-code-size) var(--mono); color: var(--text-mute); }
+.hit-score { color: var(--link); }
+.hit-text { margin-top: 5px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden; color: var(--text-dim); font-size: 0.83rem; line-height: 1.45; }
+.hit.active .hit-text { color: var(--text); }
+.hit-session { margin-top: 5px; font: 11px var(--mono); color: var(--text-mute); }
+.sidebar-foot { flex: none; padding: 8px 12px; border-top: 1px solid var(--line); }
+
+/* ─── Detail pane ───────────────────────────────────────────────────────── */
+.detail { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.detail-head { flex: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.detail-title { margin: 0; font-size: 0.92rem; font-weight: 650; letter-spacing: -0.01em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-title .mono { font: var(--font-code-size) var(--mono); color: var(--text-mute); }
+.detail-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.detail-actions select { font-size: 0.78rem; }
+.btn { height: 28px; padding: 0 11px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text-dim); font-size: 0.8rem; cursor: pointer; }
+.btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.primary { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { background: var(--accent); color: var(--on-accent); opacity: 0.9; }
+.btn.danger { color: var(--danger); border-color: var(--line); }
+.chat { flex: 1; overflow-y: auto; padding: 16px 20px 24px; }
+.msg { margin-bottom: 14px; display: flex; flex-direction: column; gap: 5px; }
+.msg-head { display: flex; align-items: center; gap: 8px; font: 11px var(--mono); color: var(--text-mute); }
+.role-badge { display: inline-block; padding: 1px 7px; border-radius: 99px; font-weight: 600;
+  border: 1px solid var(--line); color: var(--text-dim); }
+.role-badge.user { background: var(--user-bubble); border-color: transparent; color: var(--text); }
+/* `pre-wrap` wraps at soft break opportunities only, and transcript text is
+   full of runs with none: absolute paths, URLs, base64, hashes. Without
+   `overflow-wrap` a single such run made the body 3200px wide inside a 990px
+   pane, so `.chat` grew a horizontal scrollbar and slid the whole message list
+   sideways. */
+.msg-body { padding: 9px 13px; border-radius: var(--radius-md); white-space: pre-wrap;
+  overflow-wrap: anywhere; line-height: 1.6; font-size: 0.88rem; }
+.msg.user .msg-body { background: var(--user-bubble); }
+.msg.assistant .msg-body { background: transparent; border: 1px solid var(--line); }
+.msg-head .btn { height: 22px; padding: 0 7px; font: 11px var(--sans); }
+.empty { padding: 40px 20px; color: var(--text-mute); font-size: 0.88rem; text-align: center; }
+.empty-block { margin: 14px; padding: 28px 20px; border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-lg); color: var(--text-mute); text-align: center; font-size: 0.88rem; }
+.empty-block strong { display: block; margin-bottom: 6px; color: var(--text-dim); font-size: 0.95rem; }
+pre.preview { margin: 0 16px 20px; max-height: 40vh; overflow: auto; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--code-bg);
+  color: var(--text-dim); font: var(--font-code-size)/1.6 var(--mono); white-space: pre-wrap;
+  overflow-wrap: anywhere; }
+
+/* ─── Responsive ────────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  .shell { height: auto; min-height: 100vh; }
+  .topbar { height: auto; min-height: 52px; flex-wrap: wrap; gap: 6px; padding: 6px 8px; }
+  .topbar-spacer { display: none; }
+  .searchwrap { order: 2; flex: 1 1 100%; max-width: none; height: 44px; }
+  #searchButton { order: 3; min-height: 44px; }
+  #langToggle, .icon-btn { min-width: 44px; min-height: 44px; }
+  .layout { flex: none; flex-direction: column; }
+  .sidebar { width: 100%; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }
+  .hit-list { flex: none; max-height: 40vh; }
+  .chat { flex: none; max-height: 70vh; }
+  .status { display: none; }
+  .searchwrap kbd { display: none; }
+  .sidebar-controls { gap: 8px; max-height: none; overflow: visible; }
+  .ctl-select, .filter-field { font-size: 0.78rem; }
+  input[type="text"], input[type="number"], select { min-height: 44px; font-size: 1rem; }
+  .search-filters summary, .ctl-row label, .btn { min-height: 44px; }
+  .msg-head .btn { min-height: 44px; }
 }
-@media (prefers-reduced-motion: reduce) { .hit { transition: none; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
-<main class="shell">
-  <header class="masthead">
-    <div>
-      <div class="eyebrow">local session observatory</div>
-      <h1>Find the thread.</h1>
-      <p class="subtitle">A private, loopback-only window into indexed agent history. Every result is served by the same contract as the CLI.</p>
+
+<div id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <h1 data-i18n="gateTitle"></h1>
+    <div id="gateError" class="gate-error" role="alert"></div>
+    <p data-i18n="gateBody"></p>
+    <div class="gate-row">
+      <input id="gateInput" type="text" autocomplete="off" spellcheck="false">
+      <button id="gateSubmit" class="btn primary" type="button" data-i18n="gateGo"></button>
     </div>
-    <div id="status" class="status" role="status">Connecting to local catalog…</div>
+    <p class="gate-hint" data-i18n="gateHint"></p>
+  </div>
+</div>
+
+<div id="shell" class="shell" data-shell="asg-web" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M10.5 10.5 L14 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      </svg>
+      <span>agent-session-grep</span>
+    </div>
+    <div class="searchwrap">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M10.5 10.5 L14 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      </svg>
+      <label class="visually-hidden" for="query" data-i18n="queryLabel"></label>
+      <input id="query" type="search" autocomplete="off">
+      <kbd>/</kbd>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div id="status" class="status" role="status"></div>
+    <button id="searchButton" class="btn primary" type="button" data-i18n="searchGo" style="flex:none"></button>
+    <button id="langToggle" type="button" title="中文 / English">中 / EN</button>
+    <button id="themeToggle" class="icon-btn" type="button" title="Theme">
+      <svg id="themeSun" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.2" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      <svg id="themeMoon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+      </svg>
+    </button>
   </header>
 
-  <section aria-label="Search controls">
-    <div class="toolbar">
-      <input id="query" type="search" placeholder="Search messages, decisions, errors…" autocomplete="off">
-      <select id="mode" aria-label="Retrieval mode">
-        <option value="lexical">Lexical</option>
-        <option value="semantic">Semantic</option>
-        <option value="hybrid">Hybrid</option>
-      </select>
-      <select id="provider" aria-label="Provider"><option value="">All providers</option></select>
-      <button id="searchButton" class="primary" type="button">Search</button>
-    </div>
-    <div class="filters">
-      <label>Page size <input id="limit" type="number" value="20" min="1" max="100"></label>
-      <label><input id="includeSystem" type="checkbox"> Include system messages</label>
-      <label><input id="groupBySession" type="checkbox"> Group by session</label>
-    </div>
-  </section>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-title" data-i18n="hits"></span>
+        <span id="resultMeta" class="sidebar-meta"></span>
+      </div>
+      <div class="sidebar-controls">
+        <div class="ctl-row">
+          <label class="ctl-select"><span data-i18n="providerLabel"></span><select id="provider"></select></label>
+          <label class="ctl-select"><span data-i18n="modeLabel"></span><select id="mode"></select></label>
+        </div>
+        <div class="ctl-row">
+          <label><input id="includeSystem" type="checkbox"><span data-i18n="includeSystem"></span></label>
+          <label><input id="groupBySession" type="checkbox"><span data-i18n="groupBySession"></span></label>
+          <label><span data-i18n="pageSize"></span><input id="limit" type="number" value="20" min="1" max="100" step="1" required></label>
+        </div>
+        <details class="search-filters">
+          <summary data-i18n="filters"></summary>
+          <div class="filter-grid">
+            <label class="filter-field"><span data-i18n="maxBytes"></span><input id="maxBytes" type="number" min="1" step="1" inputmode="numeric"></label>
+            <label class="filter-field"><span data-i18n="repo"></span><input id="repo" type="text" autocomplete="off"></label>
+            <label class="filter-field"><span data-i18n="since"></span><input id="since" type="text" autocomplete="off" placeholder="2026-01-01T00:00:00Z"></label>
+            <label class="filter-field"><span data-i18n="until"></span><input id="until" type="text" autocomplete="off" placeholder="2026-01-01T00:00:00Z"></label>
+            <label class="filter-field"><span data-i18n="sidechain"></span>
+              <select id="sidechain">
+                <option value="include" data-i18n="sidechainInclude"></option>
+                <option value="main_only" data-i18n="sidechainMain"></option>
+                <option value="subagent_only" data-i18n="sidechainSubagent"></option>
+              </select>
+            </label>
+            <label class="filter-field"><span data-i18n="toolKind"></span><input id="toolKind" type="text" autocomplete="off"></label>
+            <label class="filter-field"><span data-i18n="toolName"></span><input id="toolName" type="text" autocomplete="off"></label>
+            <p class="filter-hint" data-i18n="filterTimeHint"></p>
+          </div>
+        </details>
+      </div>
+      <div id="searchFeedback" class="feedback" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="results" class="hit-list" aria-live="polite"></div>
+      <div class="sidebar-foot">
+        <button id="loadMore" class="btn" type="button" disabled style="width:100%" data-i18n="loadMore"></button>
+      </div>
+    </aside>
 
-  <div class="rule"></div>
-  <div class="meta-row"><span id="resultMeta">Waiting for a query.</span><span id="retrievalMode" class="retrieval"></span></div>
-  <section id="results" class="results" aria-live="polite"><div class="empty">Type a query to inspect the catalog.</div></section>
-  <div class="actions"><button id="loadMore" class="quiet" type="button" disabled>Load next page</button><button id="handoff" class="quiet" type="button" disabled>Preview handoff pack</button></div>
+    <main class="detail">
+      <div class="detail-head" id="contextPanel" hidden>
+        <h2 class="detail-title" id="contextTitle"></h2>
+        <div class="detail-actions">
+          <select id="contextPolicy" aria-label="Context branch"></select>
+          <select id="contextLevel" aria-label="Context detail"></select>
+          <button id="refreshContext" class="btn" type="button" data-i18n="refresh"></button>
+          <button id="resumePreview" class="btn" type="button" data-i18n="resume"></button>
+          <button id="handoff" class="btn" type="button" disabled data-i18n="handoff"></button>
+          <button id="closeContext" class="btn danger" type="button" data-i18n="close"></button>
+        </div>
+      </div>
+      <div id="detailEmpty" class="empty-block">
+        <strong data-i18n="emptyTitle"></strong>
+        <span data-i18n="emptyBody"></span>
+      </div>
+      <div id="contextFeedback" class="feedback context-feedback" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="contextMessages" class="chat" aria-live="polite" aria-busy="false"></div>
+      <pre id="previewOutput" class="preview" hidden></pre>
+    </main>
+  </div>
+</div>
 
-  <section id="contextPanel" aria-label="Session context">
-    <div class="context-head"><h2 id="contextTitle">Session context</h2><button id="closeContext" class="quiet" type="button">Close</button></div>
-    <div class="context-controls">
-      <select id="contextPolicy" aria-label="Context branch"><option value="mainline">Mainline</option><option value="full">Full graph</option></select>
-      <select id="contextLevel" aria-label="Context detail"><option value="raw">Messages</option><option value="talks">Talks</option><option value="sessions">Session summary</option></select>
-      <button id="refreshContext" class="quiet" type="button">Refresh context</button>
-      <button id="resumePreview" class="quiet" type="button">Preview resume</button>
-    </div>
-    <div id="contextMessages"></div>
-    <pre id="previewOutput" hidden></pre>
-  </section>
-</main>
 <script>
-const url = new URL(window.location.href);
-const token = url.searchParams.get('token') || '';
-if (token) window.history.replaceState(null, '', url.pathname);
-const authHeaders = {'Authorization': 'Bearer ' + token};
+/* ─── i18n ──────────────────────────────────────────────────────────────── */
+const I18N = {
+  zh: {
+    gateTitle: '需要访问令牌',
+    gateBody: '这个页面是本机 agent-session-grep 服务的只读界面。令牌在启动 serve 的终端里,形如 #token=32位十六进制;把它粘贴到下面即可(只需一次,之后会记住)。',
+    gateGo: '进入',
+    gateHint: '找不到令牌?看运行 `asg serve` 的那个终端窗口的第一行输出。',
+    gateRejected: '令牌无效或已过期(serve 重启后令牌会更换),请从终端重新复制。',
+    gateEmpty: '请先粘贴令牌(32 位十六进制)。',
+    queryLabel: '搜索查询',
+    searchPlaceholder: '搜索消息、决策、报错……',
+    searchGo: '搜索',
+    searchLoading: '正在搜索…',
+    searchChanged: '搜索条件已更改，请重新搜索。',
+    queryRequired: '请输入搜索内容。',
+    filterInvalid: '请检查数字筛选项。',
+    filters: '更多筛选',
+    providerLabel: '来源',
+    modeLabel: '检索模式',
+    maxBytes: '最大响应字节数',
+    since: '开始时间',
+    until: '结束时间',
+    repo: '仓库',
+    sidechain: '会话分支',
+    sidechainInclude: '全部消息',
+    sidechainMain: '仅主线',
+    sidechainSubagent: '仅子代理',
+    toolKind: '工具类型',
+    toolName: '工具名称',
+    filterTimeHint: '时间使用带时区的 ISO 8601 格式，例如 2026-01-01T00:00:00Z。',
+    contextLoading: '正在加载会话…',
+    contextFailed: '会话加载失败：',
+    statusConnecting: '正在连接本地库…',
+    statusConnected: '已连接 · 第 {g} 代 · {n} 条记录',
+    statusUnavailable: '不可用 · ',
+    hits: '命中',
+    includeSystem: '含系统消息',
+    groupBySession: '按会话归并',
+    pageSize: '每页',
+    loadMore: '加载下一页',
+    refresh: '刷新',
+    resume: '恢复预览',
+    handoff: '交接包',
+    close: '关闭',
+    emptyTitle: '从左侧开始',
+    emptyBody: '搜索后点击任意一条命中,这里会展开它所在会话的完整上下文。',
+    noHits: '没有匹配的消息。试试其他关键词或放宽筛选条件。',
+    notAnswer: '查询失败:',
+    noMessages: '该会话在当前层级下没有消息。',
+    showEntity: '查看原文',
+    retrievalMode: '检索模式:',
+    allProviders: '全部来源',
+    policyMainline: '主线',
+    policyFull: '全图',
+    levelRaw: '消息',
+    levelTalks: '对话轮',
+    levelSessions: '会话概览',
+    modeLexical: '词法',
+    modeSemantic: '语义',
+    modeHybrid: '混合',
+    sessionLabel: '会话',
+    providerSuffix: '',
+  },
+  en: {
+    gateTitle: 'Access token required',
+    gateBody: 'This page is a read-only view over a local agent-session-grep serve instance. The token is printed in the terminal that started serve (a #token=… fragment); paste it below. You only need to do this once per serve session.',
+    gateGo: 'Open',
+    gateHint: 'Lost the token? It is on the first line of the terminal running `asg serve`.',
+    gateRejected: 'Token invalid or expired (serve rotates it on restart). Copy a fresh one from the terminal.',
+    gateEmpty: 'Paste the token first (32 hex characters).',
+    queryLabel: 'Search query',
+    searchPlaceholder: 'Search messages, decisions, errors…',
+    searchGo: 'Search',
+    searchLoading: 'Searching…',
+    searchChanged: 'Search criteria changed. Run the search again.',
+    queryRequired: 'Enter a search query.',
+    filterInvalid: 'Check the numeric filters.',
+    filters: 'More filters',
+    providerLabel: 'Provider',
+    modeLabel: 'Retrieval mode',
+    maxBytes: 'Maximum response bytes',
+    since: 'From',
+    until: 'Until',
+    repo: 'Repository',
+    sidechain: 'Conversation branch',
+    sidechainInclude: 'All messages',
+    sidechainMain: 'Mainline only',
+    sidechainSubagent: 'Subagent only',
+    toolKind: 'Tool kind',
+    toolName: 'Tool name',
+    filterTimeHint: 'Use a timezone-qualified ISO 8601 time, for example 2026-01-01T00:00:00Z.',
+    contextLoading: 'Loading session…',
+    contextFailed: 'Could not load session: ',
+    statusConnecting: 'Connecting to local catalog…',
+    statusConnected: 'Connected · generation {g} · {n} entities',
+    statusUnavailable: 'Unavailable · ',
+    hits: 'Hits',
+    includeSystem: 'System messages',
+    groupBySession: 'Group by session',
+    pageSize: 'Size',
+    loadMore: 'Load next page',
+    refresh: 'Refresh',
+    resume: 'Preview resume',
+    handoff: 'Handoff pack',
+    close: 'Close',
+    emptyTitle: 'Start from the sidebar',
+    emptyBody: 'Search, then click any hit to open its session context here.',
+    noHits: 'No matching messages. Try another query or fewer filters.',
+    notAnswer: 'The catalog could not answer: ',
+    noMessages: 'This session has no messages at the selected level.',
+    showEntity: 'show',
+    retrievalMode: 'retrieval_mode:',
+    allProviders: 'All providers',
+    policyMainline: 'Mainline',
+    policyFull: 'Full graph',
+    levelRaw: 'Messages',
+    levelTalks: 'Talks',
+    levelSessions: 'Session summary',
+    modeLexical: 'Lexical',
+    modeSemantic: 'Semantic',
+    modeHybrid: 'Hybrid',
+    sessionLabel: 'session',
+    providerSuffix: ' · ',
+  },
+};
+const LANG_KEY = 'asg-web-lang';
+let lang = localStorage.getItem(LANG_KEY) ||
+  (navigator.language && navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
+function t(key, vars) {
+  let s = (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
+  if (vars) for (const k of Object.keys(vars)) s = s.split('{' + k + '}').join(vars[k]);
+  return s;
+}
+function applyI18n() {
+  document.documentElement.lang = lang === 'zh' ? 'zh' : 'en';
+  document.getElementById('query').placeholder = t('searchPlaceholder');
+  for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = t(node.dataset.i18n);
+  fillSelects();
+}
+
+/* ─── Theme ─────────────────────────────────────────────────────────────── */
+const THEME_KEY = 'asg-web-theme';
+function applyTheme(mode) {
+  document.documentElement.classList.toggle('theme-dark', mode === 'dark');
+}
+{
+  const saved = localStorage.getItem(THEME_KEY);
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  applyTheme(saved || (prefersDark ? 'dark' : 'light'));
+}
+
+/* ─── Token: fragment → query fallback → remembered ────────────────────── */
+const TOKEN_KEY = 'asg-web-token';
+/* Read the token out of the address bar and strip it from the visible URL.
+   This must stay callable after load: a URL that differs only in its fragment
+   is a same-document navigation, so pasting the fresh `…/#token=…` line into
+   the tab that is already open — exactly what the gate's own error text tells
+   you to do after serve rotates the token — does not re-run this script. The
+   `hashchange` listener below is what makes that paste work. */
+function readUrlToken() {
+  const url = new URL(window.location.href);
+  const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''));
+  const found = hashParams.get('token') || url.searchParams.get('token') || '';
+  if (found) window.history.replaceState(null, '', url.pathname);
+  return found;
+}
+const urlToken = readUrlToken();
+if (urlToken) localStorage.setItem(TOKEN_KEY, urlToken);
+let token = localStorage.getItem(TOKEN_KEY) || '';
+let authHeaders = { 'Authorization': 'Bearer ' + token };
+
+function showGate(rejected) {
+  // A credential the server has already refused must not be replayed on the
+  // next load: keeping it makes every reload paint the authenticated shell for
+  // one round-trip before falling back here.
+  if (rejected) localStorage.removeItem(TOKEN_KEY);
+  cancelRequest('init');
+  invalidateSearch();
+  document.getElementById('shell').hidden = true;
+  document.getElementById('gate').hidden = false;
+  const error = document.getElementById('gateError');
+  error.textContent = rejected ? t('gateRejected') : '';
+  error.classList.toggle('show', Boolean(rejected));
+  document.getElementById('gateInput').value = '';
+  document.getElementById('gateInput').focus();
+}
+function acceptToken(value) {
+  token = (value || '').trim();
+  if (!token) {
+    const error = document.getElementById('gateError');
+    error.textContent = t('gateEmpty');
+    error.classList.add('show');
+    return;
+  }
+  localStorage.setItem(TOKEN_KEY, token);
+  authHeaders = { 'Authorization': 'Bearer ' + token };
+  invalidateSearch();
+  document.getElementById('gateError').classList.remove('show');
+  document.getElementById('gate').hidden = true;
+  document.getElementById('shell').hidden = false;
+  init();
+}
+
+/* ─── App state ─────────────────────────────────────────────────────────── */
 let activeSession = '';
 let nextCursor = null;
 let lastQuery = '';
+let activeHit = null;
+/* Every hit loaded for the current query, across all pages. The sidebar counter
+   has to report what is on screen (three pages of two is six hits, not two),
+   and the language toggle re-renders the list from here. `lastError` records a
+   failed query the same way, so the toggle re-renders the error, not an
+   invented "no hits". */
+let lastHits = [];
+let lastError = '';
+let searchSignature = '';
+const requests = { search: null, context: null, preview: null, init: null };
+const feedbackState = { search: null, context: null };
+
+// Controller identity is the request generation. Cancellation saves work;
+// identity checks also reject a response already queued when abort() runs.
+function cancelRequest(kind) {
+  const previous = requests[kind];
+  requests[kind] = null;
+  if (previous) previous.abort();
+}
+function beginRequest(kind) {
+  cancelRequest(kind);
+  const controller = new AbortController();
+  requests[kind] = controller;
+  return controller;
+}
+function currentRequest(kind, controller) {
+  return requests[kind] === controller && !controller.signal.aborted;
+}
+function setFeedback(kind, key = '', detail = '', error = false) {
+  feedbackState[kind] = { key, detail, error };
+  const node = document.getElementById(kind + 'Feedback');
+  text(node, (key ? t(key) : '') + detail);
+  node.classList.toggle('error', error);
+}
+function setSearchBusy(busy) {
+  document.getElementById('results').setAttribute('aria-busy', String(busy));
+  document.getElementById('searchButton').setAttribute('aria-busy', String(busy));
+  document.getElementById('loadMore').disabled = busy || !nextCursor;
+}
+function invalidateSearch(messageKey = '') {
+  const hadSearch = Boolean(lastQuery || requests.search || (messageKey && feedbackState.search && feedbackState.search.key === messageKey));
+  cancelRequest('search');
+  nextCursor = null;
+  searchSignature = '';
+  lastQuery = '';
+  lastHits = [];
+  lastError = '';
+  clear(document.getElementById('results'));
+  text(document.getElementById('resultMeta'), '');
+  document.getElementById('handoff').disabled = true;
+  setSearchBusy(false);
+  setFeedback('search', hadSearch ? messageKey : '');
+  closeContext();
+}
 
 function payload(body) { return body && body.data ? body.data : (body || {}); }
-function setStatus(text, kind) {
+function setStatus(textMsg, kind) {
   const node = document.getElementById('status');
-  node.textContent = text;
+  node.textContent = textMsg;
   node.className = 'status' + (kind ? ' ' + kind : '');
 }
 function clear(node) { node.replaceChildren(); }
 function text(node, value) { node.textContent = value == null ? '' : String(value); }
-function button(label, className, onClick) {
-  const node = document.createElement('button');
-  node.type = 'button'; node.className = className || 'quiet'; node.textContent = label; node.addEventListener('click', onClick); return node;
-}
-async function api(path) {
-  const response = await fetch(path, {headers: authHeaders, credentials: 'same-origin'});
+
+async function api(path, signal) {
+  const requestToken = token;
+  const response = await fetch(path, { headers: authHeaders, credentials: 'same-origin', signal });
   const body = await response.json().catch(() => ({}));
+  if (requestToken !== token || (signal && signal.aborted)) throw new DOMException('Superseded request', 'AbortError');
+  if (response.status === 401) { showGate(true); throw new Error('unauthorized'); }
   if (!response.ok) throw new Error((body.error && body.error.message) || 'HTTP ' + response.status);
   return body;
 }
 function showPreview(value) {
   const node = document.getElementById('previewOutput');
-  node.hidden = false; node.textContent = JSON.stringify(value, null, 2);
+  node.hidden = false;
+  node.textContent = JSON.stringify(value, null, 2);
 }
-async function init() {
-  try {
-    const statusBody = await api('/health');
-    const status = payload(statusBody);
-    setStatus('Connected · generation ' + (status.generation == null ? '?' : status.generation), 'ok');
-    await loadProviders();
-  } catch (error) { setStatus('Unavailable · ' + error.message, 'error'); }
-}
-async function loadProviders() {
-  const body = await api('/api/providers');
-  const providers = payload(body).providers || [];
-  const select = document.getElementById('provider');
-  for (const provider of providers) {
+
+function fillSelects() {
+  const provider = document.getElementById('provider');
+  const selectedProvider = provider.value;
+  clear(provider);
+  const all = document.createElement('option');
+  all.value = ''; all.textContent = t('allProviders');
+  provider.appendChild(all);
+  for (const item of providerCache) {
     const option = document.createElement('option');
-    option.value = provider.provider_id || provider.id || '';
-    option.textContent = (provider.provider_id || provider.id || 'unknown') + ' · ' + (provider.maturity || 'unknown');
-    select.appendChild(option);
+    option.value = item.id;
+    option.textContent = item.id + (item.maturity ? t('providerSuffix') + item.maturity : '');
+    provider.appendChild(option);
+  }
+  provider.value = selectedProvider;
+
+  const mode = document.getElementById('mode');
+  const selectedMode = mode.value || 'lexical';
+  clear(mode);
+  for (const [value, key] of [['lexical', 'modeLexical'], ['semantic', 'modeSemantic'], ['hybrid', 'modeHybrid']]) {
+    const option = document.createElement('option');
+    option.value = value; option.textContent = t(key);
+    mode.appendChild(option);
+  }
+  mode.value = selectedMode;
+
+  const policy = document.getElementById('contextPolicy');
+  const selectedPolicy = policy.value || 'mainline';
+  clear(policy);
+  for (const [value, key] of [['mainline', 'policyMainline'], ['full', 'policyFull']]) {
+    const option = document.createElement('option');
+    option.value = value; option.textContent = t(key);
+    policy.appendChild(option);
+  }
+  policy.value = selectedPolicy;
+
+  const level = document.getElementById('contextLevel');
+  const selectedLevel = level.value || 'raw';
+  clear(level);
+  for (const [value, key] of [['raw', 'levelRaw'], ['talks', 'levelTalks'], ['sessions', 'levelSessions']]) {
+    const option = document.createElement('option');
+    option.value = value; option.textContent = t(key);
+    level.appendChild(option);
+  }
+  level.value = selectedLevel;
+}
+
+let providerCache = [];
+async function loadProviders(controller, providerValues) {
+  const body = await api('/api/providers', controller.signal);
+  if (!currentRequest('init', controller)) return;
+  providerCache = (payload(body).providers || []).filter(p => providerValues.has(p.provider_id || p.id)).map(p => ({
+    id: p.provider_id || p.id || '',
+    maturity: p.maturity || '',
+  }));
+  fillSelects();
+}
+
+async function init() {
+  const controller = beginRequest('init');
+  setStatus(t('statusConnecting'));
+  try {
+    const status = payload(await api('/api/status', controller.signal));
+    if (!currentRequest('init', controller)) return;
+    setStatus(t('statusConnected', { g: status.generation == null ? '?' : status.generation, n: status.catalog_count == null ? '?' : status.catalog_count }), 'ok');
+    await loadProviders(controller, new Set(status.web_capabilities.provider_values));
+  } catch (error) {
+    if (currentRequest('init', controller) && error.name !== 'AbortError' && error.message !== 'unauthorized') setStatus(t('statusUnavailable') + error.message, 'error');
+  } finally {
+    if (currentRequest('init', controller)) requests.init = null;
   }
 }
-function queryParams(cursor) {
-  const params = new URLSearchParams({q: lastQuery, mode: document.getElementById('mode').value, limit: document.getElementById('limit').value});
-  const provider = document.getElementById('provider').value;
-  if (provider) params.set('provider', provider);
-  if (cursor) params.set('cursor', cursor);
+
+const SEARCH_FIELDS = [
+  ['provider', 'provider'], ['maxBytes', 'max_bytes'], ['repo', 'repo'],
+  ['since', 'since'], ['until', 'until'], ['sidechain', 'sidechain'],
+  ['toolKind', 'tool_kind'], ['toolName', 'tool_name'],
+];
+function queryParams() {
+  const params = new URLSearchParams({ q: document.getElementById('query').value.trim(), mode: document.getElementById('mode').value, limit: document.getElementById('limit').value });
+  for (const [id, name] of SEARCH_FIELDS) {
+    const value = document.getElementById(id).value.trim();
+    if (value && !(name === 'sidechain' && value === 'include')) params.set(name, value);
+  }
   if (document.getElementById('includeSystem').checked) params.set('include_system', 'true');
   if (document.getElementById('groupBySession').checked) params.set('group_by_session', 'true');
   return params;
 }
+
 async function doSearch(cursor) {
   const query = document.getElementById('query').value.trim();
-  if (!query) return;
-  if (!cursor) { lastQuery = query; clear(document.getElementById('results')); }
+  if (!query) {
+    invalidateSearch();
+    setFeedback('search', 'queryRequired', '', true);
+    return;
+  }
+  for (const id of ['limit', 'maxBytes']) {
+    const control = document.getElementById(id);
+    if (!control.checkValidity()) {
+      invalidateSearch();
+      setFeedback('search', 'filterInvalid', '', true);
+      control.reportValidity();
+      return;
+    }
+  }
+  const params = queryParams();
+  const signature = params.toString();
+  if (cursor && signature !== searchSignature) { invalidateSearch('searchChanged'); return; }
+  if (cursor && (requests.search || cursor !== nextCursor)) return;
+  if (!cursor) {
+    invalidateSearch();
+    lastQuery = query;
+    searchSignature = signature;
+  } else params.set('cursor', cursor);
+  const controller = beginRequest('search');
+  nextCursor = null;
+  setSearchBusy(true);
+  setFeedback('search', 'searchLoading');
   try {
-    const body = await api('/api/search?' + queryParams(cursor));
+    const body = await api('/api/search?' + params, controller.signal);
+    if (!currentRequest('search', controller)) return;
     const data = payload(body);
-    renderHits(data.hits || [], Boolean(cursor));
-    nextCursor = (body.page && body.page.next_cursor) || null;
-    document.getElementById('loadMore').disabled = !nextCursor;
-    text(document.getElementById('retrievalMode'), 'retrieval_mode: ' + (data.retrieval_mode || 'lexical'));
-    text(document.getElementById('resultMeta'), (data.hits || []).length + ' hits · generation ' + (data.generation == null ? '?' : data.generation));
+    const hits = data.hits || [];
+    lastHits = cursor ? lastHits.concat(hits) : hits;
+    lastError = '';
+    renderHits(hits, Boolean(cursor));
+    nextCursor = (body.page && body.page.has_more && body.page.next_cursor) || null;
+    text(document.getElementById('resultMeta'), (data.retrieval_mode || 'lexical') + ' · ' + lastHits.length);
     document.getElementById('handoff').disabled = false;
-  } catch (error) { renderError(error.message); }
+    setFeedback('search', '', (body.warnings || []).join(' '));
+  } catch (error) {
+    if (!currentRequest('search', controller) || error.name === 'AbortError' || error.message === 'unauthorized') return;
+    lastHits = [];
+    nextCursor = null;
+    text(document.getElementById('resultMeta'), '');
+    document.getElementById('handoff').disabled = true;
+    setFeedback('search', 'notAnswer', error.message, true);
+    renderError(error.message);
+  } finally {
+    if (currentRequest('search', controller)) {
+      requests.search = null;
+      setSearchBusy(false);
+    }
+  }
 }
+
 function renderError(message) {
-  const node = document.createElement('div'); node.className = 'empty'; text(node, 'The catalog could not answer: ' + message); clear(document.getElementById('results')); document.getElementById('results').appendChild(node);
+  lastError = message;
+  const node = document.createElement('div');
+  node.className = 'empty';
+  text(node, t('notAnswer') + message);
+  const results = document.getElementById('results');
+  clear(results);
+  results.appendChild(node);
 }
+
+function shortId(id) {
+  const s = String(id || '');
+  return s.length > 22 ? s.slice(0, 22) + '…' : s;
+}
+
 function renderHits(hits, append) {
   const results = document.getElementById('results');
   if (!append) clear(results);
-  if (!hits.length && !append) { const empty = document.createElement('div'); empty.className = 'empty'; text(empty, 'No matching messages.'); results.appendChild(empty); return; }
+  if (!hits.length && !append) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    text(empty, t('noHits'));
+    results.appendChild(empty);
+    return;
+  }
   for (const hit of hits) {
-    const card = button('', 'hit', () => loadContext(hit.session_id || ''));
-    const head = document.createElement('div'); head.className = 'hit-head';
-    const id = document.createElement('span'); text(id, hit.id || 'unknown');
-    const score = document.createElement('span'); score.className = 'hit-score'; text(score, Number(hit.score || 0).toFixed(3)); head.append(id, score);
-    const body = document.createElement('div'); body.className = 'hit-text'; text(body, hit.text || '');
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'hit' + (activeHit === hit.id ? ' active' : '');
+    const head = document.createElement('div');
+    head.className = 'hit-head';
+    const id = document.createElement('span');
+    text(id, shortId(hit.id));
+    const score = document.createElement('span');
+    score.className = 'hit-score';
+    text(score, Number(hit.score || 0).toFixed(3));
+    head.append(id, score);
+    const body = document.createElement('div');
+    body.className = 'hit-text';
+    text(body, hit.text || '');
     card.append(head, body);
-    if (hit.session_id) { const session = document.createElement('div'); session.className = 'hit-session'; text(session, 'session · ' + hit.session_id); card.appendChild(session); }
+    if (hit.session_id) {
+      const session = document.createElement('div');
+      session.className = 'hit-session';
+      text(session, t('sessionLabel') + ' · ' + shortId(hit.session_id));
+      card.appendChild(session);
+      card.title = hit.session_id;
+    }
+    card.addEventListener('click', () => {
+      activeHit = hit.id;
+      for (const other of results.children) other.classList.remove('active');
+      card.classList.add('active');
+      loadContext(hit.session_id || '');
+    });
     results.appendChild(card);
   }
 }
+
 async function loadContext(sessionId) {
-  if (!sessionId) return;
+  if (!sessionId) { closeContext(); return; }
+  /* A preview belongs to the session it was opened from. Left on screen under
+     another session's header it attributes the wrong `--resume` command to that
+     session, so drop it when the session actually changes — and only then, so
+     re-rendering the same session keeps it. */
+  if (sessionId !== activeSession) {
+    cancelRequest('preview');
+    const preview = document.getElementById('previewOutput');
+    preview.hidden = true;
+    clear(preview);
+  }
   activeSession = sessionId;
-  document.getElementById('contextPanel').classList.add('open');
-  text(document.getElementById('contextTitle'), 'Session · ' + sessionId);
+  document.getElementById('contextPanel').hidden = false;
+  document.getElementById('detailEmpty').hidden = true;
+  const title = document.getElementById('contextTitle');
+  clear(title);
+  const label = document.createElement('span');
+  text(label, t('sessionLabel') + ' ');
+  const mono = document.createElement('span');
+  mono.className = 'mono';
+  text(mono, shortId(sessionId));
+  mono.title = sessionId;
+  title.append(label, mono);
   await refreshContext();
 }
+
 async function refreshContext() {
   if (!activeSession) return;
+  const controller = beginRequest('context');
+  const session = activeSession;
+  const container = document.getElementById('contextMessages');
+  clear(container);
+  container.setAttribute('aria-busy', 'true');
+  setFeedback('context', 'contextLoading');
   try {
-    const params = new URLSearchParams({session: activeSession, policy: document.getElementById('contextPolicy').value, level: document.getElementById('contextLevel').value});
-    const body = await api('/api/context?' + params);
-    const data = payload(body); const messages = data.messages || []; const container = document.getElementById('contextMessages'); clear(container);
+    const params = new URLSearchParams({ session, policy: document.getElementById('contextPolicy').value, level: document.getElementById('contextLevel').value });
+    const body = await api('/api/context?' + params, controller.signal);
+    if (!currentRequest('context', controller) || activeSession !== session) return;
+    const messages = payload(body).messages || [];
+    clear(container);
     for (const message of messages) {
-      const item = document.createElement('article'); item.className = 'message';
-      const meta = document.createElement('div'); meta.className = 'message-meta';
-      const role = document.createElement('span'); const source = message.payload || {}; text(role, source.role || 'message');
-      const id = button('show ' + (message.message_id || message.id || ''), 'quiet', () => showEntity(message.message_id || message.id)); meta.append(role, id);
-      const bodyNode = document.createElement('div'); bodyNode.className = 'message-body'; text(bodyNode, source.text || JSON.stringify(source)); item.append(meta, bodyNode); container.appendChild(item);
+      const source = message.payload || {};
+      const role = source.role || 'message';
+      const item = document.createElement('article');
+      item.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+      const head = document.createElement('div');
+      head.className = 'msg-head';
+      const badge = document.createElement('span');
+      badge.className = 'role-badge ' + (role === 'user' ? 'user' : '');
+      text(badge, role);
+      head.appendChild(badge);
+      const entityId = message.message_id || message.id || '';
+      if (entityId) {
+        const show = document.createElement('button');
+        show.type = 'button'; show.className = 'btn';
+        text(show, t('showEntity') + ' ' + shortId(entityId));
+        show.title = entityId;
+        show.addEventListener('click', () => showEntity(entityId));
+        head.appendChild(show);
+      }
+      const bodyNode = document.createElement('div');
+      bodyNode.className = 'msg-body';
+      text(bodyNode, source.text || JSON.stringify(source));
+      item.append(head, bodyNode);
+      container.appendChild(item);
     }
-    if (!messages.length) { const empty = document.createElement('div'); empty.className = 'empty'; text(empty, 'This session has no messages at the selected level.'); container.appendChild(empty); }
-  } catch (error) { const node = document.getElementById('contextMessages'); clear(node); const empty = document.createElement('div'); empty.className = 'empty'; text(empty, error.message); node.appendChild(empty); }
+    if (!messages.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      text(empty, t('noMessages'));
+      container.appendChild(empty);
+    }
+    setFeedback('context', '', (body.warnings || []).join(' '));
+  } catch (error) {
+    if (!currentRequest('context', controller) || activeSession !== session || error.name === 'AbortError' || error.message === 'unauthorized') return;
+    clear(container);
+    setFeedback('context', 'contextFailed', error.message, true);
+  } finally {
+    if (currentRequest('context', controller)) {
+      requests.context = null;
+      container.setAttribute('aria-busy', 'false');
+    }
+  }
 }
+
+function closeContext() {
+  cancelRequest('context');
+  cancelRequest('preview');
+  document.getElementById('contextPanel').hidden = true;
+  document.getElementById('detailEmpty').hidden = false;
+  clear(document.getElementById('contextMessages'));
+  document.getElementById('contextMessages').setAttribute('aria-busy', 'false');
+  document.getElementById('previewOutput').hidden = true;
+  clear(document.getElementById('previewOutput'));
+  setFeedback('context');
+  for (const card of document.getElementById('results').children) card.classList.remove('active');
+  activeSession = ''; activeHit = null;
+}
+
+async function loadPreview(path) {
+  const controller = beginRequest('preview');
+  try {
+    const body = await api(path, controller.signal);
+    if (currentRequest('preview', controller)) showPreview(payload(body));
+  } catch (error) {
+    if (currentRequest('preview', controller) && error.name !== 'AbortError' && error.message !== 'unauthorized') showPreview({ error: error.message });
+  } finally {
+    if (currentRequest('preview', controller)) requests.preview = null;
+  }
+}
+
 async function showEntity(id) {
   if (!id) return;
-  try { showPreview(payload(await api('/api/show?id=' + encodeURIComponent(id)))); } catch (error) { showPreview({error: error.message}); }
+  await loadPreview('/api/show?id=' + encodeURIComponent(id));
 }
+
 async function previewResume() {
   if (!activeSession) return;
-  try { showPreview(payload(await api('/api/resume?session=' + encodeURIComponent(activeSession)))); } catch (error) { showPreview({error: error.message}); }
+  await loadPreview('/api/resume?session=' + encodeURIComponent(activeSession));
 }
+
 async function previewHandoff() {
   if (!lastQuery) return;
-  try { showPreview(payload(await api('/api/handoff?q=' + encodeURIComponent(lastQuery)))); } catch (error) { showPreview({error: error.message}); }
+  await loadPreview('/api/handoff?q=' + encodeURIComponent(lastQuery));
 }
+
+/* ─── Wiring ────────────────────────────────────────────────────────────── */
+document.getElementById('gateSubmit').addEventListener('click', () => acceptToken(document.getElementById('gateInput').value));
+document.getElementById('gateInput').addEventListener('keydown', event => { if (event.key === 'Enter') acceptToken(event.target.value); });
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const dark = document.documentElement.classList.toggle('theme-dark');
+  localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light');
+});
+document.getElementById('langToggle').addEventListener('click', () => {
+  lang = lang === 'zh' ? 'en' : 'zh';
+  localStorage.setItem(LANG_KEY, lang);
+  applyI18n();
+  for (const [kind, state] of Object.entries(feedbackState)) {
+    if (state) setFeedback(kind, state.key, state.detail, state.error);
+  }
+  /* `applyI18n()` only rewrites `[data-i18n]` markup and the select options.
+     Every other string on screen came from `t()` at render time — the status
+     line, each hit card's session line, the context title, the per-message
+     `show` buttons — so those regions must be rendered again or the toggle
+     leaves the page half-translated. */
+  if (lastError) renderError(lastError);
+  else if (lastQuery) renderHits(lastHits, false);
+  if (activeSession) loadContext(activeSession);
+  init();
+});
 document.getElementById('searchButton').addEventListener('click', () => doSearch());
 document.getElementById('query').addEventListener('keydown', event => { if (event.key === 'Enter') doSearch(); });
-document.getElementById('loadMore').addEventListener('click', () => doSearch(nextCursor));
+for (const id of ['query', 'mode', 'limit', 'includeSystem', 'groupBySession', ...SEARCH_FIELDS.map(([id]) => id)]) {
+  document.getElementById(id).addEventListener('input', () => invalidateSearch('searchChanged'));
+  document.getElementById(id).addEventListener('change', () => invalidateSearch('searchChanged'));
+}
+document.getElementById('loadMore').addEventListener('click', () => { if (nextCursor) doSearch(nextCursor); });
 document.getElementById('handoff').addEventListener('click', previewHandoff);
 document.getElementById('refreshContext').addEventListener('click', refreshContext);
 document.getElementById('resumePreview').addEventListener('click', previewResume);
-document.getElementById('closeContext').addEventListener('click', () => document.getElementById('contextPanel').classList.remove('open'));
-init();
+document.getElementById('closeContext').addEventListener('click', closeContext);
+document.getElementById('contextPolicy').addEventListener('change', refreshContext);
+document.getElementById('contextLevel').addEventListener('change', refreshContext);
+/* A fragment-only navigation does not reload the page, so the token pasted into
+   the address bar of an already-open tab arrives here and nowhere else. */
+window.addEventListener('hashchange', () => {
+  const fresh = readUrlToken();
+  if (fresh) acceptToken(fresh);
+});
+document.addEventListener('keydown', event => {
+  const editing = document.activeElement && (document.activeElement.matches('input, textarea, select') || document.activeElement.isContentEditable);
+  if (event.key === '/' && !editing && document.getElementById('gate').hidden) {
+    event.preventDefault();
+    document.getElementById('query').focus();
+  }
+});
+
+applyI18n();
+if (token) { document.getElementById('gate').hidden = true; document.getElementById('shell').hidden = false; init(); }
+else showGate(false);
 </script>
 </body>
 </html>

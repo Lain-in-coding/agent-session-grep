@@ -4,7 +4,7 @@
   "messages": [
     {
       "is_sidechain": false,
-      "native_id": "codebuddy-msg-0",
+      "native_id": "",
       "parent_native_id": null,
       "role": "user",
       "seq": 0,
@@ -17,7 +17,7 @@
     },
     {
       "is_sidechain": false,
-      "native_id": "codebuddy-msg-1",
+      "native_id": "",
       "parent_native_id": null,
       "role": "assistant",
       "seq": 1,
@@ -30,7 +30,7 @@
     },
     {
       "is_sidechain": false,
-      "native_id": "codebuddy-msg-2",
+      "native_id": "",
       "parent_native_id": null,
       "role": "user",
       "seq": 2,

@@ -227,7 +227,10 @@ fn build_transcript(seed: u64, with_large_field: bool) -> GeneratedTranscript {
                 None
             };
             let sidechain = rng.chance(30);
-            // content 两种形态：字符串，或 text 块与无 text 工具块混排的数组。
+            // content 两种形态：字符串，或 text 块与工具块混排的数组。
+            // 工具块的 ground truth 是它的可检索摘要（设计 R7：`名字(target)`），
+            // 按 block 顺序追加在文本块之后——生成器与 adapter 用同一规则，
+            // 属性才检验"投影确定且只用 provider 记录的事实"。
             let (content, text) = if force_large_valid || rng.chance(50) {
                 let t = make_text(&mut rng, force_large_valid);
                 (json!(t), t)
@@ -235,17 +238,24 @@ fn build_transcript(seed: u64, with_large_field: bool) -> GeneratedTranscript {
                 let block_count = rng.below(4);
                 let mut blocks = Vec::new();
                 let mut texts = Vec::new();
+                let mut tool_summaries = Vec::new();
                 for _ in 0..block_count {
                     if rng.chance(75) {
                         let t = make_text(&mut rng, false);
                         blocks.push(json!({"type": "text", "text": t.clone()}));
                         texts.push(t);
                     } else {
+                        let path = format!("crates/prop/src/f{}.rs", rng.below(1000));
                         blocks.push(json!({
-                            "type": "tool_use", "id": "toolu-prop", "name": "Synthetic", "input": {}
+                            "type": "tool_use",
+                            "id": "toolu-prop",
+                            "name": "Read",
+                            "input": {"file_path": path.clone()},
                         }));
+                        tool_summaries.push(format!("Read({path})"));
                     }
                 }
+                texts.extend(tool_summaries);
                 (json!(blocks), texts.join("\n"))
             };
             let mut record = json!({
@@ -530,6 +540,66 @@ fn prop_malformed_lines_only_skip_never_abort() {
             report.session_native_id.as_deref(),
             Some(case.session_id.as_str()),
             "seed={seed}: sessionId 必须被正常提取"
+        );
+    });
+}
+
+/// 属性 6（生命周期 append，B5）：在已封口快照末尾追加一条合法记录后，
+/// 既有消息的 seq/native_id/parent/role/text/timestamp/sidechain/span 必须
+/// 逐字段不变，新消息追加在末尾——增量 sync 的"前缀稳定"前提。
+#[test]
+fn prop_append_keeps_prefix_byte_stable() {
+    for_each_seed(|seed, case| {
+        let mut extended = case.bytes.clone();
+        // 未封口的末行先补行尾，否则追加会与残余字节拼成一行。
+        if extended.last().is_some_and(|b| *b != b'\n') {
+            extended.push(b'\n');
+        }
+        let appended = serde_json::to_string(&json!({
+            "type": "assistant",
+            "uuid": format!("prop-{seed:016x}-appended"),
+            "parentUuid": null,
+            "isSidechain": false,
+            "sessionId": case.session_id,
+            "message": {"role": "assistant", "content": "appended lifecycle record"},
+        }))
+        .expect("render appended record");
+        let append_start = extended.len() as u64;
+        extended.extend_from_slice(appended.as_bytes());
+        extended.push(b'\n');
+
+        let (base_report, base) = parse_transcript(seed, &case.bytes);
+        let (ext_report, ext) = parse_transcript(seed, &extended);
+
+        assert_eq!(
+            ext.len(),
+            base.len() + 1,
+            "seed={seed}: 追加一条合法记录只新增一条消息"
+        );
+        assert_eq!(
+            ext[..base.len()],
+            base[..],
+            "seed={seed}: 追加不得移动既有消息的任何字段（含 span）"
+        );
+        let last = &ext[base.len()];
+        assert_eq!(
+            last.native_id,
+            format!("prop-{seed:016x}-appended"),
+            "seed={seed}: 追加消息 native id 必须原样透传"
+        );
+        assert_eq!(
+            last.span,
+            Some((append_start, append_start + appended.len() as u64)),
+            "seed={seed}: 追加消息 span 必须覆盖追加行（不含行尾）"
+        );
+        assert_eq!(
+            ext_report.committed,
+            base_report.committed + 1,
+            "seed={seed}: committed 只新增一"
+        );
+        assert_eq!(
+            ext_report.skipped, base_report.skipped,
+            "seed={seed}: 追加不得改变既有 skipped 计数"
         );
     });
 }

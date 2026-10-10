@@ -45,6 +45,12 @@ function Exit-Smoke {
     # The temp store is disposable and must go even on the failure path, but only
     # after diagnostics have been printed.
     if ($script:TempDir -and (Test-Path -LiteralPath $script:TempDir)) {
+        $cleanupPath = [System.IO.Path]::GetFullPath($script:TempDir)
+        $cleanupParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([char[]]'\/')
+        if ([System.IO.Path]::GetDirectoryName($cleanupPath) -ne $cleanupParent -or
+            -not [System.IO.Path]::GetFileName($cleanupPath).StartsWith('agent-session-grep-smoke-')) {
+            throw 'Refusing cleanup outside the owned smoke directory'
+        }
         Remove-Item -LiteralPath $script:TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     exit $Code
@@ -118,18 +124,23 @@ Set-Content -LiteralPath $fixture -Value ($fixtureLines -join "`n") -Encoding ut
 Write-Host "smoke: binary  $Binary"
 Write-Host "smoke: workdir $script:TempDir"
 
-# 1. doctor against a fresh store: reports the store as openable with a numeric schema.
+# An absent catalog stays absent on read; SQLite open failures map to catalog_error.
+$r = Invoke-Robot @('--db', $db, '--robot', 'doctor')
+Assert-That ($r.Code -eq 6 -and $null -ne $r.Frame -and $r.Frame.error.code -eq 'catalog_error') 'doctor on an absent store returns catalog_error (exit 6)' $r.Text
+Assert-That (-not (Test-Path -LiteralPath $db)) 'doctor does not create an absent database' $r.Text
+
+# 1. Only an explicit write initializes the fresh store; doctor is read-only.
+$r = Invoke-Robot @('--db', $db, '--robot', 'sync', $fixture)
+Assert-That ($r.Code -eq 0) 'sync exits 0' "exit=$($r.Code) stdout=$($r.Text)"
+Assert-That ($null -ne $r.Frame -and $r.Frame.ok -eq $true) 'sync envelope reports ok:true' $r.Text
+Assert-That ($null -ne $r.Frame -and $r.Frame.data.messages -eq 3) 'sync reports data.messages == 3' $r.Text
+
+# 2. doctor reports the initialized store as openable with a numeric schema.
 $r = Invoke-Robot @('--db', $db, '--robot', 'doctor')
 Assert-That ($r.Code -eq 0) 'doctor exits 0' "exit=$($r.Code) stdout=$($r.Text)"
 Assert-That (($null -ne $r.Frame) -and ($r.Frame.data.db -eq 'ok')) 'doctor reports data.db == ok' $r.Text
 $schema = if ($null -ne $r.Frame) { $r.Frame.data.schema } else { $null }
 Assert-That (($schema -is [int]) -or ($schema -is [int64]) -or ($schema -is [double])) 'doctor reports a numeric data.schema' $r.Text
-
-# 2. sync the fixture: all three conversational records are ingested in one batch.
-$r = Invoke-Robot @('--db', $db, '--robot', 'sync', $fixture)
-Assert-That ($r.Code -eq 0) 'sync exits 0' "exit=$($r.Code) stdout=$($r.Text)"
-Assert-That ($null -ne $r.Frame -and $r.Frame.ok -eq $true) 'sync envelope reports ok:true' $r.Text
-Assert-That ($null -ne $r.Frame -and $r.Frame.data.messages -eq 3) 'sync reports data.messages == 3' $r.Text
 
 # 3. search for the fixture term: hits are message-level entities.
 $r = Invoke-Robot @('--db', $db, '--robot', 'search', 'smokezylograph')
@@ -203,6 +214,87 @@ $r = Invoke-Robot @('--db', $db, '--robot', 'search', 'smokezylograph', '--curso
 Assert-That ($r.Code -eq 2) 'search with a garbage cursor exits 2' "exit=$($r.Code) stdout=$($r.Text)"
 Assert-That ($null -ne $r.Frame -and $r.Frame.error.code -eq 'cursor_invalid') 'garbage cursor reports error.code == cursor_invalid' $r.Text
 
+# Advertised provider filters must accept every implemented row. A distinct
+# Grok source makes filter enforcement observable, including semantic modes.
+$grokFixture = Join-Path $script:TempDir 'grok.jsonl'
+Set-Content -LiteralPath $grokFixture -Value '{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"smokegrokfilter retained message"},"_meta":{"promptIndex":0}}}' -Encoding utf8NoBOM -NoNewline
+$r = Invoke-Robot @('--db', $db, '--robot', 'sync', $grokFixture)
+Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.data.messages -eq 1) 'sync ingests one Grok message' $r.Text
+$r = Invoke-Robot @('--db', $db, '--robot', 'providers')
+Assert-That ($r.Code -eq 0) 'providers exits 0' $r.Text
+$filterable = @(if ($null -ne $r.Frame) { $r.Frame.data.providers | Where-Object { $_.maturity -ne 'unsupported' } })
+Assert-That ($filterable.Count -gt 2) 'providers advertises more than the legacy two providers' $r.Text
+foreach ($provider in $filterable) {
+    $r = Invoke-Robot @('--db', $db, '--robot', 'search', 'smokegrokfilter', '--provider', $provider.provider_id)
+    $expected = if ($provider.provider_id -eq 'grok-build') { 1 } else { 0 }
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and @($r.Frame.data.hits).Count -eq $expected) "advertised provider filter $($provider.provider_id) selects the right messages" $r.Text
+}
+$r = Invoke-Robot @('--db', $db, '--robot', 'index', 'embeddings')
+Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.data.indexed -eq 4) 'index embeddings indexes all four synthetic messages' $r.Text
+foreach ($retrievalMode in @('semantic', 'hybrid')) {
+    $r = Invoke-Robot @('--db', $db, '--robot', 'search', 'smokegrokfilter', '--provider', 'grok-build', '--mode', $retrievalMode)
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.data.retrieval_mode -eq $retrievalMode -and @($r.Frame.data.hits).Count -eq 1) "CLI $retrievalMode uses the index and Grok filter" $r.Text
+}
+
+# Relocation uses a separate synthetic catalog and preserves canonical IDs.
+$relocationArea = Join-Path $script:TempDir 'relocation'
+$relocationOld = Join-Path $relocationArea 'old-installation'
+$relocationNew = Join-Path $relocationArea 'new-installation'
+$relocationDb = Join-Path $relocationArea 'catalog.db'
+$relocationBackup = Join-Path $relocationArea 'catalog-backup.db'
+$relocationSource = Join-Path $relocationOld 'session.jsonl'
+New-Item -ItemType Directory -Path $relocationOld -Force | Out-Null
+Copy-Item -LiteralPath $fixture -Destination $relocationSource
+$r = Invoke-Robot @('--db', $relocationDb, '--robot', 'relocate', '--provider', 'claude', '--from', $relocationOld, '--to', $relocationNew)
+Assert-That ($r.Code -eq 6 -and $null -ne $r.Frame -and $r.Frame.error.code -eq 'catalog_error') 'relocate preview refuses an absent catalog' $r.Text
+Assert-That (-not (Test-Path -LiteralPath $relocationDb)) 'relocate preview creates no catalog' $r.Text
+$r = Invoke-Robot @('--db', $relocationDb, '--robot', 'sync', $relocationSource)
+Assert-That ($r.Code -eq 0) 'relocation fixture sync succeeds' $r.Text
+$relocationGeneration = if ($null -ne $r.Frame) { [long]$r.Frame.data.generation } else { -1 }
+$r = Invoke-Robot @('--db', $relocationDb, '--robot', 'search', 'smokezylograph')
+$relocationSession = if ($null -ne $r.Frame -and @($r.Frame.data.hits).Count -gt 0) { $r.Frame.data.hits[0].session_id } else { $null }
+Assert-That (-not [string]::IsNullOrWhiteSpace($relocationSession)) 'relocation fixture has a canonical Session ID' $r.Text
+$relocationBoundary = [System.IO.Path]::GetFullPath($script:TempDir).TrimEnd([char[]]'\/') + [System.IO.Path]::DirectorySeparatorChar
+foreach ($candidate in @($relocationOld, $relocationNew)) {
+    if (-not [System.IO.Path]::GetFullPath($candidate).StartsWith($relocationBoundary, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Abort 'Refusing fixture move outside the owned smoke directory'
+    }
+}
+Move-Item -LiteralPath $relocationOld -Destination $relocationNew
+$catalogHash = (Get-FileHash -LiteralPath $relocationDb).Hash
+$sourceHash = (Get-FileHash -LiteralPath (Join-Path $relocationNew 'session.jsonl')).Hash
+$r = Invoke-Robot @('--db', $relocationDb, '--robot', 'relocate', '--provider', 'claude', '--from', $relocationOld, '--to', $relocationNew, '--alias-ttl-days', '7')
+Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.command -eq 'relocate.preview' -and $r.Frame.data.status -eq 'planned') 'relocate preview returns a planned Robot result' $r.Text
+Assert-That ((Get-FileHash -LiteralPath $relocationDb).Hash -ceq $catalogHash) 'relocate preview does not write the catalog' $r.Text
+Assert-That (-not (Test-Path -LiteralPath $relocationBackup)) 'relocate preview creates no backup' $r.Text
+$relocationPlan = if ($null -ne $r.Frame -and (Test-HasProperty $r.Frame.data 'plan')) { $r.Frame.data.plan } else { $null }
+
+if (-not [string]::IsNullOrWhiteSpace($relocationPlan)) {
+    Assert-That ($r.Frame.data.source_count -eq 1 -and $r.Frame.data.session_count -eq 1 -and $r.Frame.data.alias_ttl_days -eq 7) 'relocate preview reports bounded counts and selected retention' $r.Text
+    Assert-That (-not (Test-HasProperty $r.Frame.data 'from') -and -not (Test-HasProperty $r.Frame.data 'to') -and -not (Test-HasProperty $r.Frame.data 'backup')) 'relocate results contain no private path fields' $r.Text
+    $r = Invoke-Robot @('--db', $relocationDb, '--robot', 'relocate', '--provider', 'claude', '--from', $relocationOld, '--to', $relocationNew, '--alias-ttl-days', '7', '--apply', '--plan', $relocationPlan, '--backup', $relocationBackup)
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.command -eq 'relocate.apply' -and $r.Frame.data.status -eq 'applied' -and $r.Frame.data.generation -eq ($relocationGeneration + 1)) 'relocate apply advances generation exactly once' $r.Text
+    Assert-That (Test-Path -LiteralPath $relocationBackup) 'relocate apply creates a verified backup' $r.Text
+    Assert-That ((Get-FileHash -LiteralPath (Join-Path $relocationNew 'session.jsonl')).Hash -ceq $sourceHash) 'relocate apply leaves provider source bytes unchanged' $r.Text
+    $r = Invoke-Robot @('--db', $relocationBackup, '--robot', 'status')
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.data.generation -eq $relocationGeneration) 'relocate backup retains the previous generation' $r.Text
+    $r = Invoke-Robot @('--db', $relocationDb, '--robot', 'sync', (Join-Path $relocationNew 'session.jsonl'))
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.data.generation -eq ($relocationGeneration + 1)) 'sync after relocation retains identity and generation' $r.Text
+    if ($relocationSession) {
+        $r = Invoke-Robot @('--db', $relocationDb, '--robot', 'context', $relocationSession)
+        Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and @($r.Frame.data.messages).Count -gt 0) 'the original Session ID still resolves after relocation' $r.Text
+    }
+    $r = Invoke-Robot @('--db', $relocationDb, '--robot', 'relocate', '--provider', 'claude', '--from', $relocationOld, '--to', $relocationNew, '--alias-ttl-days', '7')
+    Assert-That ($r.Code -eq 0 -and $null -ne $r.Frame -and $r.Frame.command -eq 'relocate.preview' -and $r.Frame.data.status -eq 'unchanged' -and $r.Frame.data.generation -eq ($relocationGeneration + 1)) 'repeated relocation preview is an unchanged no-op' $r.Text
+} else {
+    Write-Fail 'relocate preview provides an opaque plan' $r.Text
+}
+$r = Invoke-Robot @('--robot', 'relocate', '--help')
+Assert-That ($r.Code -eq 0 -and $r.Text.Contains('--backup') -and $r.Text.Contains('--alias-ttl-days')) 'relocate help describes apply and alias lifetime without a catalog' $r.Text
+$r = Invoke-Robot @('--robot', 'providers')
+$relocationCapability = if ($null -ne $r.Frame -and (Test-HasProperty $r.Frame.data 'relocation')) { $r.Frame.data.relocation } else { $null }
+Assert-That ($null -ne $relocationCapability -and ($relocationCapability.interfaces -join ',') -eq 'cli') 'capability metadata marks relocation CLI-only' $r.Text
+
 # 10. MCP stdio handshake. stdout is the protocol channel, so every line must be
 # a complete JSON-RPC frame; anything else means diagnostics leaked into it.
 $mcpInput = @(
@@ -219,6 +311,8 @@ $mcpInput = @(
             arguments = @{ message_id = $mainlineMessageId; session_id = $sessionId; around = 0 }
         }
     } | ConvertTo-Json -Depth 5 -Compress)
+    '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_sessions","arguments":{"query":"smokegrokfilter","providers":["grok-build"],"mode":"semantic"}}}'
+    '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_sessions","arguments":{"query":"smokegrokfilter","providers":["grok-build"],"mode":"hybrid"}}}'
 )
 $mcpOut = $mcpInput | & $Binary --db $db mcp
 $mcpCode = $LASTEXITCODE
@@ -248,6 +342,12 @@ $messageData = if ($null -ne $messageFrame) { $messageFrame.result.structuredCon
 Assert-That ($null -ne $messageFrame -and $messageFrame.result.isError -eq $false) 'tools/call get_message returns isError:false' $mcpText
 Assert-That ($null -ne $messageData -and $messageData.message_id -eq $mainlineMessageId) 'get_message returns the real anchor message id' $mcpText
 Assert-That ($null -ne $messageData -and @($messageData.messages).Count -eq 1) 'get_message around=0 returns exactly one message' $mcpText
+
+foreach ($case in @(@{ Id = 5; Mode = 'semantic' }, @{ Id = 6; Mode = 'hybrid' })) {
+    $searchFrame = $frames | Where-Object { (Test-HasProperty $_ 'id') -and $_.id -eq $case.Id } | Select-Object -First 1
+    $searchData = if ($null -ne $searchFrame -and (Test-HasProperty $searchFrame 'result')) { $searchFrame.result.structuredContent.data } else { $null }
+    Assert-That ($null -ne $searchData -and $searchFrame.result.isError -eq $false -and $searchData.retrieval_mode -eq $case.Mode -and @($searchData.hits).Count -eq 1) "MCP $($case.Mode) uses the index and Grok filter" $mcpText
+}
 
 if ($script:Failures -gt 0) {
     Write-Host "smoke: $script:Failures assertion(s) failed" -ForegroundColor Red

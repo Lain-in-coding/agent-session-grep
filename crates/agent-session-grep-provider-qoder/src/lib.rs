@@ -12,6 +12,30 @@
 //! `session_meta`/`user`/`assistant`/`progress`/`tool_use`/`tool_result`.
 //! Identity fields are extracted from `session_meta` (fixture-derived;
 //! `session_id`/`cwd` keys are matched leniently).
+//!
+//! # Scope: Qoder writes history to two unrelated surfaces
+//!
+//! This adapter covers **only** the transcript JSONL tree above. Qoder's
+//! Electron IDE keeps a second, entirely different history store — a SQLite DB
+//! at `%APPDATA%/Qoder/SharedClientCache/cache/db/local.db` with
+//! `chat_session(session_id, session_title, project_uri, gmt_create, …)`,
+//! `chat_message(id, session_id, request_id, role, content, …)`, and
+//! `chat_record(request_id, session_id, question, answer, summary, …)`. That
+//! schema is the Lingma one (Qoder is Alibaba's rebrand of the Lingma product
+//! line, and `ctx` imports it under its `lingma_sqlite` source format from
+//! `~/.lingma/vscode/sharedClientCache/cache/db/local.db`); `ctx` likewise
+//! keeps the two rows separate and records "does not parse Qoder VS Code /
+//! Electron state databases" against its Qoder JSONL row.
+//!
+//! The split is why `qoder` has no [`PROVIDER_DISCOVERY_ROOTS`] entry: a
+//! discovery root is a (root, extension) pair, and the two surfaces share
+//! neither. Registering the JSONL root on a machine that only has the SQLite
+//! store would make the scan *complete and empty*, which is precisely the
+//! shape that tombstones an entire provider's index. Adding SQLite support
+//! means a second variant (`qoder/sqlite-v1`, modeled on `opencode/sqlite-v1`)
+//! plus its own root — not a widened extension filter on this one.
+//!
+//! [`PROVIDER_DISCOVERY_ROOTS`]: ../../agent_session_grep_cli/index.html
 
 use agent_session_grep_ports::MetadataResolution;
 use agent_session_grep_ports::{
@@ -90,6 +114,9 @@ impl ProviderAdapter for QoderAdapter {
             &[
                 "identity fields are matched leniently from session_meta (session_id/cwd)",
                 "non-conversational records (progress/tool_use/tool_result) are skipped",
+                "only the transcript JSONL surface is parsed; the Qoder IDE's Electron \
+                 SQLite store (chat_session/chat_message/chat_record) is a different \
+                 format and is not read",
             ],
         )
     }
@@ -123,6 +150,7 @@ impl ProviderAdapter for QoderAdapter {
         let mut session_meta = 0usize;
         let mut conversational = 0usize;
 
+        let mut codex_envelopes = 0usize;
         for &(line_no, line) in &sample {
             match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(v) => {
@@ -131,7 +159,17 @@ impl ProviderAdapter for QoderAdapter {
                         .get("type")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
+                    // `session_meta` 这个 type 名并非 Qoder 独有：Codex rollout 的
+                    // 每条记录都是 `{timestamp, type, payload}` 封套，其首行同样是
+                    // 顶层 `type:"session_meta"`。Qoder 的 session_meta 把身份字段放
+                    // 在顶层或 `session_meta` 对象里，从不带 `payload`——因此
+                    // `payload` 的存在就是"这是 Codex 封套而非 Qoder 头"的判别位。
+                    // 不区分会让 Qoder 对 Codex rollout 报 High：codex 自身遇到容忍
+                    // 范围内的坏行时会从 Confirmed 降到 High，两者并列即触发
+                    // `select_and_stage_source` 的 tie 分支拒绝整个源。
+                    let codex_enveloped = v.get("payload").is_some();
                     match t {
+                        "session_meta" if codex_enveloped => codex_envelopes += 1,
                         "session_meta" => session_meta += 1,
                         "user" | "assistant" => {
                             conversational += 1;
@@ -144,6 +182,12 @@ impl ProviderAdapter for QoderAdapter {
                     unmatched.push(format!("line {line_no}: not valid JSON"));
                 }
             }
+        }
+        if codex_envelopes > 0 {
+            unmatched.push(format!(
+                "{codex_envelopes} session_meta record(s) carry a `payload` envelope \
+                 (Codex rollout shape, not Qoder)"
+            ));
         }
 
         if json_lines == 0 {
@@ -306,8 +350,9 @@ impl ProviderAdapter for QoderAdapter {
                         .filter(|s| !s.trim().is_empty())
                         .or(rec.timestamp.as_deref().filter(|s| !s.trim().is_empty()));
                     sink.emit_message(MessageEvent {
+                        session: None,
                         seq,
-                        native_id: &format!("qoder-msg-{seq}"),
+                        native_id: "",
                         parent_native_id: None,
                         role,
                         text: &text,
@@ -421,6 +466,27 @@ mod tests {
     }
 
     #[test]
+    fn probe_rejects_codex_rollout_envelopes() {
+        // `session_meta` 这个 type 名不是 Qoder 独有：Codex rollout 的每条记录都是
+        // `{timestamp, type, payload}` 封套，首行同样是顶层 `type:"session_meta"`。
+        // 若不看 `payload` 判别位，Qoder 会对 Codex rollout 报 High；codex 自身在
+        // 容忍范围内的坏行下会从 Confirmed 降到 High，两者并列即触发
+        // `select_and_stage_source` 的 tie 分支拒绝整个源——codex 的真实 golden
+        // fixture 恰好含一条故意截断的记录，因此这不是理论风险。
+        let adapter = QoderAdapter::new();
+        let rollout = concat!(
+            r#"{"timestamp":"2026-07-26T08:00:00.000Z","type":"session_meta","payload":{"session_id":"s-1","cwd":"/work"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-26T08:00:01.000Z","type":"response_item","payload":{"type":"message","id":"m-1","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+            "\n",
+        );
+        assert!(
+            adapter.probe(rollout.as_bytes()).is_err(),
+            "带 payload 封套的 session_meta 是 Codex rollout，Qoder 必须拒绝认领"
+        );
+    }
+
+    #[test]
     fn probe_rejects_chat_only_without_session_meta() {
         let adapter = QoderAdapter::new();
         let fixture = r#"{"type":"user","message":{"role":"user","content":"hi"}}
@@ -494,6 +560,43 @@ mod tests {
         assert_eq!(report.committed, 1);
         assert!(!report.diagnostics.is_empty());
         assert!(report.session_observation.multi_session);
+    }
+
+    struct TextSink {
+        texts: Vec<String>,
+    }
+    impl CanonicalEventSink for TextSink {
+        fn emit_message(
+            &mut self,
+            event: MessageEvent<'_>,
+        ) -> agent_session_grep_ports::PortResult<()> {
+            self.texts.push(event.text.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parse_passes_noise_shaped_user_text_through_verbatim() {
+        // 钉住测试：Qoder transcript JSONL 没有 system-reminder / AGENTS.md /
+        // 环境上下文等注入概念（type 即角色，user 行就是用户原文）。形似噪声
+        // 的文本必须逐字透传，防止将来把别家格式的过滤规则盲目搬来造成
+        // silent drift。
+        let adapter = QoderAdapter::new();
+        let fixture = r##"{"type":"session_meta","session_id":"s1","cwd":"/p"}
+{"type":"user","message":{"role":"user","content":"<system-reminder>reminder text</system-reminder>"}}
+{"type":"user","message":{"role":"user","content":"# AGENTS.md instructions"}}
+"##;
+        let mut sink = TextSink { texts: vec![] };
+        let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "<system-reminder>reminder text</system-reminder>".to_string(),
+                "# AGENTS.md instructions".to_string(),
+            ]
+        );
     }
 
     #[test]

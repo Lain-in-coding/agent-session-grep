@@ -184,6 +184,22 @@ class GateManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 GATE.validate_manifest(path)
 
+    def test_gate_verdict_decides_the_exit_status(self) -> None:
+        # The manifest is only evidence; CI reads the exit code. A false verdict
+        # must name the metrics that missed their threshold.
+        self.assertIsNone(
+            GATE.gate_failure_reason({"gate": {"pass": True, "failures": []}})
+        )
+        self.assertEqual(
+            GATE.gate_failure_reason(
+                {"gate": {"pass": False, "failures": ["lexical_recall_at_10"]}}
+            ),
+            "gate metrics below threshold: lexical_recall_at_10",
+        )
+        # A verdict that is absent or not a real boolean is not a pass either.
+        self.assertIsNotNone(GATE.gate_failure_reason({}))
+        self.assertIsNotNone(GATE.gate_failure_reason({"gate": {"pass": "true"}}))
+
 
 if __name__ == "__main__":
     unittest.main()

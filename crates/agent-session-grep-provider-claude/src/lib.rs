@@ -5,11 +5,13 @@
 //! `{"type":"user"|"assistant"|..., "message":{"role":..,"content":..}}`。
 //! adapter 只做格式隔离，绝不接触存储 / 检索 / UI（RFC-0002 §7）。
 
-use agent_session_grep_domain::{ToolActivityActor, ToolActivityStatus};
+use agent_session_grep_domain::{
+    TokenSource, ToolActivityActor, ToolActivityStatus, UsageObservation,
+};
 use agent_session_grep_ports::{
     AdapterManifest, CanonicalEventSink, Confidence, MessageEvent, MetadataResolution, ParseReport,
-    ProbeResult, ProviderAdapter, ProviderError, ToolActivityEvent, build_tool_activity,
-    manifest_for,
+    ProbeResult, ProviderAdapter, ProviderError, TOOL_ACTIVITY_TARGET_MAX_CHARS, ToolActivityEvent,
+    UsageEvent, build_tool_activity, extract_tool_activity_target, manifest_for,
 };
 use serde::{Deserialize, de::IgnoredAny};
 
@@ -25,6 +27,21 @@ const SAMPLE_BROKEN_TOLERANCE: usize = 3;
 const BAD_LINE_LIST_LIMIT: usize = 5;
 /// 多会话诊断中列出的 session id 条数上限（bounded detail）。
 const SESSION_ID_LIST_LIMIT: usize = 3;
+
+/// `message.usage` 的 bucket 键名（provider 原始字段名，逐字匹配，不猜别名）。
+const USAGE_KEY_INPUT: &str = "input_tokens";
+const USAGE_KEY_OUTPUT: &str = "output_tokens";
+const USAGE_KEY_CACHE_READ: &str = "cache_read_input_tokens";
+const USAGE_KEY_CACHE_WRITE: &str = "cache_creation_input_tokens";
+
+/// `tool_use` 摘要在可检索正文里的渲染形状（设计 R7）：`名字(target)`，
+/// 无 target 时只有名字。两个包裹符与 target 上限集中在此。
+const TOOL_SUMMARY_OPEN: char = '(';
+const TOOL_SUMMARY_CLOSE: char = ')';
+/// 摘要里 target 的字符上限：与 ports 的
+/// [`TOOL_ACTIVITY_TARGET_MAX_CHARS`] 同值，因此正文里看到的 target 与
+/// `tool_activities` 表里存的逐字一致（同一常量，无第二个数字可漂移）。
+const TOOL_SUMMARY_TARGET_MAX_CHARS: usize = TOOL_ACTIVITY_TARGET_MAX_CHARS;
 
 // Adapted from claude-historian-mcp/src/parser.ts:74-92 (MIT): inspect cheap
 // JSONL markers before invoking serde. Keep this predicate conservative: an
@@ -226,6 +243,11 @@ struct RawMessage {
     /// content 可能是字符串，也可能是 content-block 数组——用 untagged 兼容。
     #[serde(default)]
     content: RawContent,
+    /// assistant 记录自带的 token 用量（`message.usage`，provider 原生给出）。
+    /// 保持 `serde_json::Value` 原样：字段形状异常时只丢 usage 事件，绝不
+    /// 拖垮整条消息的反序列化（fail-closed 在提取侧，不在行解析侧）。
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 /// Claude 的 content 字段有两种形态：纯字符串或 block 数组。
@@ -251,6 +273,10 @@ struct RawBlock {
     /// 仅抽取带 `text` 的 block（如 `type:"text"`）；工具调用块无 text，忽略。
     #[serde(default)]
     text: Option<String>,
+    /// `type:"thinking"` block 的正文字段名是 `thinking`（另带 `signature`），
+    /// **不是** `text`——只读 `text` 会把整段推理当成空内容。
+    #[serde(default)]
+    thinking: Option<String>,
     /// `tool_result` block 的载荷在 `content`（字符串或 text block 数组），
     /// 真实工具输出（文件内容、命令输出）由此携带；缺失则为 None。
     #[serde(default)]
@@ -284,11 +310,29 @@ struct PendingToolCall {
 }
 
 impl RawBlock {
-    /// 抽取本 block 的可检索纯文本：`text` 优先，`tool_result` 的 `content`
-    /// 其次，否则为空。
+    /// 抽取本 block 的可检索纯文本：`text` 优先，`thinking` block 的
+    /// `thinking` 其次，`tool_result` 的 `content` 再次，否则为空。
+    ///
+    /// **为什么要读 `thinking`**：extended thinking 的 block 形状是
+    /// `{"type":"thinking","thinking":"…","signature":"…"}`——正文在 `thinking`
+    /// 键上，`text` 键根本不存在。只读 `text` 时，"只含一个 thinking block 的
+    /// assistant 记录"会整条投影成空正文却照样计入 committed，进了 catalog 与
+    /// FTS 却一个词都匹配不到（与 `tool_use_summary` 记录的同一类缺陷）。
+    /// 形状证据：cc-sessions-viewer `src-tauri/src/agents/claude.rs` 的
+    /// `"thinking" => el.get("thinking")` 分支，以及 agent-sessions 的
+    /// `Resources/Fixtures/stage0/agents/claude/*.jsonl` 语料。
+    ///
+    /// 空白 `thinking`（真实语料里存在）返回 `None`：不产出只有换行的空片段，
+    /// 与 cc-sessions-viewer 丢弃空/纯空白 thinking block 的行为一致。
     fn plain_text(&self) -> Option<String> {
         if let Some(text) = self.text.as_deref() {
             return Some(text.to_string());
+        }
+        if self.kind == "thinking"
+            && let Some(thinking) = self.thinking.as_deref()
+            && !thinking.trim().is_empty()
+        {
+            return Some(thinking.to_string());
         }
         match &self.content {
             Some(RawContent::Text(s)) => Some(s.clone()),
@@ -306,6 +350,49 @@ impl RawBlock {
             }
             Some(RawContent::Empty) | None => None,
         }
+    }
+
+    /// `tool_use` block 的可检索摘要（设计 R7）：`名字(target)`，取不到 target
+    /// 时只有名字。非 `tool_use` block、或名字为空的不透明调用 → `None`。
+    ///
+    /// **为什么要进正文**：Claude Code 把工具调用记在 assistant 消息的
+    /// `content[]` 里，而这类 block 没有 `text` 字段。真实语料普查（本机 25 个
+    /// 最近 transcript）：4226 条 assistant 消息里 2610 条（62%）**没有任何非空
+    /// text block**——它们的 canonical 正文因此为空串，进了 catalog 与 FTS 却一
+    /// 个词都匹配不到（`capability_parse_claim_matches_real_parse_on_own_golden`
+    /// 明确把"空正文却计入 committed"判为不诚实，只是 golden 里没有这一类，守卫
+    /// 抓不到）。把调用渲染成摘要后，"我当时用什么工具动了哪个文件"才可检索。
+    ///
+    /// **边界（THREAT-MODEL：Catalog 不在索引期改写原文）**：改写的是 canonical
+    /// **投影**，不是原文——catalog payload 仍保留 provider 原始记录全文，
+    /// source span 仍指向源记录字节，两者都不因本规则改变。投影只使用 provider
+    /// 逐字记录的事实（`name` 原样、target 走 R1 优先级链），模板固定、无语义
+    /// 推断，因此同一字节输入永远得到同一正文（determinism）。
+    ///
+    /// 借鉴 cc-switch `session_manager/providers/utils.rs::extract_text_from_item`
+    /// （MIT）的思想：工具调用渲染成人读摘要并入正文；实现为本项目自有代码。
+    fn tool_use_summary(&self) -> Option<String> {
+        if self.kind != "tool_use" {
+            return None;
+        }
+        let name = self.name.as_deref().map(str::trim).unwrap_or_default();
+        if name.is_empty() {
+            return None;
+        }
+        let target = self
+            .input
+            .as_ref()
+            .and_then(extract_tool_activity_target)
+            .map(|target| {
+                target
+                    .chars()
+                    .take(TOOL_SUMMARY_TARGET_MAX_CHARS)
+                    .collect::<String>()
+            });
+        Some(match target {
+            Some(target) => format!("{name}{TOOL_SUMMARY_OPEN}{target}{TOOL_SUMMARY_CLOSE}"),
+            None => name.to_string(),
+        })
     }
 }
 
@@ -339,7 +426,12 @@ impl RawContent {
                 {
                     return command.to_string();
                 }
-                text_blocks.join("\n")
+                // 工具调用摘要（设计 R7）：按 block 顺序追加在文本块之后。
+                // 刻意排在既有分支之后——本地命令封套/enriched meta 的规范化形态
+                // 是 pinned 的跨副本 determinism 契约，不得因摘要而改变。
+                let mut parts = text_blocks;
+                parts.extend(blocks.iter().filter_map(RawBlock::tool_use_summary));
+                parts.join("\n")
             }
             RawContent::Empty => String::new(),
         }
@@ -447,6 +539,30 @@ fn emit_unpaired_activity(
     })
 }
 
+/// 从 `message.usage` 提取用量观察（Observed）。
+///
+/// 只认 provider 明确给出的非负整数；缺失 bucket 记 0（Recall
+/// `claude_code.rs` 同语义——usage 对象存在即该消息有用量事实），负值或
+/// 非整数 → 整条事件 fail-closed 跳过（绝不 clamp、绝不编造）。Claude Code
+/// 的 usage 不单独记录 reasoning bucket，恒为 0。
+fn extract_usage(usage: &serde_json::Value) -> Option<UsageObservation> {
+    let object = usage.as_object()?;
+    let bucket = |key: &str| -> Option<u64> {
+        match object.get(key) {
+            None => Some(0),
+            Some(value) => value.as_u64(),
+        }
+    };
+    Some(UsageObservation {
+        input_tokens: bucket(USAGE_KEY_INPUT)?,
+        output_tokens: bucket(USAGE_KEY_OUTPUT)?,
+        cache_read_tokens: bucket(USAGE_KEY_CACHE_READ)?,
+        cache_write_tokens: bucket(USAGE_KEY_CACHE_WRITE)?,
+        reasoning_tokens: 0,
+        token_source: TokenSource::Observed,
+    })
+}
+
 /// Claude copies some generated meta prompts as four blocks: two generated
 /// text blocks, an image block, then the original stable prompt text. The
 /// explicit meta/session markers and exact block shape are required so ordinary
@@ -476,6 +592,83 @@ fn canonical_local_command_block(text: &str) -> Option<&str> {
     }
 
     Some(text.strip_suffix('\n').unwrap_or(text))
+}
+
+/// 伪 user 消息噪声判定（只认明确封套形状，绝不语义猜测）。
+///
+/// 返回命中的规则名（供诊断引用）；`None` = 保留。每条规则的格式证据：
+///
+/// - `<system-reminder>` 开头：Claude Code 把 system-reminder 以 user 消息
+///   注入 transcript（AgentRecall `isMeaningfulUserMessage` 排除清单，
+///   format-adapters.ts）。
+/// - `<local-command-caveat>` / `Caveat:` 开头：本地命令启动时的系统注入
+///   说明（sessiongrep claude.rs 与 cc-switch claude.rs 均展示
+///   `<local-command-caveat>Caveat: The messages below were generated by the
+///   user while running local commands.` 的 user 记录）。
+/// - 整行 `[Request interrupted by user]` / `[Request interrupted by user for
+///   tool use]`：中断标记的两种精确形态（cc-sessions-viewer `INTERRUPT_RE`；
+///   AgentRecall 同规）。仅整行匹配，前缀不判——后接用户文本的变体不误滤。
+/// - `<command-name>` 封套且 `<command-args>` 空白：无参数 slash 命令的纯 UI
+///   记账回声（`/clear` `/context` 等；sessiongrep `should_skip_message`
+///   同规）。有参数的命令保留——参数是真实用户输入。
+/// - `<local-command-stdout>` / `<local-command-stderr>` / `<bash-input>` /
+///   `<bash-stdout>` / `<bash-stderr>` / `<user-prompt-submit-hook>` /
+///   `<task-notification>` 开头：harness 注入的命令/工具输出与 hook 回声封套
+///   （cc-sessions-viewer format.ts 封套正则；AgentRecall 同清单）。
+/// - `[Image: …]` 整行：isMeta 图片引用副本（cc-sessions-viewer claude.rs
+///   `[Image: source: <local-path>]` 形状）。
+///
+/// 刻意不收（缺 claude-code 的 per-format 证据，宁可漏滤不可误滤）：
+/// `# AGENTS.md` / `# CLAUDE.md` 标题注入（Claude Code 的项目指令走系统提示，
+/// 不以 user 消息注入）、`<environment_context>`（Codex 形状）、
+/// `<system_notification>` 与 "The beginning of the above subagent result …"
+/// （无格式归属证据）。
+fn claude_user_noise_kind(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("<system-reminder>") || trimmed.starts_with("<system-reminder ") {
+        return Some("system-reminder");
+    }
+    if trimmed.starts_with("<local-command-caveat>") || trimmed.starts_with("Caveat:") {
+        return Some("local-command-caveat");
+    }
+    if trimmed == "[Request interrupted by user]"
+        || trimmed == "[Request interrupted by user for tool use]"
+    {
+        return Some("interrupt-marker");
+    }
+    for tag in [
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<user-prompt-submit-hook>",
+        "<task-notification>",
+    ] {
+        if trimmed.starts_with(tag) {
+            return Some(tag);
+        }
+    }
+    // 无参数命令封套 = 纯 UI 记账回声；有参数保留（用户输入）。
+    if trimmed.starts_with("<command-name>") && command_args_blank(trimmed) {
+        return Some("empty-command-envelope");
+    }
+    // isMeta 图片引用副本（整行 [Image: …]）。
+    if trimmed.starts_with("[Image:") && trimmed.ends_with(']') {
+        return Some("image-reference");
+    }
+    None
+}
+
+/// `<command-args>` 内容是否空白；封套缺闭合标签时不判（保守：宁可漏滤）。
+fn command_args_blank(text: &str) -> bool {
+    let Some(start) = text.find("<command-args>") else {
+        return false;
+    };
+    let rest = &text[start + "<command-args>".len()..];
+    let Some(end) = rest.find("</command-args>") else {
+        return false;
+    };
+    rest[..end].trim().is_empty()
 }
 
 /// 判定一行是否是我们承认的对话记录。
@@ -544,8 +737,19 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             self.provider_id(),
             Some(1),
             &[
-                "tool activity extraction is partial",
-                "turn_context metadata is not surfaced as canonical messages",
+                "tool activity kind is inferred from a closed set of documented tool names; \
+                 user-defined and MCP tools are recorded with kind `unknown`",
+                "a tool call with no matching tool_result reports status `unknown`",
+                // 此前这里写的是 Codex 的 `turn_context`——Claude Code JSONL 里
+                // 根本没有这个记录类型（本机 1641 个真实 transcript 普查：0 次
+                // 出现），所以那条"已知限制"从来不是 Claude 的事实。真实的
+                // 对应限制是：`type:"system"` 事件记录把正文放在**顶层**
+                // `content` 键上而非 `message` 里，`is_conversational` 只承认
+                // 带 `message` 的 system 行，故它们不产出 canonical 消息。
+                "`type:\"system\"` event records carry their body on a top-level `content` key \
+                 rather than inside `message`, so they are not surfaced as canonical messages",
+                "`attachment` records (harness-injected context such as output styles, \
+                 reminders, listings and hook output) are not surfaced as canonical messages",
             ],
         )
     }
@@ -799,6 +1003,20 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             let body = msg
                 .content
                 .to_plain_text(rec.is_meta, rec.session_kind.is_some());
+            // 伪 user 消息过滤（检索层保守白名单）：Claude Code 以 user 角色
+            // 落盘的系统注入记录（system-reminder、本地命令封套、中断标记等）
+            // 不进索引，计入 skipped（record_recoverable）。只认明确前缀/整行
+            // 形状，绝不语义猜测；规则出处见 claude_user_noise_kind。
+            if role == "user"
+                && let Some(kind) = claude_user_noise_kind(body.trim())
+            {
+                report.skipped += 1;
+                report.diagnostics.push(format!(
+                    "line {}: user message with injected noise envelope ({kind}), skipped",
+                    line_no + 1
+                ));
+                continue;
+            }
             // `isMeta` records are generated/copied by Claude Code. Real corpus
             // copies retain one UUID but report different top-level timestamps,
             // so no stable provider timestamp exists for this entity.
@@ -818,6 +1036,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             );
 
             sink.emit_message(MessageEvent {
+                session: None,
                 seq,
                 native_id: &rec.uuid,
                 // 空串 parentUuid 语义等价于 null（根消息）；透传空串会在
@@ -837,6 +1056,19 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             for (call, is_error) in paired {
                 emit_paired_activity(sink, &call, is_error, &rec.uuid)
                     .map_err(|e| ProviderError::StructuralFatal(e.to_string()))?;
+            }
+
+            // usage 观察（usage 维度）：assistant 记录自带 `message.usage` 时
+            // 锚定本记录 uuid emit。usage 对象存在但字段异常（负值/非整数）→
+            // extract_usage 返回 None，事件静默丢弃（消息本身不受影响）。
+            if role == "assistant"
+                && let Some(usage) = msg.usage.as_ref().and_then(extract_usage)
+            {
+                sink.emit_usage(UsageEvent {
+                    message_native_id: &rec.uuid,
+                    usage,
+                })
+                .map_err(|e| ProviderError::StructuralFatal(e.to_string()))?;
             }
         }
 
@@ -893,11 +1125,54 @@ mod tests {
         assert_eq!(manifest.fixture_revision, Some(1));
     }
 
+    #[test]
+    fn manifest_limitations_only_name_claude_code_record_types() {
+        // 防漂移：已知限制必须是**本 provider** 的事实。此前第三条抄了 Codex 的
+        // `turn_context`（Claude Code JSONL 无此记录类型，本机 1641 个真实
+        // transcript 普查 0 次出现），是对外声明里一条查不到出处的限制。
+        let manifest = ClaudeCodeAdapter::new().manifest();
+        assert!(
+            !manifest.known_limitations.is_empty(),
+            "must declare non-empty known limitations"
+        );
+        for foreign in [
+            "turn_context",
+            "world_state",
+            "response_item",
+            "event_msg",
+            "session_meta",
+            "append_message",
+            "sessionUpdate",
+            "step_index",
+        ] {
+            assert!(
+                !manifest
+                    .known_limitations
+                    .iter()
+                    .any(|limitation| limitation.contains(foreign)),
+                "known_limitations 提到了别的 provider 的记录类型 `{foreign}`: {:?}",
+                manifest.known_limitations
+            );
+        }
+        // 正向：真实存在的两类被跳过记录必须被如实声明。
+        for own in ["system", "attachment"] {
+            assert!(
+                manifest
+                    .known_limitations
+                    .iter()
+                    .any(|limitation| limitation.contains(own)),
+                "known_limitations 必须声明跳过 `{own}` 记录: {:?}",
+                manifest.known_limitations
+            );
+        }
+    }
+
     /// 收集 emit 的消息事件，供断言解析结果（含 native 身份/threading）。
     #[derive(Default)]
     struct CollectingSink {
         messages: Vec<Captured>,
         activities: Vec<CapturedActivity>,
+        usages: Vec<CapturedUsage>,
     }
     /// 拍平的事件快照（`MessageEvent` 借用输入，测试侧需拥有所有权）。
     struct Captured {
@@ -914,6 +1189,11 @@ mod tests {
     struct CapturedActivity {
         message_native_id: String,
         activity: ToolActivity,
+    }
+    /// 拍平的用量快照（anchor + 完整事实）。
+    struct CapturedUsage {
+        message_native_id: String,
+        usage: UsageObservation,
     }
     impl CanonicalEventSink for CollectingSink {
         fn emit_message(
@@ -940,6 +1220,17 @@ mod tests {
             self.activities.push(CapturedActivity {
                 message_native_id: event.message_native_id.to_string(),
                 activity: event.activity,
+            });
+            Ok(())
+        }
+
+        fn emit_usage(
+            &mut self,
+            event: UsageEvent<'_>,
+        ) -> agent_session_grep_ports::PortResult<()> {
+            self.usages.push(CapturedUsage {
+                message_native_id: event.message_native_id.to_string(),
+                usage: event.usage,
             });
             Ok(())
         }
@@ -1195,7 +1486,172 @@ mod tests {
             {"type": "text", "text": "ordinary second block\n"}
         ]));
 
-        assert_eq!(text, " ordinary first block \nordinary second block\n");
+        // 文本块的内部空白逐字保留、按序以 `\n` 拼接；`tool_use` 摘要（设计 R7）
+        // 追加在文本块之后。`Synthetic` 的 input 无可用字段 → 只渲染名字。
+        assert_eq!(
+            text,
+            " ordinary first block \nordinary second block\n\nSynthetic"
+        );
+    }
+
+    #[test]
+    fn parse_renders_tool_use_only_message_into_searchable_text() {
+        // 真实语料里最常见的一类 assistant 消息：content 只有 tool_use block，
+        // 没有任何 text block（本机 25 个 transcript 普查：4226 条 assistant 消息
+        // 里 2610 条如此）。此前它们的 canonical 正文是空串——占一个 catalog
+        // 实体 + 一条 FTS 行，却一个词都检索不到。
+        let text = parse_single_content(serde_json::json!([
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "crates/a/src/lib.rs"}},
+            {"type": "tool_use", "id": "toolu_2", "name": "PowerShell", "input": {"command": "cargo test --workspace"}}
+        ]));
+        assert_eq!(
+            text,
+            "Read(crates/a/src/lib.rs)\nPowerShell(cargo test --workspace)"
+        );
+        assert!(
+            !text.trim().is_empty(),
+            "tool-use-only 消息必须产出非空可检索正文"
+        );
+    }
+
+    #[test]
+    fn parse_renders_thinking_only_message_into_searchable_text() {
+        // extended thinking 的 block 正文在 `thinking` 键上（另带 `signature`），
+        // 不在 `text` 键上。本机真实语料普查（`~/.claude/projects` 全量 1641 个
+        // transcript，每文件前 1500 行）：158,293 条 assistant 记录里 34,989 条
+        // （22%）的 content **只有** thinking block——此前它们的 canonical 正文
+        // 整条为空串，却照样计入 committed，共 6,730 万字符推理正文完全不可检索。
+        // 形状证据：cc-sessions-viewer `agents/claude.rs` 的 `"thinking"` 分支读
+        // `el.get("thinking")`；agent-sessions `Resources/Fixtures/stage0/agents/
+        // claude/*.jsonl` 同形语料。
+        let text = parse_single_content(serde_json::json!([
+            {"type": "thinking", "thinking": "synthetic chain of thought", "signature": "sig-abc"}
+        ]));
+        assert_eq!(text, "synthetic chain of thought");
+    }
+
+    #[test]
+    fn parse_keeps_thinking_block_in_content_order() {
+        // thinking 走 `plain_text`，因此与 text block 一样按 block 顺序拼接
+        // （真实语料里 thinking 在数组首位）；tool_use 摘要仍追加在最后。
+        let text = parse_single_content(serde_json::json!([
+            {"type": "thinking", "thinking": "first I reason", "signature": "sig"},
+            {"type": "text", "text": "then I answer"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.rs"}}
+        ]));
+        assert_eq!(text, "first I reason\nthen I answer\nRead(a.rs)");
+    }
+
+    #[test]
+    fn parse_drops_blank_thinking_and_opaque_redacted_thinking() {
+        // 真实语料里存在 `thinking` 为空/纯空白的 block：不得产出只有换行的
+        // 空片段。`redacted_thinking` 是加密载荷（无明文字段），保持忽略——
+        // 不编造它没有的正文。
+        assert_eq!(
+            parse_single_content(serde_json::json!([
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "thinking", "thinking": "  \n  ", "signature": "sig"},
+                {"type": "text", "text": "only real text survives"}
+            ])),
+            "only real text survives"
+        );
+        assert_eq!(
+            parse_single_content(serde_json::json!([
+                {"type": "redacted_thinking", "data": "AAAAopaque"},
+                {"type": "text", "text": "kept"}
+            ])),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn parse_never_reads_thinking_from_a_non_thinking_block() {
+        // 只有 `type:"thinking"` 的 block 才允许把 `thinking` 键当正文：其它
+        // block 上同名的 additive 字段不是对话正文，读它就是越界解释格式。
+        let text = parse_single_content(serde_json::json!([
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.rs"}, "thinking": "not a body"},
+            {"type": "text", "text": "body"}
+        ]));
+        assert_eq!(text, "body\nRead(a.rs)");
+    }
+
+    #[test]
+    fn parse_tool_use_summary_follows_the_target_priority_chain() {
+        // 摘要里的 target 与 activity 的 target 是同一条链（ports R1），
+        // 因此正文与 `tool_activities` 表里的值逐字一致。
+        let cases = [
+            (
+                serde_json::json!({"type": "tool_use", "name": "Edit", "input": {"file_path": "a.rs", "old_string": "x"}}),
+                "Edit(a.rs)",
+            ),
+            (
+                serde_json::json!({"type": "tool_use", "name": "Grep", "input": {"pattern": "fn main", "output_mode": "content"}}),
+                "Grep(fn main)",
+            ),
+            (
+                serde_json::json!({"type": "tool_use", "name": "WebFetch", "input": {"url": "https://example.test/doc"}}),
+                "WebFetch(https://example.test/doc)",
+            ),
+            (
+                // 闭集外的工具照样进正文（正文只需要事实，不需要 kind）。
+                serde_json::json!({"type": "tool_use", "name": "mcp__server__tool", "input": {"query": "q"}}),
+                "mcp__server__tool(q)",
+            ),
+            (
+                // input 里没有链上任何键 → 只渲染名字，绝不编 target。
+                serde_json::json!({"type": "tool_use", "name": "TodoWrite", "input": {"todos": []}}),
+                "TodoWrite",
+            ),
+            (
+                // 完全没有 input 字段 → 同上。
+                serde_json::json!({"type": "tool_use", "name": "ExitPlanMode"}),
+                "ExitPlanMode",
+            ),
+        ];
+        for (block, expected) in cases {
+            assert_eq!(
+                parse_single_content(serde_json::json!([block.clone()])),
+                expected,
+                "block: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tool_use_summary_skips_opaque_and_non_tool_blocks() {
+        // 无 name / 空白 name 的 tool_use 是不透明记录（R6 同规）：不进正文，
+        // 也就不会出现 "()" 这种噪声条目。tool_result / image 等 block 不受影响。
+        let text = parse_single_content(serde_json::json!([
+            {"type": "tool_use", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "   ", "input": {"command": "pwd"}},
+            {"type": "text", "text": "only real text survives"}
+        ]));
+        assert_eq!(text, "only real text survives");
+    }
+
+    #[test]
+    fn parse_tool_use_summary_bounds_the_target() {
+        // 长命令按 ports 的存储上限截断（同一常量），正文不被单条工具参数淹没。
+        let long_command = "x".repeat(TOOL_SUMMARY_TARGET_MAX_CHARS + 200);
+        let text = parse_single_content(serde_json::json!([
+            {"type": "tool_use", "name": "Bash", "input": {"command": long_command}}
+        ]));
+        let expected_target = "x".repeat(TOOL_SUMMARY_TARGET_MAX_CHARS);
+        assert_eq!(text, format!("Bash({expected_target})"));
+    }
+
+    #[test]
+    fn parse_keeps_local_command_canonicalization_ahead_of_tool_summaries() {
+        // 本地命令封套的规范化形态是 pinned 的跨副本 determinism 契约：同一
+        // native message 的两种形态必须产出同一正文。摘要规则不得插队破坏它。
+        let envelope = "<command-name>synthetic-local</command-name>\n\
+                        <command-message>run synthetic local command</command-message>\n\
+                        <command-args>--flag value</command-args>";
+        let with_tool_block = parse_single_content(serde_json::json!([
+            {"type": "text", "text": format!("{envelope}\n")},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.rs"}}
+        ]));
+        assert_eq!(with_tool_block, envelope);
     }
 
     #[test]
@@ -1215,6 +1671,84 @@ mod tests {
         assert_eq!(string_form, first);
         assert_eq!(enriched_form, second);
         assert_ne!(string_form, enriched_form);
+    }
+
+    /// 解析单条 user 记录（合成语料），返回报告与产出文本。
+    fn parse_single_user(content: &str) -> (ParseReport, Vec<String>) {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "type": "user",
+            "uuid": "noise-uuid-1",
+            "sessionId": "synthetic-noise-session",
+            "message": { "role": "user", "content": content },
+        }))
+        .expect("serialize synthetic transcript");
+        let mut sink = CollectingSink::default();
+        let report = ClaudeCodeAdapter::new()
+            .parse(&input, &mut sink)
+            .expect("parse synthetic transcript");
+        let texts = sink.messages.into_iter().map(|m| m.text).collect();
+        (report, texts)
+    }
+
+    #[test]
+    fn parse_filters_injected_user_noise_envelopes() {
+        // 每条都是 Claude Code 以 user 角色落盘的系统注入形状
+        // （证据逐条见 claude_user_noise_kind 注释）。
+        for noise in [
+            "<system-reminder>You must never mention this conversation.</system-reminder>",
+            "<system-reminder>\nReview plan every 30 min</system-reminder>",
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>",
+            "Caveat: The messages below were generated by the user while running local commands.",
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+            "<local-command-stdout>Compacted</local-command-stdout>",
+            "<local-command-stderr>synthetic traceback</local-command-stderr>",
+            "<bash-input>ls -la</bash-input>",
+            "<bash-stdout>file.txt</bash-stdout>",
+            "<bash-stderr>no such file</bash-stderr>",
+            "<user-prompt-submit-hook>hook output</user-prompt-submit-hook>",
+            "<task-notification>synthetic task done</task-notification>",
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>",
+            "<command-name>/context</command-name>\n<command-message>context</command-message>\n<command-args>  </command-args>",
+            "[Image: source: C:\\placeholder\\project\\shot.png]",
+        ] {
+            let (report, texts) = parse_single_user(noise);
+            assert_eq!(
+                report.committed, 0,
+                "noise must not be committed: {noise:?}"
+            );
+            assert_eq!(report.skipped, 1, "noise must be skipped: {noise:?}");
+            assert!(texts.is_empty(), "noise must not be indexed: {noise:?}");
+            assert_eq!(
+                report.diagnostics.len(),
+                1,
+                "one diagnostic per skip: {noise:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_keeps_genuine_user_text_and_command_args() {
+        // 非前缀/非整行的相似文本与带参数命令必须逐字保留：宁可漏滤不可误滤。
+        for kept in [
+            "真实问题：请修复登录页",
+            "Please explain <system-reminder> usage", // 非前缀，不滤
+            "[Request interrupted by user] 之后的追问", // 非整行，不滤
+            "<command-name>/review</command-name>\n<command-message>review</command-message>\n<command-args>src/main.rs</command-args>", // 有参数 = 用户输入
+            "Caveats aside, ship it", // 非 "Caveat:" 前缀
+        ] {
+            let (report, texts) = parse_single_user(kept);
+            assert_eq!(
+                report.committed, 1,
+                "real user text must be committed: {kept:?}"
+            );
+            assert_eq!(report.skipped, 0, "no skip for: {kept:?}");
+            assert_eq!(
+                texts,
+                vec![kept.to_string()],
+                "text must pass through verbatim: {kept:?}"
+            );
+        }
     }
 
     #[test]
@@ -2083,5 +2617,149 @@ mod tests {
         assert_eq!(activities[0].activity.kind, ToolActivityKind::Unknown);
         assert_eq!(activities[0].activity.target, None);
         assert_eq!(activities[0].activity.status, ToolActivityStatus::Success);
+    }
+
+    // ===== usage 维度：assistant 记录的 `message.usage`（Observed）=====
+
+    fn parse_usage_records(records: &[serde_json::Value]) -> (usize, Vec<CapturedUsage>) {
+        let input = records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("serialize synthetic records")
+            .join("\n");
+        let mut sink = CollectingSink::default();
+        ClaudeCodeAdapter::new()
+            .parse(input.as_bytes(), &mut sink)
+            .expect("parse synthetic transcript");
+        (sink.messages.len(), sink.usages)
+    }
+
+    fn assistant_with_usage(uuid: &str, usage: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": null,
+            "sessionId": "sess-usage",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "answer"}],
+                "usage": usage,
+            },
+        })
+    }
+
+    #[test]
+    fn parse_extracts_observed_usage_from_assistant_records() {
+        // 四桶逐键提取；锚定记录 uuid；Observed 来源（provider 原生逐消息给出）。
+        let (messages, usages) = parse_usage_records(&[assistant_with_usage(
+            "a-usage",
+            serde_json::json!({
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 20,
+            }),
+        )]);
+        assert_eq!(messages, 1);
+        assert_eq!(usages.len(), 1);
+        let captured = &usages[0];
+        assert_eq!(captured.message_native_id, "a-usage");
+        assert_eq!(captured.usage.input_tokens, 100);
+        assert_eq!(captured.usage.output_tokens, 50);
+        assert_eq!(captured.usage.cache_read_tokens, 30);
+        assert_eq!(captured.usage.cache_write_tokens, 20);
+        assert_eq!(
+            captured.usage.reasoning_tokens, 0,
+            "Claude usage 无 reasoning 桶"
+        );
+        assert_eq!(captured.usage.token_source, TokenSource::Observed);
+    }
+
+    #[test]
+    fn parse_usage_missing_buckets_are_zero() {
+        // 缺失桶记 0（usage 对象存在即该消息有用量事实）；全缺 = 全零事件保留。
+        let (_, usages) = parse_usage_records(&[assistant_with_usage(
+            "a-partial",
+            serde_json::json!({ "output_tokens": 7 }),
+        )]);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].usage.input_tokens, 0);
+        assert_eq!(usages[0].usage.output_tokens, 7);
+        assert_eq!(usages[0].usage.cache_read_tokens, 0);
+        assert_eq!(usages[0].usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_without_usage_object_emits_nothing() {
+        let (_, usages) = parse_usage_records(&[assistant(
+            "a-plain",
+            false,
+            serde_json::json!([
+                {"type": "text", "text": "no usage here"},
+            ]),
+        )]);
+        assert!(usages.is_empty());
+    }
+
+    #[test]
+    fn parse_usage_on_user_records_is_ignored() {
+        // usage 只出现在 assistant 记录上；user 记录即便误带 usage 也不提取
+        // （Recall claude_code.rs 同语义：只在 assistant 角色上提取）。
+        let (_, usages) = parse_usage_records(&[serde_json::json!({
+            "type": "user",
+            "uuid": "u-usage",
+            "parentUuid": null,
+            "sessionId": "sess-usage",
+            "message": {
+                "role": "user",
+                "content": "hi",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+            },
+        })]);
+        assert!(usages.is_empty());
+    }
+
+    #[test]
+    fn parse_usage_with_negative_or_malformed_buckets_is_dropped() {
+        // 负值/非整数：fail-closed 丢弃整条事件（消息本身不受影响），
+        // 绝不 clamp、绝不编造。
+        let (messages, usages) = parse_usage_records(&[
+            assistant_with_usage(
+                "a-neg",
+                serde_json::json!({"input_tokens": -1, "output_tokens": 50}),
+            ),
+            assistant_with_usage(
+                "a-str",
+                serde_json::json!({"input_tokens": "hundred", "output_tokens": 50}),
+            ),
+            assistant_with_usage(
+                "a-ok",
+                serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
+            ),
+        ]);
+        assert_eq!(messages, 3, "usage 字段异常不得拖垮消息");
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].message_native_id, "a-ok");
+        assert_eq!(usages[0].usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn parse_usage_on_sidechain_assistant_is_anchored_to_its_record() {
+        // sidechain 记录同样按自己的 uuid 锚定（不因 isSidechain 丢弃事实）。
+        let (_, usages) = parse_usage_records(&[serde_json::json!({
+            "type": "assistant",
+            "uuid": "a-side",
+            "parentUuid": null,
+            "sessionId": "sess-usage",
+            "isSidechain": true,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "sub answer"}],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        })]);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].message_native_id, "a-side");
     }
 }

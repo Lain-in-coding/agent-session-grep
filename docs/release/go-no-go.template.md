@@ -1,8 +1,11 @@
-# Go/No-Go Report — agent-session-grep v0.1.0
+# Go/No-Go Report — agent-session-grep v<version>
 
-> Template. Fill in every section. Delete angle-bracket placeholders.
+> Candidate template. Fill in every section and replace all placeholders.
+> Do not recreate or replace the existing v0.1.0 tag/Release; any future
+> publication needs a newly approved version and source.
 
 - **Date**: <YYYY-MM-DD>
+- **Source commit**: <full 40-character candidate SHA>
 - **Rehearsal run ids**: <list all run ids from the runbook>
 - **Operator**: <operator identifier>
 - **Environment manifests**: <paths to completed manifests>
@@ -57,11 +60,16 @@
 
 | Entry point | Status | Notes |
 |---|---|---|
-| CLI robot JSON | <pass/fail/skip> | |
-| MCP JSON-RPC | <pass/fail/skip> | |
-| Robot envelope (alias of CLI) | <pass/fail/alias> | |
-| Web/HTTP | <pass/fail/skip> | |
-| TUI automated | <pass/fail/skip> | |
+| CLI JSON (`--output json`) | <pass/fail> | |
+| MCP JSON-RPC | <pass/fail> | |
+| Robot JSON (`--robot`) | <pass/fail> | |
+| Web/HTTP (real loopback server) | <pass/fail> | |
+| TUI headless (`--snapshot-json`) | <pass/fail> | |
+
+All five surfaces must be directly compared by the existing harness.
+Its `pending`, `skipped`, `aliases`, and `unimplemented` lists must be empty;
+a missing result, skip, or alias is a failed gate, never an acceptable pass.
+The TUI snapshot checks the structural projection, not interactive terminal UX.
 
 **Consistency report**: <path to compare_entrypoints.py output>
 **Overall verdict**: <consistent | divergent>

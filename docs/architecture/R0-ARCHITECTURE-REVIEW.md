@@ -117,7 +117,7 @@
 - [ ] ADR-0001 的 corpus、指标、阈值和后端决定签署。
 - [ ] ADR-0002 的 target、最低平台和认证门签署。
 - [ ] CLI/Robot/MCP 的 not-found、cursor、partial、机器模式签署。
-- [ ] Threat Model 两项开放问题（隐私模式、网络文件系统）签署；脱敏时机已由 ADR-0004 裁定（2026-08-13）。
+- [ ] Threat Model 两项开放问题（隐私模式、网络文件系统）签署；脱敏时机已由 ADR-0004 裁定（2026-08-13）。两项的事实基础与建议裁定已写入 `docs/security/THREAT-MODEL.md` §7.1 / §7.2（含对"spike 已确认 lease 不支持 NFS"这一错误证据宣称的纠正），待 owner 签署。
 - [ ] Fixture、SLI、license 与 external readiness 各有 owner/approver。
 - [ ] 对先实现后审批作显式 exception/追认决定，不回填虚假历史日期。
 

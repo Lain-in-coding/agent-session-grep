@@ -308,6 +308,54 @@ impl ToolActivity {
     }
 }
 
+/// Where one usage observation came from.
+///
+/// `Observed` = the provider recorded a per-event token count (e.g. Claude
+/// Code's `message.usage`). `Derived` = the value was deterministically
+/// derived from accumulated provider totals (e.g. Codex `token_count`
+/// cumulative counters, converted to per-event deltas under monotonicity
+/// validation). Every stored number keeps this provenance — never erased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenSource {
+    Observed,
+    Derived,
+}
+
+impl TokenSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+/// One token-usage observation: five non-negative buckets.
+///
+/// Only numbers the provider format explicitly gives are recorded — never
+/// estimated from text length or any other proxy. A stored row means the
+/// provider reported usage for that message/session (agentsview-style
+/// coverage marker: absence of rows means "unknown", not "zero"). Buckets a
+/// provider format does not carry are stored as 0 (documented per adapter);
+/// a provider-reported negative value fails the event closed (never clamped,
+/// never invented).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageObservation {
+    /// Non-cached prompt tokens (cache reads are split out, see below).
+    pub input_tokens: u64,
+    /// Completion tokens.
+    pub output_tokens: u64,
+    /// Tokens served from the provider cache (read side).
+    pub cache_read_tokens: u64,
+    /// Tokens written into the provider cache (creation side).
+    pub cache_write_tokens: u64,
+    /// Reasoning/thinking tokens, where the format records them separately.
+    pub reasoning_tokens: u64,
+    /// Provenance of the numbers (observed vs derived).
+    pub token_source: TokenSource,
+}
+
 /// The complete typed graph needed to resolve one Session context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContextGraph {
