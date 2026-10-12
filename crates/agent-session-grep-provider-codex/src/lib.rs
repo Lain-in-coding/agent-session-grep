@@ -55,9 +55,12 @@ const USAGE_KEY_LAST: &str = "last_token_usage";
 /// 整条事件跳过——绝不把回退差当负增量、也不编造一个补数。
 const STALE_REGRESSION_PERCENT: i64 = 98;
 
-// Adapted from claude-historian-mcp/src/parser.ts:74-92 (MIT): inspect cheap
-// JSONL markers before invoking serde. Unknown or ambiguous lines remain parse
-// candidates so the adapter keeps its existing recoverable-error behavior.
+// Prefilter-before-parse idea credited to claude-historian-mcp (MIT),
+// [src/parser.ts:55-176](https://github.com/Vvkmnn/claude-historian-mcp/blob/b627cdfbfe46040368ed9c3f5bb2b531c65a8988/src/parser.ts#L55-L176) at reference revision
+// `b627cdfbfe46040368ed9c3f5bb2b531c65a8988`. That filter uses query substrings;
+// this local predicate checks envelope markers, not query terms. Unknown or
+// ambiguous records remain parse candidates. Original consultation revision
+// not established; see NOTICE and docs/operations/REUSE-LICENSE-AUDIT.md (A06).
 #[derive(Default)]
 struct TopLevelMarkers<'a> {
     kind: Option<&'a [u8]>,
@@ -882,10 +885,10 @@ impl ProviderAdapter for CodexAdapter {
             if parse_line.trim().is_empty() {
                 continue;
             }
-            // Prefilter (adapted from claude-historian-mcp, MIT): skip
-            // deserialization for records whose type marker is a known
-            // non-conversational, non-session-bearing envelope. Conservative:
-            // unknown/ambiguous records fall through to serde.
+            // Idea-level prefilter credit: claude-historian-mcp (MIT; A06).
+            // Unlike its query-substring filter, this marker check avoids full
+            // record deserialization for known non-dialogue envelopes; serde
+            // still validates JSON. Unknown/ambiguous records are parsed.
             if !codex_line_may_need_deserialize(parse_line.as_bytes())
                 && serde_json::from_str::<IgnoredAny>(parse_line).is_ok()
             {

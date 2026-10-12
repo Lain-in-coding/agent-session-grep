@@ -5,13 +5,12 @@
 > 能力、license、形态);不能合法/稳定运行的竞品标「不可比」。
 > 证据来源: 本地深读报告(15 份外部项目报告,不纳入公开树)与固定 clone
 > (commit 见 `docs/operations/REUSE-LICENSE-AUDIT.md`)。
-> 其中两项因 license 状态只能 clean-room 引用思路、不进入可复现对比基线:
-> cass(coding_agent_session_search)的 LICENSE 含 restricted-party rider;
-> cc-sessions-viewer 的 README 挂 MIT badge 但仓库内没有 LICENSE 文件
-> (GitHub 仓库元数据 `licenseInfo: null`),在作者补上之前不存在可依赖的
-> 授权。因此可自由引用的对比基线是 13 项,名单共 15 项。
-> 更新:2026-08-29(新增 cc-sessions-viewer;并纠正上一版"cass 不产 deep-read
-> 报告"的说法——报告存在于本地不公开的深读集内,受限的是代码复用而不是阅读)
+> 历史资格口径排除两项:cass 的 restricted-party rider 与 cc-sessions-viewer
+> 当时未见 LICENSE 的快照。15 项名单 / 13 项历史许可候选集合保留,不因本次
+> 元数据更正自动扩大可复现 benchmark 基线;cc-switch 另有证据级检索不可比限制。
+> 历史更新(2026-08-29):新增 cc-sessions-viewer,并记录 cass 深读报告存在于
+> 本地不公开的旧报告集。这不授权阅读:cass 源码当前禁止 read/analyze/index/copy;
+> 原文「受限的是代码复用而不是阅读」的宽泛表述撤回,不作为许可解释。
 > 更新:2026-10-06 B0(按源码级收据修正 9 处形态/检索表述;补 Wake 行,Rust+GPUI、
 > FTS5 trigram、CLI/MCP;名单 14→15、可自由引用 12→13;cc-switch「无检索」改为
 > FlexSearch 元数据检索,「不可比」限定为证据级检索不可比;表内数字仍为快照口径,未重数)
@@ -25,7 +24,7 @@
 | 项目 | 形态 | License | Provider 覆盖 | 检索方式 | 其他可复现事实 |
 |---|---|---|---|---|---|
 | **agent-session-grep (本产品)** | Rust CLI + MCP + Robot + TUI + Web UI | MIT OR Apache-2.0 | 14 实现 + 2 deferred(16 行矩阵,诚实分级) | FTS5 lexical 默认 + optional semantic-candle (local E5) behind feature flag; default bigram-hash fuzzy-lexical; hybrid RRF 指标仅供参考 | evidence-first(source span,14 家中 10 家格式可得)、handoff-pack/v1、resume dry-run、零遥测可验证、跨边界默认脱敏 |
-| ctx | Rust CLI | MIT | 40+ | hybrid RRF | 语义+词法融合,分阶段发布 |
+| ctx | Rust CLI | Apache-2.0 (2026-10-11 root observation) | 40+ | hybrid RRF | 语义+词法融合,分阶段发布 |
 | coding_agent_session_search (cass) | Rust CLI/TUI (Tantivy 生态) | **restricted-party rider** | 40+(claimed) | hybrid | 仅 clean-room 思路可引用;不可复现对比 |
 | agentsview | Go 后端 + Svelte 前端 | MIT | 40+ | hybrid | secret 扫描但非分层边界 |
 | AgentRecall | TypeScript/Electron/React 桌面 | MIT | 16 | hybrid | node:sqlite + Node MCP |
@@ -35,8 +34,8 @@
 | agent-sessions | Swift/SwiftUI macOS 桌面 | MIT | 10 | FTS5 | — |
 | agf | Rust CLI + TUI | MIT | 8 | fuzzy | — |
 | cc-switch | Tauri + React + Rust 桌面 App | MIT | 7 | FlexSearch 元数据检索(sessionId/title/summary/projectDir/sourcePath;不含正文/不持久化/无 source span) | 7 家会话管理与 resume 命令生成;「不可比」限定为证据级检索不可比 |
-| cc-sessions-viewer | Tauri 2 桌面 App | **README 挂 MIT badge,仓库无 LICENSE 文件** | 7 | 无索引:rayon 并行全量扫描 + 进程内 (path→mtime) 缓存 | 仅匹配用户消息(工具调用/结果/文件改动不参与匹配);原始 JSONL 只读;不可复现对比 |
-| sessiongrep | Rust CLI | MIT | 5 | FTS5 | — |
+| cc-sessions-viewer | Tauri 2 桌面 App | **current pinned root MIT; historical snapshot provenance unresolved** | 7 | 无索引:rayon 并行全量扫描 + 进程内 (path→mtime) 缓存 | 仅匹配用户消息(工具调用/结果/文件改动不参与匹配);原始 JSONL 只读;不可复现对比 |
+| sessiongrep | Rust CLI | Apache-2.0 (2026-10-11 root observation) | 5 | FTS5 | — |
 | memex | 两套形态:memex-lite(无索引现场 regex grep 本地 CLI)与 memex-rs(FTS + LanceDB 向量 + RRF + compact + Hook 注入;HTTP/MCP/remote 服务) | MIT | 4 | hybrid(仅 memex-rs;lite 为现场 regex) | 另有 web(Vue) 前端 |
 | claude-historian-mcp | TypeScript/Node MCP | MIT | 1 | 零存储全扫 | 仅 Claude Code |
 | Wake | Rust + GPUI 桌面 | MIT | 21 | FTS5 trigram | CLI + MCP;source/sidecar/remote;固定 clone commit 71aeca6(0.8.5) |
@@ -46,7 +45,30 @@
 > agent-sessions→Swift/SwiftUI、agf→Rust CLI+TUI、claude-historian-mcp→TypeScript/Node MCP、
 > cc-switch→FlexSearch 元数据检索、memex→两套形态拆分),并补 Wake 行;证据锚点见
 > `../operations/REUSE-LICENSE-AUDIT.md` 中的固定 revision 与公开项目身份。
-> provider 数等数字未重数,原快照日期(2026-08-14)与 license 结论不变。
+> provider 数等数字未重数,原快照日期(2026-08-14)保留。以上是 2026-10-06 的
+> 历史修正说明;当前根许可元数据按下方 2026-10-12 更正,不倒填原始复用许可。
+
+### Root-license / identity correction (2026-10-12)
+
+- ctx: observed Apache-2.0 at `06bc5ed17ce4d0f6c8255981e009f86802dbe32f`;
+  sessiongrep: observed Apache-2.0 at
+  `c5c1874f420fb20cc55e484f79bdff3d848b71a8`, not the earlier MIT labels.
+- cc-sessions-viewer is `jerrywu001/cc-sessions-viewer`, repository ID
+  `1244579680`. Current root LICENSE is MIT at
+  `5bf43433977189ca67e46523ae2cc845487c113e`; LICENSE was added at
+  `91337d151fb93290fa802cf90be1f52e11e1b62e` (2026-09-16). The old no-LICENSE /
+  `licenseInfo: null` observation remains historical, not current metadata.
+  Its old local snapshot is unversioned: the inherited ancestor development
+  checkout Git identity and `f587c73332158342330a63874fabdc8f565624ec` are rejected
+  as evidence of its provenance.
+- These are retained metadata observations, not a new source audit, provenance
+  proof for an earlier snapshot, or benchmark qualification. No cass source
+  reading/analysis/indexing/copying and no cc-sessions-viewer source reading/
+  copying are authorized. Original consultation revisions remain unknown.
+- The 15 distinct public identities, pinned LICENSE links and raw hashes are
+  in [the reuse audit](../operations/REUSE-LICENSE-AUDIT.md#11-observed-root-license-register).
+  Wake's current Cursor reference and the separate official Hermes format
+  source are inventoried there, without expanding this competitor set.
 
 ## 已核验差异(agent-session-grep vs 参考项目)
 
@@ -66,13 +88,14 @@
   「不可比」限定为证据级检索不可比(metadata 检索不等价全文证据检索)。
   - 修正说明(2026-10-06):原写「配置切换器,无检索能力」,与源码复核不符,已按上述范围限定。
 - **cass**: 受限 license,不可复现对比。
-- **cc-sessions-viewer**: 仓库无 LICENSE 文件(README 的 MIT badge 无文件支撑,
-  GitHub `licenseInfo: null`),因此只能 clean-room 引用思路;其检索为「无索引
-  全量并行扫描 + 只匹配用户消息」,与本产品的持久 FTS5 全内容索引不是同一
-  问题域,亦不作优劣结论。
-- 其余 13 项:license 可自由引用,但 provider 数、能力为 deep-read 快照
-  (快照日期 2026-08-14),与最新上游可能有差异;发布 benchmark 时以固定 clone commit
-  为准复现。
+- **cc-sessions-viewer**: 历史无 LICENSE 快照仍未绑定原始 provenance;
+  当前 pinned MIT 根元数据见上,不自动恢复 benchmark 资格,本任务仍禁读/复制源码。
+  保留原能力快照:「无索引全量并行扫描 + 只匹配用户消息」与本产品的持久 FTS5
+  全内容索引不是同一问题域,不作优劣结论,本次未重验能力。
+- 历史 13 项集合仅排除 cass 与 cc-sessions-viewer,**包含 cc-switch**;
+  不等于三条不可比说明以外的项目数,也不是每项均可运行或 benchmark 等价的证明。
+  Provider 数、能力仍是 deep-read 快照(2026-08-14,Wake 例外见上),本次未重数;
+  发布 benchmark 仍需固定 revision、许可资格和实际运行证据。
 
 ## 口径说明
 

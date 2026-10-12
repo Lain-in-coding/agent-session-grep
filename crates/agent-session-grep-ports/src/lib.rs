@@ -1448,9 +1448,13 @@ pub fn read_bounded_source(
 /// Returns the number of bytes read; 0 means EOF. The line buffer is cleared
 /// and reused on every call, so streaming adapters never allocate per record.
 ///
-/// The bounded-reader pattern shared by this function, [`BoundedSourceLine`],
-/// [`BoundedLineReader`] and [`for_each_bounded_source_line`] is adapted from
-/// agf's bounded reader (`read_head_tail` / `char_prefix`, MIT License).
+/// The bounded-input idea shared by this function, [`BoundedSourceLine`],
+/// [`BoundedLineReader`] and [`for_each_bounded_source_line`] is credited to
+/// agf (`read_head_tail` / `char_prefix`, MIT), [src/scanner/mod.rs:47-50,107-174](https://github.com/subinium/agf/blob/44be9cffd3b3eeb44ff1f31a751ec8954adf14cf/src/scanner/mod.rs)
+/// at reference revision `44be9cffd3b3eeb44ff1f31a751ec8954adf14cf`. These local
+/// line/stream limits and buffering differ from the compared head/tail reader.
+/// This idea-only disposition does not prove independent authorship or the
+/// original consultation revision. See NOTICE and docs/operations/REUSE-LICENSE-AUDIT.md (A05b).
 fn read_one_bounded_line(
     reader: &mut dyn BufRead,
     line: &mut Vec<u8>,

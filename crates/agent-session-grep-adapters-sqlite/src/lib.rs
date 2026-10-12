@@ -1811,8 +1811,12 @@ impl SqliteStore {
 
     /// 打开并把 schema 迁移到当前版本，为版本化 migration 与可重建索引奠基。
     ///
-    /// WAL journal 模式的 PRAGMA 初始化复制自 ctx（ctxrs，Apache-2.0）的
-    /// catalog 初始化。
+    /// Bounded WAL/cache configuration adaptation from ctx (ctxrs, Apache-2.0),
+    /// [crates/ctx-history-store/src/connection.rs:218-230](https://github.com/ctxrs/ctx/blob/06bc5ed17ce4d0f6c8255981e009f86802dbe32f/crates/ctx-history-store/src/connection.rs#L218-L230), reference revision
+    /// `06bc5ed17ce4d0f6c8255981e009f86802dbe32f`. The local PRAGMA set and cache
+    /// value differ; this is not a copy of the complete initialization or doctor
+    /// function. The original consultation revision is not established.
+    /// See NOTICE and docs/operations/REUSE-LICENSE-AUDIT.md (A04a/A04b).
     fn init(conn: &Connection) -> PortResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;

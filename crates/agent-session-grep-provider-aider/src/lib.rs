@@ -8,8 +8,13 @@
 //!   - plain text after a turn → assistant response
 //!   - "> <text>" → aider tool/edit output (blockquote)
 //!
-//! Format evidence: agentsview (MIT) `internal/parser/aider.go`.
-//! The line-prefix role reconstruction is adapted from agentsview under MIT.
+//! Format evidence: agentsview (MIT) [internal/parser/aider.go:276-365](https://github.com/kenn-io/agentsview/blob/a84564ad6ea35f8fb80905da4693144f89f84229/internal/parser/aider.go#L276-L365),
+//! reference revision `a84564ad6ea35f8fb80905da4693144f89f84229`.
+//! The line-prefix/channel-state reconstruction is adapted from agentsview;
+//! local run handling and folding tool output into assistant text differ.
+//! The compared reference is not a proven original consultation revision.
+//! Copyright (c) 2026 Kenn Software LLC (observed root MIT notice).
+//! See NOTICE and docs/operations/REUSE-LICENSE-AUDIT.md (A03).
 
 use agent_session_grep_ports::{
     AdapterManifest, CanonicalEventSink, Confidence, MessageEvent, ParseReport, ProbeResult,
