@@ -113,7 +113,13 @@ license to F01. No new upstream source or fixture was read for this correction.
    the existing idea-only scope for Swift/TS references and restricted-source
    boundaries. Classification follows the particular asset and evidence, not
    repository language; this correction grants no new source-use scope.
-4. **依赖许可单列**:任何被复用资产引入的传递依赖(如 agf 的 nucleo 系列为 MPL-2.0,须 attribution;tantivy 传递引入 ort-sys 许可不干净——已由 spike 实证)必须进 SBOM 与 `cargo deny` 白名单,未过 deny 门不得合入。
+4. **依赖许可单列（2026-10-12 更正）**: Review dependencies actually introduced
+   into the resolved graph under the existing cargo-deny policy; do not inherit
+   an upstream dependency merely from idea reuse (including the earlier agf/
+   nucleo example). The committed spike lock does not support the asserted
+   Tantivy → ort-sys failure (§5). Keep metadata gaps explicit, require real
+   command/source-bound license evidence, and do not broaden allowlists or
+   claim a complete SBOM/license pass from this correction.
 5. **制品 attribution 诚实边界**:release pipeline 生成的
    `THIRD-PARTY-DEPENDENCIES.json/.csv` 是可审计 resolved-dependency 报告,
    仅记录 `cargo metadata --locked --format-version 1` 与 `Cargo.lock` 实际
@@ -258,7 +264,10 @@ Cross-record corrections: **C01** reconciles ctx/sessiongrep Apache metadata;
 **C02** separates current P05 MIT from the old snapshot and rejected identity;
 **C03** preserves cass's no-read/analyze/index/copy boundary; **C04** maps current
 RRF to ctx while retaining Recall history; **C05** splits AgentRecall and
-agent-sessions; **C08** separates categories, language, evidence and approval.
+agent-sessions; **C06** dates the old no-semantic scope (X12 / ADR-0001);
+**C07** corrects the unsupported dependency chain and downstream reasoning
+(§5 / both ADRs / dated spike appendices); **C08** separates categories,
+language, evidence and approval.
 
 ## 4. 反模式登记（作为验收反例，禁止复用）
 
@@ -278,11 +287,35 @@ guard mappings are preserved, not re-tested upstream claims or code reuse.
 | X09 | adapter 子进程无超时/无输出上限致 OOM | hstry runner.rs、claude-historian | `../architecture/RFC-0002-provider-adapter-contract.md` §7 流式 + bounded buffer |
 | X10 | mtime as i64 纳秒截断、纯 mtime 判增量 | sessiongrep、agf cache.rs | `../architecture/RFC-0001-canonical-model-and-stable-id.md` §6；source-snapshot spike |
 | X11 | API key 明文入库 | AgentRecall schema.ts | `../security/THREAT-MODEL.md` §5 |
-| X12 | 向量检索引入 protoc/联网模型构建依赖 | memex LanceDB、Recall candle | v1.0 不含 vector/embedding；`../adr/ADR-0002-platform-targets.md` 禁止联网构建依赖 |
+| X12 | 向量检索引入 protoc/联网模型构建依赖 | memex LanceDB、Recall candle | 历史 R0 范围曾为 v1.0 不含 vector/embedding；2026-10-12 澄清：当前默认 lexical，opt-in semantic-candle + 离线本地导入；`../adr/ADR-0002-platform-targets.md` 禁止联网构建依赖仍有效，权重分发/晋级未获本次批准 |
 
-## 5. spike 补充的实证结论
+## 5. Spike dependency-evidence correction (2026-10-12)
 
-- **Tantivy 供应链风险已实证**：`cargo tree` 确认 tantivy 0.26.1 传递引入 `ort-sys`（ONNX Runtime），`cargo deny` 报 unlicensed。该证据从供应链维度进一步支持 `../adr/ADR-0001-fulltext-search-engine.md` 的 FTS5 默认选择（另见 `spikes/search-backend/EVIDENCE.md`、`spikes/cross-platform-packaging/EVIDENCE.md`）。
+The earlier claim that Tantivy 0.26.1 transitively introduced `ort-sys` and
+produced a cargo-deny `unlicensed` failure is **not substantiated by the
+committed evidence**. H5's `spikes/search-backend/Cargo.lock` has raw SHA256
+`77e547af8ff41e17429f334b13607a5bf7829ed7e04f7cbdb511352b8f1aa41d`:
+151 locked packages, 140 in the recorded Tantivy closure, no `ort-sys`
+anywhere in that lock and no path to it. This observation is confined to that
+source/lock, not every Tantivy version or historical environment.
+
+The [packaging probe](../../spikes/cross-platform-packaging/verify-release-pipeline.ps1)
+step 2 invokes `cargo audit`, **not cargo-deny**; its old fixed INFO string
+was not an executed license check. Historical failure reproduction requires
+the exact source, lock/configuration, command, tool version and result; those
+inputs remain unestablished. Absence from this graph is neither a new
+cargo-deny pass nor proof that the event never happened.
+
+The original claims and measured results remain in
+[the R0 summary](../../spikes/R0-EVIDENCE-SUMMARY.md) and
+[packaging evidence](../../spikes/cross-platform-packaging/EVIDENCE.md), each
+with an appended dated correction. Do not use the old dependency claim or
+its inferred ctx-fork/cleaner-FTS5 rationale as decision evidence.
+[Search-backend measurements](../../spikes/search-backend/EVIDENCE.md) still
+support the bounded recall comparison and single-storage consistency rationale
+in [ADR-0001](../adr/ADR-0001-fulltext-search-engine.md), with scale/platform/
+ranking limits intact. The FTS5 default, dependencies and approval status do
+not change; neither backend receives universal license clearance.
 
 ## 6. Release attribution bundle contract
 

@@ -18,7 +18,7 @@ Write-Output "`nstep 2: 供应链审计"
 Push-Location $spike
 cargo audit 2>&1 | Out-Null
 Write-Output ("  [{0}] cargo-audit 退出码 0" -f (@{$true="PASS";$false="INFO"}[[bool]($LASTEXITCODE -eq 0)]))
-Write-Output "  [INFO] cargo-deny: tantivy->ort-sys 许可问题已知（见 R0 证据），支持 FTS5 默认"
+Write-Output "  [INFO] 本探针不运行 cargo-deny；当前 spike lock 不支持旧 Tantivy->ort-sys 断言，历史失败证据待核实（见 EVIDENCE 的 2026-10-12 更正）"
 Pop-Location
 
 Write-Output "`nstep 3: SBOM 生成 (CycloneDX)"

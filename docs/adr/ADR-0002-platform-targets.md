@@ -36,7 +36,13 @@ agent-session-grep 将 Windows x64、Linux x64、macOS x64/ARM64 作为 v1.0 正
 
 - **禁止联网构建依赖**：不得依赖构建期下载模型、protoc 二进制或其他网络产物（反例：memex 的 LanceDB 需 protoc、Recall 的 candle 需模型）。
 - SQLite 采用 `rusqlite` 的 `bundled` feature，随构建静态编入，免系统 SQLite；R0 冻结实际链接的 SQLite 版本，由 benchmark harness 记录并经 spike 的 `rusqlite::version()` 交叉核对（当前 spike 实测 3.53.2；`doctor` 输出的是 schema/generation/interrupted-batch 状态，不输出 SQLite 版本）。
-- 全文引擎默认 FTS5（ADR-0001），避免 Tantivy 传递引入 `ort-sys` 等许可不干净、需上游 fork 的原生依赖。
+- 全文引擎默认 FTS5（ADR-0001），依据单存储一致性与有限测量，而非未经证实的许可链。
+  **2026-10-12 更正**：H5 `spikes/search-backend/Cargo.lock`（raw SHA256
+  `77e547af8ff41e17429f334b13607a5bf7829ed7e04f7cbdb511352b8f1aa41d`）的
+  151 个包/140 个 Tantivy closure 包不含 `ort-sys`。packaging 探针不运行
+  cargo-deny，不能支持旧的传递许可失败或需 fork 理由；历史原始命令/配置/结果
+  尚未建立。这不是任何版本的通用许可 PASS；具体依赖与平台仍需实际检查。
+  详见 [audit §5](../operations/REUSE-LICENSE-AUDIT.md#5-spike-dependency-evidence-correction-2026-10-12)。
 
 ### 非承诺 target
 

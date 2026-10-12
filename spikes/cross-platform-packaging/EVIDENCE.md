@@ -32,3 +32,37 @@
 - `docs/operations/external-readiness-gate.md` 应继续引用本机已测的 checksum-after-sign、依赖审计与 SBOM 证据；
 - 签名/公证/多平台构建仍是 External Readiness Gate 的未决项，本 spike 不构成通过声明；
 - FTS5/Tantivy 供应链结果作为 ADR-0001 的证据输入，ADR 状态由 R0 Architecture Review 决定。
+
+
+---
+
+## 2026-10-12 correction: cargo-deny was not executed by this probe
+
+The original text and all measurement/claim lines above are preserved as
+historical evidence. The “关键结论” item 3 and the final recommendation to use
+FTS5/Tantivy supply-chain results as ADR-0001 evidence are superseded:
+the committed inputs do not substantiate the asserted Tantivy→ort-sys
+`unlicensed` failure or the resulting “FTS5 依赖树更干净” conclusion.
+
+At H5 `36616b7957e504aa4c6d514a50545dcd9bbc47cd`,
+`spikes/search-backend/Cargo.lock` has raw SHA256
+`77e547af8ff41e17429f334b13607a5bf7829ed7e04f7cbdb511352b8f1aa41d`:
+151 locked packages, 140 in the recorded Tantivy closure, no `ort-sys`
+and no path to it. `verify-release-pipeline.ps1` step 2 invokes `cargo audit`,
+not cargo-deny. Having cargo-deny installed and printing an INFO statement
+are not evidence of its execution. Only that misleading explanatory string
+is corrected; tool invocations, control flow and exit handling are unchanged.
+The legacy probe was not run for this correction.
+
+The historical failure's source, lock/configuration, command, tool version
+and result remain unestablished. No fresh cargo-deny PASS or universal license
+cleanliness is claimed, nor is the event declared impossible historically.
+The recorded build, cargo-audit, CycloneDX and simulated-signature/checksum
+results are retained, not independently revalidated. Formal recommendations
+may use those bounded historical measurements, but not infer license clearance
+from cargo-audit/SBOM generation or the old INFO string.
+
+FTS5 remains default for the measured/consistency reasons in ADR-0001, still
+Proposed. Cross-platform, genuine signing/notarization and minimum-OS limits
+remain unresolved by this spike. See [audit §5](../../docs/operations/REUSE-LICENSE-AUDIT.md#5-spike-dependency-evidence-correction-2026-10-12)
+and [the R0 summary correction](../R0-EVIDENCE-SUMMARY.md).

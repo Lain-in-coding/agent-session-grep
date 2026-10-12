@@ -92,3 +92,46 @@
 - **本机安全软件对部分文档静默删除**：起草 R0 文档时，`EXTERNAL-READINESS-GATE.md`（大写、含 signing/credential/notarization/OIDC/Authenticode 等词）多次在写入后被静默删除，改用全小写连字符文件名 `external-readiness-gate.md` 后稳定持久。推断为本机安全软件基于文件名/内容启发式误判。
 - **影响**：这印证了 `docs/product/SLI-AND-BENCHMARK-FORMAT.md` 要求记录 `antivirus_state` 的必要性；Windows 构建、签名和安装验证必须在受控、可复现且记录安全软件状态的环境执行。
 - **对 External Readiness Gate 的意义**：签名/公证凭据相关流程需在 CI 或专用发布主机验证；本 spike 未验证真实凭据。
+
+
+---
+
+## 2026-10-12 correction: unsupported dependency chain and dependent rationale
+
+The original text above is retained as historical evidence, including all
+measurements and claims. This correction supersedes the affirmative
+Tantivy→ort-sys / cargo-deny `unlicensed` assertion and the conclusions that
+relied on it; it does not rerun the probes or erase the historical record.
+
+Bound source: H5 `36616b7957e504aa4c6d514a50545dcd9bbc47cd`,
+`search-backend/Cargo.lock`, raw SHA256
+`77e547af8ff41e17429f334b13607a5bf7829ed7e04f7cbdb511352b8f1aa41d`.
+The committed lock has 151 packages, 140 in the recorded Tantivy closure,
+and no `ort-sys` or path to it. The packaging script's step 2 runs
+`cargo audit`, not cargo-deny; its old hardcoded INFO line was not a license
+check. The historical failure's exact source, lock/configuration, command,
+tool version and result are not established by these committed inputs.
+
+Affected passages and their current interpretation:
+
+- Opening “only measured conclusions” / §0: the old dependency failure was
+  not substantiated by the committed evidence. Do not count it among the
+  measured assumptions or use “叠加本轮供应链证据” to support engine selection.
+- §1.1 “决策证据”: retain measured recall parity and the limited single-storage
+  consistency rationale; remove the unsupported chain from the evidence for
+  choosing FTS5. Beacon queries do not establish ranking-quality superiority.
+- §1.5 “供应链审计”: the old cargo-deny/ort-sys failure, inferred ctx-fork reason
+  and resulting cleaner-FTS5 conclusion are unverified/superseded. The recorded
+  cargo-audit, CycloneDX, build and checksum measurements remain historical;
+  this correction does not independently revalidate them.
+- §2 item 1: ADR-0001 should use the search measurements and single-storage
+  trade-off, not the old FTS5/Tantivy license comparison. Item 6 and the other
+  signing/platform/readiness limitations are unchanged.
+
+This graph observation is not a fresh cargo-deny pass, universal license
+cleanliness or proof the claimed event never occurred in another environment.
+The FTS5 default and Proposed ADR status do not change. Current behavior is
+default lexical with opt-in `semantic-candle` and offline local model import;
+old R0 no-semantic scope is historical, not removal of that feature or approval
+of weight redistribution. See [audit §5](../docs/operations/REUSE-LICENSE-AUDIT.md#5-spike-dependency-evidence-correction-2026-10-12)
+and [the packaging correction](cross-platform-packaging/EVIDENCE.md).
