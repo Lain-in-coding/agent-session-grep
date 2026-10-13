@@ -3,8 +3,13 @@ name: security-audit
 "on":
   schedule:
     - cron: "23 4 * * 1"
-  pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_commit:
+        description: "Exact source SHA; scheduled/manual standalone audits use their event SHA"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,14 +18,91 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  source:
+    name: resolve audit source
+    runs-on: ubuntu-latest
+    outputs:
+      source_commit: ${{ steps.source.outputs.source_commit }}
+    steps:
+      - name: Resolve exact audit source
+        id: source
+        shell: python {0}
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          CALLER_SHA: ${{ github.sha }}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          import json
+          import os
+
+          def parse_inputs(raw, event_name):
+              if raw == "" and event_name in {"schedule", "workflow_dispatch"}:
+                  return {}
+              # Malformed nonempty JSON is never an unavailable context.
+              return json.loads(raw)
+
+          def select_source(inputs, event_name, caller_sha):
+              if (inputs is None or inputs == "") and event_name in {"schedule", "workflow_dispatch"}:
+                  inputs = {}
+              if not isinstance(inputs, dict):
+                  raise ValueError("audit inputs must be an object")
+              # Called workflows retain caller event_name and can also receive the
+              # caller's dispatch fields. The declared source key takes precedence;
+              # unrelated caller fields stay inert and never replace its value.
+              if "source_commit" in inputs:
+                  return validate_source_commit(inputs["source_commit"])
+              if inputs or event_name not in {"schedule", "workflow_dispatch"}:
+                  raise ValueError("missing source_commit for reusable audit")
+              return validate_source_commit(caller_sha)
+
+          if __name__ == "__main__":
+              source = select_source(parse_inputs(os.environ["INPUTS_JSON"], os.environ["EVENT_NAME"]), os.environ["EVENT_NAME"], os.environ["CALLER_SHA"])
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"source_commit={source}\n")
+
   dependency-audit:
     name: Cargo dependency audit
+    needs: [source]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout exact source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          ref: ${{ needs.source.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Assert exact source checkout
+        id: assert_source
+        shell: python {0}
+        env:
+          SOURCE_COMMIT: ${{ needs.source.outputs.source_commit }}
+        run: |
+          import re
+
+          def validate_source_commit(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+                  raise ValueError("source_commit must be a nonzero full lowercase Git SHA")
+              return value
+
+          import os
+          import subprocess
+
+          def assert_source(source_commit):
+              expected = validate_source_commit(source_commit)
+              actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if actual != expected:
+                  raise ValueError("checkout HEAD does not match prepared source_commit")
+
+          if __name__ == "__main__":
+              assert_source(os.environ["SOURCE_COMMIT"])
 
       - name: Install pinned audit tools
         run: |
@@ -34,24 +116,36 @@ jobs:
         run: cargo deny check
 
       - name: Check zero-egress static audit
-        # 零遥测审计：默认 build 不得依赖 HTTP client，唯一 socket 是 serve 的
-        # loopback TcpListener。
-        # 与 crates/agent-session-grep-cli/tests/network_egress.rs 同一语义，此处用
-        # grep 作 CI 前置快速闸门（不依赖 cargo build）。
+        id: zero_egress
+        shell: python {0}
+        # Keep the existing grep predicates aligned with network_egress.rs.
+        # Only no-match (1) is benign; tool failures are not a clean audit.
         run: |
-          set -euo pipefail
-          for crate in reqwest hyper ureq isahc surf attohttpc tiny_http rouille warp axum tokio async-std; do
-            if grep -q "^name = \"${crate}\"" Cargo.lock; then
-              echo "zero-egress audit failed: HTTP client dependency ${crate} found in Cargo.lock" >&2
-              exit 1
-            fi
-          done
-          sockets=$(grep -rlE 'TcpListener|TcpStream|TcpSocket|UdpSocket|std::net' crates --include='*.rs' | grep '/src/' | grep -v 'crates/agent-session-grep-cli/src/serve.rs' || true)
-          if [ -n "${sockets}" ]; then
-            echo "zero-egress audit failed: socket usage outside serve.rs:" >&2
-            echo "${sockets}" >&2
-            exit 1
-          fi
+          import subprocess
+
+          def grep_result(arguments):
+              result = subprocess.run(["grep", *arguments], capture_output=True, text=True)
+              if result.returncode not in (0, 1):
+                  raise ValueError("zero-egress grep failed; audit is incomplete")
+              return result
+
+          def audit_zero_egress():
+              for crate in ("reqwest", "hyper", "ureq", "isahc", "surf", "attohttpc", "tiny_http",
+                            "rouille", "warp", "axum", "tokio", "async-std"):
+                  if grep_result(["-q", f'^name = "{crate}"', "Cargo.lock"]).returncode == 0:
+                      raise ValueError("zero-egress audit found a forbidden HTTP client dependency")
+              result = grep_result(["-rlEZ", "TcpListener|TcpStream|TcpSocket|UdpSocket|std::net",
+                                    "crates", "--include=*.rs"])
+              if result.returncode == 1 and not result.stdout:
+                  return
+              if not result.stdout or not result.stdout.endswith("\0"):
+                  raise ValueError("zero-egress grep returned an invalid path inventory")
+              for path in result.stdout.split("\0")[:-1]:
+                  if "/src/" in path and path != "crates/agent-session-grep-cli/src/serve.rs":
+                      raise ValueError("zero-egress audit found socket usage outside the allowed serve module")
+
+          if __name__ == "__main__":
+              audit_zero_egress()
 
       - name: Check RustSec advisories
         run: cargo audit --file Cargo.lock

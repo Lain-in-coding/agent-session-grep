@@ -6,14 +6,14 @@
 
 use agent_session_grep_domain::{
     ContextPolicy, DomainError, IdKind, Message, MessagePlacement, Role, SourceDocument, StableId,
-    ToolActivity, select_full, select_mainline,
+    ToolActivity, UsageObservation, select_full, select_mainline,
 };
 use agent_session_grep_ports::{
     CanonicalEventSink, CatalogEntry, CatalogStore, Confidence, ContextGraphStore, MessageEvent,
     NoResumeClaims, NoSemanticIndex, ParseReport, PortError, PortResult, ProbeResult,
-    ProviderAdapter, ProviderError, ReadOnlySource, ResumeClaimsStore, RetrievalMode, SearchFacets,
-    SearchFilters, SearchHit, SearchIndex, SearchInstant, SearchQuery, SemanticIndex,
-    SessionResumeMetadata, ToolActivityEvent,
+    ProviderAdapter, ProviderError, ReadOnlySource, RepoTotals, ResumeClaimsStore, RetrievalMode,
+    SearchFacets, SearchFilters, SearchHit, SearchIndex, SearchInstant, SearchQuery, SemanticIndex,
+    SessionResumeMetadata, ToolActivityEvent, UsageEvent, UsageTotals,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -28,11 +28,19 @@ pub mod evidence;
 pub mod guidance;
 pub mod handoff_pack;
 pub mod hybrid;
+pub mod maintenance;
+pub mod peek;
+pub mod ranking;
+pub mod relocation;
 pub mod resume;
+pub mod retention;
+pub mod snippet;
 
 pub use budget::{ResponseBudget, Truncation};
-pub use cjk::bigram_cjk;
+pub use cjk::{bigram_cjk, fts_tokens_cjk};
 pub use evidence::EvidenceSpanDto;
+pub use peek::SessionPeek;
+pub use retention::{MESSAGE_FTS_MAX_CHARS, bounded_index_text};
 
 /// 排序方案标识：catalog 列表的钉住排序（wire id 升序，见 sqlite `ORDER BY id ASC`）。
 pub const SORT_WIRE_ID_ASC: &str = "wire_id_asc";
@@ -65,10 +73,26 @@ const STRUCTURAL_METADATA_RESERVE_BYTES: usize = 320;
 /// overflowing into a negative SQL LIMIT (SQLite treats -1 as "no limit").
 const MAX_FETCH_WINDOW: u64 = 1 << 20;
 
+/// 应用层重排路径（纯 lexical 的 rank signals、semantic/hybrid 未就绪时的
+/// lexical_fallback，以及 hybrid 的 RRF 融合）的 **排序窗口**：与 cursor
+/// offset 无关的固定取数上限。重排后的钉住排序是"同一窗口上的全序"——窗口
+/// 若随 offset 增长，每一页都在不同的集合上重排，拼接结果会重复页尾命中、
+/// 漏掉真正的高分命中（silent wrong result）。所有页取同一窗口、重排一次后
+/// 按 offset 切片，分页才是同一个全序的不重不漏划分；offset 越过窗口后分页
+/// 以 has_more=false 诚实终止（这是排序视界，不是缺陷）。512 ≈ 20 条/页 ×
+/// 25 页，覆盖典型翻页深度；不受伪造 offset 影响（窗口不随 offset 变化）。
+const RANK_SCAN_WINDOW: u64 = 512;
+
 /// group_by_session（R3）模式下相对分页窗口的扫描放大倍数：归并需要把命中先
 /// 汇到会话级再切页，扫描窗口取 `页窗口 × GROUP_SCAN_FACTOR`（仍被
 /// MAX_FETCH_WINDOW 封顶），使 `occurrences` 覆盖更有意义的命中样本。
 const GROUP_SCAN_FACTOR: u64 = 16;
+
+/// JSON 语法开销：list 条目附加派生标题（#6，schema v13）时写入的
+/// `,"title":` 前缀（`,` + `"title"` + `:`）。与 peek 的
+/// [`peek::PEEK_ENTRY_OVERHEAD_BYTES`] 同一计费方式——标题是渲染产物，
+/// 字节必须计入 `max_response_bytes` 字节闸。
+const TITLE_ENTRY_OVERHEAD_BYTES: usize = 9;
 
 /// 一条 JSON 字符串字面量的序列化长度（含两端引号与转义）。
 fn json_string_len(value: &str) -> usize {
@@ -82,48 +106,20 @@ fn json_string_len(value: &str) -> usize {
         .sum::<usize>()
 }
 
-/// 估算 `payload` 经 `String::from_utf8_lossy` 转为字符串、再做 JSON 字符串
-/// 转义后的序列化长度（含两端引号）。
+/// `payload` 经 `String::from_utf8_lossy` 转为字符串、再做 JSON 字符串转义后的
+/// 序列化长度（含两端引号）。
 ///
 /// 字节闸的估算必须按**序列化后**长度计，而不是原始字节数：`Vec<u8>` 渲染为
-/// 字符串时，控制字节会膨胀为 `\uXXXX`（6 字符），无效 UTF-8 序列替换为一个
-/// U+FFFD（3 字节），与 CLI 的 lossy 渲染一致。
+/// 字符串时，控制字节会膨胀为 `\uXXXX`（6 字符），无效 UTF-8 的每个"最大子部分"
+/// 替换为一个 U+FFFD（3 字节）。
+///
+/// 实现直接复用渲染侧的同一个 `from_utf8_lossy`，而不是再实现一遍 UTF-8 校验：
+/// 手写规则必然与 `core` 的替换语义分叉——overlong 编码、UTF-16 代理区、超出
+/// U+10FFFF 的首字节都"看起来像"合法多字节序列，按长度计费即低估到真实值的
+/// 三分之一，字节闸会放行超预算的页并报 `truncated: false`。合法 UTF-8 时
+/// `from_utf8_lossy` 借用原缓冲、不分配。
 fn lossy_payload_json_len(payload: &[u8]) -> usize {
-    fn utf8_width(byte: u8) -> usize {
-        match byte {
-            0x00..=0x7F => 1,
-            0xC0..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            0xF0..=0xF7 => 4,
-            _ => 0, // 续字节或越界头字节：无效
-        }
-    }
-    let mut len = 2usize; // 两端引号
-    let mut i = 0;
-    while i < payload.len() {
-        let width = utf8_width(payload[i]);
-        if width == 0
-            || i + width > payload.len()
-            || (1..width).any(|k| payload[i + k] & 0xC0 != 0x80)
-        {
-            // 无效/截断序列 → 一个 U+FFFD（3 字节，无需转义）。
-            len += 3;
-            i += 1;
-        } else {
-            // 多字节序列的续字节不会是引号/控制字符，只有单字节需要转义计。
-            len += if width == 1 {
-                match payload[i] {
-                    b'"' | b'\\' => 2,
-                    0x00..=0x1F | 0x7F => 6,
-                    _ => 1,
-                }
-            } else {
-                width
-            };
-            i += width;
-        }
-    }
-    len
+    json_string_len(&String::from_utf8_lossy(payload))
 }
 
 /// Application 边界错误：保留 Domain、Port、Provider、Cursor 与 Budget 的原始分类，
@@ -332,6 +328,15 @@ pub enum AppResponse {
     /// 稳定排序后的 Catalog 条目（wire id 升序）。
     List {
         entries: Vec<CatalogEntry>,
+        /// 与 `entries` 逐位对齐的 Peek 预览（#7）：`sessions_only` 列表的每个
+        /// 会话条目一个 `Some`，普通 `list` 全为 `None`。预览字节计入
+        /// `max_response_bytes` 字节闸，绝不免费越闸。
+        peeks: Vec<Option<SessionPeek>>,
+        /// 与 `entries` 逐位对齐的派生会话标题（#6，schema v13 标题投影）：
+        /// `sessions_only` 列表的每个会话条目一个 `Option`（`None` = 无派生
+        /// 标题），普通 `list` 全为 `None`。标题字节与 peek 一样计入
+        /// `max_response_bytes` 字节闸。
+        titles: Vec<Option<String>>,
         next_cursor: Option<String>,
         generation: u64,
         truncation: Truncation,
@@ -380,6 +385,10 @@ pub enum AppResponse {
         active_generation: u64,
         placements: u64,
         source_placement_claims: u64,
+        /// 全库 token 用量聚合；`None` = 存储无 usage 投影。
+        usage: Option<UsageTotals>,
+        /// 全库 repo 身份聚合（schema v16）；空列表 = 无 repo 事实（未知 ≠ 零）。
+        repos: Vec<RepoTotals>,
     },
 }
 
@@ -390,6 +399,7 @@ pub enum AppResponse {
 /// 使 stage 本身与存储无关、可独立单测。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedMessage {
+    pub session: Option<agent_session_grep_ports::ProviderSessionIdentity>,
     pub seq: u32,
     /// provider-native 消息 id；空串表示 provider 未提供，调用方回退派生。
     pub native_id: String,
@@ -416,21 +426,33 @@ pub struct StagedActivity {
     pub activity: ToolActivity,
 }
 
+/// 一次 staging 中缓冲的 token 用量观察（usage 维度）。
+///
+/// `message_native_id` 为空串表示 session 级观察（如 Codex `token_count`），
+/// 由调用方挂到本批会话上；非空时调用方按消息锚点解析，失败即丢弃。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedUsage {
+    pub message_native_id: String,
+    pub usage: UsageObservation,
+}
+
 /// 一次 staging 的完整产物：缓冲消息 + provider 的完整解析报告。
 ///
-/// 会话 native id 的唯一权威来源是 [`ParseReport::session_native_id`]。
+/// Explicit per-message session identities take precedence; report-level
+/// session metadata is the compatibility projection for single-session sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedBatch {
     pub messages: Vec<StagedMessage>,
     /// 工具活动观察（设计 R1-R6；provider 未声明工具活动时为空）。
     pub activities: Vec<StagedActivity>,
+    /// token 用量观察（usage 维度；provider 未声明用量时为空）。
+    pub usage_events: Vec<StagedUsage>,
     /// Authoritative provider parse accounting and diagnostics.
     pub report: ParseReport,
     /// Deprecated compatibility shim: the CLI composition root still
     /// constructs this struct literally, so the field cannot be removed yet.
-    /// It mirrors `report.session_native_id` (which is the single source of
-    /// truth) and must not be trusted independently — new code must read
-    /// `report.session_native_id`.
+    /// It mirrors `report.session_native_id` and must not be trusted
+    /// independently. Multi-session sources carry membership on each message.
     pub session_native_id: Option<String>,
 }
 
@@ -490,6 +512,7 @@ fn staged_batch(sink: StagingSink, report: ParseReport) -> StagedBatch {
     StagedBatch {
         messages: sink.buffered,
         activities: sink.activities,
+        usage_events: sink.usage_events,
         report,
         session_native_id,
     }
@@ -641,11 +664,13 @@ pub fn select_and_stage_source(
 struct StagingSink {
     buffered: Vec<StagedMessage>,
     activities: Vec<StagedActivity>,
+    usage_events: Vec<StagedUsage>,
 }
 
 impl CanonicalEventSink for StagingSink {
     fn emit_message(&mut self, event: MessageEvent<'_>) -> PortResult<()> {
         self.buffered.push(StagedMessage {
+            session: event.session.cloned(),
             seq: event.seq,
             native_id: event.native_id.to_string(),
             parent_native_id: event.parent_native_id.map(str::to_string),
@@ -665,6 +690,39 @@ impl CanonicalEventSink for StagingSink {
         });
         Ok(())
     }
+
+    fn emit_usage(&mut self, event: UsageEvent<'_>) -> PortResult<()> {
+        self.usage_events.push(StagedUsage {
+            message_native_id: event.message_native_id.to_string(),
+            usage: event.usage,
+        });
+        Ok(())
+    }
+}
+
+/// Validate search input without accessing a backend. Entrypoints reuse this
+/// before opening a catalog; Application remains authoritative for all callers.
+pub fn validate_search_request(
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    budget: &ResponseBudget,
+) -> Result<(), AppError> {
+    if limit == 0 {
+        return Err(DomainError::InvalidRequest("limit must be > 0".into()).into());
+    }
+    if query.chars().any(char::is_control) {
+        return Err(DomainError::InvalidRequest("query contains control characters".into()).into());
+    }
+    if query.trim().is_empty() {
+        return Err(DomainError::InvalidRequest("query must not be empty".into()).into());
+    }
+    if let (Some(since), Some(until)) = (filters.since, filters.until)
+        && since >= until
+    {
+        return Err(DomainError::InvalidRequest("since must be earlier than until".into()).into());
+    }
+    budget.validate().map_err(AppError::from)
 }
 
 /// Parse a timezone-qualified RFC3339/ISO-8601 timestamp into a normalized
@@ -703,12 +761,18 @@ pub fn parse_search_instant(value: &str) -> Option<SearchInstant> {
         let (hours, minutes) = digits
             .split_once(':')
             .unwrap_or_else(|| digits.split_at_checked(2).unwrap_or((digits, "")));
-        if minutes.is_empty() || hours.len() != 2 || minutes.len() != 2 {
+        if hours.len() != 2
+            || minutes.len() != 2
+            || !hours
+                .bytes()
+                .chain(minutes.bytes())
+                .all(|byte| byte.is_ascii_digit())
+        {
             return None;
         }
         let hours: i32 = hours.parse().ok()?;
         let minutes: i32 = minutes.parse().ok()?;
-        if hours > 23 || minutes > 59 {
+        if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
             return None;
         }
         let magnitude = hours * 60 + minutes;
@@ -720,6 +784,12 @@ pub fn parse_search_instant(value: &str) -> Option<SearchInstant> {
     };
     let (hour, minute, second) = match clock.split_once(':') {
         Some(_) => {
+            if !clock
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b':')
+            {
+                return None;
+            }
             let mut parts = clock.split(':');
             let hour: i64 = parts.next()?.parse().ok()?;
             let minute: i64 = parts.next()?.parse().ok()?;
@@ -740,7 +810,7 @@ pub fn parse_search_instant(value: &str) -> Option<SearchInstant> {
             )
         }
     };
-    if hour > 23 || minute > 59 || second > 59 {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
         return None;
     }
     if has_fraction && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
@@ -774,17 +844,31 @@ pub fn parse_search_instant(value: &str) -> Option<SearchInstant> {
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
     let year = if month <= 2 {
         year.checked_sub(1)?
     } else {
         year
     };
     let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
+    let era_years = era.checked_mul(400)?;
+    let year_of_era = year.checked_sub(era_years)?;
     let shifted_month = (month + 9) % 12;
-    let day_of_year = ((153 * shifted_month + 2) / 5 + day - 1) as i64;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146097 + day_of_era - 719468)
+    let month_start = 153_u32
+        .checked_mul(shifted_month)?
+        .checked_add(2)?
+        .checked_div(5)?;
+    let day_of_year = i64::from(month_start.checked_add(day.checked_sub(1)?)?);
+    let day_of_era = year_of_era
+        .checked_mul(365)?
+        .checked_add(year_of_era / 4)?
+        .checked_sub(year_of_era / 100)?
+        .checked_add(day_of_year)?;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
 }
 
 /// Resolve the CLI's compact duration syntax against the caller's injected
@@ -806,40 +890,63 @@ pub fn parse_relative_search_instant(value: &str, now_ms: i64) -> Option<SearchI
     Some(SearchInstant::from_unix_millis(now_ms.checked_sub(delta)?))
 }
 
+/// Cursor 绑定的查询摘要：任何会改变结果集或其顺序的输入都必须进这个摘要，
+/// 否则换了输入的续页请求会静默按错误的 offset 切片。
+///
+/// 除 query/filters/facets/include_system/group_by_session 外，`current_repo`
+/// （调用方当前工作目录派生的 repo slug，见 [`ranking::CURRENT_REPO_SCORE_BOOST`]）
+/// 同样入摘要：它只改排序不改召回，但换了仓库就是另一个排序，跨仓库复用 cursor
+/// 必须显式失败而不是静默错页。检索模式、模型、向量、排序版本同样绑定；
+/// 旧版未绑定这些状态的 search cursor 显式失效。
+struct RetrievalBinding<'a> {
+    requested: RetrievalMode,
+    effective: RetrievalMode,
+    model: Option<String>,
+    embedding: Option<&'a [f32]>,
+}
+
 fn search_query_digest(
     query: &str,
     filters: &SearchFilters,
     facets: &SearchFacets,
     include_system: bool,
     group_by_session: bool,
+    current_repo: Option<&str>,
+    retrieval: &RetrievalBinding<'_>,
 ) -> String {
-    if filters.is_empty() && facets.is_default() && !include_system && !group_by_session {
-        return cursor::digest_query(query);
-    }
-    let providers = filters
-        .providers
-        .iter()
-        .map(|provider| provider.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let since = filters
-        .since
-        .map(|instant| format!("{}:{}", instant.unix_seconds, instant.nanosecond))
-        .unwrap_or_default();
-    let until = filters
-        .until
-        .map(|instant| format!("{}:{}", instant.unix_seconds, instant.nanosecond))
-        .unwrap_or_default();
-    cursor::digest_query(&format!(
-        "search-filter-v1\0{}\0providers={}\0since={}\0until={}\0include_system={}\0group_by_session={}\0facets={}",
-        query,
-        providers,
-        since,
-        until,
-        include_system,
-        group_by_session,
-        facets.canonical_binding(),
-    ))
+    let embedding_digest = retrieval.embedding.map(|values| {
+        let mut hasher = blake3::Hasher::new();
+        for value in values {
+            hasher.update(&value.to_le_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    });
+    // Structured encoding prevents delimiter collisions in untrusted strings.
+    // v2 intentionally rejects old cursors whose ranking state was unbound.
+    cursor::digest_query(&serde_json::json!({
+        "version": "search-v2-rrf60-signals-v2-clock",
+        "result_set": "search",
+        "query": query,
+        "providers": filters.providers.iter().map(|provider| provider.as_str()).collect::<Vec<_>>(),
+        "since": filters.since.map(|i| (i.unix_seconds, i.nanosecond)),
+        "until": filters.until.map(|i| (i.unix_seconds, i.nanosecond)),
+        "repo": filters.repo,
+        "facets": {
+            "sidechain": facets.sidechain.as_str(),
+            "tool_kind": facets.tool_kind,
+            "tool_name": facets.tool_name,
+        },
+        "include_system": include_system,
+        "group_by_session": group_by_session,
+        "current_repo": current_repo,
+        "requested_mode": retrieval.requested.as_str(),
+        "effective_mode": retrieval.effective.as_str(),
+        "model": retrieval.model,
+        "dimension": retrieval.embedding.map(<[f32]>::len),
+        "embedding": embedding_digest,
+        "rank_window": RANK_SCAN_WINDOW,
+        "group_factor": GROUP_SCAN_FACTOR,
+    }).to_string())
 }
 
 /// R2 系统噪声判定：canonical message payload 的 `role` 字段为 system 或
@@ -859,8 +966,9 @@ fn payload_role_is_system_noise(payload: Option<&[u8]>) -> bool {
         .is_some_and(|role| role == "system" || role == "developer")
 }
 
-/// 装配一条检索命中（R1/ADR-0008 + guidance）：从 payload 解析 `text` 摘要、
-/// 填充归属会话、派生确定性 `why_matched` 与 `suggested_next_commands`。
+/// 装配一条检索命中（R1/ADR-0008 + guidance）：从 payload 解析 `text` 摘要
+/// （有字面证据取命中窗口，否则回退前缀，见 [`snippet::build`]）、填充归属
+/// 会话、派生确定性 `why_matched` 与 `suggested_next_commands`。
 /// payload 无 text（或非 JSON）→ text None；无 placement → session_id None。
 fn assemble_search_hit(
     hit: &mut SearchHit,
@@ -880,13 +988,11 @@ fn assemble_search_hit(
     });
     // 证据装配期间全量 payload 仍可用：除规范 `text` 字段外，把整棵 JSON 值
     // 交给 guidance（string-leaves 源覆盖 Codex content blocks 等无顶层 text
-    // 的 payload），显示前缀作最后一个兜底源（可能是截断 snippet，会漏掉前缀
-    // 之后的真实命中——guidance design §2）。
+    // 的 payload），显示摘要作最后一个兜底源（可能是截断窗口，会漏掉窗口之外
+    // 的真实命中——guidance design §2）。
     let payload_value =
         payload.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
-    hit.text = full_text
-        .as_deref()
-        .map(|text| text.chars().take(max_snippet_chars).collect());
+    hit.text = snippet::build(full_text.as_deref(), query_terms, max_snippet_chars);
     // 保留 adapter 提供的 canonical session_id（Session 元数据命中自带归属
     // 会话）；否则才用 placement 解析的归属会话回填。metadata-only Session
     // 命中无 placement，session_of 返回 None，不得把既有值覆盖成 None。
@@ -906,7 +1012,13 @@ fn assemble_search_hit(
 /// 检索命中在 `max_response_bytes` 闸内的序列化字节估算（与 CLI 渲染对齐）：
 /// id + session_id + text + guidance；`occurrences` 仅当 >1（归并模式）时计入，
 /// 与序列化器"occurrences == 1 时省略该键"的约定一致。
+///
+/// `session_id` 与 `text` 是**恒发**字段（schema 承诺键不消失，缺值渲染为
+/// `null`），因此缺值也要计费——按 `null` 的 4 字节计。空集合的 guidance 字段
+/// 才是真正省略整个键的追加字段，缺值记 0。
 fn search_hit_charge(hit: &SearchHit) -> usize {
+    /// `null` 字面量的序列化长度（恒发字段缺值时的实际字节）。
+    const NULL_LEN: usize = 4;
     let why_matched_len = if hit.why_matched.is_empty() {
         0
     } else {
@@ -933,11 +1045,13 @@ fn search_hit_charge(hit: &SearchHit) -> usize {
         0
     };
     json_string_len(hit.id.as_str())
+        + 14
         + hit
             .session_id
             .as_ref()
-            .map_or(0, |s| json_string_len(s) + 14)
-        + hit.text.as_ref().map_or(0, |s| json_string_len(s) + 8)
+            .map_or(NULL_LEN, |s| json_string_len(s))
+        + 8
+        + hit.text.as_ref().map_or(NULL_LEN, |s| json_string_len(s))
         + why_matched_len
         + suggested_len
         + occurrences_len
@@ -945,8 +1059,9 @@ fn search_hit_charge(hit: &SearchHit) -> usize {
         + 32
 }
 
-/// 系统时钟（Unix 毫秒）。[`App::new`] 的默认时钟；测试经 [`App::with_clock`] 注入固定值。
-fn system_now_ms() -> i64 {
+/// 系统时钟（Unix 毫秒）。[`App::new`] 的默认时钟；测试经 [`App::with_clock`]
+/// 注入固定值。CLI 组合根在 `ASG_CLOCK_MS` 未注入时回落本函数。
+pub fn system_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1364,6 +1479,14 @@ pub struct App<
     resume: R,
     semantic: M,
     clock_ms: fn() -> i64,
+    /// 调用方当前工作目录派生的 repo slug（`host/owner/name`），用于
+    /// [`ranking::CURRENT_REPO_SCORE_BOOST`] 的当前仓库偏好。
+    ///
+    /// `None` = 该入口没有可派生的仓库身份（不在 git 工作树内、无 origin、
+    /// 或该面本身没有 cwd 语义如 MCP/Web）——此时该信号恒不动分，且不产生
+    /// 任何额外读取。组合根用 [`Self::with_current_repo`] 显式注入，既有
+    /// 构造器一律为 `None`，调用点零改动。
+    current_repo: Option<String>,
 }
 
 impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore>
@@ -1379,6 +1502,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore>
             resume,
             semantic: NoSemanticIndex,
             clock_ms: system_now_ms,
+            current_repo: None,
         }
     }
 
@@ -1390,6 +1514,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore>
             resume,
             semantic: NoSemanticIndex,
             clock_ms,
+            current_repo: None,
         }
     }
 }
@@ -1405,6 +1530,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
             resume,
             semantic,
             clock_ms: system_now_ms,
+            current_repo: None,
         }
     }
 
@@ -1421,6 +1547,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
             resume,
             semantic,
             clock_ms,
+            current_repo: None,
         }
     }
 }
@@ -1438,6 +1565,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex>
             resume: NoResumeClaims,
             semantic: NoSemanticIndex,
             clock_ms: system_now_ms,
+            current_repo: None,
         }
     }
 
@@ -1449,6 +1577,7 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex>
             resume: NoResumeClaims,
             semantic: NoSemanticIndex,
             clock_ms,
+            current_repo: None,
         }
     }
 }
@@ -1460,6 +1589,16 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
     /// value so every frontend shares the same time source.
     pub fn now_ms(&self) -> i64 {
         (self.clock_ms)()
+    }
+
+    /// 注入调用方当前工作目录派生的 repo slug（当前仓库偏好信号，见
+    /// [`ranking::CURRENT_REPO_SCORE_BOOST`]）。组合根在构造后链式调用；
+    /// 传 `None` 或不调用即该信号关闭（默认），此时排序与注入前逐字节一致。
+    ///
+    /// 空白 slug 视为无身份（`None`）：宁可关掉信号，也不拿空串去比对。
+    pub fn with_current_repo(mut self, slug: Option<String>) -> Self {
+        self.current_repo = slug.filter(|value| !value.trim().is_empty());
+        self
     }
 
     /// 解析续读偏移：无令牌即第一页（offset 0）；有令牌则完整校验
@@ -1570,59 +1709,116 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 mode,
                 query_embedding,
             } => {
-                if limit == 0 {
-                    return Err(DomainError::InvalidRequest("limit must be > 0".into()).into());
-                }
-                // R4.2（ADR-0003）：NUL/C0/C1 控制字符在 Application 边界拒绝为
-                // invalid_request，绝不清除式净化（删除会拼接 token）。必须发生在
-                // 任何索引查询之前。
-                if query.chars().any(char::is_control) {
-                    return Err(DomainError::InvalidRequest(
-                        "query contains control characters".into(),
-                    )
-                    .into());
-                }
-                if query.trim().is_empty() {
-                    return Err(
-                        DomainError::InvalidRequest("query must not be empty".into()).into(),
-                    );
-                }
+                validate_search_request(&query, &filters, limit, &budget)?;
                 filters.providers.sort_unstable();
                 filters.providers.dedup();
-                if let (Some(since), Some(until)) = (filters.since, filters.until)
-                    && since >= until
+                let generation = self.catalog.active_generation()?;
+                if mode != RetrievalMode::Lexical
+                    && query_embedding.as_deref().is_some_and(|values| {
+                        values.is_empty() || values.iter().any(|value| !value.is_finite())
+                    })
                 {
                     return Err(DomainError::InvalidRequest(
-                        "since must be earlier than until".into(),
+                        "query embedding must contain finite values and not be empty".into(),
                     )
                     .into());
                 }
-                budget.validate().map_err(AppError::from)?;
-                let generation = self.catalog.active_generation()?;
+                let semantic_ready = mode != RetrievalMode::Lexical
+                    && self.semantic.is_ready()?
+                    && query_embedding.is_some();
+                let response_mode = if mode == RetrievalMode::Lexical || semantic_ready {
+                    mode
+                } else {
+                    RetrievalMode::LexicalFallback
+                };
+                let retrieval = RetrievalBinding {
+                    requested: mode,
+                    effective: response_mode,
+                    model: if mode == RetrievalMode::Lexical {
+                        None
+                    } else {
+                        self.semantic.semantic_model_id()?
+                    },
+                    embedding: if semantic_ready {
+                        query_embedding.as_deref()
+                    } else {
+                        None
+                    },
+                };
                 let query_digest = search_query_digest(
                     &query,
                     &filters,
                     &facets,
                     include_system,
                     group_by_session,
+                    self.current_repo.as_deref(),
+                    &retrieval,
                 );
-                let offset = self.resolve_offset(
-                    token.as_deref(),
-                    generation,
-                    &query_digest,
-                    SORT_SCORE_DESC,
-                    None,
-                )?;
+                let now = self.now_ms();
+                let search_claims = match token.as_deref() {
+                    Some(token) => cursor::verify(
+                        token,
+                        &cursor::CursorExpectations {
+                            now_ms: now,
+                            active_generation: generation,
+                            query_digest: query_digest.clone(),
+                            sort_digest: SORT_SCORE_DESC.into(),
+                            result_set: None,
+                        },
+                    )?,
+                    None => cursor::CursorClaims {
+                        contract_major: cursor::SUPPORTED_CONTRACT_MAJOR,
+                        generation,
+                        issued_at_ms: now,
+                        expires_at_ms: now.saturating_add(cursor::DEFAULT_TTL_MS),
+                        query_digest: query_digest.clone(),
+                        sort_digest: SORT_SCORE_DESC.into(),
+                        result_set: None,
+                        offset: 0,
+                    },
+                };
+                let offset = search_claims.offset;
+                let ranking_time = search_claims.issued_at_ms;
+                // Recency is part of the pinned order. Continuations retain
+                // the initial query clock and expiry; only the offset changes.
+                let issue_search_cursor = |has_more: bool, offset: u64| {
+                    has_more.then(|| {
+                        cursor::issue(&cursor::CursorClaims {
+                            offset,
+                            ..search_claims.clone()
+                        })
+                        .into_string()
+                    })
+                };
 
-                // 分页模型：钉住排序（bm25 + id tiebreak 全序）内的 offset 续读。
-                // 端口无 offset 参数——超取 offset+page+1（+1 作 has_more 哨兵）后
-                // 切片。grouped 模式把扫描窗放大 GROUP_SCAN_FACTOR 倍（仍封顶），
-                // 让 occurrences 覆盖更有意义的同会话命中样本。
+                // 分页模型：钉住排序（重排后的 final desc + id tiebreak 全序）
+                // 内的 offset 续读。端口无 offset 参数，因此在应用层超取后切片。
+                //
+                // **应用层重排**路径的取数窗口必须与 offset 无关（见
+                // RANK_SCAN_WINDOW）：重排后的钉住排序是"同一窗口上的全序"，
+                // 窗口随 offset 增长会让每页在不同集合上重排，拼接结果重复页尾
+                // 命中并漏掉真正的高分命中。重排有两种：lexical rank signals
+                // （[`ranking::apply_lexical_signals`]）与 hybrid 的 RRF 融合
+                // （[`hybrid::fuse`]）——后者尤其危险，两路都命中的文档拿到两份
+                // `1/(k+rank)` 加分，可以一举超过任何单路命中，窗口一放大就整体
+                // 顶到榜首。只有 semantic 单路不重排（顺序由检索侧给定且是稳定
+                // 前缀），保持 offset+page+1 超取，+1 作 has_more 哨兵。
+                //
+                // grouped 模式把窗口放大 GROUP_SCAN_FACTOR 倍（仍封顶），让
+                // occurrences 覆盖更有意义的同会话命中样本。
                 let page = limit.min(budget.max_items);
-                let fetch = offset
-                    .saturating_add(page as u64)
-                    .saturating_add(1)
-                    .min(MAX_FETCH_WINDOW);
+                let will_rank = mode == RetrievalMode::Lexical || !semantic_ready;
+                // 融合也是重排：窗口必须与 offset 无关，与 rank 路径同一口径。
+                let reorders_window =
+                    will_rank || mode == RetrievalMode::Hybrid || group_by_session;
+                let fetch = if reorders_window {
+                    RANK_SCAN_WINDOW
+                } else {
+                    offset
+                        .saturating_add(page as u64)
+                        .saturating_add(1)
+                        .min(MAX_FETCH_WINDOW)
+                };
                 let scan = if group_by_session {
                     fetch
                         .saturating_mul(GROUP_SCAN_FACTOR)
@@ -1635,32 +1831,42 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 // （PRD Q54：禁止静默切换）。
                 let (mut scanned, fallback_warning) = if mode == RetrievalMode::Lexical {
                     (
-                        self.index.query_faceted(
+                        self.index.query_with_policy(
                             SearchQuery {
                                 text: &query,
                                 filters: &filters,
                             },
                             scan as usize,
                             &facets,
+                            include_system,
                         )?,
                         None,
                     )
-                } else if self.semantic.is_ready()
-                    && let Some(query_embedding) = query_embedding.as_deref()
-                {
-                    let semantic_hits = self
-                        .semantic
-                        .query_semantic(query_embedding, scan as usize)?;
+                } else if semantic_ready && let Some(query_embedding) = query_embedding.as_deref() {
+                    let semantic_hits = self.semantic.query_semantic_filtered(
+                        query_embedding,
+                        scan as usize,
+                        &filters,
+                        &facets,
+                        include_system,
+                    )?;
+                    if semantic_hits.iter().any(|hit| !hit.score.is_finite()) {
+                        return Err(PortError::Backend(
+                            "semantic index returned a non-finite score".into(),
+                        )
+                        .into());
+                    }
                     if mode == RetrievalMode::Semantic {
                         (semantic_hits, None)
                     } else {
-                        let lexical_hits = self.index.query_faceted(
+                        let lexical_hits = self.index.query_with_policy(
                             SearchQuery {
                                 text: &query,
                                 filters: &filters,
                             },
                             scan as usize,
                             &facets,
+                            include_system,
                         )?;
                         (hybrid::fuse(&lexical_hits, &semantic_hits), None)
                     }
@@ -1670,13 +1876,14 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                         mode.as_str()
                     ));
                     (
-                        self.index.query_faceted(
+                        self.index.query_with_policy(
                             SearchQuery {
                                 text: &query,
                                 filters: &filters,
                             },
                             scan as usize,
                             &facets,
+                            include_system,
                         )?,
                         warning,
                     )
@@ -1691,20 +1898,93 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 };
                 let response_warning = fallback_warning.clone();
 
+                // 检索侧返回满窗 ⇒ 窗口之外可能还有命中。必须在 R2 噪声过滤
+                // **之前**记录：窗口随 offset 增长的路径（semantic）以末尾 `+1`
+                // 作 has_more 哨兵，而过滤发生在取数之后，窗口内一条
+                // system/developer 命中就会把哨兵吃掉，让后续命中变成不可达
+                // （has_more=false 却确有下一页）。固定窗口的重排路径不适用：
+                // 那里的窗口就是排序视界，越界以 has_more=false 诚实终止。
+                let window_truncated_by_fetch = !reorders_window && scanned.len() as u64 >= scan;
+
+                // Rank signals（competitor-borrowings #1）：纯 lexical 命中（含
+                // semantic/hybrid 未就绪时的 lexical_fallback）在分页钉住排序前
+                // 重算最终分并重排；semantic 命中与 hybrid RRF 融合排序不动
+                // （README 明示）。`will_rank` 在取数前已按同一谓词判定——
+                // 它同时决定了扫描窗口形态（见上方分页模型注释），两处必须
+                // 同源。时效与 sidechain 事实来自整窗 payload——
+                // 与 R2 系统噪声过滤共用同一次批量 get_many，无额外 N+1。
+                let rank_lexical = will_rank;
+                let mut window_payloads = if rank_lexical || !include_system {
+                    let scanned_ids: Vec<StableId> =
+                        scanned.iter().map(|hit| hit.id.clone()).collect();
+                    Some(self.catalog.get_many(&scanned_ids)?)
+                } else {
+                    None
+                };
+
                 // R2 系统噪声默认排除：role=system/developer 的命中不进入结果，
                 // `include_system` 显式恢复。过滤先于 offset 切片，cursor 位置因此
                 // 指向"非系统"序列。判定需整窗 payload（分块批量取，无 N+1）；扫描
                 // 窗内系统噪声饱和时可能提前终止分页（边界行为，见 GROUP_SCAN_FACTOR）。
+                // 过滤发生在任何重排之前，hit 与 payload 始终一一配对。
                 if !include_system {
-                    let scanned_ids: Vec<StableId> =
-                        scanned.iter().map(|hit| hit.id.clone()).collect();
-                    let scanned_payloads = self.catalog.get_many(&scanned_ids)?;
                     scanned = scanned
                         .into_iter()
-                        .zip(scanned_payloads)
+                        .zip(window_payloads.take().expect("payloads fetched above"))
                         .filter(|(_, payload)| !payload_role_is_system_noise(payload.1.as_deref()))
                         .map(|(hit, _)| hit)
                         .collect();
+                }
+
+                // 重算最终分并重排为 (final desc, id asc)：payload 与仓库事实以
+                // (hit, payload, in_current_repo) 三元组进入评分函数，排序发生在
+                // 配对之后，结构上排除错位。payload 被噪声过滤消耗后按需补取一次
+                // （同窗批量，无 N+1）。仓库事实只在调用方确有当前仓库身份时才
+                // 读取（两次同窗批量：message→session、session→slug）；无身份时
+                // 该项恒 false 且不产生任何额外读取。
+                if rank_lexical {
+                    let payloads = match window_payloads.take() {
+                        Some(payloads) => payloads,
+                        None => {
+                            let scanned_ids: Vec<StableId> =
+                                scanned.iter().map(|hit| hit.id.clone()).collect();
+                            self.catalog.get_many(&scanned_ids)?
+                        }
+                    };
+                    let in_current_repo: Vec<bool> = match self.current_repo.as_deref() {
+                        Some(current) => {
+                            let scanned_ids: Vec<StableId> =
+                                scanned.iter().map(|hit| hit.id.clone()).collect();
+                            let sessions = self.catalog.session_of(&scanned_ids)?;
+                            let session_ids: Vec<StableId> = sessions
+                                .iter()
+                                .map(|(_message_id, session)| session.clone())
+                                .map(|session| {
+                                    session.unwrap_or_else(|| {
+                                        StableId::native(
+                                            agent_session_grep_domain::IdKind::Session,
+                                            "",
+                                        )
+                                    })
+                                })
+                                .collect();
+                            let slugs = self.catalog.session_repo_slugs(&session_ids)?;
+                            slugs
+                                .into_iter()
+                                .map(|slug| slug.as_deref() == Some(current))
+                                .collect()
+                        }
+                        None => vec![false; scanned.len()],
+                    };
+                    scanned = ranking::apply_lexical_signals(
+                        scanned
+                            .into_iter()
+                            .zip(payloads)
+                            .zip(in_current_repo)
+                            .map(|((hit, (_id, payload)), in_repo)| (hit, payload, in_repo))
+                            .collect(),
+                        ranking_time,
+                    );
                 }
 
                 // R3 按会话归并：整窗装配后每会话只保留最高分命中（钉住顺序中的
@@ -1743,13 +2023,12 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                             }
                         }
                     }
-                    let grouped_kept: Vec<SearchHit> = grouped
+                    let grouped_len = grouped.len() as u64;
+                    let slice: Vec<SearchHit> = grouped
                         .into_iter()
                         .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-                        .take(page + 1)
+                        .take(page)
                         .collect();
-                    let has_more = grouped_kept.len() > page;
-                    let slice: Vec<SearchHit> = grouped_kept.into_iter().take(page).collect();
                     let net_bytes = budget
                         .max_response_bytes
                         .saturating_sub(ENVELOPE_RESERVE_BYTES);
@@ -1758,17 +2037,17 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     // Resume 可用性（ADR-0009）：只对保留的命中批量解析一次（无 N+1）。
                     self.assemble_resume_availability(&mut hits)?;
                     let consumed = offset + hits.len() as u64;
-                    // 与逐命中/List 分支相同的守卫：字节 clamp 把本页清空（首条组
-                    // 超预算）时 cursor 停在原 offset，must 终止分页而非死循环。
-                    let has_more = has_more && !hits.is_empty();
-                    let next_cursor = self.issue_cursor(
-                        has_more,
-                        generation,
-                        &query_digest,
-                        SORT_SCORE_DESC,
-                        None,
-                        consumed,
-                    );
+                    // has_more 必须按**实际消耗**判定，与逐命中/List 分支同一口径
+                    // （`总数 > consumed`）：字节 clamp 削短本页时被削掉的组仍在
+                    // 后续页可达。若按"是否存在第 page+1 组"判定，组总数不超过页
+                    // 大小时会报 has_more=false，被削掉的组从此不可达（静默漏结果）。
+                    // `window_truncated_by_fetch` 补上归并对计数的压缩：整窗命中
+                    // 挤在少数会话里时组数会低于消耗量，但更大的窗口仍有新组。
+                    // `!hits.is_empty()` 守卫首组即超预算的情形：cursor 会停在原
+                    // offset，此时必须终止分页而非死循环。
+                    let has_more =
+                        (grouped_len > consumed || window_truncated_by_fetch) && !hits.is_empty();
+                    let next_cursor = issue_search_cursor(has_more, consumed);
                     return Ok(AppResponse::Search {
                         hits,
                         next_cursor,
@@ -1787,10 +2066,11 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     .collect();
 
                 // R1/ADR-0008 装配：对页内命中一次性批量取 payload（分块 IN，
-                // 无 N+1），解析 `text` 字段按 `max_snippet_chars` 截取前缀；
-                // 再一次性批量解析归属会话（session_of，同序）。payload 无 text
-                // （或非 JSON）→ text None，不臆造正文；无 placement → session_id
-                // None。不做任何脱敏（ADR-0004 所有者决定，本地优先工具接受屏显）。
+                // 无 N+1），解析 `text` 字段按 `max_snippet_chars` 构建命中窗口
+                // （无字面证据回退前缀，见 [`snippet::build`]）；再一次性批量
+                // 解析归属会话（session_of，同序）。payload 无 text（或非 JSON）
+                // → text None，不臆造正文；无 placement → session_id None。
+                // 不做任何脱敏（ADR-0004 所有者决定，本地优先工具接受屏显）。
                 let ids: Vec<StableId> = slice.iter().map(|hit| hit.id.clone()).collect();
                 let payloads = self.catalog.get_many(&ids)?;
                 let sessions = self.catalog.session_of(&ids)?;
@@ -1818,15 +2098,11 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 let consumed = offset + hits.len() as u64;
                 // A truncated page with zero kept hits cannot advance the
                 // cursor offset; terminate paging instead of looping forever.
-                let has_more = scanned_len > consumed && !hits.is_empty();
-                let next_cursor = self.issue_cursor(
-                    has_more,
-                    generation,
-                    &query_digest,
-                    SORT_SCORE_DESC,
-                    None,
-                    consumed,
-                );
+                // `window_truncated_by_fetch` covers the offset-dependent
+                // window whose `+1` sentinel the noise filter can consume.
+                let has_more =
+                    (scanned_len > consumed || window_truncated_by_fetch) && !hits.is_empty();
+                let next_cursor = issue_search_cursor(has_more, consumed);
                 Ok(AppResponse::Search {
                     hits,
                     next_cursor,
@@ -1891,17 +2167,61 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                     .skip(usize::try_from(offset).unwrap_or(usize::MAX))
                     .take(page)
                     .collect();
+                // Peek 预览（#7）：sessions_only 列表在每条会话条目上附 1 KiB 级
+                // 分诊预览。预览字节计入同一字节闸——`max_response_bytes` 是最终
+                // 序列化硬门（CONTRACT §3），预览不是免费内容。
+                let peeks: Vec<Option<SessionPeek>> = if sessions_only {
+                    self.build_session_peeks(&slice)?
+                } else {
+                    slice.iter().map(|_| None).collect()
+                };
+                // 标题投影（#6，schema v13）：sessions_only 列表逐条附派生标题
+                // （custom-title > ai-title > 首条有效 user，存储层批量读取）；
+                // 普通 `list` 全 None。标题字节计入同一字节闸——与 peek 一样
+                // 不是免费内容。
+                let titles: Vec<Option<String>> = if sessions_only {
+                    let session_ids: Vec<StableId> =
+                        slice.iter().map(|entry| entry.id.clone()).collect();
+                    self.catalog.session_titles(&session_ids)?
+                } else {
+                    slice.iter().map(|_| None).collect()
+                };
                 let net_bytes = budget
                     .max_response_bytes
                     .saturating_sub(ENVELOPE_RESERVE_BYTES);
-                let (entries, truncation, _) =
-                    budget::clamp_items(slice, page, net_bytes, |entry| {
-                        // 最终 JSON 形态 `{"id":"<id>","payload":"<lossy utf-8>"}`：
-                        // id 按转义计长，payload 按序列化后长度计（不是原始字节数）。
+                let paired: Vec<(CatalogEntry, Option<SessionPeek>, Option<String>)> = slice
+                    .into_iter()
+                    .zip(peeks)
+                    .zip(titles)
+                    .map(|((entry, peek), title)| (entry, peek, title))
+                    .collect();
+                let (paired, truncation, _) =
+                    budget::clamp_items(paired, page, net_bytes, |(entry, peek, title)| {
+                        // 最终 JSON 形态 `{"id":"<id>","payload":"<lossy utf-8>"}`
+                        // （sessions_only 时附加 `,"peek":{...}` 与 `,"title":"..."`）：
+                        // id 按转义计长，payload 按序列化后长度计（不是原始字节数），
+                        // peek 按实际序列化长度计 + `,"peek":` 前缀 8 字节，
+                        // title 按转义后长度计 + `,"title":` 前缀 9 字节。
                         json_string_len(entry.id.as_str())
                             + lossy_payload_json_len(&entry.payload)
                             + 18
+                            + peek
+                                .as_ref()
+                                .map(|peek| peek::PEEK_ENTRY_OVERHEAD_BYTES + peek.json_len())
+                                .unwrap_or(0)
+                            + title
+                                .as_ref()
+                                .map(|title| TITLE_ENTRY_OVERHEAD_BYTES + json_string_len(title))
+                                .unwrap_or(0)
                     });
+                let mut entries = Vec::with_capacity(paired.len());
+                let mut peeks = Vec::with_capacity(paired.len());
+                let mut titles = Vec::with_capacity(paired.len());
+                for (entry, peek, title) in paired {
+                    entries.push(entry);
+                    peeks.push(peek);
+                    titles.push(title);
+                }
                 let consumed = offset + entries.len() as u64;
                 // A truncated page with zero kept entries means the first
                 // entity already exceeds the byte budget: the next cursor
@@ -1919,6 +2239,8 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 );
                 Ok(AppResponse::List {
                     entries,
+                    peeks,
+                    titles,
                     next_cursor,
                     generation,
                     truncation,
@@ -1962,14 +2284,68 @@ impl<C: CatalogStore + ContextGraphStore, S: SearchIndex, R: ResumeClaimsStore, 
                 let catalog_count = self.catalog.count()?;
                 let active_generation = self.catalog.active_generation()?;
                 let context_stats = self.catalog.context_stats()?;
+                let usage = self.catalog.usage_totals()?;
+                let repos = self.catalog.repo_totals()?;
                 Ok(AppResponse::Status {
                     catalog_count,
                     active_generation,
                     placements: context_stats.placements,
                     source_placement_claims: context_stats.source_placement_claims,
+                    usage,
+                    repos,
                 })
             }
         }
+    }
+
+    /// `list_sessions` 的 Peek 预览（#7）：按会话 payload 的 `messages` 数组
+    /// 抽取成员 id，整页一次批量读（[`CatalogStore::get_many`]，绝不 N+1），
+    /// 再交给 [`peek::build_session_peek`] 派生首/尾用户消息。
+    ///
+    /// 预览是派生数据：payload 不可解析、`messages` 缺失、成员 id 非法时
+    /// 降级为全 null 字段，绝不拖垮列表本身。
+    fn build_session_peeks(
+        &self,
+        slice: &[CatalogEntry],
+    ) -> Result<Vec<Option<SessionPeek>>, AppError> {
+        let mut member_lists: Vec<Vec<StableId>> = Vec::with_capacity(slice.len());
+        for entry in slice {
+            let mut members = Vec::new();
+            let parsed = serde_json::from_slice::<serde_json::Value>(&entry.payload).ok();
+            if let Some(ids) = parsed
+                .as_ref()
+                .and_then(|value| value.get("messages"))
+                .and_then(serde_json::Value::as_array)
+            {
+                members = ids
+                    .iter()
+                    .filter_map(|id| id.as_str().and_then(StableId::from_wire))
+                    .collect();
+            }
+            member_lists.push(members);
+        }
+        let all_ids: Vec<StableId> = member_lists.iter().flatten().cloned().collect();
+        let fetched = self.catalog.get_many(&all_ids)?;
+        let mut payload_by_id: HashMap<&str, Option<&[u8]>> = HashMap::with_capacity(fetched.len());
+        for (id, payload) in &fetched {
+            // 同一条消息可属多个会话：get_many 保序重复返回同一 payload，
+            // 索引取首次出现即可。
+            payload_by_id
+                .entry(id.as_str())
+                .or_insert(payload.as_deref());
+        }
+        let peeks = slice
+            .iter()
+            .zip(&member_lists)
+            .map(|(_, members)| {
+                Some(peek::build_session_peek(
+                    members
+                        .iter()
+                        .map(|id| payload_by_id.get(id.as_str()).copied().flatten()),
+                ))
+            })
+            .collect();
+        Ok(peeks)
     }
 
     /// 会话上下文装配（CONTRACT §1-2）：
@@ -2647,8 +3023,8 @@ mod tests {
     #[test]
     fn search_hits_carry_text_summary_from_payloads() {
         // R1（ADR-0004）/ADR-0008：text 摘要（原 snippet）在 Application 检索
-        // 装配时生成——批量取 payload、解析 `text` 字段、截取前缀；不做任何
-        // 脱敏。MapCatalog 无 placement 数据 → session_id 为 None。
+        // 装配时生成——批量取 payload、解析 `text` 字段、构建命中窗口（短正文
+        // 整体输出）；不做任何脱敏。MapCatalog 无 placement → session_id 为 None。
         let mut cat = MapCatalog::new(7);
         for (tag, text) in [("hit00", "hello world"), ("hit01", "second hit")] {
             let id = hit_id(tag);
@@ -2672,8 +3048,9 @@ mod tests {
     }
 
     #[test]
-    fn search_text_truncates_to_max_snippet_chars() {
-        // R1.2：单条 text 摘要按 `max_snippet_chars`（字符数）显式截取前缀。
+    fn search_text_falls_back_to_prefix_without_literal_evidence() {
+        // R1.2：无字面证据（本用例查询词不在正文）时，单条 text 摘要按
+        // `max_snippet_chars`（字符数）回退为前缀；命中窗口语义见 snippet 模块。
         let mut cat = MapCatalog::new(7);
         let id = hit_id("hit00");
         cat.insert(
@@ -2773,16 +3150,94 @@ mod tests {
     }
 
     #[test]
+    fn search_window_bytes_are_charged_not_full_payload() {
+        // 命中窗口（而非完整正文）经既有 `search_hit_charge` 计入
+        // `max_response_bytes`：4 条 10 万字符正文在 32 字符窗口下全部放得下
+        // 且顺序不变；窗口放到 2000 字符时净预算 3072 只容 1 条，截断原因
+        // 显式报 max_response_bytes（预算收紧时既有 truncation 语义可复现）。
+        let mut cat = MapCatalog::new(7);
+        for tag in ["hit00", "hit01", "hit02", "hit03"] {
+            let id = hit_id(tag);
+            let mut full = "x".repeat(100_000);
+            full.push_str(" needle");
+            cat.insert(
+                &id,
+                serde_json::json!({ "text": full }).to_string().into_bytes(),
+            );
+        }
+        let app = App::with_clock(&cat, PagedIndex { n: 4 }, clock_t0);
+        let request = |max_snippet_chars: usize| AppRequest::Search {
+            query: "needle".into(),
+            filters: SearchFilters::default(),
+            facets: SearchFacets::default(),
+            limit: 10,
+            cursor: None,
+            budget: ResponseBudget {
+                max_response_bytes: budget::MIN_RESPONSE_BYTES,
+                max_snippet_chars,
+                ..Default::default()
+            },
+            include_system: false,
+            group_by_session: false,
+            mode: RetrievalMode::Lexical,
+            query_embedding: None,
+        };
+        let AppResponse::Search {
+            hits,
+            next_cursor,
+            truncation,
+            ..
+        } = app.handle(request(32)).unwrap()
+        else {
+            panic!("expected Search response");
+        };
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+            vec![
+                hit_id("hit00"),
+                hit_id("hit01"),
+                hit_id("hit02"),
+                hit_id("hit03")
+            ],
+            "窗口构建不得影响排序"
+        );
+        assert!(!truncation.truncated && next_cursor.is_none(), "{hits:?}");
+        for hit in &hits {
+            let window = hit.text.as_deref().expect("window text");
+            assert_eq!(window.chars().count(), 32);
+            assert!(window.contains("needle"), "{window:?}");
+        }
+        let AppResponse::Search {
+            hits,
+            next_cursor,
+            truncation,
+            ..
+        } = app.handle(request(2000)).unwrap()
+        else {
+            panic!("expected Search response");
+        };
+        assert!(hits.len() < 4 && !hits.is_empty(), "kept {}", hits.len());
+        assert_eq!(
+            truncation.reason.as_deref(),
+            Some(budget::TRUNCATION_MAX_RESPONSE_BYTES)
+        );
+        assert!(next_cursor.is_some(), "被截断的页必须仍交出 cursor");
+    }
+
+    #[test]
     fn search_hits_carry_session_id_from_placements() {
         // ADR-0008：命中带归属会话 wire id（session_of 批量解析）+ text 摘要。
         // GraphCatalog 的 graph 里有 placement → session_id 有值；payload 的
-        // `text` 字段 → text 有值。
+        // `text` 字段 → text 有值。FixedHits 同分命中被 rank signals 重钉为
+        // wire id 升序（与真实 store 的 bm25+id 全序一致）——输入按同序喂入，
+        // 产出顺序即输入顺序。
         let fixture = ctx_fixture();
-        let ids = vec![
+        let mut ids = vec![
             fixture.root.clone(),
             fixture.repeated.clone(),
             fixture.leaf.clone(),
         ];
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         let app = App::with_clock(&fixture.store, FixedHits(ids.clone()), clock_t0);
         let resp = app.handle(search_req("q", 10, None)).unwrap();
         let AppResponse::Search { hits, .. } = resp else {
@@ -2793,9 +3248,10 @@ mod tests {
             assert_eq!(&hit.id, expected);
             assert_eq!(hit.session_id.as_deref(), Some(fixture.session.as_str()));
         }
-        assert_eq!(hits[0].text.as_deref(), Some("root"));
+        // wire id 升序：ctx-leaf < ctx-repeated < ctx-root。
+        assert_eq!(hits[0].text.as_deref(), Some("leaf"));
         assert_eq!(hits[1].text.as_deref(), Some("repeated"));
-        assert_eq!(hits[2].text.as_deref(), Some("leaf"));
+        assert_eq!(hits[2].text.as_deref(), Some("root"));
     }
 
     #[test]
@@ -2855,7 +3311,9 @@ mod tests {
                 active_generation: 7,
                 placements: 2,
                 source_placement_claims: 3,
-            })
+                usage: None,
+                repos,
+            }) if repos.is_empty()
         ));
     }
 
@@ -2870,6 +3328,9 @@ mod tests {
     }
 
     /// 可分页假索引：n 个确定性命中，按 limit 截取（模拟钉住排序上的超取）。
+    /// 分数为正、严格降序（与真实 store 的 bm25 负分取负后的形态一致）——
+    /// 产出顺序即 Application 重钉后的 (final desc, id asc) 序，重排是 no-op，
+    /// 既有分页/顺序断言保持有效。
     struct PagedIndex {
         n: usize,
     }
@@ -2889,7 +3350,7 @@ mod tests {
                         Stability::Reconstructed,
                         &[format!("hit{i:02}").as_bytes()],
                     ),
-                    score: -(i as f32),
+                    score: (self.n - i) as f32,
                     session_id: None,
                     text: None,
                     why_matched: Vec::new(),
@@ -2929,12 +3390,84 @@ mod tests {
         }
     }
 
+    /// 固定分值假索引：按给定 (id, bm25) 序返回——rank signals 测试用非零
+    /// 且可人为相等的 bm25（`FixedHits` 全 0 分无法区分衰减/惩罚）。
+    struct ScoredHits(Vec<(StableId, f32)>);
+    impl SearchIndex for ScoredHits {
+        fn index(&self, _id: &StableId, _text: &str) -> PortResult<()> {
+            Ok(())
+        }
+        fn query_filtered(
+            &self,
+            _query: SearchQuery<'_>,
+            limit: usize,
+        ) -> PortResult<Vec<SearchHit>> {
+            Ok(self
+                .0
+                .iter()
+                .take(limit)
+                .map(|(id, score)| SearchHit {
+                    id: id.clone(),
+                    score: *score,
+                    session_id: None,
+                    text: None,
+                    why_matched: Vec::new(),
+                    suggested_next_commands: Vec::new(),
+                    occurrences: 1,
+                    resume_available: false,
+                })
+                .collect())
+        }
+    }
+
+    /// 就绪的假语义索引：按给定 id 序返回"余弦相似度降序"的 top-k
+    /// （`take(limit)`，与端口契约同形）。`is_ready` 恒 true，使
+    /// semantic/hybrid 路径真正执行（而非降级 lexical_fallback）。
+    struct FakeSemantic(Vec<StableId>);
+    impl SemanticIndex for FakeSemantic {
+        fn index_embedding(&self, _id: &StableId, _embedding: &[f32]) -> PortResult<()> {
+            Ok(())
+        }
+        fn query_semantic_filtered(
+            &self,
+            _query_embedding: &[f32],
+            limit: usize,
+            _filters: &SearchFilters,
+            _facets: &SearchFacets,
+            _include_system: bool,
+        ) -> PortResult<Vec<SearchHit>> {
+            Ok(self
+                .0
+                .iter()
+                .take(limit)
+                .enumerate()
+                .map(|(rank, id)| SearchHit {
+                    id: id.clone(),
+                    score: 1.0 - (rank as f32) / 100.0,
+                    session_id: None,
+                    text: None,
+                    why_matched: Vec::new(),
+                    suggested_next_commands: Vec::new(),
+                    occurrences: 1,
+                    resume_available: false,
+                })
+                .collect())
+        }
+        fn is_ready(&self) -> PortResult<bool> {
+            Ok(true)
+        }
+        fn semantic_model_id(&self) -> PortResult<Option<String>> {
+            Ok(Some("fake-model".into()))
+        }
+    }
+
     /// 内存 map 目录：BTreeMap 键序即 wire id 升序（与 sqlite list 的钉住排序一致）；
     /// generation 用 Cell 可变，测 cursor 的 generation 绑定。
     struct MapCatalog {
         map: std::collections::BTreeMap<String, Vec<u8>>,
         generation: std::cell::Cell<u64>,
         session_of: std::collections::BTreeMap<String, String>,
+        titles: std::collections::BTreeMap<String, String>,
     }
     impl MapCatalog {
         fn new(generation: u64) -> Self {
@@ -2942,6 +3475,7 @@ mod tests {
                 map: Default::default(),
                 generation: std::cell::Cell::new(generation),
                 session_of: Default::default(),
+                titles: Default::default(),
             }
         }
         fn insert(&mut self, id: &StableId, payload: impl Into<Vec<u8>>) {
@@ -2952,6 +3486,11 @@ mod tests {
                 message_id.as_str().to_string(),
                 session_id.as_str().to_string(),
             );
+        }
+        /// 注入标题投影（#6）：默认无标题；有则按 session wire id 返回。
+        fn set_title(&mut self, session_id: &StableId, title: impl Into<String>) {
+            self.titles
+                .insert(session_id.as_str().to_string(), title.into());
         }
     }
     impl CatalogStore for MapCatalog {
@@ -2991,6 +3530,12 @@ mod tests {
                     id: StableId::from_wire(k).expect("map keys are wire ids"),
                     payload: v.clone(),
                 })
+                .collect())
+        }
+        fn session_titles(&self, session_ids: &[StableId]) -> PortResult<Vec<Option<String>>> {
+            Ok(session_ids
+                .iter()
+                .map(|id| self.titles.get(id.as_str()).cloned())
                 .collect())
         }
         fn count(&self) -> PortResult<u64> {
@@ -3220,7 +3765,11 @@ mod tests {
             panic!("expected Search response");
         };
         let kept: Vec<StableId> = hits.iter().map(|hit| hit.id.clone()).collect();
-        assert_eq!(kept, vec![hit_id("hit00"), hit_id("hit03")]);
+        // rank signals 重钉后同分命中按 wire id 升序（与真实 store 的
+        // bm25+id 全序同一约定）——期望值按同序排序再比较。
+        let mut expected = vec![hit_id("hit00"), hit_id("hit03")];
+        expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(kept, expected);
     }
 
     #[test]
@@ -3256,21 +3805,283 @@ mod tests {
         assert_eq!(hits[0].id, hit_id("hit00"));
     }
 
+    /// semantic 请求：`Semantic` 模式 + 就绪语义索引 + 查询向量。
+    fn semantic_req(query: &str, limit: usize, cursor: Option<String>) -> AppRequest {
+        AppRequest::Search {
+            query: query.into(),
+            filters: SearchFilters::default(),
+            facets: SearchFacets::default(),
+            limit,
+            cursor,
+            budget: ResponseBudget::default(),
+            include_system: false,
+            group_by_session: false,
+            mode: RetrievalMode::Semantic,
+            query_embedding: Some(vec![0.1f32; 8]),
+        }
+    }
+
+    /// 回归：系统噪声过滤不得吃掉 `has_more` 哨兵。
+    ///
+    /// 缺陷形态：不重排的路径（semantic）按 `offset + page + 1` 超取，末尾那个
+    /// `+1` 是"还有下一页"的唯一哨兵。R2 噪声过滤在**取数之后**执行，只要窗口
+    /// 内出现一条 role=system/developer 的命中，过滤后的窗口长度就恰好等于
+    /// 本页消耗量，`has_more` 判为 false、不发 cursor——窗口之外的命中从此
+    /// 不可达。返回码正常、`truncated` 为 false，调用方以为这就是全部结果。
+    ///
+    /// fixture：4 条语义命中，第 1 条是 system 噪声；page=2 时首页窗口恰好 3 条
+    /// （2 条可见 + 被吃掉的哨兵），第 4 条命中只有继续分页才能拿到。
+    struct MutableSemantic {
+        inner: FakeSemantic,
+        ready: std::cell::Cell<bool>,
+        model: std::cell::RefCell<String>,
+        fail: std::cell::Cell<bool>,
+        nonfinite: std::cell::Cell<bool>,
+    }
+    impl SemanticIndex for MutableSemantic {
+        fn index_embedding(&self, _id: &StableId, _embedding: &[f32]) -> PortResult<()> {
+            Ok(())
+        }
+        fn query_semantic_filtered(
+            &self,
+            embedding: &[f32],
+            limit: usize,
+            filters: &SearchFilters,
+            facets: &SearchFacets,
+            include_system: bool,
+        ) -> PortResult<Vec<SearchHit>> {
+            let mut hits = self.inner.query_semantic_filtered(
+                embedding,
+                limit,
+                filters,
+                facets,
+                include_system,
+            )?;
+            if self.nonfinite.get() {
+                hits[0].score = f32::NAN;
+            }
+            Ok(hits)
+        }
+        fn is_ready(&self) -> PortResult<bool> {
+            if self.fail.get() {
+                Err(PortError::Backend("synthetic readiness failure".into()))
+            } else {
+                Ok(self.ready.get())
+            }
+        }
+        fn semantic_model_id(&self) -> PortResult<Option<String>> {
+            Ok(Some(self.model.borrow().clone()))
+        }
+    }
+
+    fn mutable_semantic_app() -> App<MapCatalog, FixedHits, NoResumeClaims, MutableSemantic> {
+        let ids: Vec<_> = ["sem-a", "sem-b", "sem-c"]
+            .iter()
+            .map(|tag| StableId::native(IdKind::Message, tag))
+            .collect();
+        let mut cat = MapCatalog::new(7);
+        for id in &ids {
+            cat.insert(id, br#"{"role":"user","text":"needle"}"#.to_vec());
+        }
+        App::with_resume_semantic_and_clock(
+            cat,
+            FixedHits(ids.clone()),
+            NoResumeClaims,
+            MutableSemantic {
+                inner: FakeSemantic(ids),
+                ready: std::cell::Cell::new(true),
+                model: std::cell::RefCell::new("model-a".into()),
+                fail: std::cell::Cell::new(false),
+                nonfinite: std::cell::Cell::new(false),
+            },
+            clock_t0,
+        )
+    }
+
+    #[test]
+    fn semantic_readiness_errors_and_nonfinite_scores_do_not_fallback() {
+        let app = mutable_semantic_app();
+        app.semantic.fail.set(true);
+        assert!(matches!(
+            app.handle(semantic_req("needle", 1, None)),
+            Err(AppError::Port(PortError::Backend(_)))
+        ));
+        // A lexical request never probes the semantic backend.
+        assert!(app.handle(search_req("needle", 1, None)).is_ok());
+        app.semantic.fail.set(false);
+        app.semantic.nonfinite.set(true);
+        assert!(matches!(
+            app.handle(semantic_req("needle", 1, None)),
+            Err(AppError::Port(PortError::Backend(_)))
+        ));
+    }
+
+    #[test]
+    fn search_cursor_facet_binding_has_no_delimiter_collisions() {
+        let first = SearchFacets {
+            tool_kind: Some("a|tool_name=b".into()),
+            tool_name: Some("c".into()),
+            ..Default::default()
+        };
+        let second = SearchFacets {
+            tool_kind: Some("a".into()),
+            tool_name: Some("b|tool_name=c".into()),
+            ..Default::default()
+        };
+        let retrieval = RetrievalBinding {
+            requested: RetrievalMode::Lexical,
+            effective: RetrievalMode::Lexical,
+            model: None,
+            embedding: None,
+        };
+        let digest = |facets: &SearchFacets| {
+            search_query_digest(
+                "needle",
+                &SearchFilters::EMPTY,
+                facets,
+                false,
+                false,
+                None,
+                &retrieval,
+            )
+        };
+        assert_ne!(digest(&first), digest(&second));
+        assert_ne!(
+            digest(&SearchFacets::default()),
+            digest(&SearchFacets {
+                tool_name: Some(String::new()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_cursor_binds_mode_model_dimension_and_readiness() {
+        let app = mutable_semantic_app();
+        let (_, token, _, _) = hits_of(app.handle(semantic_req("needle", 1, None)).unwrap());
+        let token = token.expect("first page");
+        assert!(matches!(
+            app.handle(search_req("needle", 1, Some(token.clone()))),
+            Err(AppError::Cursor(_))
+        ));
+        *app.semantic.model.borrow_mut() = "model-b".into();
+        assert!(matches!(
+            app.handle(semantic_req("needle", 1, Some(token.clone()))),
+            Err(AppError::Cursor(_))
+        ));
+        *app.semantic.model.borrow_mut() = "model-a".into();
+        let mut request = semantic_req("needle", 1, Some(token.clone()));
+        if let AppRequest::Search {
+            query_embedding, ..
+        } = &mut request
+        {
+            *query_embedding = Some(vec![1.0; 17]);
+        }
+        assert!(matches!(app.handle(request), Err(AppError::Cursor(_))));
+        app.semantic.ready.set(false);
+        assert!(matches!(
+            app.handle(semantic_req("needle", 1, Some(token))),
+            Err(AppError::Cursor(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_rejects_nonfinite_query_embedding_before_backend() {
+        let app = mutable_semantic_app();
+        app.semantic.fail.set(true);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut request = semantic_req("needle", 1, None);
+            if let AppRequest::Search {
+                query_embedding, ..
+            } = &mut request
+            {
+                *query_embedding = Some(vec![bad]);
+            }
+            assert!(matches!(
+                app.handle(request),
+                Err(AppError::Domain(DomainError::InvalidRequest(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn search_semantic_noise_filter_does_not_eat_the_has_more_sentinel() {
+        let mut cat = MapCatalog::new(7);
+        let noise = StableId::native(IdKind::Message, "sem-noise");
+        cat.insert(
+            &noise,
+            serde_json::json!({ "role": "system", "text": "semantic needle" })
+                .to_string()
+                .into_bytes(),
+        );
+        let visible: Vec<StableId> = ["sem-m1", "sem-m2", "sem-m3"]
+            .iter()
+            .map(|tag| StableId::native(IdKind::Message, tag))
+            .collect();
+        for id in &visible {
+            cat.insert(
+                id,
+                serde_json::json!({ "role": "user", "text": "semantic needle" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let mut ranked = vec![noise];
+        ranked.extend(visible.iter().cloned());
+        let app = App::with_resume_semantic_and_clock(
+            cat,
+            FixedHits(Vec::new()),
+            NoResumeClaims,
+            FakeSemantic(ranked),
+            clock_t0,
+        );
+
+        let (unpaged, _, _, _) = hits_of(
+            app.handle(semantic_req("semantic needle", 10, None))
+                .unwrap(),
+        );
+        let expected: Vec<String> = visible
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(unpaged, expected, "system noise stays excluded, order kept");
+
+        let mut paged: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..4 {
+            let (ids, next, _, _) = hits_of(
+                app.handle(semantic_req("semantic needle", 2, token.take()))
+                    .unwrap(),
+            );
+            paged.extend(ids);
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(token.is_none(), "paging must terminate");
+        assert_eq!(
+            paged, expected,
+            "a filtered-out hit inside the fetch window must not end paging early"
+        );
+    }
+
     #[test]
     fn search_group_by_session_collapses_with_occurrences() {
         // R3 归并：每会话保留最高分命中（钉住顺序中的首个），occurrences 为该
-        // 会话在扫描窗内的命中数；无归属（None）命中自成单例组。
+        // 会话在扫描窗内的命中数；无归属（None）命中自成单例组。同分命中被
+        // rank signals 重钉为 wire id 升序——native id 使该序可静态断言。
         let mut cat = MapCatalog::new(7);
-        let session_a = StableId::derive(IdKind::Session, Stability::Reconstructed, &[b"sA"]);
-        let session_b = StableId::derive(IdKind::Session, Stability::Reconstructed, &[b"sB"]);
+        let session_a = StableId::native(IdKind::Session, "sess-a");
+        let session_b = StableId::native(IdKind::Session, "sess-b");
         for (tag, session) in [
-            ("hit00", Some(&session_a)),
-            ("hit01", Some(&session_a)),
-            ("hit02", Some(&session_b)),
-            ("hit03", Some(&session_b)),
-            ("hit04", None),
+            ("grp-a1", Some(&session_a)),
+            ("grp-a2", Some(&session_a)),
+            ("grp-b1", Some(&session_b)),
+            ("grp-b2", Some(&session_b)),
+            ("grp-solo", None),
         ] {
-            let id = hit_id(tag);
+            let id = StableId::native(IdKind::Message, tag);
             cat.insert(
                 &id,
                 serde_json::json!({ "role": "user", "text": "needle" })
@@ -3281,12 +4092,13 @@ mod tests {
                 cat.set_session_of(&id, session);
             }
         }
+        // wire id 升序（与 rank signals 的重钉序一致）：a1 < a2 < b1 < b2 < solo。
         let index = FixedHits(vec![
-            hit_id("hit00"),
-            hit_id("hit01"),
-            hit_id("hit02"),
-            hit_id("hit03"),
-            hit_id("hit04"),
+            StableId::native(IdKind::Message, "grp-a1"),
+            StableId::native(IdKind::Message, "grp-a2"),
+            StableId::native(IdKind::Message, "grp-b1"),
+            StableId::native(IdKind::Message, "grp-b2"),
+            StableId::native(IdKind::Message, "grp-solo"),
         ]);
         let app = App::with_clock(cat, index, clock_t0);
         let AppResponse::Search { hits, .. } = app
@@ -3307,13 +4119,13 @@ mod tests {
             panic!("expected Search response");
         };
         assert_eq!(hits.len(), 3, "one group per session + singleton");
-        assert_eq!(hits[0].id, hit_id("hit00"));
+        assert_eq!(hits[0].id, StableId::native(IdKind::Message, "grp-a1"));
         assert_eq!(hits[0].occurrences, 2);
         assert_eq!(hits[0].session_id.as_deref(), Some(session_a.as_str()));
-        assert_eq!(hits[1].id, hit_id("hit02"));
+        assert_eq!(hits[1].id, StableId::native(IdKind::Message, "grp-b1"));
         assert_eq!(hits[1].occurrences, 2);
         assert_eq!(hits[1].session_id.as_deref(), Some(session_b.as_str()));
-        assert_eq!(hits[2].id, hit_id("hit04"));
+        assert_eq!(hits[2].id, StableId::native(IdKind::Message, "grp-solo"));
         assert_eq!(hits[2].occurrences, 1);
         assert!(hits[2].session_id.is_none());
     }
@@ -3322,10 +4134,11 @@ mod tests {
     fn search_group_by_session_default_path_keeps_occurrences_one() {
         // R3 默认路径（group_by_session=false）保持不变：不归并、逐命中返回，
         // occurrences 恒为 1（序列化时省略该键，与既有输出字节兼容）。
+        // 同分命中被 rank signals 重钉为 wire id 升序——输入按该序喂入。
         let mut cat = MapCatalog::new(7);
-        let session_a = StableId::derive(IdKind::Session, Stability::Reconstructed, &[b"sA"]);
-        for tag in ["hit00", "hit01"] {
-            let id = hit_id(tag);
+        let session_a = StableId::native(IdKind::Session, "sess-a");
+        for tag in ["grp-a1", "grp-a2"] {
+            let id = StableId::native(IdKind::Message, tag);
             cat.insert(
                 &id,
                 serde_json::json!({ "role": "user", "text": "needle" })
@@ -3334,20 +4147,103 @@ mod tests {
             );
             cat.set_session_of(&id, &session_a);
         }
-        let index = FixedHits(vec![hit_id("hit00"), hit_id("hit01")]);
+        let index = FixedHits(vec![
+            StableId::native(IdKind::Message, "grp-a1"),
+            StableId::native(IdKind::Message, "grp-a2"),
+        ]);
         let app = App::with_clock(cat, index, clock_t0);
         let AppResponse::Search { hits, .. } = app.handle(search_req("needle", 10, None)).unwrap()
         else {
             panic!("expected Search response");
         };
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].id, hit_id("hit00"));
+        assert_eq!(hits[0].id, StableId::native(IdKind::Message, "grp-a1"));
         assert_eq!(hits[0].occurrences, 1);
         assert_eq!(hits[1].occurrences, 1);
     }
 
+    /// 回归：归并模式下被字节闸截断的页必须继续发 cursor。
+    ///
+    /// 缺陷形态：`has_more` 曾在字节 clamp **之前**按"是否存在第 page+1 组"
+    /// 判定。当组总数不超过页大小、而字节预算只装得下前几组时，clamp 把本页
+    /// 削短却仍报 `has_more = false` → 无 next_cursor，被削掉的组从此不可达。
+    /// 逐命中路径（`has_more = scanned_len > consumed`）不存在该问题，两条
+    /// 路径对同一输入给出不同答案，正是缺陷的判据。
+    ///
+    /// fixture：4 组、page=10（组数不足以触发 page+1 哨兵）、字节预算只容 1 组。
     #[test]
-    fn search_why_matched_detects_term_beyond_displayed_prefix() {
+    fn search_group_by_session_byte_truncated_page_keeps_paging() {
+        let mut cat = MapCatalog::new(7);
+        let tags = ["cut-a", "cut-b", "cut-c", "cut-d"];
+        for tag in tags {
+            let id = StableId::native(IdKind::Message, tag);
+            // 每组一条命中，正文足够长使字节闸每页只放过一组。
+            cat.insert(
+                &id,
+                serde_json::json!({ "role": "user", "text": "x".repeat(2000) })
+                    .to_string()
+                    .into_bytes(),
+            );
+            cat.set_session_of(&id, &StableId::native(IdKind::Session, tag));
+        }
+        let index = FixedHits(
+            tags.iter()
+                .map(|tag| StableId::native(IdKind::Message, tag))
+                .collect(),
+        );
+        let app = App::with_clock(cat, index, clock_t0);
+        let grouped_req = |cursor: Option<String>| AppRequest::Search {
+            query: "grouped needle".into(),
+            filters: SearchFilters::default(),
+            facets: SearchFacets::default(),
+            limit: 10,
+            cursor,
+            budget: ResponseBudget {
+                max_response_bytes: 4096,
+                ..Default::default()
+            },
+            include_system: false,
+            group_by_session: true,
+            mode: RetrievalMode::Lexical,
+            query_embedding: None,
+        };
+
+        let (first, token, _, truncation) = hits_of(app.handle(grouped_req(None)).unwrap());
+        assert!(
+            truncation.truncated && !first.is_empty() && first.len() < tags.len(),
+            "byte gate must cut a non-empty prefix: kept {first:?}, {truncation:?}"
+        );
+        assert_eq!(
+            truncation.reason.as_deref(),
+            Some(budget::TRUNCATION_MAX_RESPONSE_BYTES)
+        );
+        assert!(
+            token.is_some(),
+            "a byte-truncated grouped page must still hand out a cursor"
+        );
+
+        let mut paged = first;
+        let mut token = token;
+        while let Some(cursor) = token.take() {
+            let (ids, next, _, _) = hits_of(app.handle(grouped_req(Some(cursor))).unwrap());
+            assert!(!ids.is_empty(), "paging must advance, not spin");
+            paged.extend(ids);
+            token = next;
+        }
+        let expected: Vec<String> = tags
+            .iter()
+            .map(|tag| StableId::native(IdKind::Message, tag).as_str().to_string())
+            .collect();
+        assert_eq!(
+            paged, expected,
+            "every group must stay reachable across byte-truncated pages"
+        );
+    }
+
+    #[test]
+    fn search_text_window_keeps_late_literal_match_visible() {
+        // 命中位于前缀之外：text 摘要不再是固定前缀，而是包含该命中的窗口；
+        // why_matched 仍按完整正文派生（证据来源与显示窗口无关的回归断言）。
         let mut cat = MapCatalog::new(7);
         let mut text = "x".repeat(1500);
         text.push_str(" needle");
@@ -3376,7 +4272,7 @@ mod tests {
         else {
             panic!("expected Search response");
         };
-        assert_eq!(hits[0].text.as_deref(), Some("xxxxxxxx"));
+        assert_eq!(hits[0].text.as_deref(), Some("x needle"));
         assert_eq!(hits[0].why_matched, vec!["needle"]);
     }
 
@@ -3430,6 +4326,390 @@ mod tests {
         let first = app.handle(search_req("数据库 guidance", 10, None)).unwrap();
         let second = app.handle(search_req("数据库 guidance", 10, None)).unwrap();
         assert_eq!(first, second);
+    }
+
+    // ---- rank signals（competitor-borrowings #1）：lexical 时效衰减 + sidechain 惩罚 ----
+
+    /// 固定 rank 时钟：2026-08-25T00:00:00Z（与 CLI e2e 的 `ASG_CLOCK_MS` 同值）。
+    fn rank_clock() -> i64 {
+        1_787_616_000_000
+    }
+
+    #[test]
+    fn search_cursor_pins_recency_clock_and_original_expiry_across_pages() {
+        thread_local! {
+            static NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+        }
+        fn moving_clock() -> i64 {
+            NOW.with(std::cell::Cell::get)
+        }
+        for grouped in [false, true] {
+            NOW.with(|now| now.set(rank_clock()));
+            let ids: Vec<_> = ["clock-a", "clock-b", "clock-c"]
+                .iter()
+                .map(|tag| StableId::native(IdKind::Message, tag))
+                .collect();
+            let mut catalog = MapCatalog::new(7);
+            for id in &ids {
+                catalog.insert(id, br#"{"text":"needle"}"#.to_vec());
+            }
+            // Rank 1 crosses rank 2's constant score five minutes after the
+            // first page, well within the cursor's fifteen-minute lifetime.
+            catalog.insert(
+                &ids[0],
+                br#"{"text":"needle","timestamp":"2026-08-24T07:11:34Z"}"#.to_vec(),
+            );
+            let app = App::with_clock(
+                catalog,
+                ScoredHits(
+                    ids.iter()
+                        .enumerate()
+                        .map(|(rank, id)| (id.clone(), 1.0 / (61 + rank) as f32))
+                        .collect(),
+                ),
+                moving_clock,
+            );
+            let request = |token| {
+                let mut request = search_req("needle", 1, token);
+                if let AppRequest::Search {
+                    group_by_session, ..
+                } = &mut request
+                {
+                    *group_by_session = grouped;
+                }
+                request
+            };
+            let (first, token, _, _) = hits_of(app.handle(request(None)).unwrap());
+            assert_eq!(first, [ids[0].as_str()]);
+            NOW.with(|now| now.set(rank_clock() + 10 * 60 * 1_000));
+            let (fresh, _, _, _) = hits_of(app.handle(request(None)).unwrap());
+            assert_eq!(
+                fresh,
+                [ids[1].as_str()],
+                "fixture must change fresh ranking"
+            );
+            let (second, token, _, _) = hits_of(app.handle(request(token)).unwrap());
+            assert_eq!(
+                second,
+                [ids[1].as_str()],
+                "continuation must not repeat page one"
+            );
+            let token = token.expect("third page");
+            NOW.with(|now| now.set(rank_clock() + 14 * 60 * 1_000));
+            let (third, _, _, _) = hits_of(app.handle(request(Some(token.clone()))).unwrap());
+            assert_eq!(third, [ids[2].as_str()]);
+            NOW.with(|now| now.set(rank_clock() + cursor::DEFAULT_TTL_MS));
+            assert!(matches!(
+                app.handle(request(Some(token))),
+                Err(AppError::Cursor(cursor::CursorError::Expired(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn search_lexical_ranking_prefers_newer_message_under_fixed_clock() {
+        let old = StableId::native(IdKind::Message, "rank-old");
+        let new = StableId::native(IdKind::Message, "rank-new");
+        let mut cat = MapCatalog::new(7);
+        cat.insert(
+            &old,
+            serde_json::json!({ "text": "rank needle", "timestamp": "2026-01-01T00:00:00Z" })
+                .to_string()
+                .into_bytes(),
+        );
+        cat.insert(
+            &new,
+            serde_json::json!({ "text": "rank needle", "timestamp": "2026-08-24T00:00:00Z" })
+                .to_string()
+                .into_bytes(),
+        );
+        // 假索引按 [old, new] 序返回、bm25 全等——重排必须来自时效衰减。
+        let app = App::with_clock(
+            cat,
+            ScoredHits(vec![(old.clone(), 1.0), (new.clone(), 1.0)]),
+            rank_clock,
+        );
+        let (ids, _, _, _) = hits_of(app.handle(search_req("rank needle", 10, None)).unwrap());
+        assert_eq!(
+            ids,
+            vec![new.as_str().to_string(), old.as_str().to_string()],
+            "newer message must rank first"
+        );
+    }
+
+    #[test]
+    fn search_lexical_ranking_demotes_sidechain_under_equal_relevance() {
+        let main = StableId::native(IdKind::Message, "rank-main");
+        let side = StableId::native(IdKind::Message, "rank-side");
+        let mut cat = MapCatalog::new(7);
+        cat.insert(
+            &main,
+            serde_json::json!({ "text": "side needle", "is_sidechain": false })
+                .to_string()
+                .into_bytes(),
+        );
+        cat.insert(
+            &side,
+            serde_json::json!({ "text": "side needle", "is_sidechain": true })
+                .to_string()
+                .into_bytes(),
+        );
+        let app = App::with_clock(
+            cat,
+            ScoredHits(vec![(side.clone(), 2.0), (main.clone(), 2.0)]),
+            rank_clock,
+        );
+        let (ids, _, _, _) = hits_of(app.handle(search_req("side needle", 10, None)).unwrap());
+        assert_eq!(
+            ids,
+            vec![main.as_str().to_string(), side.as_str().to_string()],
+            "sidechain hit must rank after equal-relevance mainline hit"
+        );
+    }
+
+    #[test]
+    fn search_lexical_ranking_is_deterministic_across_identical_queries() {
+        let old = StableId::native(IdKind::Message, "rank-old");
+        let new = StableId::native(IdKind::Message, "rank-new");
+        let mut cat = MapCatalog::new(7);
+        cat.insert(
+            &old,
+            serde_json::json!({ "text": "rank needle", "timestamp": "2026-01-01T00:00:00Z" })
+                .to_string()
+                .into_bytes(),
+        );
+        cat.insert(
+            &new,
+            serde_json::json!({ "text": "rank needle", "timestamp": "2026-08-24T00:00:00Z" })
+                .to_string()
+                .into_bytes(),
+        );
+        let app = App::with_clock(
+            cat,
+            ScoredHits(vec![(old.clone(), 1.0), (new.clone(), 1.0)]),
+            rank_clock,
+        );
+        let first = app.handle(search_req("rank needle", 10, None)).unwrap();
+        let second = app.handle(search_req("rank needle", 10, None)).unwrap();
+        assert_eq!(first, second, "same clock + same query must be identical");
+    }
+
+    #[test]
+    fn search_lexical_ranking_pages_partition_the_pinned_ordering() {
+        // 时效重排后的钉住排序必须同样支持不重不漏分页（cursor 绑定 query+sort，
+        // 同 clock 下 offset 续读稳定）。三条命中且每页 fetch 窗口 ≥ 3（offset 0
+        // 时 fetch = page+1 = 3 恰好覆盖全集），窗口内的重排序与全集一致，
+        // 三页拼接 == 不分页结果。
+        let hits: Vec<(StableId, f32)> = (0..3)
+            .map(|i| {
+                (
+                    StableId::native(IdKind::Message, &format!("rank-p{i}")),
+                    1.0,
+                )
+            })
+            .collect();
+        let mut cat = MapCatalog::new(7);
+        for (index, (id, _)) in hits.iter().enumerate() {
+            cat.insert(
+                id,
+                serde_json::json!({ "text": "rank paged", "timestamp": format!(
+                    "2026-08-0{}T00:00:00Z", index + 1
+                ) })
+                .to_string()
+                .into_bytes(),
+            );
+        }
+        let app = App::with_clock(cat, ScoredHits(hits), rank_clock);
+        let (unpaged, _, _, _) = hits_of(app.handle(search_req("rank paged", 10, None)).unwrap());
+        assert_eq!(
+            unpaged,
+            vec!["msg_v1_rank-p2", "msg_v1_rank-p1", "msg_v1_rank-p0"],
+            "newest-first pinned order"
+        );
+
+        let mut paged: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..2 {
+            let (ids, next, _, truncation) = hits_of(
+                app.handle(search_req("rank paged", 2, token.take()))
+                    .unwrap(),
+            );
+            assert!(!truncation.truncated);
+            paged.extend(ids);
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(paged, unpaged);
+        assert!(token.is_none());
+    }
+
+    /// 回归：重排后的分页必须不重不漏，且**扫描窗口不得随 offset 变化**。
+    ///
+    /// 缺陷形态：取数窗口曾是 `offset + page + 1`，于是第 1 页只看到全集的一个
+    /// 前缀、第 2 页看到更大的前缀。当 bm25 序与重排序不一致时，两页各自在
+    /// **不同的集合**上重排，拼接结果既重复又漏命中——返回码正常，结果静默错误。
+    ///
+    /// fixture 用等值 bm25 + 单调变新的时间戳，使时效成为唯一排序因素（重排序
+    /// 恰为索引返回序的反序）。bm25 若有较大跨度会盖过衰减区间、把重排变成
+    /// no-op，缺陷就观察不到——这正是既有分页测试用 3 条命中（fetch 窗口恰好
+    /// 覆盖全集）时未能暴露它的原因。
+    #[test]
+    fn search_rank_pages_do_not_depend_on_the_cursor_offset() {
+        let ids: Vec<StableId> = (0..4)
+            .map(|i| StableId::native(IdKind::Message, &format!("rank-off{i}")))
+            .collect();
+        let mut cat = MapCatalog::new(7);
+        // index 越大 → 时间越新 → 重排越靠前，与索引返回序完全相反。
+        for (index, id) in ids.iter().enumerate() {
+            cat.insert(
+                id,
+                serde_json::json!({
+                    "text": "rank offset",
+                    "timestamp": format!("2026-08-1{index}T00:00:00Z"),
+                })
+                .to_string()
+                .into_bytes(),
+            );
+        }
+        let scored: Vec<(StableId, f32)> = ids.iter().map(|id| (id.clone(), 1.0)).collect();
+        let app = App::with_clock(cat, ScoredHits(scored), rank_clock);
+
+        // 一次取全 4 条即钉住排序的真值：最新在前。
+        let (unpaged, _, _, _) = hits_of(app.handle(search_req("rank offset", 10, None)).unwrap());
+        assert_eq!(
+            unpaged,
+            vec![
+                "msg_v1_rank-off3",
+                "msg_v1_rank-off2",
+                "msg_v1_rank-off1",
+                "msg_v1_rank-off0",
+            ],
+            "unpaged pinned order must be newest-first"
+        );
+
+        let mut paged: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..4 {
+            let (page_ids, next, _, truncation) = hits_of(
+                app.handle(search_req("rank offset", 2, token.take()))
+                    .unwrap(),
+            );
+            assert!(!truncation.truncated);
+            paged.extend(page_ids);
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(token.is_none(), "paging must terminate");
+        assert_eq!(
+            paged, unpaged,
+            "paged concatenation must equal the unpaged pinned order: a window that \
+             grows with the cursor offset re-ranks a different set on every page"
+        );
+    }
+
+    /// hybrid 请求：`Hybrid` 模式 + 就绪语义索引 + 查询向量（三者齐备才真正
+    /// 走 RRF 融合，缺一即降级 lexical_fallback）。
+    fn hybrid_req(query: &str, limit: usize, cursor: Option<String>) -> AppRequest {
+        AppRequest::Search {
+            query: query.into(),
+            filters: SearchFilters::default(),
+            facets: SearchFacets::default(),
+            limit,
+            cursor,
+            budget: ResponseBudget::default(),
+            include_system: false,
+            group_by_session: false,
+            mode: RetrievalMode::Hybrid,
+            query_embedding: Some(vec![0.1f32; 8]),
+        }
+    }
+
+    /// 回归：hybrid 的 RRF 融合同样是"应用层重排"，扫描窗口必须与 offset 无关。
+    ///
+    /// 缺陷形态：hybrid 取数窗口曾是 `offset + page + 1`，两路召回各截同一前缀
+    /// 后再融合。RRF 分数 `1/(k+rank)` 在**单路**内随窗口增长是稳定前缀，但
+    /// **两路都命中**的文档拿到两份加分（`1/(k+r_lex) + 1/(k+r_sem)`），可以
+    /// 一举超过任何单路命中——只要它的两个 rank 落在小窗口之外，它就在第 1 页
+    /// 不可见、在第 2 页跃居榜首，把整个融合序整体下移。于是第 2 页原样重复
+    /// 第 1 页的命中，而真正的最高分命中永远不出现。返回码正常，结果静默错误。
+    ///
+    /// fixture：两路各 5 条，前 3 条互不相交、后 2 条两路共有（rank 4/5）。
+    /// page=2 时第 1 页窗口 3 只看到不相交部分，第 2 页窗口 5 才看到共有部分。
+    #[test]
+    fn search_hybrid_pages_do_not_depend_on_the_cursor_offset() {
+        let tags = [
+            "lex1", "lex2", "lex3", "sem1", "sem2", "sem3", "dup1", "dup2",
+        ];
+        let mut cat = MapCatalog::new(7);
+        for tag in tags {
+            cat.insert(
+                &StableId::native(IdKind::Message, tag),
+                serde_json::json!({ "role": "user", "text": "hybrid needle" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let native = |tag: &str| StableId::native(IdKind::Message, tag);
+        // 两路召回的后两位是同一对文档（dup1/dup2）——它们各拿两份 RRF 加分。
+        let lexical = FixedHits(vec![
+            native("lex1"),
+            native("lex2"),
+            native("lex3"),
+            native("dup1"),
+            native("dup2"),
+        ]);
+        let semantic = FakeSemantic(vec![
+            native("sem1"),
+            native("sem2"),
+            native("sem3"),
+            native("dup1"),
+            native("dup2"),
+        ]);
+        let app =
+            App::with_resume_semantic_and_clock(cat, lexical, NoResumeClaims, semantic, rank_clock);
+
+        // 一次取全 8 条即融合后的钉住排序真值：两路共有的 dup1/dup2 居首。
+        let (unpaged, _, _, _) =
+            hits_of(app.handle(hybrid_req("hybrid needle", 10, None)).unwrap());
+        assert_eq!(
+            unpaged,
+            vec![
+                "msg_v1_dup1",
+                "msg_v1_dup2",
+                "msg_v1_lex1",
+                "msg_v1_sem1",
+                "msg_v1_lex2",
+                "msg_v1_sem2",
+                "msg_v1_lex3",
+                "msg_v1_sem3",
+            ],
+            "documents hit by both retrievers must outrank single-retriever hits"
+        );
+
+        let mut paged: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..8 {
+            let (page_ids, next, _, truncation) = hits_of(
+                app.handle(hybrid_req("hybrid needle", 2, token.take()))
+                    .unwrap(),
+            );
+            assert!(!truncation.truncated);
+            paged.extend(page_ids);
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(token.is_none(), "paging must terminate");
+        assert_eq!(
+            paged, unpaged,
+            "paged concatenation must equal the unpaged fused order: a fusion window \
+             that grows with the cursor offset re-fuses a different set on every page"
+        );
     }
 
     #[test]
@@ -3522,6 +4802,7 @@ mod tests {
                         providers: Vec::new(),
                         since: Some(since),
                         until: Some(until),
+                        repo: None,
                     },
                 ))
                 .expect_err("since >= until must be rejected");
@@ -3541,6 +4822,7 @@ mod tests {
             providers: vec![SearchProvider::Codex, SearchProvider::Claude],
             since: Some(seconds_instant(1_000)),
             until: None,
+            repo: None,
         };
         let (_, next, _, _) = hits_of(
             app.handle(filtered_search_req("q", 2, None, issued_filters))
@@ -3554,6 +4836,7 @@ mod tests {
             ],
             since: Some(seconds_instant(1_000)),
             until: None,
+            repo: None,
         };
         assert!(
             app.handle(filtered_search_req(
@@ -3569,9 +4852,26 @@ mod tests {
             providers: Vec::new(),
             since: Some(seconds_instant(2_000)),
             until: None,
+            repo: None,
         };
         let err = app
             .handle(filtered_search_req("q", 2, next.clone(), mutated))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Cursor(cursor::CursorError::Invalid(_))
+        ));
+
+        // repo 维度同样绑定进 digest：同 query 同 provider/time、不同 repo
+        // 的旧令牌必须失效（schema v16）。
+        let mutated_repo = SearchFilters {
+            providers: vec![SearchProvider::Codex, SearchProvider::Claude],
+            since: Some(seconds_instant(1_000)),
+            until: None,
+            repo: Some("github.com/o/app".into()),
+        };
+        let err = app
+            .handle(filtered_search_req("q", 2, next.clone(), mutated_repo))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3594,6 +4894,7 @@ mod tests {
                     providers: vec![SearchProvider::Claude],
                     since: None,
                     until: None,
+                    repo: None,
                 },
             ))
             .unwrap_err();
@@ -3627,12 +4928,24 @@ mod tests {
             "2026-07-28T24:00:00Z",
             "2026-07-28T00:00:00.1234567891Z",
             "2026-07-28T12:00Z",
+            "2026-01-01T-1:00:00Z",
+            "2026-01-01T00:-1:00Z",
+            "2026-01-01T00:00:-1Z",
+            "2026-01-01T-0:00:00Z",
+            "2026-01-01T00:+0:00Z",
+            "2026-01-01T00:00:00+-0:00",
+            "2026-01-01T00:00:00+00:+0",
+            "2026-01-01T00:00:00-25:00",
             "1h",
             "",
         ] {
             assert!(parse_search_instant(value).is_none(), "{value:?}");
         }
         assert!(parse_search_instant("2024-02-29T00:00:00Z").is_some());
+        assert!(
+            parse_search_instant(&format!("{}-12-31T00:00:00Z", i64::MAX)).is_none(),
+            "extreme year arithmetic must fail closed instead of panicking or wrapping"
+        );
     }
 
     #[test]
@@ -3794,7 +5107,20 @@ mod tests {
             &cursor::CursorExpectations {
                 now_ms: clock_t0(),
                 active_generation: 7,
-                query_digest: cursor::digest_query("q"),
+                query_digest: search_query_digest(
+                    "q",
+                    &SearchFilters::EMPTY,
+                    &SearchFacets::default(),
+                    false,
+                    false,
+                    None,
+                    &RetrievalBinding {
+                        requested: RetrievalMode::Lexical,
+                        effective: RetrievalMode::Lexical,
+                        model: None,
+                        embedding: None,
+                    },
+                ),
                 sort_digest: SORT_SCORE_DESC.into(),
                 result_set: None,
             },
@@ -3888,6 +5214,152 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    /// 回归：payload 字节估算必须与 CLI 的 `String::from_utf8_lossy` 渲染逐字节
+    /// 一致。
+    ///
+    /// 缺陷形态：估算器手写了一遍 UTF-8 规则，只按首字节区间取长度、再检查续
+    /// 字节的高两位。它因此把**永不合法**的序列当成合法多字节字符：overlong
+    /// 编码（`C0 80`）、UTF-16 代理区（`ED A0 80`）、超出 U+10FFFF 的首字节
+    /// （`F5..FF`、`F4 90..`）。这些序列 lossy 渲染时逐字节各产出一个 U+FFFD
+    /// （3 字节），估算却只记 2–4 字节——最坏低估到真实值的三分之一，字节闸
+    /// 因此放行超预算的页并报 `truncated: false`。
+    ///
+    /// 断言写成与渲染函数的恒等式：估算只能由同一个 lossy 转换派生，不能靠
+    /// 再实现一遍 UTF-8 校验来"平行推导"。
+    /// 回归：字节闸对**恒发**字段缺值时也必须计费。
+    ///
+    /// 缺陷形态：机器渲染器恒发 `session_id` 与 `text` 两个键（schema 1.1 承诺
+    /// 键不消失，缺值渲染为 `null`），而估算把 `None` 记 0 字节。一条既无归属
+    /// 会话（无 placement）又无 `text` 的命中因此少算 18 字节；同一页约 58 条
+    /// 这样的命中就吃穿 1 KiB 的 envelope 预留，响应超出 `max_response_bytes`
+    /// 却报 `truncated: false`（CONTRACT §3 违约）。
+    ///
+    /// 断言按权威线形态的实际长度写，而不是复述估算表达式。
+    #[test]
+    fn search_hit_charge_covers_always_emitted_null_fields() {
+        let mut hit = SearchHit {
+            id: StableId::from_wire("msg_v1_aaaa").expect("valid wire id"),
+            score: 2.0,
+            session_id: None,
+            text: None,
+            why_matched: Vec::new(),
+            suggested_next_commands: Vec::new(),
+            occurrences: 1,
+            resume_available: false,
+        };
+        // 恒发字段缺值时的权威线形态（protocol schema 1.1）。
+        let null_wire = concat!(
+            r#"{"id":"msg_v1_aaaa","score":2.0,"session_id":null,"text":null,"#,
+            r#""resume_available":false}"#
+        );
+        assert!(
+            search_hit_charge(&hit) >= null_wire.len(),
+            "charge {} must cover the {} rendered bytes of {null_wire}",
+            search_hit_charge(&hit),
+            null_wire.len()
+        );
+        // 带值时同样不得低估（既有行为，一并钉住）。
+        hit.session_id = Some("ses_v1_aaaa".into());
+        hit.text = Some("T".into());
+        let full_wire = concat!(
+            r#"{"id":"msg_v1_aaaa","score":2.0,"session_id":"ses_v1_aaaa","text":"T","#,
+            r#""resume_available":false}"#
+        );
+        assert!(
+            search_hit_charge(&hit) >= full_wire.len(),
+            "charge {} must cover the {} rendered bytes of {full_wire}",
+            search_hit_charge(&hit),
+            full_wire.len()
+        );
+    }
+
+    #[test]
+    fn lossy_payload_estimate_matches_the_rendered_length() {
+        let cases: Vec<Vec<u8>> = vec![
+            // 合法输入：ASCII、转义字符、控制字节、多字节、非 BMP。
+            b"plain ascii".to_vec(),
+            br#"{"quoted":"va\\lue"}"#.to_vec(),
+            vec![0x00, 0x01, 0x1F, 0x7F],
+            "配置备份 café 🦀".as_bytes().to_vec(),
+            Vec::new(),
+            // 截断/孤立续字节（估算器原本已正确处理的形态）。
+            vec![0xE7, 0x95], // 截断的 3 字节序列
+            vec![0x80, 0xBF], // 孤立续字节
+            vec![0xFF, 0xFE],
+            // 永不合法的首字节/序列（缺陷所在）。
+            vec![0xC0, 0x80],             // overlong NUL
+            vec![0xC1, 0xBF],             // overlong
+            vec![0xE0, 0x80, 0x80],       // overlong 3 字节
+            vec![0xF0, 0x80, 0x80, 0x80], // overlong 4 字节
+            vec![0xED, 0xA0, 0x80],       // UTF-16 代理 D800
+            vec![0xED, 0xBF, 0xBF],       // UTF-16 代理 DFFF
+            vec![0xF4, 0x90, 0x80, 0x80], // U+110000，超出上界
+            vec![0xF5, 0x80, 0x80, 0x80], // 首字节超出上界
+            vec![0xF7, 0xBF, 0xBF, 0xBF],
+            // 混合：合法文本夹着非法序列。
+            b"ok\xC0\x80ok\xED\xA0\x80ok".to_vec(),
+        ];
+        for payload in cases {
+            let rendered = json_string_len(&String::from_utf8_lossy(&payload));
+            assert_eq!(
+                lossy_payload_json_len(&payload),
+                rendered,
+                "estimate must equal the rendered length for {payload:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_byte_gate_holds_for_never_valid_utf8_payloads() {
+        // 端到端：`C0 80` 对每字节渲染为一个 U+FFFD（每对 6 字节而非 2 字节）。
+        // 低估时三条全部放行且 `truncated: false`，实际渲染 3789 字节远超净预算
+        // 3072——响应超出 `max_response_bytes` 却声称未截断（CONTRACT §3 违约）。
+        let mut cat = MapCatalog::new(7);
+        let payload: Vec<u8> = [0xC0u8, 0x80].repeat(200);
+        for tag in ["ua", "ub", "uc"] {
+            let id = StableId::derive(IdKind::Message, Stability::Reconstructed, &[tag.as_bytes()]);
+            cat.insert(&id, payload.clone());
+        }
+        let app = App::with_clock(&cat, FakeIndex, clock_t0);
+        let AppResponse::List {
+            entries,
+            truncation,
+            ..
+        } = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget {
+                    max_response_bytes: budget::MIN_RESPONSE_BYTES,
+                    ..Default::default()
+                },
+                sessions_only: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected List response");
+        };
+        let net_bytes = budget::MIN_RESPONSE_BYTES - ENVELOPE_RESERVE_BYTES;
+        // 真实渲染字节（CLI 的 `{"id":...,"payload":<lossy>}` 形态）。
+        let rendered: usize = entries
+            .iter()
+            .map(|entry| {
+                json_string_len(entry.id.as_str())
+                    + json_string_len(&String::from_utf8_lossy(&entry.payload))
+                    + 18
+            })
+            .sum();
+        assert!(
+            rendered <= net_bytes,
+            "kept page renders to {rendered} bytes, over the {net_bytes} net budget"
+        );
+        assert!(!entries.is_empty(), "a page that fits must not be empty");
+        assert!(
+            truncation.truncated && entries.len() < 3,
+            "the over-budget tail must be reported as truncated: {truncation:?}"
+        );
+    }
+
     #[test]
     fn list_byte_gate_counts_serialized_payload_inflation() {
         // payload 含控制字节时，最终 JSON 里每个字节膨胀为 ``（6 字符）；
@@ -3921,6 +5393,206 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert!(truncation.truncated);
+        assert_eq!(
+            truncation.reason.as_deref(),
+            Some(budget::TRUNCATION_MAX_RESPONSE_BYTES)
+        );
+    }
+
+    #[test]
+    fn list_sessions_byte_gate_counts_peek_serialized_bytes() {
+        // peek 是渲染产物，不是免费内容（#7）：字节闸必须按 peek 的实际序列化
+        // 长度计费。每条会话条目 ≈ id(41) + 会话 payload(73) + 骨架(18) +
+        // `,"peek":`(8) + peek(~1002，宽字符被字节闸压到 1 KiB 内) ≈ 1142；
+        // 净预算 3072（4096 - envelope 预留 1024）只容 2 条，第三条必须被截。
+        let mut cat = MapCatalog::new(7);
+        let user_text = "🦀".repeat(1000);
+        for tag in ["sa", "sb", "sc", "sd"] {
+            let session =
+                StableId::derive(IdKind::Session, Stability::Reconstructed, &[tag.as_bytes()]);
+            let message =
+                StableId::derive(IdKind::Message, Stability::Reconstructed, &[tag.as_bytes()]);
+            cat.insert(
+                &message,
+                serde_json::json!({ "role": "user", "text": user_text })
+                    .to_string()
+                    .into_bytes(),
+            );
+            cat.insert(
+                &session,
+                serde_json::json!({ "documents": [], "messages": [message.as_str()] })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let app = App::with_clock(&cat, FakeIndex, clock_t0);
+        let resp = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget {
+                    max_response_bytes: budget::MIN_RESPONSE_BYTES,
+                    ..Default::default()
+                },
+                sessions_only: true,
+            })
+            .unwrap();
+        let AppResponse::List {
+            entries,
+            peeks,
+            truncation,
+            ..
+        } = resp
+        else {
+            panic!("expected List response");
+        };
+        assert_eq!(entries.len(), peeks.len(), "peeks must align with entries");
+        assert_eq!(entries.len(), 2, "3072 net bytes fit two peeked sessions");
+        assert_eq!(
+            truncation.reason.as_deref(),
+            Some(budget::TRUNCATION_MAX_RESPONSE_BYTES)
+        );
+        for peek in peeks.iter().flatten() {
+            assert!(peek.json_len() <= peek::PEEK_MAX_BYTES);
+        }
+        // 未截断的对照：宽松预算下四条全保留，且每条都带 peek。
+        let resp = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget::default(),
+                sessions_only: true,
+            })
+            .unwrap();
+        let AppResponse::List {
+            entries,
+            peeks,
+            truncation,
+            ..
+        } = resp
+        else {
+            panic!("expected List response");
+        };
+        assert_eq!(entries.len(), 4);
+        assert!(peeks.iter().all(Option::is_some));
+        assert!(!truncation.truncated);
+    }
+
+    #[test]
+    fn list_sessions_attaches_titles_aligned_with_entries() {
+        // 标题投影（#6，schema v13）：sessions_only 列表逐条附派生标题，
+        // 与 entries/peeks 逐位对齐；无标题会话为 None；普通 list 全 None。
+        let mut cat = MapCatalog::new(7);
+        let titled = StableId::derive(IdKind::Session, Stability::Reconstructed, &[b"tsa"]);
+        let untitled = StableId::derive(IdKind::Session, Stability::Reconstructed, &[b"tsb"]);
+        for session in [&titled, &untitled] {
+            cat.insert(
+                session,
+                serde_json::json!({ "documents": [], "messages": [] })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        cat.set_title(&titled, "synthetic title");
+        let app = App::with_clock(&cat, FakeIndex, clock_t0);
+        let resp = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget::default(),
+                sessions_only: true,
+            })
+            .unwrap();
+        let AppResponse::List {
+            entries,
+            peeks,
+            titles,
+            ..
+        } = resp
+        else {
+            panic!("expected List response");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), peeks.len(), "peeks must align with entries");
+        assert_eq!(
+            entries.len(),
+            titles.len(),
+            "titles must align with entries"
+        );
+        let titled_index = entries
+            .iter()
+            .position(|entry| entry.id.as_str() == titled.as_str())
+            .expect("titled session listed");
+        let untitled_index = entries
+            .iter()
+            .position(|entry| entry.id.as_str() == untitled.as_str())
+            .expect("untitled session listed");
+        assert_eq!(titles[titled_index].as_deref(), Some("synthetic title"));
+        assert_eq!(titles[untitled_index], None);
+
+        // 普通 list（非 sessions_only）不附标题。
+        let resp = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget::default(),
+                sessions_only: false,
+            })
+            .unwrap();
+        let AppResponse::List { titles, .. } = resp else {
+            panic!("expected List response");
+        };
+        assert!(titles.iter().all(Option::is_none), "{titles:?}");
+    }
+
+    #[test]
+    fn list_sessions_byte_gate_counts_title_serialized_bytes() {
+        // 标题是渲染产物，不是免费内容（#6）：字节闸必须按标题的序列化长度
+        // 计费。每条带 500 个 emoji 标题（≈2 KiB 序列化）的会话条目超过净预算
+        // 3072 的 1/2——只容 1 条；同一目录去掉标题后 4 条全保留。
+        let mut cat = MapCatalog::new(7);
+        for tag in ["ta", "tb", "tc", "td"] {
+            let session =
+                StableId::derive(IdKind::Session, Stability::Reconstructed, &[tag.as_bytes()]);
+            cat.insert(
+                &session,
+                serde_json::json!({ "documents": [], "messages": [] })
+                    .to_string()
+                    .into_bytes(),
+            );
+            cat.set_title(&session, "🦀".repeat(500));
+        }
+        let app = App::with_clock(&cat, FakeIndex, clock_t0);
+        let resp = app
+            .handle(AppRequest::List {
+                limit: 10,
+                cursor: None,
+                budget: ResponseBudget {
+                    max_response_bytes: budget::MIN_RESPONSE_BYTES,
+                    ..Default::default()
+                },
+                sessions_only: true,
+            })
+            .unwrap();
+        let AppResponse::List {
+            entries,
+            titles,
+            truncation,
+            ..
+        } = resp
+        else {
+            panic!("expected List response");
+        };
+        assert_eq!(
+            entries.len(),
+            titles.len(),
+            "titles must align with entries even after clamping"
+        );
+        assert!(titles.iter().all(Option::is_some));
+        assert!(
+            entries.len() < 4,
+            "title bytes must be charged: {entries:?}"
+        );
         assert_eq!(
             truncation.reason.as_deref(),
             Some(budget::TRUNCATION_MAX_RESPONSE_BYTES)
@@ -5443,6 +7115,7 @@ mod tests {
                 sink: &mut dyn CanonicalEventSink,
             ) -> Result<agent_session_grep_ports::ParseReport, ProviderError> {
                 sink.emit_message(MessageEvent {
+                    session: None,
                     seq: 0,
                     native_id: "m-1",
                     parent_native_id: None,
@@ -5454,6 +7127,7 @@ mod tests {
                 })
                 .map_err(|e| ProviderError::Io(e.to_string()))?;
                 sink.emit_message(MessageEvent {
+                    session: None,
                     seq: 1,
                     native_id: "m-2",
                     parent_native_id: None,
@@ -5736,6 +7410,7 @@ mod tests {
             sink: &mut dyn CanonicalEventSink,
         ) -> Result<agent_session_grep_ports::ParseReport, ProviderError> {
             sink.emit_message(MessageEvent {
+                session: None,
                 seq: 0,
                 native_id: "m-1",
                 parent_native_id: None,
@@ -5921,9 +7596,17 @@ mod tests {
             panic!("expected Search response");
         };
         assert_eq!(hits.len(), 3);
-        assert!(hits[0].resume_available, "claimed session must be true");
-        assert!(!hits[1].resume_available, "unclaimed session must be false");
-        assert!(!hits[2].resume_available, "no session_id must be false");
+        // rank signals 把同分命中重钉为 wire id 升序，位置断言改为按 id 查找，
+        // 保持"有声明 → true；无声明/无归属 → false"的语义不变。
+        let resume_of = |tag: &str| {
+            hits.iter()
+                .find(|hit| hit.id == hit_id(tag))
+                .unwrap_or_else(|| panic!("missing hit {tag}"))
+                .resume_available
+        };
+        assert!(resume_of("hit00"), "claimed session must be true");
+        assert!(!resume_of("hit01"), "unclaimed session must be false");
+        assert!(!resume_of("hit02"), "no session_id must be false");
     }
 
     #[test]

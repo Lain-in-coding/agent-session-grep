@@ -10,6 +10,7 @@ use agent_session_grep_ports::{
 };
 use agent_session_grep_provider_claude::ClaudeCodeAdapter;
 use agent_session_grep_testkit::assert_read_only;
+use agent_session_grep_testkit::golden;
 use serde_json::{Value, json};
 
 /// fixture 与期望文件随 crate 固定存放；以 manifest 目录定位，不依赖 cwd。
@@ -17,6 +18,14 @@ const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/ba
 const EXPECTED_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/golden/basic.expected.json"
+);
+/// extended thinking 语料：正文只在 `thinking` 键上的 block（真实语料里最常见
+/// 的一类 assistant 记录），`basic.jsonl` 完全没有覆盖它。
+const THINKING_FIXTURE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/thinking.jsonl");
+const THINKING_EXPECTED_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/thinking.expected.json"
 );
 
 /// 收集 emit 的消息事件（每个测试目标自持一份本地 helper，与单元测试同构）。
@@ -220,4 +229,76 @@ fn golden_spans_slice_back_to_exact_source_lines() {
             m.seq
         );
     }
+}
+
+// ---- extended thinking 语料（thinking.jsonl）----
+//
+// `basic.jsonl` 没有一条 `{"type":"thinking","thinking":…}` block，所以"thinking
+// 正文被整条丢弃"这个缺陷在 golden 全绿的情况下存活了下来。本机真实语料普查
+// （`~/.claude/projects` 全量）里 158,293 条 assistant 记录有 34,989 条只含
+// thinking block——它们此前一律以空正文计入 committed。新增本 fixture 把该形状
+// 钉住，读取/投影复用 testkit 的共享脚手架。
+
+#[test]
+fn thinking_golden_canonical_output_is_pinned() {
+    let expected = golden::read_expected(THINKING_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(THINKING_FIXTURE_PATH, &expected);
+    let (report, sink) = golden::parse_golden(&ClaudeCodeAdapter::new(), &bytes);
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let actual = golden::canonical_json(&hash, &report, &sink.messages);
+    let actual_pretty = serde_json::to_string_pretty(&actual).expect("serialize actual");
+    assert_eq!(
+        actual, expected,
+        "thinking canonical 输出与 pinned 期望不一致——parser 行为漂移或 fixture 未经评审变更。actual =\n{actual_pretty}"
+    );
+}
+
+#[test]
+fn thinking_golden_never_commits_an_empty_body() {
+    // 这条是本 fixture 存在的理由：thinking-only 记录必须产出可检索正文。
+    // 空正文却计入 committed = 宣称索引了检索不到的内容
+    // （与 `capability_parse_claim_matches_real_parse_on_own_golden` 同一口径）。
+    let expected = golden::read_expected(THINKING_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(THINKING_FIXTURE_PATH, &expected);
+    let (report, sink) = golden::parse_golden(&ClaudeCodeAdapter::new(), &bytes);
+    assert_eq!(report.committed, sink.messages.len());
+    assert!(report.committed > 0, "fixture must exercise message output");
+    for m in &sink.messages {
+        assert!(
+            !m.text.trim().is_empty(),
+            "seq={}: thinking 语料不得出现空正文消息",
+            m.seq
+        );
+    }
+}
+
+#[test]
+fn thinking_golden_probe_and_parse_never_mutate_source_bytes() {
+    let expected = golden::read_expected(THINKING_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(THINKING_FIXTURE_PATH, &expected);
+    assert_read_only(&bytes, |source| ClaudeCodeAdapter::new().probe(source))
+        .expect("thinking golden probe must succeed");
+    let mut sink = golden::CapturingSink::default();
+    let report = assert_read_only(&bytes, |source| {
+        ClaudeCodeAdapter::new().parse(source, &mut sink)
+    })
+    .expect("thinking golden parse must succeed");
+    assert_eq!(report.committed, sink.messages.len());
+}
+
+/// 手动再生辅助：
+/// ```text
+/// cargo test -p agent-session-grep-provider-claude --test golden -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual regeneration helper — prints canonical JSON for thinking.expected.json"]
+fn print_actual_thinking_canonical_output_for_regeneration() {
+    let bytes = std::fs::read(THINKING_FIXTURE_PATH).expect("read thinking.jsonl fixture");
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let (report, sink) = golden::parse_golden(&ClaudeCodeAdapter::new(), &bytes);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&golden::canonical_json(&hash, &report, &sink.messages))
+            .expect("serialize canonical output")
+    );
 }

@@ -154,7 +154,20 @@ print(value)
 ' "$1"
 }
 
-# 1. doctor on a fresh store: opening it creates and migrates the schema.
+# An absent catalog stays absent on read; SQLite open failures map to catalog_error.
+run_robot doctor
+assert_envelope 'doctor-absent' 6 'f["error"]["code"] == "catalog_error"'
+[ ! -e "$db" ] || fail 'doctor created an absent database'
+pass 'doctor reports catalog_error without creating an absent database'
+
+# 1. Only an explicit write initializes the fresh store; doctor is read-only.
+run_robot sync "$fixture"
+assert_envelope 'sync' 0 \
+    'f["ok"] is True' \
+    'f["data"]["messages"] == 3'
+pass 'sync ingested 3 messages from the synthetic fixture'
+
+# 2. doctor on the initialized store reports its schema without migrating it.
 #    run_robot already prepends --db "$db" --robot; passing --db again here
 #    yields a duplicate flag and fails the first smoke step.
 run_robot doctor
@@ -163,13 +176,6 @@ assert_envelope 'doctor' 0 \
     'f["data"]["db"] == "ok"' \
     'isinstance(f["data"]["schema"], int)'
 pass 'doctor reports db ok with a numeric schema'
-
-# 2. sync the synthetic fixture: all three conversational records must land.
-run_robot sync "$fixture"
-assert_envelope 'sync' 0 \
-    'f["ok"] is True' \
-    'f["data"]["messages"] == 3'
-pass 'sync ingested 3 messages from the synthetic fixture'
 
 # 3. search for the fixture token; hits are message-level entities.
 run_robot search "$term"
@@ -231,6 +237,96 @@ assert_envelope 'cursor-invalid' 2 \
     'f["error"]["code"] == "cursor_invalid"'
 pass 'garbage cursor yields exit 2 with error.code cursor_invalid'
 
+# Advertised provider filters must accept every implemented row. A distinct
+# Grok source makes filter enforcement observable, including semantic modes.
+grok_fixture="$workdir/grok.jsonl"
+cat > "$grok_fixture" <<'EOF'
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"smokegrokfilter retained message"},"_meta":{"promptIndex":0}}}
+EOF
+run_robot sync "$grok_fixture"
+assert_envelope 'sync-grok' 0 'f["data"]["messages"] == 1'
+run_robot providers
+assert_envelope 'providers' 0 'len([p for p in f["data"]["providers"] if p["maturity"] != "unsupported"]) > 2'
+filterable=$(envelope_value '"\n".join(p["provider_id"] for p in f["data"]["providers"] if p["maturity"] != "unsupported")')
+while IFS= read -r provider; do
+    run_robot search 'smokegrokfilter' --provider "$provider"
+    expected=0
+    if [ "$provider" = 'grok-build' ]; then expected=1; fi
+    assert_envelope "provider-filter-$provider" 0 "len(f[\"data\"][\"hits\"]) == $expected"
+done <<< "$filterable"
+pass 'every advertised implemented provider filter selects the right messages'
+run_robot index embeddings
+assert_envelope 'index-embeddings' 0 'f["data"]["indexed"] == 4'
+for retrieval_mode in semantic hybrid; do
+    run_robot search 'smokegrokfilter' --provider grok-build --mode "$retrieval_mode"
+    assert_envelope "search-$retrieval_mode" 0 \
+        "f[\"data\"][\"retrieval_mode\"] == '$retrieval_mode'" \
+        'len(f["data"]["hits"]) == 1'
+done
+pass 'CLI semantic and hybrid use the index and Grok filter'
+
+# Relocation covers the installed CLI surface using a separate synthetic store.
+# The script moves its own fixture; the binary only reconnects catalog locators.
+relocation_area="$workdir/relocation"
+relocation_old="$relocation_area/old-installation"
+relocation_new="$relocation_area/new-installation"
+relocation_backup="$relocation_area/catalog-backup.db"
+mkdir -p "$relocation_old"
+cp "$fixture" "$relocation_old/session.jsonl"
+saved_db="$db"
+db="$relocation_area/catalog.db"
+run_robot relocate --provider claude --from "$relocation_old" --to "$relocation_new"
+assert_envelope 'relocate-absent' 6 'f["error"]["code"] == "catalog_error"'
+[ ! -e "$db" ] || fail 'relocate preview created an absent catalog'
+pass 'relocate preview refuses an absent catalog without creating it'
+run_robot sync "$relocation_old/session.jsonl"
+assert_envelope 'relocate-fixture' 0 'f["data"]["messages"] == 3'
+relocation_generation=$(envelope_value 'f["data"]["generation"]')
+run_robot search "$term"
+assert_envelope 'relocate-session' 0 'len(f["data"]["hits"]) > 0'
+relocation_session=$(envelope_value 'f["data"]["hits"][0]["session_id"]')
+mv "$relocation_old" "$relocation_new"
+catalog_hash=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$db")
+run_robot relocate --provider claude --from "$relocation_old" --to "$relocation_new" --alias-ttl-days 7
+assert_envelope 'relocate-preview' 0 \
+    'f["command"] == "relocate.preview"' \
+    'f["data"]["status"] == "planned"' \
+    'f["data"]["source_count"] == 1 and f["data"]["session_count"] == 1' \
+    'f["data"]["alias_ttl_days"] == 7' \
+    '"from" not in f["data"] and "to" not in f["data"] and "backup" not in f["data"]'
+relocation_plan=$(envelope_value 'f["data"]["plan"]')
+after_hash=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$db")
+[ "$catalog_hash" = "$after_hash" ] || fail 'relocate preview changed the catalog'
+[ ! -e "$relocation_backup" ] || fail 'relocate preview created a backup'
+pass 'relocate preview is read-only and returns bounded counts and an opaque plan'
+run_robot relocate --provider claude --from "$relocation_old" --to "$relocation_new" --alias-ttl-days 7 --apply --plan "$relocation_plan" --backup "$relocation_backup"
+assert_envelope 'relocate-apply' 0 \
+    'f["command"] == "relocate.apply"' \
+    'f["data"]["status"] == "applied"' \
+    "f[\"data\"][\"generation\"] == $((relocation_generation + 1))"
+[ -f "$relocation_backup" ] || fail 'relocate apply did not produce a backup'
+cmp "$fixture" "$relocation_new/session.jsonl" >/dev/null || fail 'relocate apply changed provider source bytes'
+pass 'relocate apply advances generation once and leaves source bytes unchanged'
+db="$relocation_backup"
+run_robot status
+assert_envelope 'relocate-backup' 0 "f[\"data\"][\"generation\"] == $relocation_generation"
+db="$relocation_area/catalog.db"
+run_robot sync "$relocation_new/session.jsonl"
+assert_envelope 'relocate-resync' 0 "f[\"data\"][\"generation\"] == $((relocation_generation + 1))"
+run_robot context "$relocation_session"
+assert_envelope 'relocate-old-id' 0 'len(f["data"]["messages"]) > 0'
+run_robot relocate --provider claude --from "$relocation_old" --to "$relocation_new" --alias-ttl-days 7
+assert_envelope 'relocate-repeat' 0 \
+    'f["command"] == "relocate.preview" and f["data"]["status"] == "unchanged"' \
+    "f[\"data\"][\"generation\"] == $((relocation_generation + 1))"
+pass 'relocation backup, old-ID lookup, re-sync and repeated preview preserve their contracts'
+run_robot relocate --help
+assert_envelope 'relocate-help' 0 'f["ok"] is True'
+run_robot providers
+assert_envelope 'relocate-capability' 0 'f["data"]["relocation"]["interfaces"] == ["cli"]'
+pass 'relocate help and capability metadata remain CLI-only'
+db="$saved_db"
+
 # 9. MCP stdio handshake: stdout must carry nothing but JSON-RPC frames, and
 #    EOF on stdin must shut the server down cleanly.
 mcp_in="$workdir/mcp-in.jsonl"
@@ -243,6 +339,10 @@ cat > "$mcp_in" <<'EOF'
 EOF
 printf '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_message","arguments":{"message_id":"%s","session_id":"%s","around":0}}}\n' \
     "$anchor_id" "$session_id" >> "$mcp_in"
+cat >> "$mcp_in" <<'EOF'
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_sessions","arguments":{"query":"smokegrokfilter","providers":["grok-build"],"mode":"semantic"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_sessions","arguments":{"query":"smokegrokfilter","providers":["grok-build"],"mode":"hybrid"}}}
+EOF
 
 set +e
 "$binary" --db "$db" mcp <"$mcp_in" >"$mcp_out" 2>"$workdir/mcp-stderr.txt"
@@ -270,7 +370,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
             sys.exit(1)
 
 by_id = {frame.get("id"): frame for frame in frames}
-for expected in (1, 2, 3, 4):
+for expected in (1, 2, 3, 4, 5, 6):
     if expected not in by_id:
         print(f"missing JSON-RPC response for id {expected}", file=sys.stderr)
         sys.exit(1)
@@ -298,12 +398,21 @@ if message_data.get("message_id") != sys.argv[2]:
 if len(message_data.get("messages", [])) != 1:
     print("get_message around=0 must return exactly one message", file=sys.stderr)
     sys.exit(1)
+
+for request_id, mode in ((5, "semantic"), (6, "hybrid")):
+    search_result = by_id[request_id].get("result", {})
+    search_data = search_result.get("structuredContent", {}).get("data", {})
+    if (search_result.get("isError") is not False
+            or search_data.get("retrieval_mode") != mode
+            or len(search_data.get("hits", [])) != 1):
+        print(f"MCP {mode} must use the index and Grok filter", file=sys.stderr)
+        sys.exit(1)
 ' "$mcp_out" "$anchor_id"; then
     printf 'smoke: mcp: handshake assertions failed\n' >&2
     cat "$mcp_out" >&2
     exit 1
 fi
-pass 'MCP stdio handshake: 9 tools listed, get_status and get_message succeeded'
+pass 'MCP stdio: 9 tools, status, message, indexed semantic and hybrid search'
 
 printf 'smoke: all %d assertions passed against %s\n' "$step" "$binary"
 exit 0

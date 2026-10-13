@@ -1,5 +1,12 @@
 # Go/No-Go Report — agent-session-grep v0.1.0 (draft, 2026-08-16)
 
+> Historical draft, not a current release decision. Preserve the recorded
+> results and limitations below as historical context. The canonical repository
+> already has a `0.1.0` release; old no-release/CI-blocker statements below do
+> not describe its current state. Reassess a new candidate using
+> [the owner checklist](OWNER-RELEASE-CHECKLIST.md) and the go/no-go template.
+
+
 > Non-template draft. Conclusion is **No-Go**: local P0 gaps and external
 > release gates remain open. This draft records the rehearsal evidence and the
 > residual risks; it is submitted for the owner's final decision, not as a
@@ -126,8 +133,8 @@ Claude/Codex certified — currently 0 Beta. **Not release-ready per provider ga
 3. **External**: cross-platform CI remains blocked. Publication itself is
    **closed 2026-08-18**: the clean public tree was exported via
    `scripts/release/export_public_tree.py` (privacy scan 0 findings), pushed to
-   `qin-devs/agent-session-grep` (`main`), and the `v0.1.0` tag + GitHub Release
-   published (https://github.com/qin-devs/agent-session-grep/releases/tag/v0.1.0).
+   `Lain-in-coding/agent-session-grep` (`main`), and the `v0.1.0` tag + GitHub Release
+   published (https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0).
    Still open: Authenticode/notarization/cosign; branch protection; ADR
    signing/owner decisions.
 4. **macOS**: rehearsal not run (external CI blocker).

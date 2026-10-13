@@ -1,0 +1,2 @@
+{"timestamp":"2026-01-04T00:00:00Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"object-shaped user"}},"_meta":{"promptIndex":0}}}
+{"timestamp":"2026-01-04T00:00:01Z","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"object-shaped assistant"}},"_meta":{"promptId":"object-prompt-1"}}}

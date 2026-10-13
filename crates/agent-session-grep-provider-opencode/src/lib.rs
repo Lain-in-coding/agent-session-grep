@@ -72,16 +72,16 @@ impl ProviderAdapter for OpenCodeAdapter {
 
         matched.push("SQLite magic header detected".into());
 
-        // Open read-only and check for OpenCode tables.
-        // _temp_db drops after conn: the guard deletes the temp file once the
-        // connection is closed (Windows cannot delete an open file).
-        let (conn, _temp_db) = open_readonly_from_bytes(bytes)
+        // Open read-only and check for OpenCode tables. `db` unlinks the temp
+        // copy when it goes out of scope (see `TempDb`).
+        let db = open_readonly_from_bytes(bytes)
             .map_err(|e| ProviderError::StructuralFatal(format!("failed to open SQLite: {e}")))?;
+        let conn = &db.conn;
 
         // Check for OpenCode-specific tables: session, message, part.
-        let has_session = table_exists(&conn, "session");
-        let has_message = table_exists(&conn, "message");
-        let has_part = table_exists(&conn, "part");
+        let has_session = table_exists(conn, "session")?;
+        let has_message = table_exists(conn, "message")?;
+        let has_part = table_exists(conn, "part")?;
 
         if !has_session {
             return Err(ProviderError::AmbiguousVariant(
@@ -116,10 +116,10 @@ impl ProviderAdapter for OpenCodeAdapter {
     ) -> Result<ParseReport, ProviderError> {
         let mut report = ParseReport::default();
 
-        // _temp_db drops after conn (see probe): the temp file is deleted once
-        // the connection is closed.
-        let (conn, _temp_db) = open_readonly_from_bytes(bytes)
+        // `db` unlinks the temp copy when it goes out of scope (see `TempDb`).
+        let db = open_readonly_from_bytes(bytes)
             .map_err(|e| ProviderError::StructuralFatal(format!("failed to open SQLite: {e}")))?;
+        let conn = &db.conn;
 
         // Query messages with their session and role.
         // Schema (from fast-resume):
@@ -127,112 +127,135 @@ impl ProviderAdapter for OpenCodeAdapter {
         //   message(id, session_id, data)  -- data is JSON with role
         //   part(id, message_id, data)     -- data is JSON with type/text
 
-        // Collect session metadata.
-        let mut session_meta: std::collections::HashMap<String, (Option<String>, Option<String>)> =
-            std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT id, title, directory FROM session")
-            && let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
+        let sql_error = |error: rusqlite::Error| {
+            ProviderError::StructuralFatal(format!("OpenCode SQLite query failed: {error}"))
+        };
+        let mut session_meta = std::collections::BTreeMap::new();
+        let mut stmt = conn
+            .prepare("SELECT id, directory FROM session ORDER BY id")
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })
-        {
-            for row in rows.filter_map(Result::ok) {
-                session_meta.insert(row.0, (row.1, row.2));
+            .map_err(sql_error)?;
+        for row in rows {
+            let (id, directory) = row.map_err(sql_error)?;
+            if id.trim().is_empty() {
+                return Err(ProviderError::StructuralFatal(
+                    "OpenCode session id is empty".into(),
+                ));
             }
+            let cwd = directory.filter(|value| !value.trim().is_empty());
+            session_meta.insert(
+                id.clone(),
+                agent_session_grep_ports::ProviderSessionIdentity {
+                    source_key: id.clone(),
+                    observation: agent_session_grep_ports::ProviderSessionObservation {
+                        provider_session_id: MetadataResolution::Resolved(id),
+                        original_working_directory: cwd
+                            .clone()
+                            .map(MetadataResolution::Resolved)
+                            .unwrap_or_default(),
+                        pair_observed: cwd.is_some(),
+                        multi_session: false,
+                    },
+                },
+            );
         }
 
-        // Collect text parts by message_id.
         let mut parts_by_message: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT message_id, json_extract(data, '$.text') FROM part \
-             WHERE json_extract(data, '$.type') = 'text' ORDER BY time_created ASC",
-        ) && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
-        }) {
-            for (msg_id, text) in rows.filter_map(Result::ok) {
-                if !text.is_empty() {
-                    parts_by_message.entry(msg_id).or_default().push(text);
-                }
+        let mut stmt = conn
+            .prepare(
+                "SELECT message_id, json_extract(data, '$.text') FROM part \
+             WHERE json_extract(data, '$.type') = 'text' ORDER BY time_created ASC, id ASC",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (msg_id, text) = row.map_err(sql_error)?;
+            if !text.is_empty() {
+                parts_by_message.entry(msg_id).or_default().push(text);
             }
         }
 
-        // Query messages ordered by time.
         let mut seq: u32 = 0;
-        let mut session_ids: Vec<String> = Vec::new();
-
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session_id, json_extract(data, '$.role') \
-             FROM message ORDER BY time_created ASC",
-        ) && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?, // message id
-                row.get::<_, String>(1)?, // session_id
-                row.get::<_, String>(2)?, // role
-            ))
-        }) {
-            for (msg_id, sess_id, role) in rows.filter_map(Result::ok) {
-                if !matches!(role.as_str(), "user" | "assistant") {
-                    continue;
-                }
-                let parts = parts_by_message.get(&msg_id);
-                let text = match parts {
-                    Some(parts) if !parts.is_empty() => parts.join("\n"),
-                    _ => continue,
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-
-                // Session identity from first message.
-                if report.session_native_id.is_none() {
-                    report.session_native_id = Some(sess_id.clone());
-                    report.session_observation.provider_session_id =
-                        MetadataResolution::Resolved(sess_id.clone());
-                    if let Some((_, cwd)) = session_meta.get(&sess_id)
-                        && let Some(cwd) = cwd
-                        && !cwd.trim().is_empty()
-                    {
-                        report.session_observation.original_working_directory =
-                            MetadataResolution::Resolved(cwd.trim().to_string());
-                        report.session_observation.pair_observed = true;
-                    }
-                }
-                if !session_ids.iter().any(|s| s == &sess_id) {
-                    session_ids.push(sess_id.clone());
-                }
-
-                sink.emit_message(MessageEvent {
-                    seq,
-                    native_id: &msg_id,
-                    parent_native_id: None,
-                    role: &role,
-                    text: &text,
-                    timestamp: None,
-                    is_sidechain: false,
-                    span: None, // SQLite doesn't have byte spans
-                })
-                .map_err(|e| ProviderError::StructuralFatal(e.to_string()))?;
-                seq += 1;
-                report.committed += 1;
+        let mut session_ids = std::collections::BTreeSet::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, json_extract(data, '$.role') \
+             FROM message ORDER BY time_created ASC, id ASC",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (msg_id, sess_id, role) = row.map_err(sql_error)?;
+            // A decoded SQL value lacking a textual role is a malformed
+            // provider record, counted as skipped. Prepare/query/row-decoding
+            // failures above remain fatal; no backend error is swallowed.
+            let rusqlite::types::Value::Text(role) = role else {
+                report.skipped += 1;
+                report
+                    .diagnostics
+                    .push("OpenCode message has no textual role; skipped".into());
+                continue;
+            };
+            if !matches!(role.as_str(), "user" | "assistant") {
+                continue;
             }
+            let text = match parts_by_message.get(&msg_id) {
+                Some(parts) => parts.join("\n"),
+                None => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let session = session_meta.get(&sess_id).ok_or_else(|| {
+                ProviderError::StructuralFatal(
+                    "OpenCode message references an unknown session".into(),
+                )
+            })?;
+            if report.session_native_id.is_none() {
+                report.session_native_id = Some(sess_id.clone());
+                report.session_observation = session.observation.clone();
+            }
+            session_ids.insert(sess_id);
+            sink.emit_message(MessageEvent {
+                session: Some(session),
+                seq,
+                native_id: &msg_id,
+                parent_native_id: None,
+                role: &role,
+                text: &text,
+                timestamp: None,
+                is_sidechain: false,
+                span: None,
+            })
+            .map_err(|e| ProviderError::StructuralFatal(e.to_string()))?;
+            seq = seq.checked_add(1).ok_or_else(|| {
+                ProviderError::StructuralFatal("too many OpenCode messages".into())
+            })?;
+            report.committed += 1;
         }
-
-        // Multi-session diagnostic.
         if session_ids.len() > 1 {
             report.session_observation.multi_session = true;
             report.session_observation.provider_session_id = MetadataResolution::Ambiguous;
-            report.diagnostics.push(format!(
-                "数据库包含 {} 个不同 session——单文件=单会话，全部消息归属首个会话 {}",
-                session_ids.len(),
-                session_ids[0]
-            ));
         }
 
         Ok(report)
@@ -254,50 +277,79 @@ fn temp_file_suffix() -> String {
     )
 }
 
-/// Deletes the temp SQLite file when dropped. Must be dropped AFTER the
-/// `Connection` (Windows cannot delete an open file), so callers bind it in a
-/// tuple pattern after the connection: `let (conn, _temp) = ...`.
+/// Deletes the owned temp SQLite database and sidecars after its connection closes.
+/// A final read-only connection may leave WAL/SHM files behind.
 struct TempDbGuard {
     path: std::path::PathBuf,
 }
 
 impl Drop for TempDbGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut owned_file = self.path.as_os_str().to_os_string();
+            owned_file.push(suffix);
+            let _ = std::fs::remove_file(std::path::Path::new(&owned_file));
+        }
+    }
+}
+
+/// A read-only connection over a temp copy of the source bytes, bundled with the
+/// guard that unlinks that copy.
+///
+/// **Field order is load-bearing.** Struct fields drop in declaration order, so
+/// `conn` closes the database before `_guard` unlinks the file. Windows refuses
+/// to delete a file that is still open and `remove_file`'s error is discarded, so
+/// the reverse order leaks every temp copy silently. A tuple binding
+/// (`let (conn, guard) = ...`) drops the *later* binding first — i.e. the guard
+/// while the connection is still open — which is exactly the broken order this
+/// struct exists to prevent.
+struct TempDb {
+    conn: Connection,
+    _guard: TempDbGuard,
+}
+
+impl TempDb {
+    /// Path of the temp copy backing this connection.
+    #[cfg(test)]
+    fn temp_path(&self) -> &std::path::Path {
+        &self._guard.path
     }
 }
 
 /// Open a SQLite database from bytes, read-only.
 ///
 /// Writes bytes to a temp file, opens with SQLITE_OPEN_READONLY + busy_timeout,
-/// and returns the connection plus a guard that deletes the temp file when the
-/// connection has been dropped.
-fn open_readonly_from_bytes(bytes: &[u8]) -> Result<(Connection, TempDbGuard), String> {
+/// and returns a [`TempDb`] that deletes the temp copy once it goes out of scope.
+fn open_readonly_from_bytes(bytes: &[u8]) -> Result<TempDb, String> {
     let temp_dir = std::env::temp_dir();
     let temp_path = temp_dir.join(format!("asg-opencode-{}.db", temp_file_suffix()));
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
+    let guard = TempDbGuard { path: temp_path };
+    let mut file = std::fs::File::create(&guard.path).map_err(|e| e.to_string())?;
     file.write_all(bytes).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
 
     let conn = Connection::open_with_flags(
-        &temp_path,
+        &guard.path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(1))
         .map_err(|e| e.to_string())?;
 
-    Ok((conn, TempDbGuard { path: temp_path }))
+    Ok(TempDb {
+        conn,
+        _guard: guard,
+    })
 }
 
 /// Check if a table exists in the database.
-fn table_exists(conn: &Connection, table_name: &str) -> bool {
-    conn.prepare(&format!(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'"
-    ))
-    .and_then(|mut stmt| stmt.exists([]))
-    .unwrap_or(false)
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, ProviderError> {
+    conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")
+        .and_then(|mut stmt| stmt.exists([table_name]))
+        .map_err(|error| {
+            ProviderError::StructuralFatal(format!("OpenCode SQLite schema query failed: {error}"))
+        })
 }
 
 #[cfg(test)]
@@ -314,6 +366,91 @@ mod tests {
         assert_eq!(manifest.capabilities.variant_id, VARIANT_ID);
         assert!(manifest.last_certified_targets.is_empty());
         assert_eq!(manifest.fixture_revision, Some(1));
+    }
+
+    fn assert_wal_temp_copy_cleanup(query: &str, should_fail: bool) {
+        let fixture = TempDbGuard {
+            path: std::env::temp_dir().join(format!(
+                "asg-opencode-wal-fixture-{}.db",
+                temp_file_suffix()
+            )),
+        };
+        let writer = Connection::open(&fixture.path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE cleanup_fixture (value INTEGER);
+                 INSERT INTO cleanup_fixture VALUES (7);",
+            )
+            .unwrap();
+        drop(writer);
+        let bytes = std::fs::read(&fixture.path).unwrap();
+        let mut copy_path = None;
+        let result = (|| -> rusqlite::Result<i64> {
+            let db = open_readonly_from_bytes(&bytes).unwrap();
+            let path = db.temp_path().to_path_buf();
+            // A real read materializes the private WAL/SHM files.
+            db.conn
+                .query_row("SELECT value FROM cleanup_fixture", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                assert!(std::path::Path::new(&sidecar).exists());
+            }
+            copy_path = Some(path);
+            // The error case returns while TempDb is still a local owner.
+            db.conn.query_row(query, [], |row| row.get(0))
+        })();
+        assert_eq!(result.is_err(), should_fail);
+        let path = copy_path.unwrap();
+        let mut remaining = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut owned_file = path.as_os_str().to_os_string();
+            owned_file.push(suffix);
+            let owned_file = std::path::Path::new(&owned_file);
+            if owned_file.exists() {
+                remaining.push(suffix);
+                // Do not leave this test's files behind when the assertion fails.
+                std::fs::remove_file(owned_file).unwrap();
+            }
+        }
+        assert!(
+            remaining.is_empty(),
+            "temporary SQLite files leaked: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn wal_temp_copy_cleans_sidecars_after_success() {
+        assert_wal_temp_copy_cleanup("SELECT value FROM cleanup_fixture", false);
+    }
+
+    #[test]
+    fn wal_temp_copy_cleans_sidecars_after_query_error() {
+        assert_wal_temp_copy_cleanup("SELECT missing_column FROM cleanup_fixture", true);
+    }
+
+    #[test]
+    fn temp_copy_is_unlinked_once_the_connection_goes_out_of_scope() {
+        // Regression: the guard used to be returned next to the connection in a
+        // tuple, and a tuple binding drops the *later* binding first — so the
+        // unlink ran while SQLite still held the file open. Windows refuses that
+        // delete and `remove_file`'s error is discarded, so every parse silently
+        // leaked its temp copy. `TempDb`'s field order fixes the sequence; this
+        // test fails if the pairing is ever unbundled again.
+        let db_bytes = create_test_opencode_db();
+        let leaked_path = {
+            let db = open_readonly_from_bytes(&db_bytes).unwrap();
+            let path = db.temp_path().to_path_buf();
+            assert!(path.exists(), "temp copy must exist while the db is open");
+            path
+        };
+        assert!(
+            !leaked_path.exists(),
+            "temp copy must be unlinked after the connection is dropped"
+        );
     }
 
     #[test]
@@ -386,5 +523,57 @@ mod tests {
         let bytes = std::fs::read(&temp_path).unwrap();
         let _ = std::fs::remove_file(&temp_path);
         bytes
+    }
+
+    #[test]
+    fn parse_passes_noise_shaped_user_text_through_verbatim() {
+        // 钉住测试：OpenCode SQLite 没有 system-reminder / AGENTS.md /
+        // 环境上下文等注入概念（message/part 的 text 就是消息原文；part 查询
+        // 只按 `type='text'` 过滤块类型，不检查文本形状）。形似噪声的文本必须
+        // 逐字透传，防止将来把别家格式的过滤规则盲目搬来造成 silent drift。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);
+             INSERT INTO session VALUES ('ses_1', 'test', '/work', 1, 2);
+             INSERT INTO message VALUES ('msg_1', 'ses_1', '{\"role\":\"user\"}', 1);
+             INSERT INTO message VALUES ('msg_2', 'ses_1', '{\"role\":\"user\"}', 2);
+             INSERT INTO part VALUES ('part_1', 'msg_1', '{\"type\":\"text\",\"text\":\"<system-reminder>reminder text</system-reminder>\"}', 1);
+             INSERT INTO part VALUES ('part_2', 'msg_2', '{\"type\":\"text\",\"text\":\"# AGENTS.md instructions\"}', 2);",
+        )
+        .unwrap();
+        let temp_path = std::env::temp_dir().join(format!("asg-test-{}.db", temp_file_suffix()));
+        conn.execute_batch(&format!("VACUUM INTO '{}'", temp_path.display()))
+            .unwrap();
+        drop(conn);
+        let db_bytes = std::fs::read(&temp_path).unwrap();
+        let _ = std::fs::remove_file(&temp_path);
+
+        struct TextSink {
+            texts: Vec<String>,
+        }
+        impl CanonicalEventSink for TextSink {
+            fn emit_message(
+                &mut self,
+                event: MessageEvent<'_>,
+            ) -> agent_session_grep_ports::PortResult<()> {
+                self.texts.push(event.text.to_string());
+                Ok(())
+            }
+        }
+
+        let adapter = OpenCodeAdapter::new();
+        let mut sink = TextSink { texts: Vec::new() };
+        let report = adapter.parse(&db_bytes, &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "<system-reminder>reminder text</system-reminder>".to_string(),
+                "# AGENTS.md instructions".to_string(),
+            ]
+        );
     }
 }

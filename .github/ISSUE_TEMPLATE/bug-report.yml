@@ -39,8 +39,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Provide the released version or development version.
-      placeholder: v0.3.0 or 0.3.x
+      description: Paste the exact output of agent-session-grep --version and identify the source commit below.
+      placeholder: agent-session-grep 0.1.0
     validations:
       required: true
 

@@ -1,0 +1,108 @@
+{
+  "activities": 0,
+  "committed": 9,
+  "diagnostics": [
+    "state.db: messages report no adopted native id (`messages.id` is a per-database rowid, reused after deletes and not unique across profiles); the composition root derives document-scoped ids and rowids are kept verbatim where a diagnostic names a row",
+    "message id 5: `content` and `reasoning` are both NULL/blank, skipped",
+    "message id 6: `content` and `reasoning` are both NULL/blank, skipped",
+    "state.db session hermes-state-sess-a: 4 message(s) emitted, 2 row(s) skipped; tool calls compact=0 function=0; associations (authoritative=false): observed_id=0 name_only=0 ambiguous_id=0 ambiguous_name=0 unmatched_id=1 unmatched_name=0 missing_identity=0",
+    "state.db session hermes-state-sess-b: 5 message(s) emitted, 0 row(s) skipped; tool calls compact=1 function=0; associations (authoritative=false): observed_id=0 name_only=1 ambiguous_id=0 ambiguous_name=0 unmatched_id=0 unmatched_name=0 missing_identity=0"
+  ],
+  "fixture_blake3": "2a21db8bcb9fa42da14243d231717ed6bc82369aafcd0521aa4712ff19aba4be",
+  "messages": [
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 0,
+      "session": "hermes-state-sess-a",
+      "span": null,
+      "text": "[thinking]\nsynthetic compact reasoning\n[/thinking]",
+      "timestamp": null
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "user",
+      "seq": 1,
+      "session": "hermes-state-sess-a",
+      "span": null,
+      "text": "  spaced synthetic text  ",
+      "timestamp": "2023-11-14T22:13:21.125Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 2,
+      "session": "hermes-state-sess-a",
+      "span": null,
+      "text": "third by id",
+      "timestamp": "2023-11-14T22:13:23.250Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "tool",
+      "seq": 3,
+      "session": "hermes-state-sess-a",
+      "span": null,
+      "text": "synthetic tool result",
+      "timestamp": "2023-11-14T22:13:24.500Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "assistant",
+      "seq": 4,
+      "session": "hermes-state-sess-b",
+      "span": null,
+      "text": "compact call",
+      "timestamp": "2023-11-14T22:13:30.000Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "tool",
+      "seq": 5,
+      "session": "hermes-state-sess-b",
+      "span": null,
+      "text": "compact result",
+      "timestamp": "2023-11-14T22:13:31.000Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "system",
+      "seq": 6,
+      "session": "hermes-state-sess-b",
+      "span": null,
+      "text": "synthetic system prompt",
+      "timestamp": "2023-11-14T22:13:32.000Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "developer",
+      "seq": 7,
+      "session": "hermes-state-sess-b",
+      "span": null,
+      "text": "synthetic developer note",
+      "timestamp": "2023-11-14T22:13:33.000Z"
+    },
+    {
+      "is_sidechain": false,
+      "native_id": "",
+      "role": "user",
+      "seq": 8,
+      "session": "hermes-state-sess-b",
+      "span": null,
+      "text": "unicode synthetic 雪 🚀",
+      "timestamp": "2023-11-14T22:13:34.750Z"
+    }
+  ],
+  "multi_session": true,
+  "session_native_id": "hermes-state-sess-a",
+  "skipped": 2,
+  "variant_id": "hermes/sqlite-state-v1"
+}

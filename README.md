@@ -12,8 +12,12 @@ Application ADT.
 workspace version. Provider adapters are Experimental maturity and the optional
 semantic backend carries no quality claim — see
 [`docs/product/PROVIDER-MATURITY-MATRIX.md`](docs/product/PROVIDER-MATURITY-MATRIX.md).
-Release archives are built from source; no signed or notarized binaries are
-published yet.
+The canonical [v0.1.0 Release](https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0)
+has GitHub-generated source archives and no uploaded assets (no prebuilt
+binaries). This checkout contains unreleased changes beyond that tag even
+though Cargo still reports 0.1.0; record `git rev-parse HEAD` with source-build
+results. Unsigned Actions artifacts are not Release assets or signed/notarized
+binary distribution.
 
 ## Why?
 
@@ -25,7 +29,11 @@ schema. `agent-session-grep` solves this by:
 
 1. **Discovering** transcripts across multiple provider directories
 2. **Normalizing** them into a canonical model (Message, Session, Placement)
-3. **Indexing** for fast full-text search (FTS5 with CJK bigram support)
+3. **Indexing** for fast full-text search (FTS5; CJK text is tokenized as
+   single characters plus adjacent-pair bigrams). The indexed projection of a
+   message is capped at 16,000 characters — the catalog keeps the provider's
+   full text (`show`/`get` return it), but words beyond the cap in one message
+   are not searchable
 4. **Serving** search/resume/handoff through a unified contract
 
 ## Quickstart
@@ -52,35 +60,56 @@ agent-session-grep --version
 asg --version
 ```
 
-Then use either command name. Every data command needs the store path
-(`--db`); run `asg config paths` to see the default data location on your
-platform:
+Then use either command name. Data commands default to the platform data
+directory reported by `asg config paths` (the catalog lives at
+`<data>/asg.db`); pass `--db <path>` to override it. Reading commands never
+create a catalog: if none exists they fail with an explicit
+`sync --discover` instruction instead of pretending there were no results.
 
 ```bash
-# Index your Claude Code + Codex sessions
-asg --db <db-path> sync --discover
+# 1. check the binary
+asg --version
+asg config paths        # 2. where the default catalog lives (data directory)
+asg providers           #    which providers can be discovered on this machine
 
-# Search across all providers
-asg --db <db-path> search "authentication refactor"
+# 3. explicit sync: discover and index your provider sessions (sources stay read-only)
+asg sync --discover
 
-# Get session context
-asg --db <db-path> context <session-id>
+# If discovery finds nothing, name the transcripts yourself:
+# asg sync <file.jsonl>...
 
-# Preview the resume command for a session (dry-run; --yes to execute)
-asg --db <db-path> resume <session-id>
+# 4. search across all providers
+asg search "authentication refactor"
 
-# Generate a handoff pack for another agent
-asg --db <db-path> handoff "how did we configure the database?"
+# 5. read a hit, expand its session, or continue work (use the wire ids from the
+#    "next step" lines that `asg search` prints)
+asg show <msg-id>
+asg context <session-id>
+asg resume <session-id>          # dry-run preview; --yes to execute
+asg handoff "how did we configure the database?"
 ```
 
-Retrieval is lexical by default (FTS5 with CJK bigram support); the default
-vector mode is an honest bigram-hash fuzzy-lexical matcher, not a semantic
-model. An optional local semantic backend (Candle + multilingual-e5-small)
-exists behind the `semantic-candle` cargo feature — off by default and
-offline-only (`asg model import --dir <bundle>` / `asg model status`).
+Retrieval is lexical by default (FTS5; CJK text is tokenized as single
+characters plus adjacent-pair bigrams; per-message indexed text is capped at
+16,000 characters while the catalog keeps the full text). The default vector
+mode is an honest fuzzy lexical vector (`bigram-hash`) — a fuzzy-lexical
+matcher, not a semantic model. Semantic/hybrid candidates whose cosine
+similarity falls below the evidence floor are discarded before RRF fusion, so
+zero-similarity vectors cannot enter results on rank alone. An optional local
+semantic backend (Candle + multilingual-e5-small) exists behind the
+`semantic-candle` cargo feature — off by default and offline-only
+(`asg model import --dir <bundle>` / `asg model status`).
 
 See [Install and upgrade](docs/operations/INSTALL-AND-UPGRADE.md) for custom
 prefixes, persistent PATH setup, upgrades, and safe uninstall.
+
+## Journal maintenance
+
+Use `asg journal preview` to review old indexing-journal detail before
+submitting a durable background maintenance job. Maintenance combines verified
+backup, fixed-scope compaction and physical SQLite space reclamation; accepted
+jobs are not necessarily complete yet. See [Journal maintenance](docs/operations/JOURNAL-MAINTENANCE.md)
+for confirmation, the 30-second soft write budget, pause/retry and recovery.
 
 ## Providers
 
@@ -96,7 +125,7 @@ Currently implemented (14/16 planned; 2 deferred — no transcript evidence):
 | Pi | Experimental | session JSONL (`type:session/message`) |
 | Hermes | Experimental | `session_<id>.json` (session_id/messages) |
 | Cursor | Experimental | `state.vscdb` SQLite KV (`chatdata`/`prompts`) |
-| Kimi Code | Experimental | wire.jsonl (`context.append_message`) |
+| Kimi Code | Experimental | wire.jsonl (`context.append_message` plus `turn.prompt`/`turn.steer`) |
 | OpenClaw | Experimental | v3 JSONL header + message records |
 | Qoder | Experimental | JSONL (`session_meta` + `type:user/assistant`) |
 | Tencent CodeBuddy | Experimental | OpenAI-style JSONL (`role`/`content`/`sessionId`) |
@@ -121,9 +150,31 @@ domain ← ports ← application ← adapters
 
 ### Key design decisions
 
-- **Stable Identity**: BLAKE3-based content-addressed IDs that survive file
-  moves, renames, and incremental appends
-- **Evidence-first**: every search hit carries a source span for verification
+- **Stable Identity**: native and content-derived message IDs preserve identity
+  across source locations. Existing `ses_v1` session namespaces still depend on
+  the installation path; cross-machine relocation needs an explicit alias
+  migration and is not currently automatic.
+- **Evidence-first**: a search hit carries the source span it was read from
+  wherever the provider's format has one, so the match can be verified against
+  the original bytes. Four of the fourteen adapters cannot supply one — two
+  read a SQLite source, where a record's text lives in B-tree cell payloads
+  that spill across overflow pages and move on any page split, and two read a
+  whole-document JSON file. Those hits report no span rather than a synthesised
+  offset that would point at the wrong bytes. The per-provider column is in the
+  [Provider Beta Readiness Ledger](docs/product/PROVIDER-BETA-READINESS.md).
+- **Recency- and repo-aware lexical ranking**: lexical search hits are scored
+  as `max(0, RRF × recency decay − sidechain penalty + current-repo boost)`.
+  Message and session FTS ranks use RRF with k=60, a 30-day half-life,
+  0.3 decay floor, `0.25/61` sidechain penalty and `0.5/61` repo boost, so
+  newer, mainline, and same-repository messages surface first without burying
+  old or strongly relevant hits. The current-repo boost applies when the hit's
+  session belongs to the repository the command is invoked from — the slug is
+  derived from the process working directory by local git detection, and a
+  caller with no derivable repository identity changes no score at all.
+  Semantic hits and hybrid RRF fusion are not re-ranked. All tuning constants
+  live in one module (`crates/agent-session-grep-application/src/ranking.rs`)
+  and are pinned by tests. Search pages keep the first request's scoring time
+  and 15-minute cursor expiry; requesting another page does not extend it.
 - **Privacy**: zero telemetry, zero upload, offline by default; the global
   `--offline` flag refuses any network-requiring capability (fail-closed),
   and the default build has no HTTP client dependency (verified by a static
@@ -138,9 +189,12 @@ MIT OR Apache-2.0
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Community provider adapters follow
-the Provider Adapter Protocol (versioned external process, manifest-declared,
-read-only, no network by default).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Provider Adapter Contributor Guide](docs/PROVIDER-ADAPTER-CONTRIBUTOR-GUIDE.md).
+Implemented adapters use the in-tree Rust contract. The versioned
+external-process boundary is planned, not a loadable plugin API; proposals
+must declare their manifest, read-only source behavior, and network permissions
+(none by default).
 
 Release history is tracked in [CHANGELOG.md](CHANGELOG.md); security
 boundaries and the vulnerability reporting process are in

@@ -2,50 +2,199 @@
 
 ## Status and boundary
 
-The public-tree privacy path cleanup has scrubbed the production tree:
-provider module docs, product docs, and this script/runbook set carry no
-personal usernames, local checkout roots, or agent worktree coordinates.
+A current-tree path scan is not a history or credential audit. Publication
+requires evidence for the exact candidate, its introduced history and metadata,
+and separate owner approval. The existing canonical repository is the future
+product authority; do not create a competing repository, import development
+ancestry, rewrite history, or replace published assets as part of a tree import.
 
-The scanner also reports paths that remain in internal coordination records,
-which are working notes rather than published files. The exporter drops those
-records, and the owner must rerun the scanner below on the exact publication
-SHA before publishing. The repository gate is:
+The older history-rewrite procedures below remain reference material for a
+separately authorized incident response, not instructions to perform a rewrite.
 
-```text
-python scripts/evidence/privacy_scan.py --repo .
-python -m unittest discover -s scripts/evidence -p "test_privacy_scan.py" -v
-```
+## Deterministic public export (v2)
 
-The owner may create a clean public-tree candidate without rewriting the
-development history by exporting the exact publication SHA. This is the
-preferred Option A mechanical rehearsal:
+Run the reviewed exporter from the canonical tool checkout, with a fixed source
+commit and an empty destination **outside the source checkout and its Git
+metadata**. Do not execute an exporter/scanner from an arbitrary source tree.
+The destination and its ancestors must not be symlinks or Windows reparse
+points. Use a privately owned destination with no concurrent writers.
 
 ```powershell
 $destination = Join-Path $env:TEMP "agent-session-grep-public-tree"
-python scripts/release/export_public_tree.py --repo . `
-  --commit <publication-sha> --destination $destination
-python -m unittest discover -s "$destination/scripts/release" -p "test_*.py"
+python scripts/release/export_public_tree.py --repo <source-checkout> `
+  --commit <full-reviewed-source-sha> --destination $destination
+python -m unittest discover -s scripts/release -p "test_export_public_tree.py" -v
 ```
 
-The exporter copies only tracked files, excludes internal coordination
-directories and generated `scripts/evidence/out/` output, writes
-`PUBLIC-TREE-MANIFEST.json` with the source SHA and per-file SHA-256, and runs
-the same privacy rules against the ordinary exported directory. It does not
-modify refs or repository visibility; review the destination and publish it
-only after the owner chooses Option A.
+The tool resolves the commit once, ignores replacement refs, enumerates Git
+objects with NUL-delimited names, and reads blobs by object ID, not checkout
+files. It validates the complete source path inventory and all exported bytes
+before creating output. Symlinks, gitlinks, traversal, ambiguous Windows names,
+case/file-directory collisions, non-normalized Unicode and destination links
+are rejected. Tab/newline names are parsed as single names and then rejected,
+not split into accidental paths. Nonempty destinations are never overwritten.
+A validation failure creates no output; an I/O failure or privacy finding can
+leave a candidate for inspection. Do not publish it or silently retry into it.
 
-This does **not** clean older commits. Git history can still retain superseded
-copies of personal paths. Do not publish until the owner chooses one of these
-publication strategies:
+Private coordination roots and generated `scripts/evidence/out/` are excluded.
+`spikes/` is deliberately included because the public ADRs/RFCs cite its
+measurements. `AGENTS.md`, when present in the source, is replaced by the
+reviewed `scripts/release/public_AGENTS.md` projection. That template preserves
+the canonical standalone architecture, privacy and contribution guidance and
+must preserve root `AGENTS.md` content in canonical LF form. A targeted
+`.gitattributes` rule pins only this template to LF so checkout newline
+conversion cannot change its bytes/profile hash. It does not require excluded
+development tooling. This projection, its output mode and SHA-256 are declared
+in the profile, not hidden as a post-export edit.
 
-1. Publish a new repository from the cleaned current tree, intentionally
-   excluding the development history; or
-2. Rewrite the development history with `git-filter-repo`, validate the
-   result, coordinate every existing clone, and then publish the rewritten
-   repository.
+Only the scanner beside the reviewed exporter executes, always using its
+`public` profile; `--repo` never supplies executable scanner/profile code. The
+export manifest records the exact exporter/scanner/template byte hashes and
+profile version/hash. The profile hash binds the rules and exclusions as well
+as the projection. Tool hashes identify the actual executed artifacts, even
+when the tool checkout is not committed; a nearby Git HEAD alone would not.
+No timestamp, machine path, source remote, or mutable ref enters the manifest.
+This is reproducibility/provenance evidence, not a signature or trust grant.
 
-This document is a decision and verification runbook. It does not authorize or
-perform a destructive history rewrite.
+### Immutable import snapshots
+
+The generated v2 manifest lives at:
+
+```text
+docs/operations/imports/public-tree-v2-<full-source-sha>.json
+```
+
+It records the source commit/tree IDs and sorted path, Git mode (`100644` or
+`100755`), byte length and SHA-256 records. It excludes itself from its file
+inventory, so there is no self-hashing cycle. Repeating the same source and
+reviewed tool/profile bytes produces the same snapshot bytes. A collision with
+an existing snapshot path is an error, not an overwrite.
+
+A source root `PUBLIC-TREE-MANIFEST.json` is accepted only as a valid v1
+manifest. Its original bytes are archived, unchanged, under:
+
+```text
+docs/operations/imports/public-tree-v1-<original-bytes-sha256>.json
+```
+
+The v2 inventory hashes that archived file and declares it as `prior_manifest`.
+Do not infer absent v1 modes from hashes; reconcile against the initial formal
+Git tree and record any independently verified mode correction. Unknown or
+malformed root manifests and archive collisions stop the export.
+
+During canonical integration, preserve the existing v1 bytes and new v2
+snapshot in this imports directory and record the actual import commit and
+reviewed target-only changes separately. Do not carry a root manifest forward
+as a purported checksum of the evolving canonical tree. Snapshots describe
+**the exported input**, not later reconciled edits or every future commit.
+They remain immutable; future development follows the public contribution
+contract, not continuous re-export or manifest regeneration.
+
+The trusted scanner has exactly two reviewed historical policy-metadata pins.
+Each binds the **complete raw SHA-256**, exact archived path and schema before
+omitting only the following top-level fields from its in-memory scan input:
+
+- v1: `docs/operations/imports/public-tree-v1-e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af.json`
+  - SHA-256: `e0f26822ff2383e0017a7054ecc1acf8d18830bd57cb32e99c5d64155f8568af`
+  - Schema: `agent-session-grep.public-tree/v1`; omit only `excluded_prefixes`.
+- v2: `docs/operations/imports/public-tree-v2-f587c73332158342330a63874fabdc8f565624ec.json`
+  - SHA-256: `121e09c2ab6f7e5922a0862ea095fae3ae343913847cc3efa62546cf71585ead`
+  - Schema: `agent-session-grep.public-tree/v2`; omit only `excluded_prefixes`
+    and `profile`.
+
+Every other field, nested value and inventory entry remains scanned under the
+unchanged rules. These are not whole-file, directory, schema or credential
+exemptions. The registry lives in reviewed scanner code, never candidate data
+or caller-supplied configuration. A self-declared digest grants no trust.
+Known-path byte/hash/schema mismatch and unregistered historical snapshots are
+non-success even without privacy-pattern hits. No legacy root-path alias is
+registered: the original root manifest and existing formal history still need
+the separate history/credential audit.
+
+Both standalone tracked-file scanning and export-directory scanning use the
+same byte/content policy. `docs/operations/imports/public-tree-*.json -text`
+keeps snapshot bytes exact on checkout with either `core.autocrlf` setting.
+Do not normalize, reserialize or rewrite a snapshot to make a hash match.
+Preserve a failed candidate and request a separately reviewed resolution.
+
+For a **freshly generated** v2 output only, the exporter checks the complete
+bytes, exact schema, current tool hash and exact profile/exclusion metadata.
+It grants the shared scanner a single path-and-raw-hash-bound authorization to
+omit only `profile` and `excluded_prefixes`. Extra fields still get scanned.
+That grant cannot override a historical pin, survive to a later file, or
+become standalone authorization for a subsequent historical snapshot. Existing
+v2 snapshots remain byte-exact inventory entries on re-export, but unregistered
+ones fail closed. Profile/tool drift is a non-success result, not a waiver.
+
+CLI diagnostics report only controlled rule identifiers, not private matches,
+source excerpts or candidate paths. Export success is not a credential/history
+audit, proof that all content is public, or permission to publish.
+
+### Explicit Git index modes, including Windows
+
+Filesystem `chmod` alone does not preserve executable bits in a Windows Git
+index. Export **never** initializes a repository, stages source/destination
+content, changes refs, or implicitly repairs an index. After reviewing a
+successful candidate, the owner may explicitly initialize and stage **only the
+disposable export** (not the development or existing canonical checkout):
+
+```powershell
+git -C $destination init
+$snapshot = "docs/operations/imports/public-tree-v2-<full-source-sha>.json"
+$manifest = Get-Content -LiteralPath (Join-Path $destination $snapshot) -Raw |
+  ConvertFrom-Json
+$paths = @($manifest.files.path) + @($snapshot)
+$paths # Stop here and review this exact inventory before staging.
+# After review, stage one literal path per command (no wildcard expansion or
+# command-line length limit). Filters/attributes that change bytes are detected.
+foreach ($path in $paths) {
+  git -C $destination --literal-pathspecs -c core.autocrlf=false add -- $path
+  if ($LASTEXITCODE -ne 0) { throw "Explicit-path staging failed; stop and inspect." }
+}
+python scripts/release/export_public_tree.py --destination $destination `
+  --manifest $snapshot --index-modes check
+# A mode mismatch is expected if Windows staged executable files as 100644.
+# Only after reviewing that mismatch:
+python scripts/release/export_public_tree.py --destination $destination `
+  --manifest $snapshot --index-modes apply
+python scripts/release/export_public_tree.py --destination $destination `
+  --manifest $snapshot --index-modes check
+git -C $destination ls-files --stage
+```
+
+The explicit operation requires an independent destination Git directory and
+exact snapshot file inventory. Every working and staged blob must match its
+recorded bytes/hash before **any** mode update. It rejects missing, extra,
+unmerged, symlink/reparse or drifted content; no filters/hooks run during mode
+application. The operation exclusively acquires Git's real index lock before
+reading any staged entries. Only necessary mode fields change in a private
+candidate via a NUL-delimited native Git update. It revalidates that candidate
+and working inventory before atomically replacing the real index. Concurrent
+Git writers are refused; validation/update failures leave the real index
+unchanged, and an existing writer's lock is never removed. It does not stage
+content or copy old source refs. `--manifest` is a literal destination-relative v2 path. Git directory,
+work-tree, index and object-directory environment overrides are rejected.
+
+These snapshot checks apply to an unmodified export, not to a merged canonical
+working tree with retained target-only edits. For canonical reconciliation,
+review modes alongside bytes and verify the actual staged tree separately.
+The known initial import defects are `scripts/install/gate_smoke.sh`,
+`install.sh`, `smoke.sh`, and `uninstall.sh`: all four require `100755` in Git.
+Apply those corrections only through explicit owner/coordinator staging;
+preserve the canonical bytes, especially the independently changed `smoke.sh`.
+Record mode-only corrections separately from source content reconciliation.
+
+For an initialized repository, run the public scanner and its tests explicitly:
+
+```text
+python scripts/evidence/privacy_scan.py --repo . --profile public
+python -m unittest discover -s scripts/evidence -p "test_privacy_scan.py" -v
+```
+
+A raw export is scanned by the exporter's directory scanner; standalone
+`privacy_scan.py` requires Git-tracked files. Record findings, skipped checks
+and tool errors distinctly. Do not substitute a local Windows run for hosted
+Linux/macOS tests or claim a credential scanner ran when it did not.
 
 ## Preconditions
 
@@ -248,3 +397,105 @@ server no longer retains old refs.
 - Official manual (`--analyze`, `--dry-run`, `--replace-text`, and
   `--sensitive-data-removal`):
   <https://github.com/newren/git-filter-repo/blob/main/Documentation/git-filter-repo.txt>
+
+## Executable export and privacy contract
+
+### Scope and trigger
+
+This contract applies when exporting a fixed source commit or checking/applying
+Git modes in an independently staged export, and when scanning a tracked tree
+or export directory under the named repo/public profile. It does not authorize publishing,
+history rewriting or applying a raw-source snapshot to a reconciled working tree.
+
+### Signatures
+
+```text
+export_public_tree.py --repo <source> --commit <ref> --destination <empty-dir>
+export_public_tree.py --destination <export> --manifest <relative-v2-path> --index-modes check
+export_public_tree.py --destination <export> --manifest <relative-v2-path> --index-modes apply
+privacy_scan.py --repo <tracked-tree> --profile repo|public
+scan_content(path: str, data: bytes, profile="repo", *, _generated_snapshot=None) -> list[Finding]
+scan_repo(repo: Path, profile="repo") -> list[Finding]
+scan_export(repo: Path, destination: Path, manifest=None) -> int
+```
+
+### Inputs, outputs and environment
+
+The source ref resolves once to a commit object. The output is the declared
+public projection plus an immutable v2 snapshot; v1 bytes remain historical
+evidence. Index operations accept that exact snapshot and staged inventory,
+not arbitrary partial path lists. Tool/scanner/profile bytes determine provenance;
+ambient Git directory/index/object overrides are rejected, not silently trusted.
+
+The shared `scan_content` scans the relative filename once, even for binary
+payloads, before applying the same selected profile to decoded content. Both
+entry points delegate to it; export does not repeat the filename scan. Binary
+payload bytes are not decoded or certified clean. `Finding` carries path, line,
+rule, match and excerpt for internal use; CLI diagnostics expose rule ids only.
+Filename findings use line1; projected JSON line numbers describe scan input,
+not necessarily the original archived lines.
+
+The two read-only historical pins above bind exact path, raw SHA256, schema and
+fixed top-level fields: v1 omits only `excluded_prefixes`; v2 omits only
+`excluded_prefixes` and `profile`. Every other field/nested value is scanned.
+There is no caller registry, root alias or whole-file exemption. Only the
+trusted exporter supplies the private `_generated_snapshot=(path, raw_sha256)`
+grant after validating exact generated bytes, v2 schema, current exporter hash,
+current profile and exclusions. It is reset per file, cannot override a
+historical pin, and never enters standalone scanning. Candidate declarations
+are data, not authorization. Snapshot `-text` attributes preserve approved raw
+bytes across checkout policies; scans never rewrite bytes to obtain a match.
+
+### Validation and error matrix
+
+| Case | Result | Mutation boundary |
+| --- | --- | --- |
+| Valid export or matching index check | Exit 0 | Export writes only its isolated destination; check preserves index content |
+| Filename/content rule finding | Exit 1 | Both scanner CLIs retain failed evidence; neither approves publication |
+| Known snapshot hash/schema mismatch (`snapshot-integrity`) or unknown historical snapshot (`unregistered-snapshot`) | Exit 1 | Reject even without regex hits; no policy omission or byte rewrite |
+| Missing/unreadable tracked file or failed tracked inventory | Standalone CLI exit 2 | No missing-file skip; helper raises I/O/Git error |
+| Exact registered snapshot or verified fresh output | Exit 0 only if remaining path/content scan is clean | Omit only fixed top-level fields in memory; no credential/history clearance |
+| Invalid source, path, manifest, destination, index or Git operation | Exit 2 | Export prevalidation writes nothing; rejected index transaction preserves the real index |
+| Mode mismatch in check mode | Exit 2 | Explicit review/apply is required; no automatic mode repair |
+| Existing index lock or incompatible environment | Exit 2 | Another writer's lock/state is not removed or overridden |
+
+### Good, base and bad cases
+
+- Good: two fresh destinations from identical source/tool/profile bytes have
+  identical snapshot bytes and verified payload hashes/modes. Registered archive
+  bytes survive both checkout policies and both scanner entry points agree.
+- Base: Windows stages a Unix script as100644. Check rejects; explicit apply
+  changes only its recorded mode to100755 with the blob unchanged.
+- Bad: a source subdirectory hides an output inside the actual source root;
+  a path collides on Windows; a malformed manifest uses a non-string path or
+  boolean count; an unmerged/extra/drifted index entry appears. Reject rather
+  than guessing, following a link or updating a partial inventory. A filename-only
+  finding fails both scanners even when its bytes are benign or binary; edited
+  or unknown pattern-free snapshots fail without consulting candidate policy.
+
+### Required tests and assertion points
+
+The exporter suite must assert deterministic objects/projection under both
+checkout newline policies, NUL-safe portable paths, untouched sources on
+rejection, v1 byte preservation, exact registered policy projection, rejection
+of changed/unregistered snapshots, and scanning of every non-policy field.
+Require registry/schema/path/hash/encoding mutations, injected inventory/free
+text, candidate-registry refusal, and private fresh-grant isolation. Filename-
+only text/JSON/binary cases must fail both scanners with one finding per name,
+not a duplicated export finding; repo/public profile distinctions stay intact. Transaction tests compare real index bytes and blob
+IDs on success/failure and preserve other writers' lock ownership. CLI tests
+assert exit codes, absent traceback/path disclosure and no destination creation
+for invalid inputs. Use synthetic fixtures, never real session data.
+
+### Wrong versus correct
+
+| Wrong | Correct |
+| --- | --- |
+| Treat matching file bytes as complete export integrity | Verify hashes, modes, profile and actual destination Git tree |
+| Hash platform-dependent template checkouts | Pin the public template to LF and test different checkout policies |
+| Validate, then update using stale staged OIDs | Lock first, validate a private candidate, recheck, then atomically publish |
+| Blanket-stage a directory or waive the whole manifest scan | Stage reviewed literal inventory paths; exempt only exact tool-owned metadata |
+| Treat a failed historical-content scan as successful migration | Keep the failure/evidence and resolve it through the reviewed integration |
+| Scan names only in export, or skip binary filenames | Use the shared filename-and-content policy once in both entry points |
+| Trust a snapshot schema, self-declared digest or candidate registry | Require the trusted exact raw pin/schema or the one-file validated fresh grant |
+| Extend a fresh grant to the next historical file | Reset per file and give historical pins precedence |

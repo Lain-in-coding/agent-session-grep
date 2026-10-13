@@ -68,10 +68,61 @@ fn verify_metadata(meta: &std::fs::Metadata, snap: &SourceSnapshot) -> PortResul
 
 /// Capture `(len, mtime, BLAKE3)` with one fixed-buffer pass.
 ///
-/// No source bytes are retained. Production parsing reopens the same path
-/// through [`open_snapshot_source`]; [`verify_snapshot`] performs a final
-/// streaming fingerprint pass before staged data may commit.
+/// Text files use a streaming byte fingerprint. SQLite files use a bounded
+/// logical backup so committed WAL frames are included, with a `sqlite:`
+/// fingerprint prefix identifying the logical verification strategy.
 pub fn capture(path: &Path) -> PortResult<SourceSnapshot> {
+    let mut header = [0; 16];
+    let mut file = File::open(path).map_err(backend)?;
+    if file.read(&mut header).map_err(backend)? == header.len() && &header == b"SQLite format 3\0" {
+        let copy = sqlite_snapshot(path)?;
+        let mut snapshot = capture_file(&copy)?;
+        snapshot.path = path.to_string_lossy().into_owned();
+        snapshot.mtime_ms = mtime_ms(&file.metadata().map_err(backend)?)?;
+        snapshot.fingerprint.insert_str(0, "sqlite:");
+        return Ok(snapshot);
+    }
+    capture_file(path)
+}
+
+/// Capture the database's logical pages, including committed WAL frames. The
+/// source connection is read-only; only the guarded destination may be written.
+fn sqlite_snapshot(path: &Path) -> PortResult<tempfile::TempPath> {
+    let source =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(backend)?;
+    source
+        .busy_timeout(std::time::Duration::from_secs(1))
+        .map_err(backend)?;
+    // Pin one read transaction before copying pages: concurrent writers cannot
+    // restart the backup indefinitely, and the size check covers that snapshot.
+    source
+        .execute_batch("BEGIN; SELECT rootpage FROM sqlite_schema LIMIT 1;")
+        .map_err(backend)?;
+    let pages: i64 = source
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .map_err(backend)?;
+    let page_size: i64 = source
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .map_err(backend)?;
+    if pages
+        .checked_mul(page_size)
+        .is_none_or(|len| len < 0 || len as u64 > agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES)
+    {
+        return Err(PortError::SourceIo(
+            "SQLite source exceeds supported snapshot size".into(),
+        ));
+    }
+    let destination = tempfile::NamedTempFile::new()
+        .map_err(backend)?
+        .into_temp_path();
+    source
+        .backup(rusqlite::MAIN_DB, &destination, None)
+        .map_err(backend)?;
+    Ok(destination)
+}
+
+fn capture_file(path: &Path) -> PortResult<SourceSnapshot> {
     let file = File::open(path).map_err(backend)?;
     let meta = file.metadata().map_err(backend)?;
     let len = meta.len();
@@ -99,6 +150,7 @@ pub fn capture(path: &Path) -> PortResult<SourceSnapshot> {
 pub struct FileSource {
     path: PathBuf,
     snapshot: SourceSnapshot,
+    _temporary: Option<std::sync::Arc<tempfile::TempPath>>,
 }
 
 impl ReadOnlySource for FileSource {
@@ -120,16 +172,31 @@ impl ReadOnlySource for FileSource {
 
 /// Reopen a captured source without reading it eagerly.
 pub fn open_snapshot_source(path: &Path, snapshot: &SourceSnapshot) -> PortResult<FileSource> {
+    if snapshot.fingerprint.starts_with("sqlite:") {
+        let copy = sqlite_snapshot(path)?;
+        let current = capture_file(&copy)?;
+        verify_sqlite_snapshot(snapshot, &current)?;
+        return Ok(FileSource {
+            path: copy.to_path_buf(),
+            snapshot: current,
+            _temporary: Some(std::sync::Arc::new(copy)),
+        });
+    }
     let meta = std::fs::metadata(path).map_err(backend)?;
     verify_metadata(&meta, snapshot)?;
     Ok(FileSource {
         path: path.to_path_buf(),
         snapshot: snapshot.clone(),
+        _temporary: None,
     })
 }
 
 /// Final pre-commit verification: metadata + captured-range BLAKE3, all streamed.
 pub fn verify_snapshot(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
+    if snap.fingerprint.starts_with("sqlite:") {
+        let copy = sqlite_snapshot(path)?;
+        return verify_sqlite_snapshot(snap, &capture_file(&copy)?);
+    }
     let file = File::open(path).map_err(backend)?;
     verify_metadata(&file.metadata().map_err(backend)?, snap)?;
     let mut captured = file.take(snap.len);
@@ -149,6 +216,17 @@ pub fn verify_snapshot(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
     // 指纹仍可与快照一致，等长替换也已被指纹覆盖，因此再核对一次 len+mtime 以
     // 收窄窗口。诚实的结论是"复核读取窗口内未观察到变化"。
     post_read_verify(path, snap)
+}
+
+fn verify_sqlite_snapshot(expected: &SourceSnapshot, current: &SourceSnapshot) -> PortResult<()> {
+    if expected.len != current.len
+        || expected.fingerprint.strip_prefix("sqlite:") != Some(current.fingerprint.as_str())
+    {
+        return Err(PortError::SnapshotChanged(
+            "SQLite logical content changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 读取完成后的最终复核：源文件的 len/mtime 不得在读取窗口内变化。
@@ -226,6 +304,49 @@ impl agent_session_grep_ports::SourceDiscovery for SnapshotFs {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn sqlite_capture_reads_wal_and_detects_wal_only_changes_without_writing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(value); INSERT INTO t VALUES('first');").unwrap();
+        let wal = path.with_extension("db-wal");
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        let snapshot = capture(&path).unwrap();
+        let source = open_snapshot_source(&path, &snapshot).unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &source.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM t", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "first"
+        );
+        verify_snapshot(&path, &snapshot).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        writer
+            .execute("INSERT INTO t VALUES('second')", [])
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert!(matches!(
+            verify_snapshot(&path, &snapshot),
+            Err(PortError::SnapshotChanged(_))
+        ));
+        let next = capture(&path).unwrap();
+        assert_ne!(next.fingerprint, snapshot.fingerprint);
+        // A checkpoint performed by the external writer changes physical
+        // files only; the captured logical source remains current.
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        verify_snapshot(&path, &next).unwrap();
+    }
 
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> std::path::PathBuf {
         let p = dir.join(name);

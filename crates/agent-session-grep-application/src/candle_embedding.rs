@@ -691,17 +691,48 @@ mod tests {
         assert_eq!(manifest, decoded);
     }
 
+    #[test]
+    fn tempfile_dirs_are_isolated_for_parallel_callers_at_one_clock_tick() {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dirs = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| tempfile_dir_at(tick)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let distinct: std::collections::BTreeSet<_> = dirs.iter().collect();
+        assert_eq!(distinct.len(), dirs.len());
+        for dir in dirs {
+            fs::remove_dir(dir).unwrap();
+        }
+    }
+
     fn tempfile_dir() -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "asg-model-test-{}-{}",
-            std::process::id(),
+        tempfile_dir_at(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+        )
+    }
+
+    fn tempfile_dir_at(tick: u128) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Wall-clock nanoseconds can repeat across parallel callers (e.g. macOS).
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "asg-model-test-{}-{tick}-{serial}",
+            std::process::id()
         ));
-        fs::create_dir_all(&dir).unwrap();
+        // Never silently reuse another fixture if a path unexpectedly exists.
+        fs::create_dir(&dir).unwrap();
         dir
     }
 

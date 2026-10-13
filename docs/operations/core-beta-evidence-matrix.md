@@ -1,5 +1,14 @@
 # Core Alpha / Cross-platform Beta Evidence Matrix
 
+> Historical imported evidence: run identifiers and results below describe
+> earlier development, not verified runs of the canonical reconciliation.
+> Their original repository attribution is unresolved in this public record;
+> do not construct canonical Actions links from those IDs or use these rows to
+> certify this candidate. Fresh SHA-bound canonical runs are required.
+> Later development-side installer/provider-run claims were not promoted here
+> because they belong to a different repository, not this candidate.
+
+
 > Evidence accounting record
 >
 > - status: **Draft**
@@ -17,7 +26,7 @@
 
 ## Recorded CI run
 
-- repository: `qin-devs/agent-session-grep`
+- repository attribution: historical imported record; not a canonical run
 - workflow: `core-beta-evidence`, run `30165919066`, triggered by pull request #1
 - source commit: as recorded by that workflow run
 - outcome: all four runner/target jobs reported `success`

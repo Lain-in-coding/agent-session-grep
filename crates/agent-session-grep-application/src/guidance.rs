@@ -117,7 +117,11 @@ fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
 /// `'\''` 转义；仅由字母/数字/`_./-` 构成的安全参数原样返回。这样既保证建议
 /// 命令可直接粘贴进 shell，又不改变常见安全 wire id 的既有输出字节。
 ///
-/// 改编自 agf 的 shell quoting（MIT License）。
+/// Conservatively credited as adapted from agf (MIT), [src/shell.rs:64-93](https://github.com/subinium/agf/blob/44be9cffd3b3eeb44ff1f31a751ec8954adf14cf/src/shell.rs#L64-L93),
+/// reference revision `44be9cffd3b3eeb44ff1f31a751ec8954adf14cf`. The POSIX
+/// quoting algorithm is similar; local safe-token passthrough differs. This
+/// comparison does not establish PowerShell code reuse or the original
+/// consultation revision. See NOTICE and docs/operations/REUSE-LICENSE-AUDIT.md (A05a).
 fn shell_quote_arg(arg: &str) -> String {
     if !arg.is_empty()
         && arg

@@ -55,37 +55,83 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The Python evidence, release, and installer harnesses are stdlib-only
-`unittest`. Run the suite for whichever directory you touched:
+The Python evidence, release, installer, and governance harnesses use
+stdlib `unittest`. Governance tests require `GOVERNANCE_TEST_ARCHIVE`
+pointing to the verified native-platform archive; missing input fails,
+not skips. Set it only for the process or by explicit user opt-in; do
+not auto-provision tools or persist configuration. See `CONTRIBUTING.md`
+for provisioning and offline inputs. Run the applicable suites:
 
 ```
 python -m unittest discover -s scripts -p "test_*.py"
 python -m unittest discover -s scripts/evidence -p "test_*.py"
 python -m unittest discover -s scripts/release -p "test_*.py"
+python -m unittest discover -s scripts/governance -p "test_*.py"
 ```
+
+Use the shared `scripts/governance/` interfaces in `CONTRIBUTING.md`.
+Local hooks are opt-in; do not replace global or existing hooks.
+Bootstrap needs an explicitly owner-reviewed frozen checker revision;
+candidate tests are not trusted server enforcement. Missing tooling,
+checks, or supported protection blocks acceptance; do not claim hosted
+success or enforcement from local passes or workflow files.
 
 ## Commit and collaboration
 
-- Conventional Commits: `type(scope): subject`, subject ≤ 50 characters,
-  imperative mood, no trailing period. One logical change per commit.
-- Never run `git commit` or `git push` unless the user explicitly asks. Stage
-  specific files; never `git add .` blindly.
-- Feature branch → pull request into `main`. Do not push to `main` and do not
-  merge pull requests; merging is the repository owner's decision.
-- Commits are authored by the repository owner only: no AI co-author trailer,
-  no "Generated with ..." footer, no command transcript in the message.
+- Never run `git commit` or `git push` unless the user explicitly asks.
+- Follow `CONTRIBUTING.md`: `type(scope): subject`, exactly one space after
+  the colon; types `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`,
+  `perf`. Scope and subject are required; use the documented lower-case
+  scope convention. The complete header is at most 50 Unicode code points,
+  not just the subject. Use imperative English and no trailing period.
+- Leave a blank line, then a substantive English why; all body lines are
+  at most 72 code points. Chinese may supplement. Unicode identifiers and
+  names are allowed; no ASCII ban or unreliable language detector. Empty,
+  footer-only, or placeholder rationale, control characters, and hidden
+  skip-CI/fixup bypasses are invalid; merges have no exemption.
+- One logical change per commit. Stage specific files, never `git add .`
+  blindly. Work in `Lain-in-coding/agent-session-grep`, the sole future
+  development/release authority. Feature branch -> PR into `main`; no
+  direct main push, dual export authority, or autonomous AI merge.
+- Each PR needs explicit human-owner acceptance for its current SHA and
+  actual mandatory check success, with rationale, risks, and verification
+  recorded. The solo-maintainer exception also covers owner-authored PRs;
+  it is not two-person review or a GitHub self-APPROVED review. Do not
+  invent reviewers. Task consent is not merge approval. New commits or
+  material PR metadata edits invalidate prior acceptance; rerun checks and
+  obtain fresh acceptance. PR titles/bodies follow the same 50/72 rules.
+- Use an ordinary merge preserving atomic commits, SHAs, and authors, not
+  default squash/rebase. The proposed merge message needs the same scoped
+  English header and substantive why. Recheck base/head and approvals;
+  GitHub's default merge text is not exempt. No autonomous approval, merge,
+  or gate waiver by AI.
+- Owner-delegated work uses the confirmed, authorized owner identity.
+  Preserve external authors, genuine human co-authors, required license
+  attribution, and already-authorized bot identities. Check author and
+  committer separately; attribution gives no write/merge authority. Do not
+  invent AI co-authors, generated-tool advertisements, or transcripts.
+  Human semantic/attribution review cannot be proved by syntax or Git
+  metadata, nor replaced by checking one owner email.
 - Do not amend, squash, or rebase pushed commits unless explicitly asked.
 - Destructive commands (`git reset --hard`, `git clean -fd`, `git push -f`,
-  `rm -rf`) are prohibited unless the user gives the exact command in the same
-  message and states they understand the consequences.
+  `rm -rf`) are prohibited unless the user gives the exact command in the
+  same message and states they understand the consequences.
 
 ## Privacy rules
 
 - Provider transcripts are read-only. Never modify, upload, or commit a real
   user's session data.
-- Keep real personal paths, hostnames, and identities out of code, tests,
-  fixtures, docs, commit messages, and pull request text. Test fixtures are
-  synthetic or irreversibly redacted, with provenance documented.
+- Keep private personal paths, private hostnames, and unrelated personal
+  data out of code, tests, fixtures, docs, logs, commits, and PR text.
+  Genuine attribution and required copyright/license notices remain.
+  Fixtures are synthetic or irreversibly redacted with provenance;
+  credential-shaped test values must be generated at runtime, never
+  hardcoded token-shaped examples or real session data.
+- Run separate path/privacy and credential gates on the exact current
+  tree and all introduced commits/blobs/messages, PR metadata, and the
+  proposed merge message. A good title or final tree cannot hide a bad
+  earlier commit. Preserve scanner rules and immutable import snapshots.
+  Share only reviewed safe summaries, not raw scanner findings/logs.
 - Never commit secrets. `.env`, `*.pem`, `*.key`, and `credentials*` are
   gitignored; keep it that way.
 - Do not add telemetry, uploads, or unrequested network access. The default

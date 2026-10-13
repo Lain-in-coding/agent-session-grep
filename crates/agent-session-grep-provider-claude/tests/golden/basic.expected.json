@@ -19,7 +19,7 @@
       "native_id": "00000000-0000-4000-8000-000000000002",
       "parent_native_id": "00000000-0000-4000-8000-000000000001",
       "role": "assistant",
-      "text": "你好，世界！🚀 多字节 span 必须按字节计。\n第二个 text block（emoji：🌏）。",
+      "text": "你好，世界！🚀 多字节 span 必须按字节计。\n第二个 text block（emoji：🌏）。\nRead(C:\\placeholder\\project\\README.md)",
       "timestamp": "2026-01-01T00:00:05.000Z",
       "is_sidechain": false,
       "span": { "start": 355, "end": 900 }

@@ -255,7 +255,7 @@ mod tests {
         let r = RedactionStatus {
             mode: RedactionMode::Revealed,
             status: RedactionState::Applied,
-            ruleset_version: "v1.0".into(),
+            ruleset_version: "v1.1".into(),
             redacted_count: 3,
             audit_id: Some("audit-xyz".into()),
         };

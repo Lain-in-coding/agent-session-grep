@@ -7,39 +7,87 @@ Copyright (c) 2026 QIN (project owner)
 Licensed under the terms of either the MIT License or the Apache License 2.0,
 at your option (see `LICENSE-MIT` and `LICENSE-APACHE` in this repository).
 
-This NOTICE records factual third-party attribution obligations. It is not a
+This NOTICE preserves third-party credits and observed source notices. It is not a
 legal opinion and does not replace the license texts of the projects listed
 below. The machine-readable dependency inventory
 (`THIRD-PARTY-DEPENDENCIES.json`) is generated at release time by
 `scripts/release/build-manifest.py inventory`; its `license_declared` values
 are copied from Cargo package metadata and are not independently verified.
 
-## Bundled/source-reuse attributions
+## Source-reuse attributions
 
-The reuse decisions and their review matrix are recorded in
-`docs/operations/REUSE-LICENSE-AUDIT.md`. Items classified as direct-copy or
-adapted carry the following attributions:
+Asset decisions, public identities/reference revisions and evidence limits are
+recorded in `docs/operations/REUSE-LICENSE-AUDIT.md` (2026-10-12 reconciliation).
+Observed root licenses below do not establish the original consultation
+revision or every subfile's applicability. The audit remains Draft; original
+reuse provenance and human approval are not supplied by this NOTICE.
+A03-A06 have bounded comparisons; other adaptations remain declarations.
 
-| Source project | License | Used for | Classification |
+| Source project / audit ID | Observed root license | Used for | Disposition / evidence |
 |---|---|---|---|
-| ctx (ctxrs) | Apache-2.0 | WAL PRAGMA group, doctor integrity_check; CJK bigram tokenization (adapted); hybrid RRF k=60 reference (adapted) | direct-copy / adapt |
-| agf | MIT | bounded reader (read_head_tail / char_prefix); shell quoting / PowerShell wrapper | direct-copy |
-| sessiongrep | Apache-2.0 | two-stage retrieval shape: FTS recall of bm25-ranked candidates, then rerank in Rust (adapted) | adapt |
-| Recall (samzong) | MIT | tool-activity target priority chain (adapted); Candle E5 embedding pipeline shape (adapted: BertModel + mean pooling + L2 + query:/passage: prefixes) | adapt |
-| fast-resume | MIT | jsonl_health source classification (adapted, retains upstream copyright line in code); opencode schema queries; pi/grok/kimi extraction approach | adapt |
-| hstry | MIT | hermes session JSON shapes and per-message extraction; transactional migration runner concepts | adapt |
-| memex | MIT | layered-dedup UNIQUE-constraint design (adapted as the placement constraint `UNIQUE(session_id, document_id, source_ordinal)`) | adapt |
-| agentsview | MIT | aider line-prefix role reconstruction | adapt |
-| claude-historian-mcp | MIT | codex/claude prefilter (skip non-dialogue records) | adapt |
-| AgentRecall | MIT | codebuddy idea-level filter; agent-sessions index-time redaction idea | adapt / idea-only |
+| ctx (ctxrs), N01a | Apache-2.0 | WAL/cache configuration; local PRAGMA set and cache value differ | bounded adapt (A04a), not a copied complete initialization/doctor function |
+| ctx (ctxrs), N01b | Apache-2.0 | CJK bigram tokenization | declared adapt |
+| ctx (ctxrs), N01c | Apache-2.0 | weighted hybrid RRF k=60 (`crates/agent-session-grep-application/src/hybrid.rs`) | declared adapt; Recall's historical RRF proposal is separate |
+| agf, N02a | MIT | POSIX shell quoting with local safe-token passthrough | conservative adapt (A05a); PowerShell copying not established |
+| sessiongrep, N03 | Apache-2.0 | FTS recall of bm25-ranked candidates, then rerank in Rust | declared adapt |
+| Recall (samzong), N04a | MIT | tool-activity target priority chain | declared adapt |
+| Recall (samzong), N04b | MIT | Candle E5 pipeline: BertModel + mean pooling + L2 + query:/passage: prefixes | declared adapt; separate from model weights |
+| fast-resume, N05a | MIT | jsonl_health source classification | declared adapt; existing source copyright retained |
+| fast-resume, N05b | MIT | OpenCode schema queries | declared adapt |
+| fast-resume, N05c-N05e | MIT | Pi, Grok and Kimi extraction (three assets) | declared adapt; OpenClaw's indirect local Pi chain is G05, not direct upstream OpenClaw copying |
+| hstry, N06a | MIT | Hermes session JSON shapes and per-message extraction | declared adapt; not the separate official Hermes SQLite schema source |
+| hstry, N06b | MIT | transactional migration runner concepts | declared adapt; purge/peek history is separate |
+| memex, N07 | MIT | layered-dedup design adapted from two columns to placement `UNIQUE(session_id, document_id, source_ordinal)` | declared adapt |
+| agentsview, N08 | MIT | Aider line-prefix/channel-state role reconstruction, with local run/tool-output handling | compared adapt (A03); distinct from historical schema/UI idea |
+| Contributor Covenant, N11 | CC BY 4.0 | `CODE_OF_CONDUCT.md` text, v2.1 | adapted text; existing source/version/modification notices preserved |
 
-Where upstream code comments carry a specific copyright line (for example the
-fast-resume adaptation in `crates/agent-session-grep-cli/src/main.rs`), that
-line is retained in the source file.
+### Design, policy and format references
 
-`coding_agent_session_search` (cass) is referenced idea-only under a
-clean-room boundary because its LICENSE contains a restricted-party rider; no
-cass source is copied or read by implementers (see REUSE-LICENSE-AUDIT §2).
+These credits are not a blanket assertion that no upstream code exists or no
+notice is required. Unknown original revisions remain unknown; category and
+license observations do not prove independent authorship or legal clearance.
+See audit §3.3-3.4 for the individual product paths and declaration limits.
+
+| Source project / audit ID | Observed root license | Reference / evidence limit |
+|---|---|---|
+| ctx, A04b/G02 | Apache-2.0 | doctor integrity/quick-check idea (only product SQL probes, not complete-function comparison); policy grading, retention length, Qoder/Cline format references |
+| agf, N02b | MIT | bounded-input idea (A05b); local line/stream limits differ from reference head/tail reader, without proving independent authorship |
+| claude-historian-mcp, N09 | MIT | prefilter-before-parse idea (A06) for both Claude and Codex; upstream query substrings differ from local envelope markers; progressive disclosure (S18) is separate |
+| AgentRecall, N10a/G01 | MIT | CodeBuddy idea-level format/root-message filter; ranking half-life reference |
+| agent-sessions, N10b | MIT | index-time redaction idea; product implementation location not established; distinct from AgentRecall |
+| sessiongrep, G01/G03 | Apache-2.0 | current-repository ranking signal and repository-identity reference |
+| Recall, G03/G11 | MIT | incremental parser_version, repository identity, usage shapes and URL examples; examples are not copied-fixture evidence |
+| hstry, G04/G09 | MIT | bulk insert, query sanitization, fork_type, Cursor ItemTable and Hermes JSON references; peek is separately credited in S12 |
+| fast-resume, G05/G11 | MIT | indirect OpenClaw → local Pi → fast-resume chain; resume, health/failure scan and fixture-name references; no upstream fixtures copied for this reconciliation |
+| agentsview, G01/G06 | MIT | sidechain ranking, unknown-vs-zero policy and forwarding-header ideas |
+| cc-switch, G07 | MIT | existing resume/format positive and negative references; unknown/unavailable capability is unchanged |
+| Wake (iAmCorey), G08 | MIT | Cursor format reference [crates/wake-core/src/adapters/cursor_ide.rs](https://github.com/iAmCorey/Wake/blob/71aeca67ec80f8645d1f9d5199290c2c732036ce/crates/wake-core/src/adapters/cursor_ide.rs) @ `71aeca67ec80f8645d1f9d5199290c2c732036ce`; product PROVENANCE declares synthetic fixtures/structural facts, not newly verified copying or compatibility |
+| NousResearch/hermes-agent, F01/G09 | not established here | official schema30 reference [hermes_state_common.py](https://github.com/NousResearch/hermes-agent/blob/bac0c45d8593ed9d53a8e3fcacecdc920b71a2c4/hermes_state_common.py) @ `bac0c45d8593ed9d53a8e3fcacecdc920b71a2c4`, declared blob `e35e61a06a3c69ebea6b37accec72d10cead20dc`; root license/applicability unknown, not hstry MIT; synthetic/no-copied-bytes statements are product declarations |
+| cc-sessions-viewer alongside AgentRecall/sessiongrep/cc-switch, G10 | P05 current pinned MIT metadata only; historical provenance unresolved | existing Claude noise-pattern names/envelopes remain unresolved provenance; names prove neither copied regex bytes nor independence; no source read/copy authorized |
+| hstry / memex / claude-historian-mcp, G12 | MIT | release-profile selection and negative ranking references, not new bundled-code or performance findings |
+
+Where upstream code comments carry a specific copyright line (for example
+`Copyright (c) 2025 Stanislas Lange` in the fast-resume adaptation in
+`crates/agent-session-grep-cli/src/lib.rs`), that line is retained.
+
+sessiongrep's observed Apache root notice is
+`Copyright 2026 Brain Co. Technologies Inc.` at
+`c5c1874f420fb20cc55e484f79bdff3d848b71a8`; see its pinned LICENSE in the audit
+and `LICENSE-APACHE` for the Apache License 2.0 text. ctx's observed root at
+`06bc5ed17ce4d0f6c8255981e009f86802dbe32f` has no NOTICE, and the compared
+connection source has no copyright header. The Apache appendix placeholder
+is not a copyright holder; none is invented here.
+
+claude-historian-mcp's MIT root at
+`b627cdfbfe46040368ed9c3f5bb2b531c65a8988` declares
+`Copyright (c) 2025 Claude Code Community`; this preserves the declaration,
+not independent proof of ownership.
+
+`coding_agent_session_search` (cass) retains restricted abstract/negative
+references only. Its restricted-party rider requires the project's existing
+no-read/analyze/index/copy source boundary; earlier clean-room/no-copy
+statements are declarations, not a new provenance certification. No cass
+source or fixture was read or copied for this reconciliation (audit §2/S20).
 
 ## Optional semantic model weights
 
@@ -66,5 +114,189 @@ tool itself; operators import a verified local bundle with
 | blake3 | CC0-1.0 OR Apache-2.0 | hashing |
 | ratatui / crossterm | MIT | TUI |
 
-The full resolved graph with per-package declared licenses ships in every
-release archive as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`.
+The optional-model and runtime rows above preserve declared metadata, not an
+independent license-file audit. Model redistribution remains separate/deferred.
+Resolved reports retain both safetensors 0.4.5 and 0.7.0; rusqlite's MIT label
+does not replace SQLite/libsqlite3-sys attribution, and ratatui/crossterm are
+separate packages. No name-only deduplication or full SPDX claim is implied.
+
+## Preserved observed MIT root notices
+
+The six texts below carry the complete registered reference notices. Five
+are retained verbatim. The hstry rendering removes only two trailing ASCII
+spaces on each of 12 source lines (24 bytes); all other license characters
+are unchanged. Each pinned source LICENSE remains linked below. This
+conservative preservation for declared/compared adaptations does not prove
+the original reuse revision, substantiality, historical authorization or
+that all obligations have been resolved.
+
+### agf
+
+Source: https://github.com/subinium/agf/blob/44be9cffd3b3eeb44ff1f31a751ec8954adf14cf/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2025 subinium
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### Recall
+
+Source: https://github.com/samzong/Recall/blob/22625bf8979a185d9913c1bfb20290ac466d492b/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2026 samzong
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### fast-resume
+
+Source: https://github.com/angristan/fast-resume/blob/66e42cfd34bca4800161098d3b302a35a52ce69b/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2025 Stanislas Lange
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### hstry
+
+Source: https://github.com/byteowlz/hstry/blob/88b78b1f3a84723e31a2c444bec326829fd02459/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2025 byteowlz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### memex
+
+Source: https://github.com/vimo-ai/memex/blob/9a88a5cbeccd14ef2a526729e1815b8df0793414/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2024-2025 vimo-ai
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### agentsview
+
+Source: https://github.com/kenn-io/agentsview/blob/a84564ad6ea35f8fb80905da4693144f89f84229/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2026 Kenn Software LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+The full resolved graph with declared licenses ships in binary bundles produced by this packaging workflow
+as `THIRD-PARTY-DEPENDENCIES.json` / `.csv`, not in GitHub-generated source archives.

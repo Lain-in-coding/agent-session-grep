@@ -14,12 +14,17 @@
 //! - `--offline` (no network)
 //! - one-switch disable
 //!
-//! Output format: Claude Code `hookSpecificOutput.additional_context` contract.
+//! Output format: Claude Code `hookSpecificOutput` contract, written bare to
+//! stdout — never inside this CLI's response envelope. Claude Code treats a
+//! hook's stdout as protocol, and for `SessionStart`/`UserPromptSubmit` injects
+//! exit-0 stdout into the session, so an envelope would both hide
+//! `hookSpecificOutput` and leak the envelope itself into the model's context.
+//! When the hook must not run, stdout stays completely empty.
 //!
 //! The `asg hook <event>` subcommand is the wiring: it reads the hook payload
 //! from stdin, honours `HookConfig` (flag-configured: `--enable`, `--max-tokens`,
-//! `--provider`, `--decay-days`; disabled by default), and writes the hook output
-//! to stdout.
+//! `--provider`, `--decay-days`, `--repo`; disabled by default), and writes the
+//! hook output to stdout via [`hook_stdout_line`].
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +40,11 @@ pub struct HookConfig {
     pub providers: Vec<String>,
     /// Time decay: only include sessions from the last N days (0 = no decay).
     pub decay_days: u32,
+    /// Repo filter (schema v16): only inject history from sessions whose
+    /// derived `host/owner/name` slug matches verbatim. `None` = no repo
+    /// restriction; sessions without a repo identity are excluded when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// One-switch disable: if true, hook is disabled regardless of `enabled`.
     pub disabled: bool,
 }
@@ -46,6 +56,7 @@ impl Default for HookConfig {
             max_tokens: 2000,
             providers: Vec::new(),
             decay_days: 0,
+            repo: None,
             disabled: false,
         }
     }
@@ -72,6 +83,10 @@ pub struct HookOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookSpecificOutput {
+    /// Which hook this output belongs to. Claude Code uses this as the
+    /// discriminator; without it the whole object is ignored, so the injection
+    /// silently does nothing.
+    pub hook_event_name: String,
     /// The additional context to inject into the session.
     pub additional_context: String,
     /// Whether the context was truncated due to budget.
@@ -83,23 +98,67 @@ pub struct HookSpecificOutput {
 ///
 /// The text is the formatted context to inject. If it exceeds `max_tokens`
 /// (approximated as chars/4), it is truncated and `truncated` is set.
-pub fn build_hook_output(text: &str, max_tokens: u64) -> HookOutput {
+pub fn build_hook_output(event: HookEvent, text: &str, max_tokens: u64) -> HookOutput {
     // Rough token estimate: ~4 chars per token.
-    let max_chars = (max_tokens.saturating_mul(4)) as usize;
-    let (context, truncated) = if text.len() > max_chars {
-        // Truncate at char boundary to avoid splitting multi-byte chars.
-        let truncated_text: String = text.chars().take(max_chars).collect();
-        (truncated_text, true)
-    } else {
-        (text.to_string(), false)
-    };
+    let max_chars = usize::try_from(max_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    // Count and cut with the same unit. Byte length would falsely mark short
+    // Unicode text as truncated while retaining every character.
+    let cutoff = text.char_indices().nth(max_chars).map(|(byte, _)| byte);
+    let context = text[..cutoff.unwrap_or(text.len())].to_string();
 
     HookOutput {
         hook_specific_output: HookSpecificOutput {
+            hook_event_name: event.as_str().to_string(),
             additional_context: context,
-            truncated: if truncated { Some(true) } else { None },
+            truncated: cutoff.map(|_| true),
         },
     }
+}
+
+/// The one line this command may write to stdout, or `None` for "write nothing".
+///
+/// Claude Code reads a hook's stdout as protocol: for `UserPromptSubmit` and
+/// `SessionStart`, exit-0 stdout is injected into the model's context — as
+/// parsed JSON when it carries `hookSpecificOutput`, and otherwise verbatim as
+/// plain text. So the envelope this CLI wraps every other command in cannot be
+/// used here twice over: it buries `hookSpecificOutput` one level too deep to
+/// be seen, *and* the whole envelope lands in the session as junk context.
+///
+/// Two outputs are therefore legal: exactly one line of contract JSON, or
+/// nothing at all. A disabled hook writes nothing.
+pub fn hook_stdout_line(data: &serde_json::Value) -> Option<String> {
+    if data.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let specific = data.get("hookSpecificOutput")?;
+    let context = specific
+        .get("additionalContext")
+        .and_then(serde_json::Value::as_str)?;
+    if context.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "hookSpecificOutput": specific }).to_string())
+}
+
+/// Operator-facing diagnostics for the same run.
+///
+/// These go to stderr on purpose: with exit 0 Claude Code sends stderr to its
+/// debug log only, never into the session, so the numbers stay visible when a
+/// human runs the command by hand without polluting anybody's context.
+pub fn hook_diagnostics(data: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        data.get(key)
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let injected = hook_stdout_line(data).is_some();
+    format!(
+        "hook: event={} enabled={} offline={} hits={} injected={injected}",
+        field("event").trim_matches('"'),
+        field("enabled"),
+        field("offline"),
+        field("hits"),
+    )
 }
 
 /// Format a context header for the hook output.
@@ -198,18 +257,19 @@ mod tests {
 
     #[test]
     fn build_hook_output_short_text() {
-        let output = build_hook_output("short context", 1000);
+        let output = build_hook_output(HookEvent::SessionStart, "short context", 1000);
         assert_eq!(
             output.hook_specific_output.additional_context,
             "short context"
         );
+        assert_eq!(output.hook_specific_output.hook_event_name, "SessionStart");
         assert!(output.hook_specific_output.truncated.is_none());
     }
 
     #[test]
     fn build_hook_output_truncates_long_text() {
         let long_text = "a".repeat(10000);
-        let output = build_hook_output(&long_text, 100);
+        let output = build_hook_output(HookEvent::UserPromptSubmit, &long_text, 100);
         assert!(output.hook_specific_output.additional_context.len() < long_text.len());
         assert_eq!(output.hook_specific_output.truncated, Some(true));
     }
@@ -217,8 +277,37 @@ mod tests {
     #[test]
     fn build_hook_output_preserves_multibyte_chars() {
         let text = "你好世界";
-        let output = build_hook_output(text, 1000);
+        let output = build_hook_output(HookEvent::UserPromptSubmit, text, 1000);
         assert_eq!(output.hook_specific_output.additional_context, text);
+    }
+
+    #[test]
+    fn hook_budget_uses_character_units_for_detection_and_truncation() {
+        for text in ["你好", "你好世界", "aé中🙂"] {
+            let output = build_hook_output(HookEvent::UserPromptSubmit, text, 1);
+            assert_eq!(output.hook_specific_output.additional_context, text);
+            assert_eq!(output.hook_specific_output.truncated, None);
+        }
+        let output = build_hook_output(HookEvent::UserPromptSubmit, "aé中🙂z", 1);
+        assert_eq!(output.hook_specific_output.additional_context, "aé中🙂");
+        assert_eq!(output.hook_specific_output.truncated, Some(true));
+    }
+
+    #[test]
+    fn hook_budget_zero_and_large_limits_do_not_wrap() {
+        let empty = build_hook_output(HookEvent::SessionStart, "", 0);
+        assert_eq!(empty.hook_specific_output.truncated, None);
+        let zero = build_hook_output(HookEvent::SessionStart, "🙂", 0);
+        assert_eq!(zero.hook_specific_output.additional_context, "");
+        assert_eq!(zero.hook_specific_output.truncated, Some(true));
+        for budget in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let output = build_hook_output(HookEvent::SessionStart, "full context", budget);
+            assert_eq!(
+                output.hook_specific_output.additional_context,
+                "full context"
+            );
+            assert_eq!(output.hook_specific_output.truncated, None);
+        }
     }
 
     #[test]
@@ -231,14 +320,71 @@ mod tests {
 
     #[test]
     fn hook_output_serializes_to_json() {
-        let output = build_hook_output("context text", 1000);
+        let output = build_hook_output(HookEvent::UserPromptSubmit, "context text", 1000);
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("hookSpecificOutput"));
         assert!(json.contains("additionalContext"));
         assert!(json.contains("context text"));
+        // hookEventName 是 Claude Code 的判别键：缺了它整个对象被忽略，注入静默失效。
+        assert!(
+            json.contains("\"hookEventName\":\"UserPromptSubmit\""),
+            "{json}"
+        );
 
         let back: HookOutput = serde_json::from_str(&json).unwrap();
         assert_eq!(back.hook_specific_output.additional_context, "context text");
+    }
+
+    #[test]
+    fn stdout_line_is_the_bare_contract_or_nothing() {
+        let enabled = |context: &str| {
+            let output = build_hook_output(HookEvent::SessionStart, context, 1000);
+            let mut data = serde_json::to_value(&output).unwrap();
+            data.as_object_mut()
+                .unwrap()
+                .insert("enabled".into(), serde_json::json!(true));
+            data.as_object_mut()
+                .unwrap()
+                .insert("event".into(), serde_json::json!("SessionStart"));
+            data
+        };
+
+        // 启用且有内容：恰好一行契约 JSON，`hookSpecificOutput` 在顶层。
+        let line = hook_stdout_line(&enabled("history")).expect("must inject");
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"], "SessionStart",
+            "{line}"
+        );
+        assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "history");
+        // envelope 字段绝不能出现在 hook 的 stdout 上（否则被原样注入上下文）。
+        for leaked in ["schema_version", "command", "outcome", "enabled", "offline"] {
+            assert!(parsed.get(leaked).is_none(), "{leaked} leaked: {line}");
+        }
+
+        // 启用但无内容：不写任何字节。
+        assert!(hook_stdout_line(&enabled("")).is_none());
+
+        // 未启用（默认）：不写任何字节——stdout 会被原样注入，一个字节都不能有。
+        let mut disabled = enabled("history");
+        disabled.as_object_mut().unwrap()["enabled"] = serde_json::json!(false);
+        assert!(hook_stdout_line(&disabled).is_none());
+        assert!(hook_stdout_line(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn diagnostics_report_whether_anything_was_injected() {
+        let data = serde_json::json!({
+            "event": "SessionStart",
+            "enabled": false,
+            "offline": true,
+            "hits": 0,
+            "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ""},
+        });
+        let line = hook_diagnostics(&data);
+        assert!(line.contains("event=SessionStart"), "{line}");
+        assert!(line.contains("enabled=false"), "{line}");
+        assert!(line.contains("injected=false"), "{line}");
     }
 
     #[test]
@@ -248,6 +394,7 @@ mod tests {
             max_tokens: 3000,
             providers: vec!["claude-code".to_string()],
             decay_days: 7,
+            repo: Some("github.com/synthetic-owner/synthetic-repo".to_string()),
             disabled: false,
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -256,6 +403,16 @@ mod tests {
         assert_eq!(back.max_tokens, 3000);
         assert_eq!(back.providers, vec!["claude-code"]);
         assert_eq!(back.decay_days, 7);
+        assert_eq!(
+            back.repo.as_deref(),
+            Some("github.com/synthetic-owner/synthetic-repo")
+        );
+
+        // 缺省的 repo 不进 JSON（旧配置读得回来，新字段可选）。
+        let bare = serde_json::to_string(&HookConfig::default()).unwrap();
+        assert!(!bare.contains("repo"), "{bare}");
+        let back: HookConfig = serde_json::from_str(&bare).unwrap();
+        assert!(back.repo.is_none());
     }
 
     #[test]

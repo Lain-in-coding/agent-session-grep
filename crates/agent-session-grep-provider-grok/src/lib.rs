@@ -103,7 +103,7 @@ impl ProviderAdapter for GrokBuildAdapter {
             self.provider_id(),
             Some(1),
             &[
-                "chunk grouping reconstructs roles; no per-message native ids (synthetic grok-msg-{seq})",
+                "chunk grouping reconstructs roles; no per-message native ids (ids are derived, not native)",
                 "per-message timestamps are not extracted (always None)",
                 "session identity falls back to the first ACP promptId seen, not a durable session id",
             ],
@@ -331,10 +331,11 @@ impl ProviderAdapter for GrokBuildAdapter {
                 }
                 "rewind_marker" => {
                     if let Some(target) = target
-                        && let Some(msg_idx) = user_message_indices.get(target as usize).copied()
+                        && let Ok(target) = usize::try_from(target)
+                        && let Some(msg_idx) = user_message_indices.get(target).copied()
                     {
                         messages.truncate(msg_idx);
-                        user_message_indices.truncate(target as usize);
+                        user_message_indices.truncate(target);
                         message_spans.truncate(msg_idx);
                         message_first_spans.truncate(msg_idx);
                         pending_user = None;
@@ -353,12 +354,17 @@ impl ProviderAdapter for GrokBuildAdapter {
         }
 
         // Emit reconstructed messages in order.
+        // `native_id` is empty: grok transcripts carry no durable per-message
+        // id, so the composition root derives a document-scoped id instead of
+        // adopting a synthetic `<provider>-msg-{seq}` that would collide
+        // across documents.
         for (idx, (is_user, text)) in messages.iter().enumerate() {
             let role = if *is_user { "user" } else { "assistant" };
             let span = message_first_spans.get(idx).copied().flatten();
             sink.emit_message(MessageEvent {
+                session: None,
                 seq,
-                native_id: &format!("grok-msg-{seq}"),
+                native_id: "",
                 parent_native_id: None,
                 role,
                 text,
@@ -393,9 +399,10 @@ impl ProviderAdapter for GrokBuildAdapter {
 
 /// Extract plain text from a Grok content value.
 ///
-/// Grok content can be a string or an array of content blocks with `text`
-/// fields (similar to Claude's content blocks). Non-string, non-array values
-/// yield empty text.
+/// Grok ACP uses all three content shapes in documented/reference transcripts:
+/// a bare string, an array of content blocks, and a single `{type:"text",text:…}`
+/// object. The object form is common in fast-resume/Recall fixtures. Non-string,
+/// non-array/object values yield empty text.
 fn grok_content_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
@@ -411,6 +418,11 @@ fn grok_content_text(content: &serde_json::Value) -> String {
             }
             buf
         }
+        serde_json::Value::Object(object) => object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -501,6 +513,22 @@ mod tests {
     }
 
     #[test]
+    fn oversized_rewind_target_cannot_wrap_to_an_existing_prompt() {
+        for target in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let fixture = format!(
+                "{{\"params\":{{\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"content\":\"retained\"}},\"_meta\":{{\"promptIndex\":0}}}}}}\n\
+                 {{\"params\":{{\"update\":{{\"sessionUpdate\":\"rewind_marker\",\"targetPromptIndex\":{target}}}}}}}\n"
+            );
+            let mut sink = TextSink { texts: vec![] };
+            let report = GrokBuildAdapter::new()
+                .parse(fixture.as_bytes(), &mut sink)
+                .unwrap();
+            assert_eq!(sink.texts, vec!["retained"]);
+            assert_eq!(report.committed, 1);
+        }
+    }
+
+    #[test]
     fn parse_skips_invalid_json_lines() {
         let adapter = GrokBuildAdapter::new();
         let fixture = "not json\n{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":\"ok\"}}}\n";
@@ -519,5 +547,71 @@ mod tests {
         let mut sink = CountSink { count: 0 };
         let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
         assert_eq!(report.committed, 1);
+    }
+
+    struct TextSink {
+        texts: Vec<String>,
+    }
+    impl CanonicalEventSink for TextSink {
+        fn emit_message(
+            &mut self,
+            event: MessageEvent<'_>,
+        ) -> agent_session_grep_ports::PortResult<()> {
+            self.texts.push(event.text.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parse_object_content_shape_is_not_dropped() {
+        // Reference ACP fixtures (fast-resume/Recall) encode a chunk as one
+        // `{type:"text",text:…}` object rather than a bare string or array. Before
+        // the object branch in `grok_content_text`, both user and assistant chunks
+        // became empty, hit `continue`, and vanished from the index.
+        let adapter = GrokBuildAdapter::new();
+        let fixture = r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"object-shaped user"}},"_meta":{"promptIndex":0}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"object-shaped assistant"}},"_meta":{"promptId":"p1"}}}
+"#;
+        let mut sink = TextSink { texts: vec![] };
+        let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "object-shaped user".to_string(),
+                "object-shaped assistant".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn object_content_shape_keeps_empty_object_non_message() {
+        // An object without a string `text` still carries no searchable prose;
+        // preserve the existing empty-content skip rather than stringifying the
+        // object or inventing a body.
+        assert!(grok_content_text(&serde_json::json!({"type": "image"})).is_empty());
+    }
+
+    #[test]
+    fn parse_passes_noise_shaped_user_text_through_verbatim() {
+        // 钉住测试：Grok ACP 流没有 system-reminder / AGENTS.md / 环境上下文等
+        // 注入概念（本格式唯一的 user-chunk 内容过滤是 bashCommand 工具元
+        // chunk，过滤依据是 `_meta` 结构而非文本形状）。形似噪声的 user 文本
+        // 必须逐字透传，防止将来把别家格式的过滤规则盲目搬来造成 silent drift。
+        let adapter = GrokBuildAdapter::new();
+        let fixture = r##"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"<system-reminder>reminder text</system-reminder>"},"_meta":{"promptIndex":0}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"# AGENTS.md instructions"},"_meta":{"promptIndex":1}}}
+"##;
+        let mut sink = TextSink { texts: vec![] };
+        let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "<system-reminder>reminder text</system-reminder>".to_string(),
+                "# AGENTS.md instructions".to_string(),
+            ]
+        );
     }
 }

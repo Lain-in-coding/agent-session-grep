@@ -1,5 +1,10 @@
 # agent-session-grep 开源登顶路线图
 
+> 此文保留历史产品决策与实现快照，不是当前发布/托管 CI 状态证明。
+> canonical 仓库既有 `0.1.0` 发布不被改写；任何新发布、可见性变更或
+> provider 晋级都需独立证据与 owner 决定，不能由导入代码自动成立。
+
+
 > 治理记录(Governance Record)
 >
 > - decision_id: DOC-OPEN-SOURCE-ROADMAP
@@ -35,6 +40,32 @@
   构建不启用该 feature，不得把 bigram-hash 宣传为真实语义模型。
 - GitHub hosted CI 当前受外部账户级阻塞，在首步前失败；这属于 External，不得改代码伪造跨平台认证。tag/release/签名与 owner governance 由 owner 决定。
 
+## 0.2 2026-08-25 历史实现快照
+
+2026-08-25 工程波次（property 全 14 家 / resume matrix 4 家新增 /
+tool_activity 7 家诚实盘点 / 3 个 Medium 修复）在当时完成。0.1 与本段均是历史实现快照，
+不表示当前 canonical candidate 已通过验收：
+
+- **三个代码审查 Medium 已闭合**：Robot/JSON 错误信封复用共享脱敏引擎且
+  `ProviderError::Io` 按 R4.3 规则掩蔽源路径；入口一致性 e2e 在无 Python
+  解释器时跳过而非 panic；CI 增加常驻 `--features semantic-candle` 测试步，
+  candle 模块每次运行都被编译与测试。
+- **property 测试全 14 家**：seeded 随机化套件（`tests/properties.rs`）此前仅
+  Claude/Codex，现覆盖全部 14 个已实现 provider；Beta readiness ledger 新增
+  `property` 列并与各套件文件存在双向守护。
+- **resume 矩阵 4 家新增**（均来自上游已核验证据）：antigravity
+  `agy --conversation <id>`、opencode `opencode <directory> --session <id>`、
+  kimi-code `kimi --session <id>`、tencent-codebuddy
+  `codebuddy --resume <id>` → 升为 `derived`；hermes/qoder/cursor 因参考项目
+  证据冲突或无证据保持 `unknown`。
+- **tool_activity 7 家诚实盘点**：四家格式携带结构化工具记录但无 per-message
+  native id 可锚定、三家无结构化记录——全部如实保持 `unsupported`，理由逐行
+  记录并由 golden 语料漂移测试钉住。
+- **阶段 2 目标未达成（如实标注）**：Claude/Codex 仍 `experimental`、未
+  certified（全矩阵 0 Beta）；DeepSeek Harness/ZCode 仍 deferred 无证据。
+  外部 blocker 不变：该快照尚无跨 target 认证证据；不代表 canonical 仓库当前 CI 或可见性。
+  后续公开/tag/release/签名仍需 owner 单独批准。
+
 
 **产品名 `agent-session-grep`,CLI 别名 `asg`。**
 
@@ -56,11 +87,11 @@
 
 | 差异化 | 说明 | 对手现状 |
 |---|---|---|
-| Evidence-first | 每条结果带 source span 可回溯原文;handoff pack 原文/推断分栏 | 无人做到 pack 级证据契约 |
+| Evidence-first | 格式可提供时结果带 source span 可回溯原文;handoff pack 原文/推断分栏 | 已核验:cass 有 pack(预算/引用/遗漏原因)、ctx 有 citations/visibility;不再主张独占,改为可测承诺:证据验证成功率、出处失效行为、过滤/分页一致性、输出 token 成本、恢复耗时 |
 | 身份与一致性 | StableId 三级 + durable outbox + CAS generation + 失败不删除 | hstry 的 UUID v5 最接近但无 outbox |
-| CJK 一等公民 | bigram 索引 + 可选 `semantic-candle` 本地 E5 后端(feature-gated、默认 off、离线导入) + 中文语义模型 benchmark 待落地后锁定(默认向量模式为 bigram-hash fuzzy-lexical,非真实语义模型) | 竞品基本无中文分词处理 |
+| CJK 一等公民 | bigram 索引 + 可选 `semantic-candle` 本地 E5 后端(feature-gated、默认 off、离线导入) + 中文语义模型 benchmark 待落地后锁定(默认向量模式为 bigram-hash fuzzy-lexical,非真实语义模型) | Wake 已用 FTS5 trigram/substr 处理 CJK(短词退化走 LIKE);差异改由可测举证:中文召回/语义 benchmark(待落地) |
 | 诚实能力矩阵 | certified/GA/beta/experimental/unsupported 分级,证据晋级,禁止跨级宣传 | 多数项目虚标 provider 数 |
-| 零遥测可验证 | 代码级禁止 + CI 静态检查 + 全局 `--offline` flag（fail-closed）+ `tests/network_egress.rs` 零 HTTP client / 唯一 loopback socket 断言 | 无人做到可验证 |
+| 零遥测可验证 | 代码级禁止 + CI 静态检查 + 全局 `--offline` flag（fail-closed）+ `tests/network_egress.rs` 零 HTTP client / 唯一 loopback socket 断言 | 未对竞品做同等零遥测审计,不作独占性主张(本产品以 CI 静态检查 + network_egress 断言自证) |
 | 跨边界默认脱敏 | Web/Handoff/MCP/Robot 默认脱敏,CLI/TUI 本地不脱敏 | agentsview 有 secret 扫描但非分层边界 |
 | Robot 契约 | 13+ 码 error catalog + cursor 防篡改 + retrieval_mode | cass robot 模式粒度更粗 |
 
@@ -96,31 +127,50 @@
 parity、零遥测可验证、跨边界脱敏、Hook 默认关闭、三平台安装、
 benchmark/文档/对比表一致、三平台演练通过。
 
-## 5. 竞品事实基线(2026-08-15 精读结论,13 个外部项目)
+## 5. 竞品事实基线(2026-10-06 B0 更新,15 个外部项目/13 个可引用)
 
-当前仓库已保存并核验的外部参考项目为:
-`ctx`、`cass`(即 `coding_agent_session_search`)、`agentsview`、`AgentRecall`、
-`agent-sessions`、`agf`、`cc-switch`、`claude-historian-mcp`、`fast-resume`、
-`hstry`、`memex`、`Recall`、`sessiongrep`,共 13 项。
-其中 12 项可自由引用,是对比表与 benchmark 基线的合法来源;
-`cass` 因其 LICENSE 含 restricted-party rider,仅限 clean-room 思路,
-计入名单但不计入可引用对比基线——即”13 个外部项目”是”12 可引用 +
-1 clean-room-only”。
+当前仓库已保存并核验的外部参考项目共 **15 个**:
+`ctx`、`agentsview`、`AgentRecall`、`agent-sessions`、`agf`、
+`cc-switch`、`claude-historian-mcp`、`fast-resume`、`hstry`、`memex`、
+`Recall`、`sessiongrep`、`coding_agent_session_search`、`cc-sessions-viewer`、
+`Wake`。
+其中 **13 个**可自由引用,是对比表与 benchmark 基线的合法来源;
+`coding_agent_session_search` 因其 LICENSE 含 restricted-party rider,
+`cc-sessions-viewer` 因其仓库无 LICENSE 文件(README 的 MIT badge 无文件
+支撑,`licenseInfo: null`),两者均仅限 clean-room 思路,计入名单但不计入
+可引用对比基线。因此名单共
+15 项 = 「13 可引用 + 2 clean-room-only」,对外口径「13 个外部项目」
+指可自由引用集,与 `COMPETITOR-COMPARISON.md` 的口径说明一致。
+
+`cass` 是 `coding_agent_session_search` 的简称,两个名字指同一个仓库
+(`Dicklesworthstone/coding_agent_session_search`,固定 commit 见
+`../operations/REUSE-LICENSE-AUDIT.md`);本节其余各处沿用简称 `cass`。
+本文此前把两个名字并列成 14 项名单并据此算出「13 可引用」,是同一项目
+被计了两次,已按去重后的 13/12 更正。
+
+2026-10-06 B0 更新:补记 Wake(MIT,commit 71aeca6/0.8.5,已有 deep-read
+回执)后,名单 14→15 项、可自由引用 12→13。上句去重更正得到的「13 可引用」
+是历史错误口径,与本次因新增项目得到的 13 不是同一来源。
+
 发布前 benchmark 必须逐项给出来源、commit/version 和可复现命令;
-若要继续使用”15 个外部项目”宣传口径,必须先补齐两项独立外部基线,
-否则统一改称”13 个外部项目”。
+不得使用「15 个外部项目」宣传口径——15 是名单数(含 2 项 clean-room-only),
+可引用集为 13 个;要达到 15 需再补齐两项独立外部基线,在那之前统一改称
+「13 个外部项目」。
 
-- provider 覆盖:ctx 40+、agentsview 40+、AgentRecall 16、hstry 16、
+- provider 覆盖(deep-read 快照,快照日期 2026-08-14,本轮未重数;Wake 行除外,
+  其 21 取自 2026-10-06 Wake 审计):ctx 40+、
+  agentsview 40+、AgentRecall 16、hstry 16、
   fast-resume 12、Recall 11、agent-sessions 10、agf 8、cc-switch 7、
-  sessiongrep 5、memex 4、claude-historian-mcp 1、
-  cass(claimed 40+,待以同一 benchmark harness 核验)。
-- 检索:纯 FTS5 系(sessiongrep/agent-sessions)、FTS+模糊(fast-resume)、
-  hybrid RRF(ctx/cass/Recall/agentsview/memex)、fuzzy(agf)、零存储全扫
-  (claude-historian-mcp)。
-- 深度精读报告(2026-08-14 生成)仅作为本地研究输入,不纳入公开树;cass 因
-  clean-room 边界不产 deep-read 报告。对外可引用的结论收敛到
-  `COMPETITOR-COMPARISON.md` 与本节。
-- 法律红线:cass LICENSE 含 rider,仅 clean-room 思路;REUSE-LICENSE-AUDIT
+  cc-sessions-viewer 7、sessiongrep 5、memex 4、claude-historian-mcp 1、Wake 21、
+  coding_agent_session_search(待以同一 benchmark harness 核验)。
+- 检索:纯 FTS5/trigram 系(sessiongrep/agent-sessions/Wake)、FTS+模糊(fast-resume)、
+  hybrid RRF(ctx/cass/Recall/agentsview/memex)、fuzzy(agf)、无索引并行全量
+  扫描+进程内缓存(cc-sessions-viewer)、零存储全扫(claude-historian-mcp)。
+- 私有调研报告不纳入公开树。公开依据为 `../operations/REUSE-LICENSE-AUDIT.md`
+  的固定项目 revision，以及各 provider 的 golden `PROVENANCE.md` 与守护测试。
+  不把报告的存在当作代码复用许可。
+- 法律红线:cass LICENSE 含 rider、cc-sessions-viewer 无 LICENSE 文件,
+  两者均仅 clean-room 思路;REUSE-LICENSE-AUDIT
   维护 direct-copy/adapt/idea-only/reject 边界。
 
 ## 6. 术语与决策日志

@@ -82,7 +82,7 @@ impl ProviderAdapter for OpenClawAdapter {
             Some(1),
             &[
                 "resume is intentionally unsupported (gateway-managed)",
-                "native message ids are not preserved (synthetic openclaw-msg-{seq})",
+                "native message ids are not preserved (ids are derived, not native)",
             ],
         )
     }
@@ -287,8 +287,9 @@ impl ProviderAdapter for OpenClawAdapter {
                         .and_then(|v| v.as_str())
                         .or(rec.timestamp.as_deref());
                     sink.emit_message(MessageEvent {
+                        session: None,
                         seq,
-                        native_id: &format!("openclaw-msg-{seq}"),
+                        native_id: "",
                         parent_native_id: None,
                         role,
                         text: &text,
@@ -462,5 +463,42 @@ mod tests {
         assert_eq!(report.committed, 1);
         assert!(!report.diagnostics.is_empty());
         assert!(report.session_observation.multi_session);
+    }
+
+    struct TextSink {
+        texts: Vec<String>,
+    }
+    impl CanonicalEventSink for TextSink {
+        fn emit_message(
+            &mut self,
+            event: MessageEvent<'_>,
+        ) -> agent_session_grep_ports::PortResult<()> {
+            self.texts.push(event.text.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parse_passes_noise_shaped_user_text_through_verbatim() {
+        // 钉住测试：OpenClaw v3 session JSONL 没有 system-reminder / AGENTS.md /
+        // 环境上下文等注入概念（message.role 就是角色，user 行就是用户原文）。
+        // 形似噪声的文本必须逐字透传，防止将来把别家格式的过滤规则盲目搬来
+        // 造成 silent drift。
+        let adapter = OpenClawAdapter::new();
+        let fixture = r##"{"type":"session","id":"s1","cwd":"/p"}
+{"type":"message","message":{"role":"user","content":"<system-reminder>reminder text</system-reminder>"}}
+{"type":"message","message":{"role":"user","content":"# AGENTS.md instructions"}}
+"##;
+        let mut sink = TextSink { texts: vec![] };
+        let report = adapter.parse(fixture.as_bytes(), &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            sink.texts,
+            vec![
+                "<system-reminder>reminder text</system-reminder>".to_string(),
+                "# AGENTS.md instructions".to_string(),
+            ]
+        );
     }
 }

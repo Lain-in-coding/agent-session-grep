@@ -922,4 +922,90 @@ mod tests {
             }
         }
     }
+
+    /// `handoff` 能力列 ↔ 生成器真实行为 防漂移（与 `resume` 列的
+    /// `capability_matrix_resume_level_matches_builder_support` 同一纪律）。
+    ///
+    /// 起因：capability.rs 曾对全部 14 个已实现 provider 声明
+    /// `handoff: Unsupported`，而 `asg handoff` 是发布功能且对 codex（JSONL）、
+    /// aider（markdown，native_id 恒空）、opencode（SQLite）三种结构迥异的真实
+    /// golden 源实测都产出 `confidence: high` 的带证据 pack。少报的根因是
+    /// 把 handoff 当成了 per-provider 能力：本生成器只消费 `SearchHit` +
+    /// 权威 source placement，`provenance`/`matched_sessions[].provider_id`
+    /// 一律为 `None`（"搜索型 pack 无单一会话/提供商，honest：不臆造"），
+    /// 全流程不读 provider 身份，也没有任何 per-provider 分支。
+    ///
+    /// 因此该列的诚实口径是：能否装出带证据的 pack 只取决于消息是否落库并带
+    /// source placement——这对所有已实现 provider 一致成立（parse 可用即成立）。
+    /// 本测试把这条不变量钉住：用同一批合成命中，逐个 provider 身份走生成器，
+    /// 断言产出逐字节相同，从而证明"provider 无关"，任何未来引入的
+    /// per-provider 分支都会在此失败。
+    #[test]
+    fn handoff_pack_generation_is_provider_independent() {
+        use agent_session_grep_ports::capability::{ProviderCapabilityMatrix, ProviderMaturity};
+
+        let matrix = ProviderCapabilityMatrix::current();
+        let implemented: Vec<String> = matrix
+            .providers
+            .iter()
+            .filter(|p| p.maturity != ProviderMaturity::Unsupported)
+            .map(|p| p.provider_id.clone())
+            .collect();
+        assert_eq!(
+            implemented.len(),
+            14,
+            "已实现 provider 应为 14 个，实际 {}",
+            implemented.len()
+        );
+
+        let hits = vec![
+            hit("msg_v1_aaa", 1.0, "hello world"),
+            hit("msg_v1_bbb", 0.8, "hello there"),
+        ];
+        let locs = locations(&hits);
+
+        // 逐个 provider 身份进入 filters.providers：生成器若读 provider 身份做
+        // 分支，pack 内容就会随之改变。这里只允许 `filters` 回显与 `pack_id`
+        // （其派生输入含 filters）不同，装配出的证据/mainline/置信度必须一致。
+        let mut baseline: Option<(Vec<EvidenceEntry>, Vec<MainlineEntry>, ConfidenceLevel)> = None;
+        for provider_id in &implemented {
+            let filters = HandoffFilters {
+                providers: vec![provider_id.clone()],
+                ..HandoffFilters::default()
+            };
+            let mut input = default_input(&hits, &locs);
+            input.filters = filters;
+            let pack = generate_deterministic(input);
+
+            assert!(
+                !pack.evidence.is_empty(),
+                "{provider_id}: handoff 生成器必须为已落库且带 source placement 的命中产出证据"
+            );
+            assert!(
+                pack.provenance.is_none(),
+                "{provider_id}: 搜索型 pack 不得臆造单一 provenance"
+            );
+            for session in &pack.matched_sessions {
+                assert!(
+                    session.provider_id.is_none(),
+                    "{provider_id}: matched_sessions 不得携带臆造的 provider 身份"
+                );
+            }
+
+            let shape = (
+                pack.evidence.clone(),
+                pack.mainline.clone(),
+                pack.confidence.overall,
+            );
+            match &baseline {
+                None => baseline = Some(shape),
+                Some(expected) => assert_eq!(
+                    &shape, expected,
+                    "{provider_id}: handoff pack 装配随 provider 身份变化——\
+                     生成器出现了 per-provider 分支，capability.rs 的 handoff \
+                     列不能再按 provider 无关 统一声明"
+                ),
+            }
+        }
+    }
 }

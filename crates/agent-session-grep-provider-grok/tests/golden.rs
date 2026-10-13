@@ -4,13 +4,16 @@
 //! fixture 字节漂移（git 行尾转换、误编辑）都必须在此响亮失败，作为
 //! Beta 认证的可复核证据。fixture 为纯合成数据，来源与覆盖点见
 //! `tests/golden/PROVENANCE.md`。
+//!
+//! 全字段捕获 sink、fixture 读取与 BLAKE3 校验、canonical JSON 投影复用
+//! `agent_session_grep_testkit::golden`，本文件只保留 grok 特有的 span↔chunk-kind
+//! 断言与一个手动再生辅助。
 
-use agent_session_grep_ports::{
-    CanonicalEventSink, Confidence, MessageEvent, ParseReport, ProviderAdapter,
-};
+use agent_session_grep_ports::{Confidence, ProviderAdapter};
 use agent_session_grep_provider_grok::GrokBuildAdapter;
 use agent_session_grep_testkit::assert_read_only;
-use serde_json::{Value, json};
+use agent_session_grep_testkit::golden::{self, CapturingSink};
+use serde_json::Value;
 
 /// fixture 与期望文件随 crate 固定存放；以 manifest 目录定位，不依赖 cwd。
 const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/basic.jsonl");
@@ -18,102 +21,27 @@ const EXPECTED_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/golden/basic.expected.json"
 );
+/// Reference ACP fixtures encode `content` as a single `{type:"text",text:…}`
+/// object. `basic.jsonl` covers only string + array, so this shape previously
+/// disappeared while every golden test still passed.
+const OBJECT_CONTENT_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/object-content.jsonl"
+);
+const OBJECT_CONTENT_EXPECTED_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/object-content.expected.json"
+);
 
-/// 收集 emit 的消息事件。
-#[derive(Default)]
-struct CollectingSink {
-    messages: Vec<Captured>,
-}
-
-/// 拍平的事件快照（`MessageEvent` 借用输入，测试侧需拥有所有权）。
-struct Captured {
-    seq: u32,
-    native_id: String,
-    parent_native_id: Option<String>,
-    role: String,
-    text: String,
-    timestamp: Option<String>,
-    is_sidechain: bool,
-    span: Option<(u64, u64)>,
-}
-
-impl CanonicalEventSink for CollectingSink {
-    fn emit_message(
-        &mut self,
-        event: MessageEvent<'_>,
-    ) -> agent_session_grep_ports::PortResult<()> {
-        self.messages.push(Captured {
-            seq: event.seq,
-            native_id: event.native_id.to_string(),
-            parent_native_id: event.parent_native_id.map(str::to_string),
-            role: event.role.to_string(),
-            text: event.text.to_string(),
-            timestamp: event.timestamp.map(str::to_string),
-            is_sidechain: event.is_sidechain,
-            span: event.span,
-        });
-        Ok(())
-    }
-}
-
-/// 读取 pinned 期望输出。
-fn read_expected() -> Value {
-    let bytes = std::fs::read(EXPECTED_PATH).expect("read basic.expected.json");
-    serde_json::from_slice(&bytes).expect("basic.expected.json must be valid JSON")
-}
-
-/// 读 fixture 字节并先校验 BLAKE3 指纹。
-fn read_fixture_verified(expected: &Value) -> Vec<u8> {
-    let bytes = std::fs::read(FIXTURE_PATH).expect("read basic.jsonl fixture");
-    let actual = blake3::hash(&bytes).to_hex().to_string();
-    let pinned = expected["fixture_blake3"]
-        .as_str()
-        .expect("expected.json must pin fixture_blake3");
-    assert_eq!(
-        actual, pinned,
-        "fixture bytes drifted — check .gitattributes -text rules (actual blake3 = {actual})"
-    );
-    bytes
-}
-
-/// 用 adapter 解析 fixture，返回报告与收集到的事件。
-fn parse_fixture(bytes: &[u8]) -> (ParseReport, Vec<Captured>) {
-    let mut sink = CollectingSink::default();
-    let report = GrokBuildAdapter::new()
-        .parse(bytes, &mut sink)
-        .expect("golden fixture parse must succeed");
-    (report, sink.messages)
-}
-
-/// 把解析结果序列化为 canonical 输出形状。
-fn canonical_json(fixture_blake3: &str, report: &ParseReport, messages: &[Captured]) -> Value {
-    json!({
-        "fixture_blake3": fixture_blake3,
-        "session_native_id": report.session_native_id,
-        "committed": report.committed,
-        "skipped": report.skipped,
-        "messages": messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "seq": m.seq,
-                    "native_id": m.native_id,
-                    "parent_native_id": m.parent_native_id,
-                    "role": m.role,
-                    "text": m.text,
-                    "timestamp": m.timestamp,
-                    "is_sidechain": m.is_sidechain,
-                    "span": m.span.map(|(start, end)| json!({"start": start, "end": end})),
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
+/// 解析 fixture：经共享 sink 全字段捕获，返回报告与 sink。
+fn parse_fixture(bytes: &[u8]) -> (agent_session_grep_ports::ParseReport, CapturingSink) {
+    golden::parse_golden(&GrokBuildAdapter::new(), bytes)
 }
 
 #[test]
 fn probe_never_mutates_source_bytes() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
 
     // RFC-0002 §7 的只读契约必须有可执行守护，不能只依赖代码审查。
     assert_read_only(&bytes, |source| GrokBuildAdapter::new().probe(source))
@@ -122,9 +50,9 @@ fn probe_never_mutates_source_bytes() {
 
 #[test]
 fn parse_never_mutates_source_bytes() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let mut sink = CollectingSink::default();
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let mut sink = CapturingSink::default();
 
     let report = assert_read_only(&bytes, |source| {
         GrokBuildAdapter::new().parse(source, &mut sink)
@@ -141,12 +69,12 @@ fn golden_provenance_revision_matches_manifest() {
 
 #[test]
 fn golden_canonical_output_is_pinned() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let (report, messages) = parse_fixture(&bytes);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let (report, sink) = parse_fixture(&bytes);
 
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    let actual = canonical_json(&hash, &report, &messages);
+    let actual = golden::canonical_json(&hash, &report, &sink.messages);
     let actual_pretty = serde_json::to_string_pretty(&actual).expect("serialize actual");
     assert_eq!(
         actual, expected,
@@ -158,8 +86,8 @@ fn golden_canonical_output_is_pinned() {
 fn golden_probe_tolerates_intentional_broken_line() {
     // PRD R2.3：fixture 内置一条故意破损行——probe 必须容忍（≤3），不得
     // 整源拒绝；chunk 证据充分时保持 Confirmed。
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
     let r = GrokBuildAdapter::new()
         .probe(&bytes)
         .expect("golden fixture probe must tolerate the broken line");
@@ -168,9 +96,10 @@ fn golden_probe_tolerates_intentional_broken_line() {
 
 #[test]
 fn golden_spans_slice_back_to_exact_source_lines() {
-    let expected = read_expected();
-    let bytes = read_fixture_verified(&expected);
-    let (_, messages) = parse_fixture(&bytes);
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let (_, sink) = parse_fixture(&bytes);
+    let messages = &sink.messages;
     assert!(!messages.is_empty(), "golden fixture must emit messages");
 
     // 独立重建行表（split_inclusive + 去行尾），据此验证 span 契约：
@@ -186,7 +115,7 @@ fn golden_spans_slice_back_to_exact_source_lines() {
         line_by_start.insert(start, line);
     }
 
-    for m in &messages {
+    for m in messages {
         let (start, end) = m.span.expect("golden message must carry a span");
         let line = line_by_start
             .get(&start)
@@ -223,6 +152,35 @@ fn golden_spans_slice_back_to_exact_source_lines() {
     }
 }
 
+#[test]
+fn tool_activity_stays_unsupported_because_activities_cannot_anchor() {
+    // 双向钉住 tool_activity=Unsupported 的诚实性：
+    // 1) 语料确含文档化的结构化工具记录（`content._meta.bashCommand` 元 chunk，
+    //    adapter 作为非对话记录跳过）——格式有工具记录，不是"格式无记录"；
+    // 2) 所有消息以空 native id 上报（ACP 无 per-message id，promptId 是 prompt
+    //    级分组键），且 adapter 零 activity 输出——per RFC-0002 R5.3 + staging
+    //    fail-closed，活动根本无法锚定，Unsupported 是唯一诚实声明。
+    // 未来若格式获得 per-message id，本测试的断言会失败，强制重评 capability。
+    let expected = golden::read_expected(EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(FIXTURE_PATH, &expected);
+    let (report, sink) = parse_fixture(&bytes);
+    assert!(report.committed > 0, "fixture must exercise message output");
+    assert!(
+        sink.activities.is_empty(),
+        "adapter 不得发出无法锚定的 activity（空 native id 会被 staging fail-closed 丢弃）"
+    );
+    assert!(
+        !sink.messages.is_empty() && sink.messages.iter().all(|m| m.native_id.trim().is_empty()),
+        "golden 消息全部以空 native id 上报——若未来带上 per-message id，\
+         capability.rs 的 tool_activity 声明必须重新评估"
+    );
+    let text = std::str::from_utf8(&bytes).expect("fixture is UTF-8");
+    assert!(
+        text.contains("\"bashCommand\""),
+        "golden 语料必须保留文档化的 bashCommand 工具记录形状（如实承认格式有工具记录）"
+    );
+}
+
 /// 手动再生辅助：fixture 合法变更（PROVENANCE.md 的 fixture_revision 递增）后，
 /// 运行下面命令打印新的 canonical JSON，人工审阅后粘贴回 basic.expected.json：
 ///
@@ -234,9 +192,76 @@ fn golden_spans_slice_back_to_exact_source_lines() {
 fn print_actual_canonical_output_for_regeneration() {
     let bytes = std::fs::read(FIXTURE_PATH).expect("read basic.jsonl fixture");
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    let (report, messages) = parse_fixture(&bytes);
+    let (report, sink) = parse_fixture(&bytes);
     println!(
         "{}",
-        serde_json::to_string_pretty(&canonical_json(&hash, &report, &messages)).unwrap()
+        serde_json::to_string_pretty(&golden::canonical_json(&hash, &report, &sink.messages))
+            .unwrap()
+    );
+}
+
+#[test]
+fn object_content_golden_canonical_output_is_pinned() {
+    let expected = golden::read_expected(OBJECT_CONTENT_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(OBJECT_CONTENT_FIXTURE_PATH, &expected);
+    let (report, sink) = golden::parse_golden(&GrokBuildAdapter::new(), &bytes);
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let actual = golden::canonical_json(&hash, &report, &sink.messages);
+    let actual_pretty = serde_json::to_string_pretty(&actual).expect("serialize actual");
+    assert_eq!(
+        actual, expected,
+        "object-content canonical 输出与 pinned 期望不一致——parser 行为漂移或 fixture 未经评审变更。actual =\n{actual_pretty}"
+    );
+}
+
+#[test]
+fn object_content_golden_keeps_both_chunk_roles() {
+    // 这条是本 fixture 存在的理由：对象形态的 user/assistant chunks 都必须进索引。
+    let expected = golden::read_expected(OBJECT_CONTENT_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(OBJECT_CONTENT_FIXTURE_PATH, &expected);
+    let (report, sink) = golden::parse_golden(&GrokBuildAdapter::new(), &bytes);
+    assert_eq!(report.committed, 2);
+    assert_eq!(
+        sink.messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "assistant"]
+    );
+    assert_eq!(
+        sink.messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        ["object-shaped user", "object-shaped assistant"]
+    );
+}
+
+#[test]
+fn object_content_golden_probe_and_parse_never_mutate_source_bytes() {
+    let expected = golden::read_expected(OBJECT_CONTENT_EXPECTED_PATH);
+    let bytes = golden::read_fixture_verified(OBJECT_CONTENT_FIXTURE_PATH, &expected);
+    assert_read_only(&bytes, |source| GrokBuildAdapter::new().probe(source))
+        .expect("object-content golden probe must succeed");
+    let mut sink = CapturingSink::default();
+    let report = assert_read_only(&bytes, |source| {
+        GrokBuildAdapter::new().parse(source, &mut sink)
+    })
+    .expect("object-content golden parse must succeed");
+    assert_eq!(report.committed, sink.messages.len());
+}
+
+/// object-content fixture 的手动再生辅助。
+#[test]
+#[ignore = "manual regeneration helper — prints canonical JSON for object-content.expected.json"]
+fn print_actual_object_content_canonical_output_for_regeneration() {
+    let bytes =
+        std::fs::read(OBJECT_CONTENT_FIXTURE_PATH).expect("read object-content.jsonl fixture");
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let (report, sink) = golden::parse_golden(&GrokBuildAdapter::new(), &bytes);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&golden::canonical_json(&hash, &report, &sink.messages))
+            .unwrap()
     );
 }

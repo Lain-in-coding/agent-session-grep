@@ -63,6 +63,25 @@ fn run() -> Result<(), String> {
             println!("INTENT:{}:{}", pending.operation_id, entry.0.as_str());
             Ok(())
         }
+        "compact-stage" => {
+            // 中断边界注入：preview+stage 已 durable 落盘后阻塞，父进程直接 kill。
+            // 子进程不再做任何写操作，复现"apply 前进程消失"的崩溃形状。
+            let store = SqliteStore::open_for_write(db).map_err(format_port_error)?;
+            let preview = store
+                .preview_journal_compaction()
+                .map_err(format_port_error)?;
+            let stage = store
+                .stage_journal_compaction(&preview)
+                .map_err(format_port_error)?;
+            println!("STAGED:{}:{}", stage.compaction_id, stage.affected_batches);
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut line = String::new();
+            io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
         "recover" => {
             let store = SqliteStore::open_for_write(db).map_err(format_port_error)?;
             println!(

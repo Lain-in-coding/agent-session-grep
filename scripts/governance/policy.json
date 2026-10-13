@@ -1,0 +1,7 @@
+{
+  "version": "1",
+  "types": ["feat", "fix", "docs", "refactor", "test", "chore", "ci", "perf"],
+  "scope_pattern": "[a-z][a-z0-9]*(?:[-./_][a-z0-9]+)*",
+  "header_width": 50,
+  "body_width": 72
+}

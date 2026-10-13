@@ -14,13 +14,21 @@ default = []
 # The default release path stays bigram-hash / lexical-only.
 semantic-candle = ["agent-session-grep-application/semantic-candle"]
 
+[lib]
+# The CLI lives in the library so both installed command names share one
+# compilation unit and one unit-test run. Two thin bin shims (src/bin/*.rs)
+# forward to `run_cli()`; pointing both bin targets at the same main.rs previously
+# made cargo compile the CLI twice and run its unit tests twice.
+name = "agent_session_grep_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent-session-grep"
-path = "src/main.rs"
+path = "src/bin/agent-session-grep.rs"
 
 [[bin]]
 name = "asg"
-path = "src/main.rs"
+path = "src/bin/asg.rs"
 
 # Test-only fake provider for the resume smoke e2e test (never shipped to users).
 [[bin]]
@@ -56,5 +64,14 @@ getrandom = "0.4"
 [dev-dependencies]
 # default-features = false 与 adapters-sqlite 保持一致,避免 test 图的特性
 # 统一把 cache/ffi-sqlite-wasm-rs 重新拉回来。
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3"
+# provider_matrix 的 capability↔adapter 漂移测试需要全字段捕获 sink
+# (emit_activity 观测),与各 provider golden 测试同一份脚手架。
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

@@ -138,7 +138,10 @@ impl CanonicalCode {
             }
             CanonicalCode::SnapshotFailed => "快照校验失败：检查源文件元数据与文件系统健康状态",
             CanonicalCode::CatalogError => {
-                "数据库打开/读取失败：检查 --db 路径是否正确（路径末尾不要带斜杠），可运行 doctor --db <path> 自检"
+                "先运行 doctor --db <path> 自检。若 doctor 正常，说明这不是打开失败而是\
+                 一次被拒绝的写入（例如同一条消息在不同源上投影冲突）：用 \
+                 ASG_DEBUG_ERRORS=1 重跑同一命令查看被掩码的原因，并按 \
+                 docs/operations/rebuild-and-migration-runbook.md 处理"
             }
             CanonicalCode::ProviderError => "该文件不是可识别的 transcript 格式，或文件已被破坏",
             CanonicalCode::CapabilityNotSupported => {
@@ -236,20 +239,64 @@ impl From<AppError> for ProtocolError {
 
 impl From<ProviderError> for ProtocolError {
     fn from(error: ProviderError) -> Self {
-        ProtocolError::new(CanonicalCode::ProviderError, error.to_string())
+        // R4.3 同款纪律：`Io` 变体携带 OS 层原始错误文本（Windows 上可能包含
+        // 真实绝对 transcript 路径），绝不进入用户可见 message。其余变体是
+        // adapter 的静态文案或有界数值，保持原样。原始细节仅在
+        // ASG_DEBUG_ERRORS=1 时写 stderr（永不进 stdout envelope）。
+        let message = match &error {
+            ProviderError::Io(_) => "提供方源文件读取失败".to_string(),
+            _ => error.to_string(),
+        };
+        if std::env::var_os("ASG_DEBUG_ERRORS").is_some() {
+            eprintln!("debug [{}]: {error}", CanonicalCode::ProviderError.as_str());
+        }
+        ProtocolError::new(CanonicalCode::ProviderError, message)
+    }
+}
+
+/// One canonical classification for both ordinary and strictly private ports.
+fn port_error_code(error: &PortError) -> CanonicalCode {
+    match error {
+        PortError::Backend(_) => CanonicalCode::CatalogError,
+        PortError::SourceIo(_) => CanonicalCode::SourceIo,
+        PortError::SchemaIncompatible(_) => CanonicalCode::SchemaIncompatible,
+        PortError::NotFound(_) => CanonicalCode::NotFound,
+        PortError::SnapshotChanged(_) => CanonicalCode::SourceChanged,
+        PortError::WriterBusy(_) => CanonicalCode::WriterBusy,
+        PortError::InvalidRequest(_) => CanonicalCode::InvalidRequest,
+        PortError::GenerationMismatch(_) => CanonicalCode::GenerationMismatch,
+    }
+}
+
+impl ProtocolError {
+    /// Relocation inputs include private roots, backup destinations and plan
+    /// tokens. Their port errors must stay opaque even under ASG_DEBUG_ERRORS.
+    pub fn from_private_port_error(error: PortError) -> Self {
+        let code = port_error_code(&error);
+        let message = match code {
+            CanonicalCode::CatalogError => "catalog operation failed",
+            CanonicalCode::SourceIo => "source or backup could not be accessed",
+            CanonicalCode::SchemaIncompatible => {
+                "catalog schema is incompatible; run index rebuild explicitly before relocation"
+            }
+            CanonicalCode::NotFound => "registered installation was not found",
+            CanonicalCode::SourceChanged => "source changed; create a fresh relocation preview",
+            CanonicalCode::WriterBusy => "another writer holds the catalog lease",
+            CanonicalCode::InvalidRequest => {
+                "relocation request is invalid; check the mapping and obtain a fresh preview"
+            }
+            CanonicalCode::GenerationMismatch => {
+                "catalog generation changed; create a fresh relocation preview"
+            }
+            _ => unreachable!("port_error_code only returns port error categories"),
+        };
+        Self::new(code, message)
     }
 }
 
 impl From<PortError> for ProtocolError {
     fn from(e: PortError) -> Self {
-        let code = match &e {
-            PortError::Backend(_) => CanonicalCode::CatalogError,
-            PortError::SourceIo(_) => CanonicalCode::SourceIo,
-            PortError::SchemaIncompatible(_) => CanonicalCode::SchemaIncompatible,
-            PortError::NotFound(_) => CanonicalCode::NotFound,
-            PortError::SnapshotChanged(_) => CanonicalCode::SourceChanged,
-            PortError::WriterBusy(_) => CanonicalCode::WriterBusy,
-        };
+        let code = port_error_code(&e);
         // R4.3：Backend、SourceIo 携带后端/文件系统原始细节，绝不进入用户可见
         // message（其中 SourceIo 可能包含绝对 transcript 路径）。其余变体已验证
         // 不携带路径/ID（静态文案或数值），保持原样。
@@ -258,6 +305,11 @@ impl From<PortError> for ProtocolError {
             PortError::SourceIo(_) => "源文件无法读取".to_string(),
             _ => e.to_string(),
         };
+        // 掩码后原始细节即丢失，`catalog_error` 在现场无从诊断。ASG_DEBUG_ERRORS=1
+        // 时把细节写 stderr（永不进 stdout envelope，不影响协议契约）。
+        if std::env::var_os("ASG_DEBUG_ERRORS").is_some() {
+            eprintln!("debug [{}]: {e}", code.as_str());
+        }
         ProtocolError::new(code, message)
     }
 }
@@ -309,10 +361,29 @@ pub fn parse_output_mode(args: &[String]) -> Result<OutputMode, String> {
             // 列表必须与 main.rs 各前缀扫描器（extract_request_id/command_name/
             // intercept_help_or_version/extract_db_flag_impl）保持一致，漏掉一个
             // 会让它的取值把后面的 --robot/--output 挡在扫描之外。
-            "--db" | "--request-id" | "--cursor" | "--max-items" | "--max-bytes"
-            | "--max-messages" | "--max-evidence" | "--max-tokens" | "--policy" | "--level"
-            | "--provider" | "--since" | "--until" | "--session" | "--around" | "--tool-kind"
-            | "--tool-name" => {
+            "--db"
+            | "--request-id"
+            | "--cursor"
+            | "--max-items"
+            | "--max-bytes"
+            | "--max-messages"
+            | "--max-evidence"
+            | "--max-tokens"
+            | "--policy"
+            | "--level"
+            | "--provider"
+            | "--since"
+            | "--until"
+            | "--session"
+            | "--around"
+            | "--tool-kind"
+            | "--tool-name"
+            | "--from"
+            | "--to"
+            | "--alias-ttl-days"
+            | "--plan"
+            | "--backup"
+            | "--max-write-seconds" => {
                 it.next();
             }
             _ => {}
@@ -349,6 +420,19 @@ pub struct Page {
     pub has_more: bool,
 }
 
+/// 脱敏状态块（ADR-0009）：Robot envelope 与 MCP 工具结果共用同一形状，
+/// 两个跨边界出口不得各写一份（否则一侧漏报脱敏，调用方无法区分
+/// "服务端涂红"与"原文就是 `[redacted:...]`"）。
+pub fn redaction_block(redaction: &RedactionStatus) -> Value {
+    json!({
+        "mode": redaction.mode.as_str(),
+        "status": redaction.status.as_str(),
+        "ruleset_version": redaction.ruleset_version,
+        "redacted_count": redaction.redacted_count,
+        "audit_id": redaction.audit_id,
+    })
+}
+
 /// 成功 envelope。`data` 是已验证的 JSON Value，不接受未校验字符串片段。
 /// `warnings` 原样序列化进 envelope 数组；模式分支（human vs envelope）由 main.rs 决定。
 ///
@@ -381,13 +465,7 @@ pub fn success_envelope(
         "outcome": outcome_str,
         "data": data,
         "retrieval_mode": retrieval_mode.as_str(),
-        "redaction": {
-            "mode": redaction.mode.as_str(),
-            "status": redaction.status.as_str(),
-            "ruleset_version": redaction.ruleset_version,
-            "redacted_count": redaction.redacted_count,
-            "audit_id": redaction.audit_id,
-        },
+        "redaction": redaction_block(redaction),
         "warnings": warnings,
         "page": {
             "next_cursor": page.next_cursor.as_deref().map_or(Value::Null, |c| json!(c)),
@@ -403,6 +481,12 @@ pub fn success_envelope(
 
 /// 错误 envelope。stdout 只有这一个对象；细节安全、有界（`err.details` 由构造方约束）。
 pub fn error_envelope(command: &str, err: &ProtocolError, request_id: Option<&str>) -> String {
+    // 与成功 envelope 同一脱敏纪律（ADR-0009）：错误路径不得绕过跨边界脱敏。
+    // message/details 可能回显调用方输入（密钥形状的 flag 值、用户参数），
+    // 出帧前统一过共享脱敏引擎；路径类细节已在各 From 转换处掩码
+    // （PortError::SourceIo / ProviderError::Io，R4.3）。
+    let (message, _) = crate::redaction::redact_text(&err.message);
+    let (details, _) = crate::redaction::redact_value(err.details.clone());
     json!({
         "schema_version": SCHEMA_VERSION,
         "frame_type": "error",
@@ -412,9 +496,9 @@ pub fn error_envelope(command: &str, err: &ProtocolError, request_id: Option<&st
         "outcome": "failure",
         "error": {
             "code": err.code.as_str(),
-            "message": err.message,
+            "message": message,
             "retryable": err.code.retryable(),
-            "details": err.details,
+            "details": details,
         },
         "warnings": [],
         "page": {
@@ -457,6 +541,29 @@ fn stream_frame(
     .to_string()
 }
 
+thread_local! {
+    static DEFER_OUTPUT_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_OUTPUT_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Write commands must release their lease and wake durable maintenance even
+/// when a consumer closes a JSONL progress stream before the command finishes.
+pub(crate) struct DeferredOutputExit;
+impl DeferredOutputExit {
+    pub(crate) fn begin() -> Self {
+        DEFER_OUTPUT_EXIT.set(true);
+        Self
+    }
+}
+impl Drop for DeferredOutputExit {
+    fn drop(&mut self) {
+        DEFER_OUTPUT_EXIT.set(false);
+        if let Some(code) = PENDING_OUTPUT_EXIT.take() {
+            std::process::exit(code);
+        }
+    }
+}
+
 /// 协议 stdout 的唯一出口（println 替身）：整行写入 + 换行 + flush。
 ///
 /// CONTRACT §6：stdout 必须协议干净、退出码受控。下游提前关管道（head/pager）
@@ -464,6 +571,9 @@ fn stream_frame(
 /// 其余写失败归 source_io 类 → stderr 一行诊断 + exit 5。
 /// 逐行 flush 是必须的：块缓冲下 EPIPE 只在冲刷时暴露，且 jsonl 进度帧要求实时可见。
 pub fn write_stdout_line(line: &str) {
+    if PENDING_OUTPUT_EXIT.get().is_some() {
+        return;
+    }
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     let result = handle
@@ -471,11 +581,17 @@ pub fn write_stdout_line(line: &str) {
         .and_then(|()| handle.write_all(b"\n"))
         .and_then(|()| handle.flush());
     if let Err(error) = result {
-        if error.kind() == ErrorKind::BrokenPipe {
-            std::process::exit(0);
+        let code = if error.kind() == ErrorKind::BrokenPipe {
+            0
+        } else {
+            eprintln!("error [source_io]: cannot write protocol output: {error}");
+            5
+        };
+        if DEFER_OUTPUT_EXIT.get() {
+            PENDING_OUTPUT_EXIT.set(Some(code));
+        } else {
+            std::process::exit(code);
         }
-        eprintln!("error [source_io]: cannot write protocol output: {error}");
-        std::process::exit(5);
     }
 }
 
@@ -587,6 +703,35 @@ mod tests {
         assert_eq!(e.message, "源文件无法读取");
         assert!(!e.message.contains("secret"));
         assert!(!e.message.contains("transcript.jsonl"));
+    }
+
+    #[test]
+    fn provider_io_error_masks_source_path_in_message() {
+        // ProviderError::Io 携带 OS 层原始文本：Windows 上可能包含真实绝对
+        // transcript 路径。与 PortError::SourceIo 同一掩码纪律（R4.3）。
+        let e: ProtocolError =
+            ProviderError::Io("cannot open C:/Users/secret/transcript.jsonl (os error 2)".into())
+                .into();
+        assert_eq!(e.code, CanonicalCode::ProviderError);
+        assert_eq!(e.message, "提供方源文件读取失败");
+        assert!(!e.message.contains("secret"));
+        assert!(!e.message.contains("transcript.jsonl"));
+    }
+
+    #[test]
+    fn error_envelope_redacts_message_and_details() {
+        // 错误 envelope 与成功 envelope 同一脱敏纪律（ADR-0009）：message 里
+        // 回显的用户输入与 details 中的密钥形状值都必须在跨边界输出前脱敏。
+        let err = ProtocolError::new(
+            CanonicalCode::InvalidRequest,
+            "--mode must be lexical|semantic|hybrid, got \"sk-ant-api03-1234567890abcdef\"",
+        )
+        .with_details(json!({ "echo": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" }));
+        let s = error_envelope("search", &err, None);
+        assert!(!s.contains("sk-ant-api03-1234567890abcdef"), "{s}");
+        assert!(s.contains("[redacted:api_key]"), "{s}");
+        assert!(!s.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"), "{s}");
+        assert!(s.contains("[redacted:bearer_token]"), "{s}");
     }
 
     #[test]
@@ -1166,7 +1311,7 @@ mod tests {
         // parse_output_mode 上方的注释要求带值 flag 列表与 main.rs 各前缀
         // 扫描器保持一致。此测试把 main.rs 源 include 进来，逐扫描器断言
         // --tool-kind/--tool-name 都在跳过列表里——上次 drift 正是漏掉它们。
-        let main_src = include_str!("main.rs");
+        let main_src = include_str!("lib.rs");
         let scanners = [
             "fn extract_request_id",
             "fn command_name",
@@ -1187,6 +1332,87 @@ mod tests {
                 body.contains("\"--tool-kind\"") && body.contains("\"--tool-name\""),
                 "{scanner} value-skip list missing --tool-kind/--tool-name"
             );
+        }
+    }
+
+    #[test]
+    fn relocation_errors_keep_canonical_categories_and_private_values_out() {
+        let secret = "private-root/private-backup/private-plan/private-native";
+        for (error, code) in [
+            (
+                PortError::InvalidRequest(secret.into()),
+                CanonicalCode::InvalidRequest,
+            ),
+            (
+                PortError::GenerationMismatch(secret.into()),
+                CanonicalCode::GenerationMismatch,
+            ),
+            (
+                PortError::Backend(secret.into()),
+                CanonicalCode::CatalogError,
+            ),
+            (PortError::SourceIo(secret.into()), CanonicalCode::SourceIo),
+            (
+                PortError::SnapshotChanged(secret.into()),
+                CanonicalCode::SourceChanged,
+            ),
+            (
+                PortError::WriterBusy(secret.into()),
+                CanonicalCode::WriterBusy,
+            ),
+            (
+                PortError::SchemaIncompatible(secret.into()),
+                CanonicalCode::SchemaIncompatible,
+            ),
+            (PortError::NotFound(secret.into()), CanonicalCode::NotFound),
+        ] {
+            let projected = ProtocolError::from_private_port_error(error);
+            assert_eq!(projected.code, code);
+            assert!(!projected.message.contains(secret));
+            assert!(projected.details.as_object().unwrap().is_empty());
+            assert!(projected.message.len() < 256);
+        }
+        assert_eq!(
+            ProtocolError::from(PortError::InvalidRequest("invalid plan".into())).code,
+            CanonicalCode::InvalidRequest
+        );
+        assert_eq!(
+            ProtocolError::from(PortError::GenerationMismatch("stale plan".into())).code,
+            CanonicalCode::GenerationMismatch
+        );
+    }
+
+    #[test]
+    fn relocation_scalar_flags_are_skipped_by_every_prefix_scanner() {
+        let source = include_str!("lib.rs");
+        for flag in ["--from", "--to", "--plan", "--backup", "--alias-ttl-days"] {
+            assert_eq!(
+                parse_output_mode(&[
+                    flag.into(),
+                    "private-value".into(),
+                    "--robot".into(),
+                    "relocate".into()
+                ]),
+                Ok(OutputMode::Json),
+                "a value must not hide --robot",
+            );
+            for scanner in [
+                "fn extract_offline_flag",
+                "fn extract_request_id",
+                "fn command_name",
+                "fn intercept_help_or_version",
+                "fn extract_db_flag_impl",
+                "fn bare_positionals",
+            ] {
+                let start = source.find(scanner).expect("scanner exists");
+                let end = source[start..]
+                    .find("\n}\n")
+                    .map_or(source.len(), |offset| start + offset);
+                assert!(
+                    source[start..end].contains(&format!("\"{flag}\"")),
+                    "{scanner} must skip {flag}'s value"
+                );
+            }
         }
     }
 }

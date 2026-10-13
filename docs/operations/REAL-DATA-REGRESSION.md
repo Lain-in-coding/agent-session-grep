@@ -79,15 +79,19 @@ every source again and compares aggregate results. All CLI calls go through
 text. (`doctor` is not part of the harness; its runtime state report is a
 separate operator command.)
 
-`sync` runs in chunks. When a chunk fails with `source_changed` — the
-transcript was modified between its capture and the post-stage verification,
-typically by the live session still appending — the harness waits
-`SYNC_CHANGED_BACKOFF_S` (3 seconds) and retries the same chunk, up to
-`SYNC_CHANGED_RETRIES` (3) attempts. `sync` is idempotent and chunk-scoped,
-so a retried chunk commits nothing from the failed attempt. Other errors are
-not retried: a persistent `source_changed` or any other failure is reported
-as-is in the report and the run finishes with the invariants it could still
-evaluate.
+`sync` runs in chunks. A source modified between its capture and the post-stage
+verification — typically the live session still appending — is now **deferred**
+by `sync` itself: it is dropped from that chunk's commit batch, reported through
+a per-source diagnostic and the chunk's `deferred` count, and the rest of the
+chunk commits. The harness therefore normally sees `ok: true` with a non-zero
+`deferred`, not a failed chunk. The retry path is still in place for a chunk
+that does fail with `source_changed` (a single-source chunk has nothing else to
+carry the run): the harness waits `SYNC_CHANGED_BACKOFF_S` (3 seconds) and
+retries the same chunk, up to `SYNC_CHANGED_RETRIES` (3) attempts. `sync` is
+idempotent and chunk-scoped, so a retried chunk commits nothing from the failed
+attempt. Other errors are not retried: a persistent `source_changed` or any
+other failure is reported as-is in the report and the run finishes with the
+invariants it could still evaluate.
 
 ## The seven invariants
 

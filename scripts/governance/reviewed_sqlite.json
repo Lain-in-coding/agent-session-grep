@@ -1,0 +1,25 @@
+{
+  "schema": "agent-session-grep.reviewed-sqlite/v1",
+  "fixtures": {
+    "crates/agent-session-grep-provider-cursor/tests/golden/basic.db": {
+      "sha256": "af01a6c3a2f4ad6f7c3f842834de96cc87dcb2a538f7b7251349e8042eb4260d",
+      "rows": 2, "text_cells": 4, "ff_cells": 0
+    },
+    "crates/agent-session-grep-provider-cursor/tests/golden/disk-kv-shuffled.db": {
+      "sha256": "344fc6106032af21318ce27a5ca7a95e17c0e096cb5c4655ddd16c8970089ee5",
+      "rows": 16, "text_cells": 30, "ff_cells": 1
+    },
+    "crates/agent-session-grep-provider-cursor/tests/golden/disk-kv.db": {
+      "sha256": "3bafaa6206830998f8f9fd2b0e9025939998e9bb182ad3065c919fa3edfcedb0",
+      "rows": 16, "text_cells": 30, "ff_cells": 1
+    },
+    "crates/agent-session-grep-provider-hermes/tests/golden/state.db": {
+      "sha256": "6c4478dd976726a856bab159318e34782347892b912dc1042f08cf71a1f515f7",
+      "rows": 13, "text_cells": 45, "ff_cells": 0
+    },
+    "crates/agent-session-grep-provider-opencode/tests/golden/basic.db": {
+      "sha256": "e12c58212870db2927040af87aaa92e4f08e04ba91510b650de4fccaa02aa396",
+      "rows": 9, "text_cells": 27, "ff_cells": 0
+    }
+  }
+}
