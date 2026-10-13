@@ -419,6 +419,11 @@ def metric_entry(
     return entry
 
 
+def metric_passes_threshold(name: str, value: float) -> bool:
+    threshold = GATE_THRESHOLDS[name]
+    return value <= threshold if name == "parse_loss_ratio" else value >= threshold
+
+
 def run_gate(args: argparse.Namespace) -> Path:
     workspace = Path(args.workspace).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -496,14 +501,14 @@ def run_gate(args: argparse.Namespace) -> Path:
             "ratio",
             mean_recall,
             GATE_THRESHOLDS["lexical_recall_at_10"],
-            mean_recall >= GATE_THRESHOLDS["lexical_recall_at_10"],
+            metric_passes_threshold("lexical_recall_at_10", mean_recall),
         ),
         metric_entry(
             "parse_loss_ratio",
             "ratio",
             loss["parse_loss_ratio"],
             GATE_THRESHOLDS["parse_loss_ratio"],
-            loss["parse_loss_ratio"] <= GATE_THRESHOLDS["parse_loss_ratio"],
+            metric_passes_threshold("parse_loss_ratio", loss["parse_loss_ratio"]),
         ),
         # semantic/hybrid recall are measured but carry no gate threshold: the
         # shipped vectorizer is a bigram hash (fuzzy lexical, not semantic), so
@@ -536,14 +541,14 @@ def run_gate(args: argparse.Namespace) -> Path:
             "ratio",
             discovery["coverage"],
             GATE_THRESHOLDS["discovery_coverage"],
-            discovery["coverage"] >= GATE_THRESHOLDS["discovery_coverage"],
+            metric_passes_threshold("discovery_coverage", discovery["coverage"]),
         ),
         metric_entry(
             "resume_handoff_success",
             "ratio",
             resume_handoff["ratio"],
             GATE_THRESHOLDS["resume_handoff_success"],
-            resume_handoff["ratio"] >= GATE_THRESHOLDS["resume_handoff_success"],
+            metric_passes_threshold("resume_handoff_success", resume_handoff["ratio"]),
         ),
     ]
 
@@ -648,63 +653,119 @@ def run_gate(args: argparse.Namespace) -> Path:
 
 def validate_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
     if manifest.get("schema_version") != GATE_SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     commit = manifest.get("commit", "")
-    if not isinstance(commit, str) or len(commit) != 40:
-        raise ValueError("commit must be a full Git SHA")
-    if manifest.get("corpus", {}).get("contains_real_transcripts") is not False:
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in commit)
+    ):
+        raise ValueError("commit must be a full 40-character hexadecimal Git SHA")
+    corpus = manifest.get("corpus")
+    if not isinstance(corpus, dict):
+        raise ValueError("corpus must be an object")
+    if corpus.get("contains_real_transcripts") is not False:
         raise ValueError("corpus.contains_real_transcripts must be false")
+    gate = manifest.get("gate")
+    if not isinstance(gate, dict):
+        raise ValueError("gate must be an object")
     metrics = manifest.get("metrics")
     if not isinstance(metrics, list) or not metrics:
         raise ValueError("metrics must be a non-empty list")
     expected_names = set(GATE_THRESHOLDS) | INFORMATIONAL_METRICS
-    actual_names = {m.get("name") for m in metrics}
+    actual_names: set[str] = set()
+    for index, m in enumerate(metrics):
+        if not isinstance(m, dict):
+            raise ValueError(f"metrics[{index}] must be an object")
+        for field in ("name", "unit", "state", "value", "threshold", "pass"):
+            if field not in m:
+                raise ValueError(f"metrics[{index}].{field} is required")
+        name = m["name"]
+        if not isinstance(name, str):
+            raise ValueError(f"metrics[{index}].name must be a string")
+        if name not in expected_names:
+            raise ValueError(f"metrics[{index}].name is unknown: {name!r}")
+        if name in actual_names:
+            raise ValueError(f"metrics[{index}].name duplicates {name!r}")
+        actual_names.add(name)
     if actual_names != expected_names:
-        raise ValueError(f"metric names {sorted(actual_names)} do not match gate schema {sorted(expected_names)}")
+        raise ValueError(f"metrics missing required names: {sorted(expected_names - actual_names)}")
+
+    applicable_failures: list[str] = []
+    expected_deferred: list[str] = []
     for m in metrics:
-        name = m.get("name")
-        threshold = m.get("threshold")
-        state = m.get("state")
+        name = m["name"]
+        threshold = m["threshold"]
+        state = m["state"]
+        if state == "measured":
+            if m["unit"] != "ratio":
+                raise ValueError(f"{name}.unit must be ratio for measured metrics")
+            value = m["value"]
+            # Range comparisons reject NaN/infinities without converting large
+            # integers to float, which could itself overflow.
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(f"{name}.value must be a finite ratio in [0, 1]")
+        elif state == "not_applicable" and name in GATE_THRESHOLDS:
+            units = ("ratio", "count") if name == "resume_handoff_success" else ("ratio",)
+            if m["unit"] not in units:
+                raise ValueError(f"{name}.unit must be one of {units!r} for not_applicable metrics")
+            if m["value"] is not None or m["pass"] is not None:
+                raise ValueError(f"{name}: not_applicable metrics must carry null value and pass")
+            expected_deferred.append(name)
+        else:
+            raise ValueError(f"{name}.state is invalid: {state!r}")
+
+        if name in INFORMATIONAL_METRICS or state == "not_applicable":
+            reason = m.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"{name}.reason must be a non-blank string")
         if name in INFORMATIONAL_METRICS:
             # Informational: no threshold, no pass verdict, and a stated reason
             # so a reader cannot mistake it for a gate metric.
-            if threshold is not None or m.get("pass") is not None:
+            if threshold is not None or m["pass"] is not None:
                 raise ValueError(f"{name}: informational metrics must carry null threshold and pass")
-            if not m.get("reason"):
-                raise ValueError(f"{name}: informational metrics must record a reason")
-            if not isinstance(m.get("value"), (int, float)):
-                raise ValueError(f"{name}: informational metrics must carry a numeric value")
             continue
-        if threshold != GATE_THRESHOLDS[name]:
-            raise ValueError(f"{name}: threshold {threshold!r} != expected {GATE_THRESHOLDS[name]!r}")
-        if state == "not_applicable":
-            if m.get("value") is not None or m.get("pass") is not None:
-                raise ValueError(f"{name}: not_applicable metrics must carry null value and pass")
-            if not m.get("reason"):
-                raise ValueError(f"{name}: not_applicable metrics must record a reason")
-        elif state == "measured":
-            if not isinstance(m.get("value"), (int, float)):
-                raise ValueError(f"{name}: measured metrics must carry a numeric value")
-            if not isinstance(m.get("pass"), bool):
-                raise ValueError(f"{name}: measured metrics must carry a bool pass")
-        else:
-            raise ValueError(f"{name}: unknown state {state!r}")
-    gate = manifest.get("gate", {})
-    applicable_failures = [
-        m["name"]
-        for m in metrics
-        if m["name"] in GATE_THRESHOLDS and m["state"] == "measured" and m["pass"] is False
-    ]
-    if gate.get("failures") != applicable_failures:
-        raise ValueError("gate.failures does not match measured metric pass flags")
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or threshold != GATE_THRESHOLDS[name]
+        ):
+            raise ValueError(f"{name}.threshold must be numeric and equal to {GATE_THRESHOLDS[name]}")
+        if state == "measured":
+            if not isinstance(m["pass"], bool):
+                raise ValueError(f"{name}.pass must be a bool")
+            expected_metric_pass = metric_passes_threshold(name, m["value"])
+            if m["pass"] is not expected_metric_pass:
+                raise ValueError(f"{name}.pass does not match its value and threshold")
+            if not expected_metric_pass:
+                applicable_failures.append(name)
+
+    failures = gate.get("failures")
+    if not isinstance(failures, list) or any(not isinstance(name, str) for name in failures):
+        raise ValueError("gate.failures must be an array of strings")
+    if failures != applicable_failures:
+        raise ValueError("gate.failures does not match recomputed measured metric failures")
+    if not isinstance(gate.get("pass"), bool):
+        raise ValueError("gate.pass must be a bool")
     expected_pass = not applicable_failures
-    if gate.get("pass") != expected_pass:
+    if gate["pass"] is not expected_pass:
         raise ValueError(f"gate.pass {gate.get('pass')!r} inconsistent with failures")
     deferred = gate.get("deferred")
-    expected_deferred = sorted(m["name"] for m in metrics if m["state"] == "not_applicable")
-    if sorted(deferred or []) != expected_deferred:
-        raise ValueError("gate.deferred does not match not_applicable metrics")
+    # Older reports may omit deferred or use null, but only an empty expected
+    # list can match that representation.
+    if deferred is None:
+        deferred = []
+    if not isinstance(deferred, list) or any(not isinstance(name, str) for name in deferred):
+        raise ValueError("gate.deferred must be an array of strings")
+    if sorted(deferred) != sorted(expected_deferred):
+        raise ValueError("gate.deferred must list each not_applicable metric exactly once")
     print(f"valid {GATE_SCHEMA_VERSION} manifest: {path}")
     return manifest
 

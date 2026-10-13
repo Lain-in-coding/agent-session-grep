@@ -393,10 +393,28 @@ python scripts/evidence/open_source_gate_benchmark.py validate-report \
   scripts/evidence/out/gate-manifest-rehearsal.json
 ```
 
-Run the full Gate D benchmark suite against the rehearsal corpus. Verify all
-six invariants pass. Refresh the benchmark report with this run's numbers,
-recording the measured commit in the external rehearsal evidence; do not
-commit the generated manifest from `scripts/evidence/out/`.
+Run the full Gate D benchmark suite against the rehearsal corpus. Inspect the
+four thresholded metrics: lexical recall, parse loss, discovery coverage, and
+resume/handoff success. Semantic and hybrid recall remain informational, with
+no threshold or pass verdict.
+
+`run` writes the report and exits nonzero when a measured gate metric fails.
+`validate-report` checks report structure and recomputes verdicts from the
+recorded ratios; it accepts a valid report that truthfully records failure.
+Its successful exit therefore does not mean the benchmark passed or that all
+release requirements are met. This consistency check does not independently
+reproduce the measurements or attest their provenance.
+
+Historical `not_applicable` metrics remain readable with null value/pass, a
+reason, and an entry in `gate.deferred`. The legacy `count` unit is accepted
+only for an unmeasured resume/handoff metric; measured metrics use `ratio`.
+An absent or null `gate.deferred` is treated as empty only when no metric is
+not applicable. Deferred metrics do not fail this gate, but must not be
+presented as completed measurements.
+
+Refresh the benchmark report with this run's numbers, recording the measured
+commit in the external rehearsal evidence; do not commit the generated
+manifest from `scripts/evidence/out/`.
 
 ---
 
