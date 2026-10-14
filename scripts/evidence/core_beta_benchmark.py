@@ -953,6 +953,21 @@ def sqlite_source_proof(package: dict[str, Any], locked: dict[str, str], cargo_h
     }
 
 
+def bundled_sqlite_library(out_dir: Path, target: str) -> Path:
+    # cc creates both names on MSVC: the linker requires sqlite3.lib, while
+    # libsqlite3.a is retained as a hard-link or byte-identical copy.
+    name = "sqlite3.lib" if target.endswith("-msvc") else "libsqlite3.a"
+    native = out_dir / name
+    require(native.is_file(), "target-native bundled SQLite library unavailable")
+    size, digest = native.stat().st_size, sha256_file(native)
+    for alias_name in {"sqlite3.lib", "libsqlite3.a"} - {name}:
+        alias = out_dir / alias_name
+        if alias.exists() or alias.is_symlink():
+            require(alias.is_file() and alias.stat().st_size == size and sha256_file(alias) == digest,
+                    "conflicting bundled SQLite library alias")
+    return native
+
+
 def build_receipt(workspace: Path, suite_root: Path, args: argparse.Namespace, source: dict[str, Any], config: dict[str, Any], cargo_home: Path) -> tuple[Path, dict[str, Any]]:
     env = baseline_environment()
     metadata = strict_json(checked_command([args.cargo, "metadata", "--locked", "--format-version", "1"], workspace, env=env, timeout=300))
@@ -978,12 +993,11 @@ def build_receipt(workspace: Path, suite_root: Path, args: argparse.Namespace, s
     require(link.get("linked_libs") == ["static=sqlite3"], "SQLite linkage is not exclusively static bundled sqlite3")
     out_dir = Path(link["out_dir"]).resolve()
     require(any(Path(path.removeprefix("native=")).resolve() == out_dir for path in link.get("linked_paths", [])), "SQLite native search path does not match build output")
-    libraries = [out_dir / name for name in ("sqlite3.lib", "libsqlite3.a") if (out_dir / name).is_file()]
-    require(len(libraries) == 1, "bundled native SQLite library unavailable")
+    library = bundled_sqlite_library(out_dir, config["target"])
     proof.update({
         "features": sorted(features), "linked_libraries": link["linked_libs"],
-        "native_library_sha256": sha256_file(libraries[0]),
-        "native_library_size_bytes": libraries[0].stat().st_size,
+        "native_library_sha256": sha256_file(library),
+        "native_library_size_bytes": library.stat().st_size,
     })
     built = Path(artifact["executable"]).resolve()
     target_directory = Path(metadata["target_directory"]).resolve()

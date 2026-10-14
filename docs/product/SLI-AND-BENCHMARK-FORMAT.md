@@ -200,7 +200,10 @@ prebuilt 消费（包括 runs 2/3）仍标 `caller_supplied_prebuilt`，保留�
 
 SQLite 证明需同时验证当前 lock 指定的 crate archive checksum、实际 bundled
 source/header/build script、resolved features、无外部链接覆盖、该 build 的静态
-native library 与最终 B。记录 `locked-bundled-source-and-build-linkage` 和
+native library 与最终 B。按 target 选择原生库：MSVC 必须有 `sqlite3.lib`，
+其他支持的 native target 必须有 `libsqlite3.a`；若另一个别名也存在，两者的
+字节数与 SHA-256 必须一致，否则拒绝。静态 `sqlite3` 链接及其输出目录仍须核验。
+记录 `locked-bundled-source-and-build-linkage` 和
 `runtime_query: false`，明确“locked bundled source + this build linkage;
 no direct CLI runtime query”。Python SQLite、旧 spike 或只写一个版本字符串
 均不能替代此证明。未解析的 Cargo 配置/编译链接覆盖、dirty/wrong source、
