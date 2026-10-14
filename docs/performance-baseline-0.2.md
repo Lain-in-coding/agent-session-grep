@@ -97,3 +97,36 @@
 `agent-session-grep` 二进制执行且六条不变量全绿；此前同一语料的慢批现象
 （batch 级 10-40 分钟）不再出现。记录见
 `docs/evidence/integration-beta/real-data-regression.md`。
+
+## 2026-10-14 current-source baseline（合成语料三跑基线）
+
+> 基于 clean source `b0fc44d756909cc840050351dd1329896a8edf75` 的一次性
+> 本地基线：同一冻结 release 二进制、三份独立完整报告（run 1 构建，run 2/3
+> 复用收据）、轮换规模顺序、每类查询/读取 100 次实测。完整原始样本、环境
+> 收据与复现命令见
+> [`docs/evidence/core-beta/b0fc44d75690/manifest.md`](evidence/core-beta/b0fc44d75690/manifest.md)。
+> 以下数字是本地证据锚点，不是正式 SLO、release 认证或跨平台结论。
+
+- anchor（20 文件 × 200 消息，查询于 shrink 后 2,000 消息库；run 1 P50）：
+  cold startup 22.8 ms / warm startup 8.6 ms；initial sync 754 ms /
+  noop 17.4 ms / shrink 620 ms；search 71.2 ms / show 15.8 ms /
+  get 14.4 ms；索引体积 19.7 MB，store/source 比 17.5。
+- 完整库诊断（P50，run 1）：initial sync 在 2k/10k/50k 分别为
+  417 ms / 1.89 s / 10.1 s；50k 时 shrink 9.9 s、noop 80.7 ms。
+- 查询随规模变化温和：50k 时 token 类 search P50 552 ms、latin 375 ms、
+  cjk/path/identifier 166–172 ms；show/get/context 保持在 12–62 ms。
+- 三轮跨 run 噪声：部分系列 P50 跨轮 spread 超过 15%（冷启动、部分 sync
+  与少数短 noop/context 系列），已按协议保留并披露，不裁剪、不挑最快。
+- trace 独立试验（仅 run 3 后、instrumentation 不入主延迟）：50k initial
+  sync 中，嵌套阶段里单段最高为事务提交（约 3.35 s）、relation upsert
+  （约 2.0 s）与 session projection（约 2.2 s）；shrink 时相应收窄。
+  各标签作用域互相嵌套、crate 时钟原点不共享，不能直接求和。
+
+### 下一步优化方向（未承诺加速）
+
+首个跟进项聚焦 50k changed-sync 的 commit 路径。验收标准：
+
+- 用同一 source/harness/矩阵重测本基线；50k initial 与 shrink 的 P50 均
+  降至原值并显著超出 15% 噪声带；
+- 五类 search、show/get、context 与 noop 不得出现超过 15% 的跨轮回归；
+- 全部合成语料 census/正确性 oracle 仍通过，且保持 offline 与隐私边界。
