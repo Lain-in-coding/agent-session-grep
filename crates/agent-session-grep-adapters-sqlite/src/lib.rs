@@ -6874,17 +6874,18 @@ impl SqliteStore {
         // source replacement 的旧 placement 与 claim 行——与写入路径同事务。
         let trace_started = trace::begin();
         let mut affected_sessions = BTreeSet::new();
+        // message 侧先在循环内只收集 id（BTreeSet 去重），循环外一次分块
+        // IN 查询。逐条调用单元素 slice 会把 50k+ 消息退化为同数量的独立
+        // 查询（50k 语料实测占 affected_sessions 阶段 0.72-0.88 s）；分块后
+        // 结果集合同为"逐 id DISTINCT 并集"，且仍先于任何写入执行。
+        let mut touched_message_ids = BTreeSet::new();
         for id in upserts.iter().map(|(id, _, _)| id).chain(deletes.iter()) {
             match id.kind() {
                 IdKind::Session => {
                     affected_sessions.insert(id.as_str().to_string());
                 }
                 IdKind::Message => {
-                    Self::collect_message_sessions(
-                        &tx,
-                        &[id.as_str().to_string()],
-                        &mut affected_sessions,
-                    )?;
+                    touched_message_ids.insert(id.as_str().to_string());
                 }
                 IdKind::Document => {}
                 IdKind::Source => {}
@@ -6903,11 +6904,7 @@ impl SqliteStore {
                 // read its old owner before the INSERT ... ON CONFLICT update.
                 old_placement_ids.push(placement.id.as_str().to_string());
                 affected_sessions.insert(placement.session_id.as_str().to_string());
-                Self::collect_message_sessions(
-                    &tx,
-                    &[placement.message_id.as_str().to_string()],
-                    &mut affected_sessions,
-                )?;
+                touched_message_ids.insert(placement.message_id.as_str().to_string());
             }
         }
         for source in &relations.source_replacements {
@@ -6928,6 +6925,8 @@ impl SqliteStore {
                 old_placement_ids.push(row.map_err(backend)?);
             }
         }
+        let touched_message_ids: Vec<String> = touched_message_ids.into_iter().collect();
+        Self::collect_message_sessions(&tx, &touched_message_ids, &mut affected_sessions)?;
         Self::collect_placement_sessions(&tx, &old_placement_ids, &mut affected_sessions)?;
         Self::collect_resume_claim_sessions(&tx, &source_paths, &mut affected_sessions)?;
         trace::add(&mut trace_stages, "affected_sessions", trace_started);
