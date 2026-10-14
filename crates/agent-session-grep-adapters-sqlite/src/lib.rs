@@ -109,11 +109,23 @@ const SESSION_TITLE_MAX_CHARS: usize = 80;
 /// 借鉴 hstry `bulk_insert_messages_in_tx`（MIT，
 /// hstry/crates/hstry-core/src/db.rs:2990）：同一事务内用多行 VALUES 语句
 /// 替代逐行 prepared execute，把往返次数从 N 压到 N/CHUNK。块内参数数
-/// 不得超过 SQLite 默认的 SQLITE_MAX_VARIABLE_NUMBER（999）；本文件最宽的
-/// 批量语句是 message_placements 的 8 列，8 × 100 = 800，与 hstry 的
-/// `COLS * ROWS_PER_CHUNK <= 950` 编译期断言保持同一保守上限（db.rs:3058）。
-const BULK_INSERT_ROWS_PER_CHUNK: usize = 100;
-const _: () = assert!(8 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+/// 不得超过 SQLite 的 SQLITE_MAX_VARIABLE_NUMBER；本文件最宽的批量语句是
+/// message_placements 的 8 列，8 × 512 = 4096 远低于 [`SQLITE_MAX_VARIABLES`]，
+/// 并保留编译期断言封住所有调用点（[`BULK_INSERT_ROWS_PER_CHUNK_CONSERVATIVE`]
+/// 是 SQLITE_MAX_VARIABLE_NUMBER = 999 的旧版/定制构建的回退块大小）。
+const BULK_INSERT_ROWS_PER_CHUNK: usize = 512;
+/// SQLite 变量数上限。SQLite ≥ 3.32 的默认值为 32766；本仓 bundled
+/// SQLite 3.53.2 的运行时值经本任务 E4 实验实测同为 32766
+/// （`sqlite3_limit(SQLITE_LIMIT_VARIABLE_NUMBER)` 与
+/// `PRAGMA compile_options` 的 `MAX_VARIABLE_NUMBER=32766` 互证）。
+const SQLITE_MAX_VARIABLES: usize = 32766;
+/// 保守回退块大小：适配 SQLITE_MAX_VARIABLE_NUMBER = 999 的旧版/定制
+/// SQLite（与 hstry `COLS * ROWS_PER_CHUNK <= 950` 同一口径，db.rs:3058）。
+/// 本仓 shipped 构建不需要它；一旦换了 SQLite 构建，把
+/// [`BULK_INSERT_ROWS_PER_CHUNK`] 改成这个值即可回到保守上限。
+const BULK_INSERT_ROWS_PER_CHUNK_CONSERVATIVE: usize = 100;
+const _: () = assert!(8 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
+const _: () = assert!(8 * BULK_INSERT_ROWS_PER_CHUNK_CONSERVATIVE <= 950);
 
 type PlacementInsertRow<'a> = (
     &'a str,
@@ -6944,7 +6956,7 @@ impl SqliteStore {
         // loops below.
         {
             let trace_catalog = trace::begin();
-            const _: () = assert!(2 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(2 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in upserts.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
                     "INSERT INTO catalog(id, payload) VALUES {}
@@ -7057,7 +7069,7 @@ impl SqliteStore {
                     ));
                 }
             }
-            const _: () = assert!(8 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(8 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in placement_rows.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
                     "INSERT INTO message_placements(
@@ -7102,7 +7114,7 @@ impl SqliteStore {
                     ));
                 }
             }
-            const _: () = assert!(4 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(4 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in edge_rows.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
                     "INSERT INTO message_edges(
@@ -7203,7 +7215,7 @@ impl SqliteStore {
             .map_err(backend)?;
             // 每源成员行可能上千，多行批量插入（同 hstry bulk_insert 模式，
             // 3 列 × 100 行 = 300 参数）。
-            const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in source.entity_memberships.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
                     "INSERT INTO source_membership(source_path, message_id, document_id)
@@ -7227,7 +7239,7 @@ impl SqliteStore {
                 [&source.source_path],
             )
             .map_err(backend)?;
-            const _: () = assert!(2 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(2 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in source.placement_ids.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
                     "INSERT INTO source_placement_membership(source_path, placement_id)
@@ -7731,7 +7743,7 @@ impl SqliteStore {
                 }
             }
             if !fts_rows.is_empty() {
-                const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+                const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
                 let sql = format!(
                     "INSERT INTO fts(rowid, id, text) VALUES {}",
                     multi_row_values(fts_rows.len(), 3)
@@ -7750,7 +7762,7 @@ impl SqliteStore {
             }
             trace_fts_time += trace::elapsed(trace_chunk);
             let trace_sidecar = trace::begin();
-            const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= 950);
+            const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             let sql = format!(
                 "INSERT INTO fts_ids(wire_id, id_json, fts_rowid) VALUES {}",
                 multi_row_values(fts_ids_rows.len(), 3)
@@ -13018,12 +13030,102 @@ mod tests {
     }
 
     #[test]
+    fn bulk_insert_statement_at_full_chunk_prepares_and_executes() {
+        // O4（依据任务 E4 实验）：分块从 100 提到 512 后，本文件最宽的批量
+        // 语句（message_placements 8 列）需要 8 × 512 = 4096 个变量。这里在
+        // 真实 store 连接上 prepare + execute 满块语句，钉住 bundled SQLite 的
+        // SQLITE_MAX_VARIABLE_NUMBER（E4 运行时实测 32766）确实容得下，并核对
+        // 一次语句落全 512 行（多行 VALUES 非深表达式树，不受
+        // SQLITE_MAX_EXPR_DEPTH 影响）。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.borrow();
+        let rows = BULK_INSERT_ROWS_PER_CHUNK;
+        assert!(8 * rows <= SQLITE_MAX_VARIABLES);
+        let sql = format!(
+            "INSERT INTO message_placements(
+                 placement_id, session_id, document_id, message_id,
+                 source_ordinal, is_sidechain, byte_start, byte_end
+             ) VALUES {}",
+            multi_row_values(rows, 8)
+        );
+        assert_eq!(sql.matches('?').count(), rows * 8);
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(rows * 8);
+        for index in 0..rows {
+            params.push(rusqlite::types::Value::Text(format!(
+                "plc_v1_smoke_{index:04}"
+            )));
+            params.push(rusqlite::types::Value::Text("ses_v1_smoke".into()));
+            params.push(rusqlite::types::Value::Text("doc_v1_smoke".into()));
+            params.push(rusqlite::types::Value::Text(format!(
+                "msg_v1_smoke_{index:04}"
+            )));
+            params.push(rusqlite::types::Value::Integer(index as i64));
+            params.push(rusqlite::types::Value::Integer(0));
+            params.push(rusqlite::types::Value::Null);
+            params.push(rusqlite::types::Value::Null);
+        }
+        let affected = conn
+            .prepare(&sql)
+            .unwrap()
+            .execute(rusqlite::params_from_iter(params))
+            .unwrap();
+        assert_eq!(affected, rows, "满块多行 INSERT 必须一次落全整块行数");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_placements", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, rows as i64);
+    }
+
+    #[test]
+    fn bulk_commit_spanning_chunk_boundary_lands_every_row() {
+        // O4：shipped 分块 512 行下，一次提交跨块（512 + 1 行）时必须与 fixture
+        // 逐表行数一致——覆盖满块与尾块两条多行语句，以及 placement/catalog/fts
+        // 三张表各自的分块边界。
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"chunk-span-session");
+        let document = sid(IdKind::Document, b"chunk-span-document");
+        let chain_len = BULK_INSERT_ROWS_PER_CHUNK + 1;
+        let (source, _) = chain_source_batch("chunk-span.jsonl", &session, &document, chain_len, 0);
+        assert!(source.entries.len() > BULK_INSERT_ROWS_PER_CHUNK);
+        assert!(source.placements.len() > BULK_INSERT_ROWS_PER_CHUNK);
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&source))
+                .unwrap()
+        );
+        assert_eq!(table_count(&store, "catalog"), source.entries.len() as i64);
+        assert_eq!(
+            table_count(&store, "message_placements"),
+            source.placements.len() as i64
+        );
+        assert_eq!(
+            table_count(&store, "message_edges"),
+            source.edges.len() as i64
+        );
+        let messages = source
+            .entries
+            .iter()
+            .filter(|(id, _, _)| id.kind() == IdKind::Message)
+            .count();
+        assert_eq!(table_count(&store, "fts") as usize, messages);
+        assert_eq!(table_count(&store, "fts_ids"), source.entries.len() as i64);
+        assert_eq!(
+            store.stored_placements().unwrap().len(),
+            source.placements.len()
+        );
+    }
+
+    #[test]
     fn batched_commit_rows_match_sequential_commit_rows() {
-        // 批量 INSERT（多行 VALUES，100 行/块，见 BULK_INSERT_ROWS_PER_CHUNK）
-        // 与逐行 INSERT 必须落出相同的 catalog/fts/fts_ids/placement/edge 行。
-        // Store A 把整个 fixture 一次提交（256 实体 → 3 个 100 行块，走多行
-        // 批量语句）；Store B 逐实体提交（每批 1 条 entry/placement/edge →
-        // 逐行语句形状）。源级表（source_scans/source_membership 等）因源路径
+        // 批量 INSERT（多行 VALUES，见 BULK_INSERT_ROWS_PER_CHUNK）与逐行
+        // INSERT 必须落出相同的 catalog/fts/fts_ids/placement/edge 行。
+        // Store A 把整个 fixture 一次提交（走多行批量语句路径）；Store B 逐实体
+        // 提交（每批 1 条 entry/placement/edge → 逐行语句形状）。分块边界（满块
+        // 与尾块）由 `bulk_commit_spanning_chunk_boundary_lands_every_row` 与
+        // `bulk_insert_statement_at_full_chunk_prepares_and_executes` 单独钉住。
+        // 源级表（source_scans/source_membership 等）因源路径
         // 分布按设计不同而不比较；会话/文档容器 payload 的兼容别名按源拓扑
         // 重投影（document_id 归属不同），也不比较——消息 payload 必须逐字节相同。
         let session = sid(IdKind::Session, b"batch-equiv-session");
@@ -13031,7 +13133,7 @@ mod tests {
         let (source, _) = chain_source_batch("batched.jsonl", &session, &document, 250, 2);
         assert!(
             source.entries.len() > 200 && source.placements.len() > 200,
-            "fixture must span multiple 100-row chunks, got {} entries / {} placements",
+            "fixture must be large enough to exercise the multi-row bulk path, got {} entries / {} placements",
             source.entries.len(),
             source.placements.len()
         );
