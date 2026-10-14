@@ -4425,7 +4425,12 @@ impl SqliteStore {
 
         let trace_started = trace::begin();
         let manifest = batch_manifest(&upserts, &deletes, &relations)?;
-        self.ensure_stored_identity_metadata_matches(&upserts)?;
+        // 身份校验不在 manifest 阶段重复：`validate_incoming` 已对每个源的全部
+        // entries 调 `ensure_stored_identity_metadata_matches`，而 `upserts` 的 id
+        // 集合完全由这些 entries 构成（`merged` 仅从 `source.entries` 建立，
+        // `merge_stored` 不改 id/StableId），两次检查之间也没有任何写入（首个写
+        // 是下方 `begin_index_batch_with_manifest` 的 INSERT）。对同一 id、同一
+        // 未变化的存储行重查一遍，逐字段比较结果必然相同。
         let batch_current = self.source_batches_are_current(
             &upserts,
             &relations,
@@ -16870,6 +16875,73 @@ mod tests {
         let hits = store.query("same", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.stability(), Stability::Reconstructed);
+    }
+
+    #[test]
+    fn tampered_identity_sidecar_fails_closed_without_state_change() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = sid(IdKind::Message, b"tampered-wire-identity");
+        let wire = message.as_str().to_string();
+        let unstable = StableId::from_wire(&wire).unwrap();
+        assert_ne!(message, unstable);
+        let first = SourceBatch {
+            source_path: "first-source".into(),
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+            entries: vec![(message.clone(), b"p".to_vec(), "same text".into())],
+        };
+        assert!(
+            store
+                .commit_source_batches_if_changed(std::slice::from_ref(&first))
+                .unwrap()
+        );
+        let generation = store.active_generation().unwrap();
+
+        // 篡改持久身份边车：wire 串不变、稳定层级被降级。入站批次携带的
+        // Reconstructed id 与存储侧不再一致，必须在任何写入前拒绝。
+        {
+            let conn = store.conn.borrow();
+            conn.execute(
+                "UPDATE fts_ids SET id_json = ?1 WHERE wire_id = ?2",
+                rusqlite::params![serde_json::to_string(&unstable).unwrap(), &wire],
+            )
+            .unwrap();
+        }
+        let second = SourceBatch {
+            source_path: "second-source".into(),
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+            entries: vec![(message.clone(), b"p2".to_vec(), "changed text".into())],
+        };
+        let err = store
+            .commit_source_batches_if_changed(std::slice::from_ref(&second))
+            .unwrap_err();
+        let PortError::Backend(msg) = err else {
+            panic!("expected backend error");
+        };
+        assert!(msg.contains("conflicting identity metadata"));
+        assert!(!msg.contains(&wire));
+        assert_eq!(store.active_generation().unwrap(), generation);
+        assert!(
+            store
+                .source_message_ids("second-source")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
