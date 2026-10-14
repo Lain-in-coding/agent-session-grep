@@ -313,6 +313,15 @@ def matrix_section(name: str, files: int, per_file: int, run: int, next_ordinal:
             "correctness": correctness,
         })
         next_ordinal += 1
+    if name == "anchor":
+        final_store = copy.deepcopy(section["snapshots"][-1]["store"])
+        final_store["files"].insert(1, {"name": "catalog.db-shm", "bytes": 32768})
+        final_store["total_bytes"] += 32768
+        section["final_store"] = {
+            "observation_point": "after-anchor-search-show-get-doctor",
+            "after_observation_ordinal": section["observations"][-1]["ordinal"],
+            "phase": "post_shrink", "trial": 3, "store": final_store,
+        }
     section["summaries"] = BENCHMARK.section_summaries(section)
     section["derived"] = BENCHMARK.section_derived(section)
     return section, next_ordinal
@@ -359,11 +368,12 @@ def baseline_report(run: int = 1) -> dict:
     peaks = [value for metric in report["metrics"].values() for value in metric["peak_rss_mb_raw_samples"]]
     report["aggregate_peak_rss_mb"] = {"raw_samples": peaks, "summary": BENCHMARK.rounded_summary(peaks)}
     report["sizes"].update(artifact_size_bytes=receipt["binary_size_bytes"], dataset_source_bytes=corpus["source_bytes"],
-                           initial_store_bytes_including_sidecars=4224, post_shrink_store_bytes_including_sidecars=4224,
+                           initial_store_bytes_including_sidecars=4224,
+                           post_shrink_store_bytes_including_sidecars=anchor["final_store"]["store"]["total_bytes"],
                            index_size_ratio=round(4224 / corpus["source_bytes"], 6),
                            initial_store_bytes_raw_samples=[4224] * 3,
                            initial_store_files=["catalog.db", "catalog.db-wal"],
-                           post_shrink_store_files=["catalog.db", "catalog.db-wal"])
+                           post_shrink_store_files=[item["name"] for item in anchor["final_store"]["store"]["files"]])
     report["recovery"]["observation"].update(doctor_open_duration_ms=3.0, active_generation=2)
     report["limitations"] = ["Synthetic test metadata; not measured performance."]
     if run != 1:
@@ -458,6 +468,80 @@ class BaselineStatisticsTests(unittest.TestCase):
             section = {"observations": [{"role": "measured", "outcome": outcome, "exit_code": code}]}
             with self.subTest(outcome=outcome), self.assertRaisesRegex(ValueError, "failed observation"):
                 BENCHMARK.section_summaries(section)
+
+
+class AnchorProductionTests(unittest.TestCase):
+    def test_run_anchor_binds_legacy_sizes_to_store_after_doctor(self) -> None:
+        # Exercise the real producer and snapshot/statistics/validator path.
+        # Only child execution and the independent product oracle are modeled.
+        sync_counts = {}
+
+        def lifecycle(command, *args, **kwargs):
+            if command[-1] == "--version":
+                return process_result()
+            db, operation = Path(command[2]), command[5]
+            if operation == "sync":
+                sync_counts[db] = sync_counts.get(db, 0) + 1
+                phase = ("initial", "noop", "shrink")[sync_counts[db] - 1]
+                count = 2000 if phase == "shrink" else 4000
+                if phase == "initial":
+                    db.write_bytes(b"synthetic catalog")
+                data = {"sources": 20, "emitted": 0 if phase == "noop" else count,
+                        "messages": 0 if phase == "noop" else count,
+                        "committed": 0 if phase == "noop" else count,
+                        "unchanged": count if phase == "noop" else 0,
+                        "retained": 0, "deferred": 0, "skipped": 0, "diagnostics": 0,
+                        "generation": 2 if phase == "shrink" else 1}
+            elif operation == "doctor":
+                db.with_name("catalog.db-shm").write_bytes(b"x" * 32768)
+                data = {"generation": 2, "interrupted_batches": 0}
+            else:
+                data = {"hits": [{"id": "synthetic-hit"}]} if operation == "search" else {}
+            return process_result((json.dumps(robot_frame(operation, data)) + "\n").encode())
+
+        def oracle(paths, per_file):
+            return SimpleNamespace(
+                paths=paths,
+                scan=lambda db, retained: BENCHMARK.expected_census(20, per_file, retained,
+                                                                  fixture_hash(f"{db.name}:{retained}")),
+                check_search=lambda frame, query: {"generation": 2, "hit_count": 20,
+                                                    "result_ids_sha256": fixture_hash("results")},
+                check_read=lambda frame, operation, index: {
+                    "generator_index": index,
+                    "message_id": f"msg_v1_00000000-0000-4000-8000-{index:012d}"},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            binary = root / "cli.exe"
+            binary.write_bytes(b"synthetic binary")
+            budget = Mock()
+            budget.remaining.return_value = 3600.0
+            budget.elapsed_ms.return_value = 0.0
+            context = BENCHMARK.BaselineRun(root, binary, root / "scratch", budget, 1)
+            context.environment_data = {}
+            args = argparse.Namespace(workspace=str(root), output_dir=str(root / "output"),
+                                      profile="full", expected_commit="1" * 40, binary=None,
+                                      disk="synthetic", filesystem="synthetic", antivirus_state="enabled",
+                                      sqlite_version="3.53.2", sqlite_version_source="synthetic fixture")
+            with patch.object(BENCHMARK, "process_lifecycle", side_effect=lifecycle), \
+                 patch.object(BENCHMARK, "SyntheticOracle", side_effect=oracle), \
+                 patch.object(BENCHMARK, "command_text", return_value="1" * 40), \
+                 patch.object(BENCHMARK, "resolve_binary", side_effect=AssertionError("unexpected build")):
+                report = BENCHMARK.run_anchor(args, context)
+            report["baseline"] = {"anchor": context.anchor}
+            BENCHMARK.validate_anchor_links(report)
+            before = context.anchor["snapshots"][-1]["store"]
+            after = context.anchor["final_store"]["store"]
+            self.assertEqual(after["total_bytes"] - before["total_bytes"], 32768)
+            self.assertEqual(report["sizes"]["post_shrink_store_bytes_including_sidecars"], after["total_bytes"])
+            self.assertEqual(report["sizes"]["post_shrink_store_files"], ["catalog.db", "catalog.db-shm"])
+            self.assertEqual(context.anchor["final_store"]["after_observation_ordinal"], 353)
+            self.assertEqual(len(context.anchor["snapshots"]), 9)
+            self.assertEqual(len(context.anchor["derived"]["store_source_ratios"]), 9)
+            report["sizes"]["post_shrink_store_bytes_including_sidecars"] = before["total_bytes"]
+            with self.assertRaisesRegex(ValueError, "final store observation"):
+                BENCHMARK.validate_anchor_links(report)
 
 
 class ProcessObservationTests(unittest.TestCase):
@@ -1121,6 +1205,46 @@ class SourceAndBuildTests(unittest.TestCase):
             self.assertEqual(attempt_path.read_bytes(), before)
 
 
+    def test_final_stage_failures_do_not_blame_successful_sync(self) -> None:
+        for failed_phase in ("final/provenance", "final/report-validation"):
+            with self.subTest(phase=failed_phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                output, scratch = root / "evidence-output/suite/run-01", root / "owned-scratch"
+                scratch.mkdir()
+                binary = root / "cli"
+                binary.write_bytes(b"synthetic binary")
+                args = argparse.Namespace(profile="full", baseline_run=1, suite_id="synthetic-suite",
+                                          expected_commit="1" * 40, binary=None, workspace=str(root),
+                                          output_dir=str(output), disk="synthetic", filesystem="synthetic",
+                                          antivirus_state="enabled", sqlite_version="3.53.2",
+                                          sqlite_version_source="synthetic fixture")
+                budget = Mock()
+                budget.elapsed_ms.return_value = 0.0
+                budget.remaining.return_value = 3600.0
+
+                def scale(context, name, files):
+                    context.failed_phase = f"{name}/shrink/sync"
+                    context.workloads.append({"id": name, "observations": [{"outcome": "success"}]})
+
+                source_error = ValueError("baseline: injected source failure") if failed_phase == "final/provenance" else None
+                with patch.object(BENCHMARK.tempfile, "mkdtemp", return_value=str(scratch)), \
+                     patch.object(BENCHMARK, "prepare_suite", return_value=(binary, source_receipt(), build_receipt(), budget, {})), \
+                     patch.object(BENCHMARK.BaselineRun, "run_preflight"), \
+                     patch.object(BENCHMARK, "run_anchor", return_value={"environment": {}, "limitations": []}), \
+                     patch.object(BENCHMARK.BaselineRun, "run_scale", autospec=True, side_effect=scale), \
+                     patch.object(BENCHMARK, "source_identity", return_value=source_receipt(), side_effect=source_error), \
+                     patch.object(BENCHMARK, "validate_report", side_effect=ValueError("baseline: injected report failure")) as validate, \
+                     self.assertRaisesRegex(ValueError, "incomplete attempt retained"):
+                    BENCHMARK.run_baseline(args)
+                attempt = json.loads((output / "attempt.json").read_text(encoding="utf-8"))
+                self.assertEqual(attempt["status"], "failed")
+                self.assertEqual(attempt["failed_phase"], failed_phase)
+                self.assertEqual([section["observations"][0]["outcome"] for section in attempt["sections"][2:]],
+                                 ["success"] * 3)
+                self.assertEqual(validate.call_count, int(failed_phase == "final/report-validation"))
+                self.assertFalse((output / "core-beta-benchmark-full.json").exists())
+
+
 class BaselineReportValidationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1340,6 +1464,35 @@ class BaselineReportValidationTests(unittest.TestCase):
         self.validate(legacy)
         with self.assertRaisesRegex(ValueError, "invocation link"):
             self.validate(report)
+
+    def test_anchor_final_store_has_closed_point_files_and_legacy_binding(self) -> None:
+        base = ("baseline", "anchor", "final_store")
+        cases = [
+            (base, None), (base, {}), ((*base, "observation_point"), "after-shrink-sync"),
+            ((*base, "phase"), "shrink"), ((*base, "trial"), 2), ((*base, "trial"), True),
+            ((*base, "after_observation_ordinal"), 1), ((*base, "after_observation_ordinal"), True),
+            ((*base, "store", "total_bytes"), 4224), ((*base, "store", "total_bytes"), True),
+            ((*base, "store", "files"), []), ((*base, "store", "files", 0, "bytes"), False),
+            ((*base, "store", "files", 1, "name"), "catalog.db"),
+            ((*base, "store", "coverage"), "checkpointed"),
+            (("sizes", "post_shrink_store_bytes_including_sidecars"), 4224),
+            (("sizes", "post_shrink_store_files"), ["catalog.db", "catalog.db-wal"]),
+        ]
+        for path, value in cases:
+            with self.subTest(path=path, value=value):
+                self.assert_invalid(path, value)
+        for extra in ("extra_point_field", "extra_store_field", "non_anchor_field", "missing_final"):
+            report = copy.deepcopy(self.valid)
+            if extra == "missing_final":
+                report["baseline"]["anchor"].pop("final_store")
+            elif extra == "non_anchor_field":
+                report["baseline"]["workloads"][0]["final_store"] = None
+            elif extra == "extra_store_field":
+                report["baseline"]["anchor"]["final_store"]["store"]["extra"] = 1
+            else:
+                report["baseline"]["anchor"]["final_store"]["extra"] = 1
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.validate(report)
 
     def test_source_build_environment_and_prebuilt_labels_cannot_be_rewritten(self) -> None:
         cases = [

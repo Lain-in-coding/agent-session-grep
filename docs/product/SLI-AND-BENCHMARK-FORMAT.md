@@ -102,6 +102,7 @@ python scripts/evidence/core_beta_benchmark.py validate-report <report.json>
 `child_policy`、固定 `plan`、`preflight`、`anchor`、三个 `workloads` 与 `coverage`。
 每个 workload 分别保留阶段快照、按执行顺序排列的 observations、context anchor、
 固定实体选择、summaries 和 derived；成功数值不得替代缺失的原始记录。
+仅 anchor 另有必填 `final_store`，保留全部读取及 doctor 结束后的独立体积观测。
 
 | 工作负载 | 生成输入 | 实际查询阶段 | shrink 后保留 |
 |---|---|---|---|
@@ -186,6 +187,15 @@ sidecars，覆盖标识为 `catalog.db-and-present-sidecars-after-exit-no-explic
 不能表述为执行了显式 checkpoint。文件清单与字节数在独立只读 census 打开
 SQLite 之前固定：`mode=ro` 在可写目录仍可能创建 WAL/SHM，不把校验器产生的
 sidecars 计入被测命令退出后的 footprint；数据库仍以普通只读模式核验。
+
+原 legacy `post_shrink_store_bytes_including_sidecars` / `post_shrink_store_files`
+的采样点是第三 trial shrink 之后，全部 search/show/get 与 doctor 完成之后。
+这与第三次 shrink-sync 退出时的快照是两个不同观测点，允许后续读取留下新的
+WAL/SHM。anchor 的闭集 `final_store` 对象记录
+`observation_point=after-anchor-search-show-get-doctor`、`phase=post_shrink`、
+`trial=3`、匹配最后成功 doctor 的 `after_observation_ordinal`，以及采用同一
+files/total_bytes/coverage 校验契约的 `store`。旧 final sizes/files 必须与它
+一致；不得覆盖较早的同步快照或改写其 derived ratios 来消除两次体积差异。
 
 #### 来源收据、有限执行与发布
 

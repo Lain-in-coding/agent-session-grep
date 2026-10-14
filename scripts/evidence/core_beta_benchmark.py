@@ -334,6 +334,14 @@ def directory_size(paths: Iterable[Path]) -> int:
     return sum(path.stat().st_size for path in paths if path.is_file())
 
 
+def store_snapshot(paths: Iterable[Path]) -> dict[str, Any]:
+    files = [{"name": path.name, "bytes": path.stat().st_size} for path in sorted(paths) if path.is_file()]
+    return {
+        "files": files, "total_bytes": sum(item["bytes"] for item in files),
+        "coverage": "catalog.db-and-present-sidecars-after-exit-no-explicit-checkpoint",
+    }
+
+
 def metric(name: str, unit: str, samples: list[dict[str, Any]], required: int, state: str) -> dict[str, Any]:
     durations = [float(sample["duration_ms"]) for sample in samples]
     peaks = [float(sample["peak_rss_mb"]) for sample in samples if sample["peak_rss_mb"] is not None]
@@ -1087,7 +1095,7 @@ def largest_sync_preflight(binary: Path, scratch: Path) -> None:
 
 
 def new_section(name: str, files: int, per_file: int = 200) -> dict[str, Any]:
-    return {
+    section = {
         "id": name, "file_count": files, "messages_per_file": per_file,
         "query_phase": "post_shrink" if name == "anchor" else "intact",
         "query_trial": 1 if name == "preflight" else 3,
@@ -1095,6 +1103,9 @@ def new_section(name: str, files: int, per_file: int = 200) -> dict[str, Any]:
         "retrieval_indices": list(range(100)) if name == "anchor" else (retrieval_indices(files, per_file) if name != "preflight" else [1]),
         "summaries": {}, "derived": {},
     }
+    if name == "anchor":
+        section["final_store"] = None
+    return section
 
 
 def observation_key(record: dict[str, Any]) -> str:
@@ -1272,14 +1283,13 @@ class BaselineRun:
         retained = section["messages_per_file"] // 2 if phase == "shrink" else section["messages_per_file"]
         # Even mode=ro can create WAL/SHM files in a writable directory. Freeze
         # the post-child footprint before the independent census opens SQLite.
-        files = [{"name": path.name, "bytes": path.stat().st_size} for path in sorted(db.parent.glob("catalog.db*")) if path.is_file()]
+        store = store_snapshot(db.parent.glob("catalog.db*"))
         census = oracle.scan(db, retained)
         corpus = copy.deepcopy(corpus_identity(section["file_count"], section["messages_per_file"], retained))
         require(tree_hash(oracle.paths, oracle.paths[0].parent) == corpus["tree_hash"], "phase corpus hash mismatch")
         section["snapshots"].append({
             "phase": phase, "trial": trial, "corpus": corpus, "census": census,
-            "store": {"files": files, "total_bytes": sum(item["bytes"] for item in files),
-                      "coverage": "catalog.db-and-present-sidecars-after-exit-no-explicit-checkpoint"},
+            "store": store,
         })
 
     def finish_section(self, section: dict[str, Any]) -> None:
@@ -1522,6 +1532,7 @@ def run_baseline(args: argparse.Namespace) -> Path:
         assert isinstance(report, dict)
         for name in scale_order(args.baseline_run):
             context.run_scale(name, dict(SCALES)[name])
+        context.failed_phase = "final/provenance"
         budget.boundary(scratch, context.peak_mib)
         after = source_identity(workspace, args.expected_commit)
         require(after == source and sha256_file(binary) == receipt["binary_sha256"], "source, harness or binary changed during measurement")
@@ -1555,12 +1566,15 @@ def run_baseline(args: argparse.Namespace) -> Path:
         report["limitations"] = [item for item in report["limitations"] if not item.startswith("The SQLite runtime version is operator-supplied")]
         report["limitations"].append("SQLite version is derived from the locked bundled source and this build's linkage receipt; no CLI runtime version query was performed.")
         report_path = output / "core-beta-benchmark-full.json"
+        context.failed_phase = "final/report-validation"
         validate_report(report_path, "full", report_data=report, quiet=True)
         markdown = render_markdown(report)
+        context.failed_phase = "final/report-write"
         write_json_new(report_path, report)
         with report_path.with_suffix(".md").open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(markdown)
         trace = run_trace_trial(context, output) if args.baseline_run == 3 else None
+        context.failed_phase = "final/complete"
         attempt.update({"status": "complete", "failed_phase": None, "reason": None, "sections": []})
         claim.update({"status": "complete", "report_sha256": sha256_file(report_path)})
         if trace is None or trace["status"] == "available":
@@ -1732,7 +1746,20 @@ def run_anchor(args: argparse.Namespace, baseline: BaselineRun | None = None) ->
         initial_durations = [float(item["duration_ms"]) for item in initial_samples]
         throughput = [rounded(dataset_bytes / (1024 * 1024) / (duration / 1000)) if duration > 0 else 0.0 for duration in initial_durations]
         storage_files = list(final_trial.glob("catalog.db*"))
-        post_shrink_storage_bytes = directory_size(storage_files)
+        if baseline is None:
+            post_shrink_storage_bytes = directory_size(storage_files)
+            post_shrink_storage_files = sorted(path.name for path in storage_files)
+        else:
+            # Preserve the legacy observation after all reads and doctor. A
+            # read-only opener can leave sidecars absent at shrink-sync exit.
+            final_store = store_snapshot(storage_files)
+            baseline.anchor["final_store"] = {
+                "observation_point": "after-anchor-search-show-get-doctor",
+                "after_observation_ordinal": baseline.anchor["observations"][-1]["ordinal"],
+                "phase": "post_shrink", "trial": 3, "store": final_store,
+            }
+            post_shrink_storage_bytes = final_store["total_bytes"]
+            post_shrink_storage_files = [item["name"] for item in final_store["files"]]
         initial_store_bytes = initial_store_bytes_samples[-1]
         metrics = {
             "cli_startup_cold_latency_ms": metric("cli_startup_cold_latency_ms", "ms", cold, profile["startup"], "cold_best_effort"),
@@ -1795,7 +1822,7 @@ def run_anchor(args: argparse.Namespace, baseline: BaselineRun | None = None) ->
                 "checkpoint": "not_available_cli_sidecars_measured_after_process_exit",
                 "initial_store_bytes_raw_samples": initial_store_bytes_samples,
                 "initial_store_files": initial_store_files,
-                "post_shrink_store_files": sorted(path.name for path in storage_files),
+                "post_shrink_store_files": post_shrink_storage_files,
             },
             "recovery": {
                 "status": "not_implemented",
@@ -2034,6 +2061,37 @@ def expected_census(files: int, per_file: int, retained: int, bindings_hash: str
     }
 
 
+def validate_store_snapshot(value: Any) -> dict[str, Any]:
+    store = closed(value, {"files", "total_bytes", "coverage"}, "store snapshot")
+    require(store["coverage"] == "catalog.db-and-present-sidecars-after-exit-no-explicit-checkpoint", "incorrect store coverage")
+    files = store["files"]
+    require(isinstance(files, list) and 0 < len(files) <= 12, "invalid store file count")
+    names = []
+    for entry in files:
+        closed(entry, {"name", "bytes"}, "store file")
+        require(isinstance(entry["name"], str) and re.fullmatch(r"catalog\.db(?:[.-][a-zA-Z0-9._-]+)?", entry["name"]) is not None, "invalid store file name")
+        require(finite_number(entry["bytes"], integer=True), "invalid store file byte count")
+        names.append(entry["name"])
+    require(names == sorted(set(names)) and "catalog.db" in names, "duplicate or missing store file")
+    require(finite_number(store["total_bytes"], integer=True) and 0 < store["total_bytes"] <= SCRATCH_LIMIT and store["total_bytes"] == sum(entry["bytes"] for entry in files), "invalid store total bytes")
+    return store
+
+
+def validate_anchor_final_store(anchor: dict[str, Any]) -> dict[str, Any]:
+    final = closed(anchor.get("final_store"), {"observation_point", "after_observation_ordinal", "phase", "trial", "store"}, "anchor final store")
+    point = {"observation_point": "after-anchor-search-show-get-doctor", "phase": "post_shrink", "trial": 3}
+    exact_json({key: final[key] for key in point}, point, "wrong anchor final store observation point")
+    observations = anchor.get("observations")
+    require(isinstance(observations, list) and bool(observations), "anchor final store lacks doctor observation")
+    doctor = observations[-1]
+    require(isinstance(doctor, dict), "anchor final store lacks doctor observation")
+    expected = {"operation": "doctor", "phase": "post_shrink", "trial": 3,
+                "role": "verification", "outcome": "success", "exit_code": 0}
+    exact_json({key: doctor.get(key) for key in expected}, expected, "anchor final store must follow the final doctor")
+    require(finite_number(final["after_observation_ordinal"], integer=True) and final["after_observation_ordinal"] > 0 and finite_number(doctor.get("ordinal"), integer=True) and final["after_observation_ordinal"] == doctor["ordinal"], "anchor final store doctor ordinal mismatch")
+    return validate_store_snapshot(final["store"])
+
+
 def validate_snapshots(section: dict[str, Any]) -> None:
     snapshots = section["snapshots"]
     trials = 1 if section["id"] == "preflight" else 3
@@ -2051,18 +2109,7 @@ def validate_snapshots(section: dict[str, Any]) -> None:
         if phase_key in bindings:
             require(census["bindings_sha256"] == bindings[phase_key], "immediate noop identities changed")
         bindings[phase_key] = census["bindings_sha256"]
-        store = closed(snapshot["store"], {"files", "total_bytes", "coverage"}, "store snapshot")
-        require(store["coverage"] == "catalog.db-and-present-sidecars-after-exit-no-explicit-checkpoint", "incorrect store coverage")
-        files = store["files"]
-        require(isinstance(files, list) and 0 < len(files) <= 12, "invalid store file count")
-        names = []
-        for entry in files:
-            closed(entry, {"name", "bytes"}, "store file")
-            require(isinstance(entry["name"], str) and re.fullmatch(r"catalog\.db(?:[.-][a-zA-Z0-9._-]+)?", entry["name"]) is not None, "invalid store file name")
-            require(finite_number(entry["bytes"], integer=True), "invalid store file byte count")
-            names.append(entry["name"])
-        require(names == sorted(set(names)) and "catalog.db" in names, "duplicate or missing store file")
-        require(finite_number(store["total_bytes"], integer=True) and 0 < store["total_bytes"] <= SCRATCH_LIMIT and store["total_bytes"] == sum(entry["bytes"] for entry in files), "invalid store total bytes")
+        validate_store_snapshot(snapshot["store"])
 
 
 def validate_correctness(record: dict[str, Any], section: dict[str, Any]) -> None:
@@ -2095,7 +2142,10 @@ def validate_correctness(record: dict[str, Any], section: dict[str, Any]) -> Non
 
 
 def validate_section(section: Any, name: str, files: int, per_file: int, baseline: dict[str, Any], suffix: str) -> list[dict[str, Any]]:
-    closed(section, {"id", "file_count", "messages_per_file", "query_phase", "query_trial", "snapshots", "observations", "context_anchor", "retrieval_indices", "summaries", "derived"}, "workload")
+    keys = {"id", "file_count", "messages_per_file", "query_phase", "query_trial", "snapshots", "observations", "context_anchor", "retrieval_indices", "summaries", "derived"}
+    if name == "anchor":
+        keys.add("final_store")
+    closed(section, keys, "workload")
     shape = {"id": name, "file_count": files, "messages_per_file": per_file, "query_phase": "post_shrink" if name == "anchor" else "intact", "query_trial": 1 if name == "preflight" else 3}
     exact_json({key: section[key] for key in shape}, shape, "wrong workload identity, size or query phase")
     exact_json(section["retrieval_indices"], [1] if name == "preflight" else list(range(100)) if name == "anchor" else retrieval_indices(files), "incorrect fixed entity selection")
@@ -2129,6 +2179,8 @@ def validate_section(section: Any, name: str, files: int, per_file: int, baselin
         else:
             require(finite_number(memory["peak_rss_mib"]) and rounded(memory["peak_rss_mib"]) == memory["peak_rss_mib"] and memory["peak_rss_mib"] <= RSS_LIMIT_MIB and memory["observation_count"] > 0 and memory["unavailable_reason"] is None, "invalid observed memory or guardrail")
         validate_correctness(record, section)
+    if name == "anchor":
+        validate_anchor_final_store(section)
     exact_json(section["summaries"], section_summaries(section), "raw-derived workload summaries differ")
     exact_json(section["derived"], section_derived(section), "raw-derived throughput or store ratios differ")
     return observations
@@ -2153,11 +2205,12 @@ def validate_anchor_links(report: dict[str, Any]) -> None:
     exact_json(report["metrics"]["initial_index_throughput_mb_s"]["raw_samples"], [rounded(initial_corpus["source_bytes"] / 1024**2 / (value / 1000)) for value in initial_durations], "legacy throughput differs from same-invocation durations")
     sizes = report["sizes"]
     initial = [item["store"] for item in anchor["snapshots"] if item["phase"] == "initial"]
-    shrink = anchor["snapshots"][-1]["store"]
+    final = validate_anchor_final_store(anchor)
     exact_json(sizes["initial_store_bytes_raw_samples"], [store["total_bytes"] for store in initial], "legacy initial store samples differ from snapshots")
-    require(sizes["initial_store_bytes_including_sidecars"] == initial[-1]["total_bytes"] and sizes["post_shrink_store_bytes_including_sidecars"] == shrink["total_bytes"], "legacy store phase mismatch")
+    require(sizes["initial_store_bytes_including_sidecars"] == initial[-1]["total_bytes"], "legacy initial store phase mismatch")
+    require(sizes["post_shrink_store_bytes_including_sidecars"] == final["total_bytes"], "legacy final store observation mismatch")
     exact_json(sizes["initial_store_files"], [item["name"] for item in initial[-1]["files"]], "legacy initial store files differ")
-    exact_json(sizes["post_shrink_store_files"], [item["name"] for item in shrink["files"]], "legacy shrink store files differ")
+    exact_json(sizes["post_shrink_store_files"], [item["name"] for item in final["files"]], "legacy final store files differ")
     require(sizes["index_size_ratio"] == rounded(initial[-1]["total_bytes"] / initial_corpus["source_bytes"]), "legacy index size ratio mismatch")
     doctor = anchor["observations"][-1]
     observation = report["recovery"]["observation"]
@@ -2477,6 +2530,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- UTC interval: {baseline['started_at_utc']} to {baseline['completed_at_utc']}",
             f"- Corrected timing: `{WALL_PROTOCOL}`; legacy metrics above retain `{LEGACY_PROTOCOL}`.",
             "- Anchor queries use 2,000 post-shrink Messages; scale queries use intact 2k/10k/50k corpora.",
+            f"- Anchor store at final shrink-sync exit: {baseline['anchor']['snapshots'][-1]['store']['total_bytes']} bytes; after search/show/get/doctor: {baseline['anchor']['final_store']['store']['total_bytes']} bytes (legacy final size).",
             "- Trace is disabled for primary samples. A separate local trial follows primary run 3.",
             "- P50/P95/MAD below use persisted corrected wall times. Response bytes include the final LF.",
             "", "| Workload | Operation/class | Samples | P50 ms | P95 ms | MAD ms | P50 bytes | RSS observations |",
