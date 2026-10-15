@@ -6965,7 +6965,7 @@ impl SqliteStore {
         // 批量写入：同一事务内以多行 VALUES 语句替代逐行 prepared execute
         // （借鉴 hstry bulk_insert_messages_in_tx，MIT，
         // hstry/crates/hstry-core/src/db.rs:2990）。200K 实体 × 5 条语句的
-        // 逐行 execute 支配了首次 ingest 的常数因子；批量后每 100 实体只发
+        // 逐行 execute 支配了首次 ingest 的常数因子；批量后每 512 实体只发
         // 5 条语句。Scoped so the borrow ends before the relation/source
         // loops below.
         {
@@ -7058,8 +7058,8 @@ impl SqliteStore {
         }
         // 关系行 upsert：多行批量（借鉴 hstry bulk_insert_messages_in_tx，MIT，
         // hstry/crates/hstry-core/src/db.rs:2990）。message_placements 8 列 ×
-        // 100 行 = 800 参数，message_edges 4 列 × 100 行 = 400 参数，均低于
-        // SQLite 默认 999 变量上限（模块级编译期断言守住上限）。
+        // 512 行 = 4096 参数，message_edges 4 列 × 512 行 = 2048 参数，均低于
+        // bundled SQLite 的 32766 变量上限（模块级编译期断言守住上限）。
         {
             let mut placement_rows: Vec<PlacementInsertRow<'_>> = Vec::new();
             for upsert in &relations.relation_upserts {
@@ -7228,7 +7228,7 @@ impl SqliteStore {
             )
             .map_err(backend)?;
             // 每源成员行可能上千，多行批量插入（同 hstry bulk_insert 模式，
-            // 3 列 × 100 行 = 300 参数）。
+            // 3 列 × 512 行 = 1536 参数）。
             const _: () = assert!(3 * BULK_INSERT_ROWS_PER_CHUNK <= SQLITE_MAX_VARIABLES);
             for chunk in source.entity_memberships.chunks(BULK_INSERT_ROWS_PER_CHUNK) {
                 let sql = format!(
@@ -10779,6 +10779,299 @@ mod tests {
     }
 
     #[test]
+    fn typed_manifest_streaming_preserves_legacy_json_and_digest() {
+        // Keep the pre-O6 collected-array algorithm as an independent byte
+        // oracle. Comparing two calls to canonical_json would miss drift.
+        fn legacy_json(relations: &RelationManifests) -> (String, String, String) {
+            relations.validate().unwrap();
+            let mut upserts: Vec<_> = relations.relation_upserts.iter().collect();
+            upserts.sort_by_key(|item| item.canonical_key());
+            let upserts: Vec<_> = upserts
+                .into_iter()
+                .map(RelationUpsertManifest::canonical_value)
+                .collect();
+            let mut deletes: Vec<_> = relations.relation_deletes.iter().collect();
+            deletes.sort_by_key(|item| item.canonical_key());
+            let deletes: Vec<_> = deletes
+                .into_iter()
+                .map(RelationDeleteManifest::canonical_value)
+                .collect();
+            let mut replacements: Vec<_> = relations.source_replacements.iter().collect();
+            replacements.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+            let replacements: Vec<_> = replacements
+                .into_iter()
+                .map(SourceReplacementManifest::canonical_value)
+                .collect();
+            (
+                serde_json::to_string(&upserts).unwrap(),
+                serde_json::to_string(&deletes).unwrap(),
+                serde_json::to_string(&replacements).unwrap(),
+            )
+        }
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join(".claude/projects/synthetic/session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let session = sid(IdKind::Session, b"typed-manifest-session");
+        let document = sid(IdKind::Document, b"typed-manifest-document");
+        let message = sid(IdKind::Message, b"typed-manifest-message");
+        let parent = sid(IdKind::Message, b"typed-manifest-parent");
+        let retired = sid(IdKind::Message, b"typed-manifest-retired");
+        let placed = placement(&session, &document, &message, 1, true, Some((4, 12)));
+        let retired_placement = placement(&session, &document, &retired, 2, false, None);
+        let mut edge = reply_edge(&placed, &parent);
+        edge.parent_native_id = Some("parent \"quoted\"\\line\n中文".into());
+        let entries = vec![
+            typed_message_entry(&message, "body \"quoted\"\\line\n中文"),
+            typed_document_entry(&document),
+            entity_entry(&session),
+            typed_message_entry(&parent, "parent body"),
+        ];
+        let source = SourceBatch {
+            provider_id: Some("claude-code".into()),
+            ..source_batch(
+                &path,
+                entries.clone(),
+                vec![placed.clone()],
+                vec![edge.clone()],
+                true,
+            )
+        };
+        let namespace = agent_session_grep_application::relocation::legacy_installation_namespace(
+            &path,
+            "claude-code",
+        );
+        store
+            .resolve_or_allocate_installation_namespace("claude-code", &path, &namespace)
+            .unwrap();
+        let installation = store.installation_for_source_commit(&source).unwrap();
+        assert!(
+            installation.is_some(),
+            "fixture must exercise installation JSON"
+        );
+        let replacement = SourceReplacementManifest {
+            source_path: path,
+            entity_memberships: entries
+                .iter()
+                .map(|(id, _, _)| SourceEntityMembershipManifest {
+                    entity_id: id.as_str().into(),
+                    document_id: Some(document.as_str().into()),
+                })
+                .collect(),
+            placement_ids: vec![placed.id.clone()],
+            activity_ids: vec!["activity-z".into(), "activity-a".into()],
+            usage_ids: vec!["usage-z".into(), "usage-a".into()],
+            relation_complete: true,
+            len_bytes: Some(128),
+            fingerprint: Some("synthetic-fingerprint".into()),
+            provider_id: Some("claude-code".into()),
+            resume_claims: vec![SourceResumeClaim {
+                provider_id: "claude-code".into(),
+                session_id: session.as_str().into(),
+                provider_session_id: Some("native \"quoted\"\\line\n中文".into()),
+                provider_session_id_state: "resolved".into(),
+                original_working_directory: None,
+                original_working_directory_state: "missing".into(),
+                pair_observed: false,
+            }],
+            installation,
+        };
+        let empty_replacement = SourceReplacementManifest {
+            source_path: "z-empty.jsonl".into(),
+            entity_memberships: Vec::new(),
+            placement_ids: Vec::new(),
+            activity_ids: Vec::new(),
+            usage_ids: Vec::new(),
+            relation_complete: false,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+            installation: None,
+        };
+        let relations = RelationManifests {
+            relation_upserts: vec![
+                RelationUpsertManifest::Usage(StoredUsage {
+                    usage_id: "usage-z".into(),
+                    session_id: session.as_str().into(),
+                    message_id: None,
+                    input_tokens: u64::from(u32::MAX) + 1,
+                    output_tokens: 0,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 3,
+                    reasoning_tokens: 4,
+                    token_source: "provider-reported".into(),
+                }),
+                RelationUpsertManifest::Placement(placed),
+                RelationUpsertManifest::Activity(StoredActivity {
+                    activity_id: "activity-z".into(),
+                    message_id: message.as_str().into(),
+                    kind: "tool_use".into(),
+                    actor: "assistant".into(),
+                    name: "Read".into(),
+                    target: Some("src/中文 \"quoted\"\\line\n.rs".into()),
+                    status: "success".into(),
+                }),
+                RelationUpsertManifest::Edge(edge),
+            ],
+            relation_deletes: vec![
+                RelationDeleteManifest::Usage("retired-usage".into()),
+                RelationDeleteManifest::Placement(retired_placement.id.clone()),
+                RelationDeleteManifest::Activity("retired-activity".into()),
+                RelationDeleteManifest::Edge(retired_placement.id),
+            ],
+            source_replacements: vec![empty_replacement, replacement],
+            relocation: None,
+        };
+        let expected = legacy_json(&relations);
+        let mut permuted = relations.clone();
+        permuted.relation_upserts.reverse();
+        permuted.relation_deletes.reverse();
+        permuted.source_replacements.reverse();
+        for replacement in &mut permuted.source_replacements {
+            replacement.entity_memberships.reverse();
+            replacement.activity_ids.reverse();
+            replacement.usage_ids.reverse();
+        }
+        assert_eq!(legacy_json(&permuted), expected);
+        let empty = RelationManifests::default();
+        for candidate in [&relations, &permuted, &empty] {
+            let expected_json = legacy_json(candidate);
+            assert_eq!(candidate.canonical_json().unwrap(), expected_json);
+            let manifest =
+                batch_manifest(&entries, std::slice::from_ref(&retired), candidate).unwrap();
+            assert_eq!(manifest.relation_upserts_json, expected_json.0);
+            assert_eq!(manifest.relation_deletes_json, expected_json.1);
+            assert_eq!(manifest.source_replacements_json, expected_json.2);
+            assert_eq!(manifest.relocation_json, "null");
+
+            // Assemble the frozen length-prefixed input independently of
+            // batch_manifest and hash_field, using the original JSON bytes.
+            let mut digest_input = Vec::new();
+            let mut append = |field: &[u8]| {
+                digest_input.extend_from_slice(&(field.len() as u64).to_le_bytes());
+                digest_input.extend_from_slice(field);
+            };
+            append(b"agentsessions-index-batch-v1");
+            append(b"sqlite-fts5-v1");
+            let mut ordered: Vec<_> = entries.iter().collect();
+            ordered.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+            for (id, payload, text) in ordered {
+                append(b"upsert");
+                append(id.as_str().as_bytes());
+                append(payload);
+                append(text.as_bytes());
+            }
+            append(b"delete");
+            append(retired.as_str().as_bytes());
+            append(b"relation_upserts");
+            append(expected_json.0.as_bytes());
+            append(b"relation_deletes");
+            append(expected_json.1.as_bytes());
+            append(b"source_replacements");
+            append(expected_json.2.as_bytes());
+            assert_eq!(
+                manifest.operation_digest,
+                blake3::hash(&digest_input).to_hex().to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_manifest_rejects_invalid_relations_before_durable_intent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"invalid-manifest-session");
+        let document = sid(IdKind::Document, b"invalid-manifest-document");
+        let message = sid(IdKind::Message, b"invalid-manifest-message");
+        let placed = placement(&session, &document, &message, 0, false, None);
+        let upsert = RelationUpsertManifest::Placement(placed.clone());
+        let delete = RelationDeleteManifest::Placement(placed.id.clone());
+        let replacement = SourceReplacementManifest {
+            source_path: "invalid-manifest.jsonl".into(),
+            entity_memberships: vec![SourceEntityMembershipManifest {
+                entity_id: session.as_str().into(),
+                document_id: None,
+            }],
+            placement_ids: Vec::new(),
+            activity_ids: Vec::new(),
+            usage_ids: Vec::new(),
+            relation_complete: false,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+            installation: None,
+        };
+        let mut invalid_membership = replacement.clone();
+        invalid_membership.entity_memberships[0].entity_id = "invalid-entity".into();
+        let cases = [
+            (
+                RelationManifests {
+                    relation_upserts: vec![upsert.clone(), upsert.clone()],
+                    ..RelationManifests::default()
+                },
+                "index batch contains duplicate relation upserts",
+            ),
+            (
+                RelationManifests {
+                    relation_deletes: vec![delete.clone(), delete.clone()],
+                    ..RelationManifests::default()
+                },
+                "index batch contains duplicate relation deletes",
+            ),
+            (
+                RelationManifests {
+                    relation_upserts: vec![upsert],
+                    relation_deletes: vec![delete],
+                    ..RelationManifests::default()
+                },
+                "index batch cannot upsert and delete the same relation",
+            ),
+            (
+                RelationManifests {
+                    source_replacements: vec![replacement.clone(), replacement],
+                    ..RelationManifests::default()
+                },
+                "index batch contains duplicate source replacements",
+            ),
+            (
+                RelationManifests {
+                    source_replacements: vec![invalid_membership],
+                    ..RelationManifests::default()
+                },
+                "source replacement has an invalid entity id",
+            ),
+        ];
+        for (relations, expected) in cases {
+            assert!(matches!(
+                relations.canonical_json(),
+                Err(PortError::Backend(message)) if message == expected
+            ));
+            assert!(matches!(
+                store.begin_index_batch_with_relations(&[], &[], &relations),
+                Err(PortError::Backend(message)) if message == expected
+            ));
+            assert_eq!(store.active_generation().unwrap(), 0);
+            for table in [
+                "index_batches",
+                "catalog",
+                "fts",
+                "fts_ids",
+                "message_placements",
+                "message_edges",
+                "source_scans",
+                "source_membership",
+            ] {
+                assert_eq!(table_count(&store, table), 0, "{table} must stay empty");
+            }
+        }
+    }
+
+    #[test]
     fn semantic_vectors_reject_nonfinite_and_corrupt_storage() {
         let store = SqliteStore::open_in_memory().unwrap();
         store.set_semantic_model("finite-model");
@@ -13118,16 +13411,16 @@ mod tests {
 
     #[test]
     fn bulk_commit_spanning_chunk_boundary_lands_every_row() {
-        // O4：shipped 分块 512 行下，一次提交跨块（512 + 1 行）时必须与 fixture
-        // 逐表行数一致——覆盖满块与尾块两条多行语句，以及 placement/catalog/fts
-        // 三张表各自的分块边界。
+        // 514 messages give 513 edges, exercising full and tail chunks in
+        // every bulk relation path as well as both source membership tables.
         let store = SqliteStore::open_in_memory().unwrap();
         let session = sid(IdKind::Session, b"chunk-span-session");
         let document = sid(IdKind::Document, b"chunk-span-document");
-        let chain_len = BULK_INSERT_ROWS_PER_CHUNK + 1;
+        let chain_len = BULK_INSERT_ROWS_PER_CHUNK + 2;
         let (source, _) = chain_source_batch("chunk-span.jsonl", &session, &document, chain_len, 0);
         assert!(source.entries.len() > BULK_INSERT_ROWS_PER_CHUNK);
         assert!(source.placements.len() > BULK_INSERT_ROWS_PER_CHUNK);
+        assert!(source.edges.len() > BULK_INSERT_ROWS_PER_CHUNK);
         assert!(
             store
                 .commit_source_batches_if_changed(std::slice::from_ref(&source))
@@ -13152,6 +13445,37 @@ mod tests {
         assert_eq!(
             store.stored_placements().unwrap().len(),
             source.placements.len()
+        );
+        let memberships = store
+            .source_entity_membership_state_for_sources(&BTreeSet::from([source
+                .source_path
+                .clone()]))
+            .unwrap();
+        let expected_memberships: BTreeMap<String, Option<String>> = source
+            .entries
+            .iter()
+            .map(|(id, _, _)| (id.as_str().to_string(), Some(document.as_str().to_string())))
+            .collect();
+        assert_eq!(
+            memberships,
+            BTreeMap::from([(source.source_path.clone(), expected_memberships)])
+        );
+        let expected_claims: BTreeSet<String> = source
+            .placements
+            .iter()
+            .map(|placement| placement.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            source_placement_claims(&store, &source.source_path),
+            expected_claims.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table_count(&store, "source_membership"),
+            source.entries.len() as i64
+        );
+        assert_eq!(
+            table_count(&store, "source_placement_membership"),
+            source.placements.len() as i64
         );
     }
 
@@ -17019,6 +17343,36 @@ mod tests {
 
     #[test]
     fn tampered_identity_sidecar_fails_closed_without_state_change() {
+        type Snapshot = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
+        fn snapshot(store: &SqliteStore) -> Snapshot {
+            let conn = store.conn.borrow();
+            let tables: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            tables
+                .into_iter()
+                .map(|table| {
+                    let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+                    let mut stmt = conn.prepare(&sql).unwrap();
+                    let columns = stmt.column_count();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|column| row.get(column))
+                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                        })
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    (table, rows)
+                })
+                .collect()
+        }
+
         let store = SqliteStore::open_in_memory().unwrap();
         let message = sid(IdKind::Message, b"tampered-wire-identity");
         let wire = message.as_str().to_string();
@@ -17043,6 +17397,13 @@ mod tests {
                 .unwrap()
         );
         let generation = store.active_generation().unwrap();
+        let before_noop = snapshot(&store);
+        assert!(
+            !store
+                .commit_source_batches_if_changed(std::slice::from_ref(&first))
+                .unwrap()
+        );
+        assert_eq!(snapshot(&store), before_noop);
 
         // 篡改持久身份边车：wire 串不变、稳定层级被降级。入站批次携带的
         // Reconstructed id 与存储侧不再一致，必须在任何写入前拒绝。
@@ -17054,6 +17415,17 @@ mod tests {
             )
             .unwrap();
         }
+        let after_tamper = snapshot(&store);
+        // The unchanged same-source input would otherwise take the no-op
+        // shortcut. Identity validation must reject it before that shortcut.
+        let error = store
+            .commit_source_batches_if_changed(std::slice::from_ref(&first))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PortError::Backend(message) if message.contains("conflicting identity metadata")
+        ));
+        assert_eq!(snapshot(&store), after_tamper);
         let second = SourceBatch {
             source_path: "second-source".into(),
             placements: Vec::new(),
@@ -17076,6 +17448,7 @@ mod tests {
         assert!(msg.contains("conflicting identity metadata"));
         assert!(!msg.contains(&wire));
         assert_eq!(store.active_generation().unwrap(), generation);
+        assert_eq!(snapshot(&store), after_tamper);
         assert!(
             store
                 .source_message_ids("second-source")
