@@ -960,32 +960,46 @@ impl RelationManifests {
     fn canonical_json(&self) -> PortResult<(String, String, String)> {
         self.validate()?;
         let mut upserts: Vec<_> = self.relation_upserts.iter().collect();
-        upserts.sort_by_key(|item| item.canonical_key());
-        let upserts: Vec<_> = upserts
-            .into_iter()
-            .map(RelationUpsertManifest::canonical_value)
-            .collect();
+        upserts.sort_by_cached_key(|item| item.canonical_key());
 
         let mut deletes: Vec<_> = self.relation_deletes.iter().collect();
-        deletes.sort_by_key(|item| item.canonical_key());
-        let deletes: Vec<_> = deletes
-            .into_iter()
-            .map(RelationDeleteManifest::canonical_value)
-            .collect();
+        deletes.sort_by_cached_key(|item| item.canonical_key());
 
         let mut replacements: Vec<_> = self.source_replacements.iter().collect();
         replacements.sort_by(|left, right| left.source_path.cmp(&right.source_path));
-        let replacements: Vec<_> = replacements
-            .into_iter()
-            .map(SourceReplacementManifest::canonical_value)
-            .collect();
 
         Ok((
-            serde_json::to_string(&upserts).map_err(backend)?,
-            serde_json::to_string(&deletes).map_err(backend)?,
-            serde_json::to_string(&replacements).map_err(backend)?,
+            canonical_manifest_array(
+                upserts
+                    .into_iter()
+                    .map(RelationUpsertManifest::canonical_value),
+            )?,
+            canonical_manifest_array(
+                deletes
+                    .into_iter()
+                    .map(RelationDeleteManifest::canonical_value),
+            )?,
+            canonical_manifest_array(
+                replacements
+                    .into_iter()
+                    .map(SourceReplacementManifest::canonical_value),
+            )?,
         ))
     }
+}
+
+/// Preserve the durable JSON bytes while retaining only one temporary value.
+/// The canonical value builders still own field order, escaping and nulls.
+fn canonical_manifest_array(values: impl Iterator<Item = serde_json::Value>) -> PortResult<String> {
+    let mut output = vec![b'['];
+    for (index, value) in values.enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        serde_json::to_writer(&mut output, &value).map_err(backend)?;
+    }
+    output.push(b']');
+    String::from_utf8(output).map_err(backend)
 }
 
 /// Canonical durable representation of one generation change set.
@@ -10738,6 +10752,30 @@ mod tests {
 
     pub(crate) fn sid(kind: IdKind, fact: &[u8]) -> StableId {
         StableId::derive(kind, Stability::Reconstructed, &[fact])
+    }
+
+    #[test]
+    fn streamed_manifest_array_preserves_collected_json_bytes() {
+        let cases = [
+            vec![],
+            vec![serde_json::json!({})],
+            vec![
+                serde_json::json!({
+                    "z": "quoted \"text\"\\line\n\u{0000}中文",
+                    "a": [null, true, -1, 1.25, {"b": 2, "a": 1}],
+                }),
+                serde_json::json!([[], {}, ""]),
+                serde_json::json!(false),
+            ],
+        ];
+        for values in cases {
+            // The previous whole-array serializer defines the durable bytes.
+            let expected = serde_json::to_string(&values).unwrap();
+            assert_eq!(
+                canonical_manifest_array(values.into_iter()).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
