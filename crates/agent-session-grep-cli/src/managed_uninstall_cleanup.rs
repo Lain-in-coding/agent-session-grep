@@ -949,8 +949,9 @@ fn finalize(
         return Err(Reason::PurgePrerequisitePending);
     }
     let control_retirement = if journal.state.owner.keep_data {
-        let control = SqliteControlStore::open_current_read_only(
+        let control = SqliteControlStore::open_current_read_only_with_deadline(
             journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
+            end,
         )
         .map_err(|_| Reason::IdentityChanged)?;
         journal.validate(&control, end)?;
@@ -1159,7 +1160,7 @@ fn launch_tail(
             .map_err(|_| Reason::IdentityChanged)?;
         plan.retirement_marker = Some(private_proof(data, RETIREMENT_MARKER, &seal.policy, end)?);
     } else {
-        let control = SqliteControlStore::open_current_read_only(data)
+        let control = SqliteControlStore::open_current_read_only_with_deadline(data, end)
             .map_err(|_| Reason::IdentityChanged)?;
         let policy = journal.validate(&control, end)?;
         if policy.policy_epoch.get() != seal.policy.policy_epoch {
@@ -1783,8 +1784,8 @@ fn validate_keep_fence(
 ) -> Result<(), Reason> {
     journal.validate_roots(end)?;
     let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
-    let control =
-        SqliteControlStore::open_current_read_only(root).map_err(|_| Reason::IdentityChanged)?;
+    let control = SqliteControlStore::open_current_read_only_with_deadline(root, end)
+        .map_err(|_| Reason::IdentityChanged)?;
     let fresh = journal.validate(&control, end)?;
     let current = TerminalPolicy::capture(&fresh, root)?;
     if current.policy_epoch != policy.policy_epoch

@@ -146,14 +146,14 @@ pub(crate) fn add_selected_history(
     let request = source_selection(provider, path)?;
     let control =
         retry_control(deadline, || identity.writable_control_before(deadline)).map_err(port)?;
-    let change = retry_control(deadline, || {
-        control.with_runtime_deadline(deadline, || {
-            identity.validate_before(deadline)?;
-            control.add_selection(control.status()?.policy.control_seq, request.clone())
-        })
+    let change = committed_control_mutation(&control, deadline, || {
+        identity.validate_before(deadline)?;
+        control.add_selection(control.status()?.policy.control_seq, request.clone())
     })
     .map_err(port)?;
-    retry_control(deadline, || identity.validate_before(deadline)).map_err(port)?;
+    // The selection commit is the operation's point of no return. A later
+    // identity/deadline check cannot undo it and must not turn a successful
+    // add into a retryable source_changed response.
     Ok(
         json!({"id":change.value.id.as_str(),"provider":provider.as_str(),"enabled":change.value.enabled,
         "kind":if change.value.region.kind==RootKind::Root {"root"} else {"exact"}}),
@@ -233,6 +233,53 @@ fn retry_control<T>(
                 std::thread::sleep(Duration::from_millis(5));
             }
             result => return result,
+        }
+    }
+}
+
+/// Run one control mutation inside the command's original deadline and retain
+/// its committed result. The store can commit and then report Busy from its
+/// trailing deadline check; retrying that acknowledgement makes the caller
+/// mistake its own committed change for a concurrent one (`changed=false`, or a
+/// revoke epoch mismatch reported as `source_changed`).
+fn committed_control_mutation<T>(
+    control: &SqliteControlStore,
+    deadline: Instant,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    committed_control_mutation_with(deadline, |committed| {
+        control.with_runtime_deadline(deadline, || {
+            *committed = Some(operation()?);
+            Ok(())
+        })
+    })
+}
+
+/// The executor may report Busy after the operation has already committed.
+/// Retain the value from that exact attempt and never run the operation again.
+fn committed_control_mutation_with<T>(
+    deadline: Instant,
+    mut execute: impl FnMut(&mut Option<T>) -> Result<(), PortError>,
+) -> Result<T, PortError> {
+    loop {
+        if deadline.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(PortError::WriterBusy("control deadline reached".into()));
+        }
+        let mut committed = None;
+        let result = execute(&mut committed);
+        if let Some(value) = committed {
+            return Ok(value);
+        }
+        match result {
+            Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+            Ok(()) => {
+                return Err(PortError::Backend(
+                    "control mutation returned without a result".into(),
+                ));
+            }
         }
     }
 }
@@ -530,7 +577,10 @@ pub(crate) fn run(
                 )
             }
             Action::Add(request) => {
-                let (before, change) = retry_control(deadline, || {
+                // Keep the pre-state of the exact CAS attempt that committed.
+                // Re-reading it after a retry would hide the change this command
+                // just made and misreport the policy delta.
+                let (before, change) = committed_control_mutation(&control, deadline, || {
                     let before = control.status()?;
                     let change =
                         control.add_selection(before.policy.control_seq, request.clone())?;
@@ -565,7 +615,11 @@ pub(crate) fn run(
                     .find(|s| s.id == selection)
                     .ok_or_else(|| port(PortError::NotFound("selection".into())))?;
                 let known_source = existing_source(&path, &control, &before, selected)?;
-                let revoked = retry_control(deadline, || {
+                // The epoch guard detects another writer between the pre-read
+                // and the CAS. A committed revoke must never be retried into
+                // that guard: its own epoch increment would be reported as a
+                // concurrent `source_changed` after the durable denial.
+                let revoked = committed_control_mutation(&control, deadline, || {
                     let current = control.status()?;
                     if current.policy.policy_epoch != before.policy.policy_epoch {
                         return Err(PortError::SnapshotChanged(
@@ -586,7 +640,7 @@ pub(crate) fn run(
                 drop(owner);
                 let settled = acquire(LockKind::PolicyEmission).and_then(|drained| {
                     let owner = acquire(LockKind::PolicyOwner)?;
-                    retry_control(deadline, || {
+                    committed_control_mutation(&control, deadline, || {
                         control.settle_revocation(
                             control.status()?.policy.control_seq,
                             &owner,
@@ -619,7 +673,7 @@ pub(crate) fn run(
                 status_data(&control, &path)?,
             ),
             Action::Start => {
-                retry_control(deadline, || {
+                committed_control_mutation(&control, deadline, || {
                     control.request_background_start(control.status()?.policy.control_seq)
                 })
                 .map_err(port)?;
@@ -627,7 +681,7 @@ pub(crate) fn run(
                 ("background.start", outcome, report)
             }
             Action::Desired(target) => {
-                retry_control(deadline, || {
+                committed_control_mutation(&control, deadline, || {
                     control.set_desired_updates(control.status()?.policy.control_seq, target)
                 })
                 .map_err(port)?;
@@ -722,6 +776,68 @@ mod tests {
             Err(PortError::WriterBusy(_))
         ));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn committed_result_survives_trailing_busy_without_reexecution() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut attempts = 0;
+        let value = committed_control_mutation_with(deadline, |committed| {
+            attempts += 1;
+            *committed = Some(42);
+            Err(PortError::WriterBusy("synthetic trailing deadline".into()))
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn committed_add_and_revoke_commit_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_root = temp.path().join("private");
+        let source = temp.path().join("history");
+        std::fs::create_dir(&source).unwrap();
+        let control = SqliteControlStore::create(
+            &control_root,
+            &ControlId::parse("synthetic_commit_ack").unwrap(),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        let request = source_selection(SearchProvider::Claude, &source).unwrap();
+        let mut add_attempts = 0;
+        let added =
+            committed_control_mutation(&control, Instant::now() + Duration::from_secs(1), || {
+                add_attempts += 1;
+                let sequence = control.status()?.policy.control_seq;
+                control.add_selection(sequence, request.clone())
+            })
+            .unwrap();
+        assert!(added.changed);
+        assert_eq!(add_attempts, 1);
+        let status = control.status().unwrap();
+        assert_eq!(status.policy.control_seq.get(), 1);
+        assert_eq!(status.policy.selections.len(), 1);
+        assert!(status.policy.selections[0].enabled);
+
+        let mut revoke_attempts = 0;
+        let revoked =
+            committed_control_mutation(&control, Instant::now() + Duration::from_secs(1), || {
+                revoke_attempts += 1;
+                let sequence = control.status()?.policy.control_seq;
+                control.revoke_selection(sequence, &added.value.id, None, app_clock_ms())
+            })
+            .unwrap();
+        assert!(revoked.changed);
+        assert_eq!(revoke_attempts, 1);
+        let status = control.status().unwrap();
+        assert_eq!(status.policy.control_seq.get(), 2);
+        assert_eq!(status.policy.policy_epoch.get(), 2);
+        assert!(!status.policy.selections[0].enabled);
+        assert_eq!(
+            status.policy.revocations[0].state,
+            RevocationState::AwaitingDrain
+        );
     }
 
     #[test]

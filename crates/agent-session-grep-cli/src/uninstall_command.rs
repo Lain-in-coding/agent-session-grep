@@ -561,8 +561,11 @@ pub(crate) fn read_deferred_cleanup(
         validate_retired_receipt(data, &state, end)?;
         return Ok(Some(state));
     }
-    let control = SqliteControlStore::open_current_read_only(data).map_err(port)?;
-    let status = control.status().map_err(port)?;
+    let control =
+        SqliteControlStore::open_current_read_only_with_deadline(data, end).map_err(port)?;
+    let status = control
+        .with_runtime_deadline(end, || control.status())
+        .map_err(port)?;
     if owner.installation_id != status.policy.installation_id.as_str() {
         return Err(error(CanonicalCode::CapabilityNotSupported));
     }
@@ -1068,13 +1071,18 @@ fn execute(
     if retirement_present(root)? {
         return resume_terminal(&install, &catalog, options.keep_data, end);
     }
-    let control = SqliteControlStore::open_current_writable(root).map_err(port)?;
+    let control =
+        SqliteControlStore::open_current_writable_with_deadline(root, end).map_err(port)?;
     let first_lock = update_state::acquire_installation_lock(&install.prefix, end)?;
     control
-        .bind_installation(&install.prefix, &first_lock)
+        .with_runtime_deadline(end, || {
+            control.bind_installation(&install.prefix, &first_lock)
+        })
         .map_err(port)?;
     let prior = read_deferred_cleanup(&install.prefix, &catalog, end)?;
-    let status = control.status().map_err(port)?;
+    let status = control
+        .with_runtime_deadline(end, || control.status())
+        .map_err(port)?;
     let (incarnation, catalog_file_identity) = if let Some(state) = &prior {
         if state.owner.keep_data != options.keep_data {
             return Err(error(CanonicalCode::InvalidRequest));

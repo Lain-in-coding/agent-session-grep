@@ -38,6 +38,9 @@ only owned startup; pause/stopped intent is preserved. Disable removes owned log
 startup without changing desired updates. Explicit background start remains available.\n\
 Registration and a launch request do not prove native login or history freshness.";
 const BUDGET: Duration = Duration::from_secs(5);
+// Control SQL uses a 250ms busy allowance. Do not begin another attempt when
+// that allowance could outlive the command's original deadline.
+const CONTROL_ATTEMPT: Duration = Duration::from_millis(250);
 const INVENTORY_LIMIT: u64 = 65536;
 const INVENTORY_SCHEMA: &str = "asg.setup-autostart-inventory/v1";
 
@@ -288,12 +291,15 @@ impl CommandIdentity {
     fn capture(catalog: &Path, end: Instant) -> Result<(Self, ControlStatus), Reason> {
         let root = catalog.parent().ok_or(Reason::ManagedStateUnavailable)?;
         let physical = RootIdentity::read(root).map_err(|_| Reason::ManagedStateUnavailable)?;
-        let control = retry_port(end, || SqliteControlStore::open_current_read_only(root))
-            .map_err(|error| admission_reason(error, end, Reason::ManagedStateUnavailable))?;
-        let status = retry_port(end, || control.status())
-            .map_err(|error| admission_reason(error, end, Reason::ManagedStateUnavailable))?;
-        let store = retry_port(end, || ManagedStore::open(catalog, &control))
-            .map_err(|error| admission_reason(error, end, Reason::ManagedStateUnavailable))?;
+        let (status, store) = retry_port(end, || {
+            let control = SqliteControlStore::open_current_read_only_with_deadline(root, end)?;
+            control_before(&control, end, || {
+                let status = control.status()?;
+                let store = ManagedStore::open(catalog, &control)?;
+                Ok((status, store))
+            })
+        })
+        .map_err(|error| admission_reason(error, end, Reason::ManagedStateUnavailable))?;
         let identity = Self {
             catalog: catalog.into(),
             root: physical,
@@ -327,12 +333,18 @@ impl CommandIdentity {
                 .map_err(|_| Reason::IdentityChanged)?;
         let catalog_pin = crate::native_autostart::platform::open_file(&self.catalog)
             .map_err(|_| Reason::IdentityChanged)?;
-        let control = retry_port(end, || {
-            SqliteControlStore::open_existing_writable(self.root_path(), &self.installation)
+        let (control, store) = retry_port(end, || {
+            let control = SqliteControlStore::open_existing_writable_with_deadline(
+                self.root_path(),
+                &self.installation,
+                end,
+            )?;
+            let store = control_before(&control, end, || {
+                ManagedStore::open(&self.catalog, &control)
+            })?;
+            Ok((control, store))
         })
         .map_err(|error| admission_reason(error, end, Reason::IdentityChanged))?;
-        let store = retry_port(end, || ManagedStore::open(&self.catalog, &control))
-            .map_err(|error| admission_reason(error, end, Reason::IdentityChanged))?;
         if store.incarnation() != &self.incarnation {
             return Err(Reason::IdentityChanged);
         }
@@ -377,7 +389,7 @@ impl LiveAuthority {
                 return Err(Reason::IdentityChanged);
             }
         }
-        let status = retry_port(end, || self.control.status())
+        let status = control_before(&self.control, end, || self.control.status())
             .map_err(|error| admission_reason(error, end, Reason::IdentityChanged))?;
         if status.policy.installation_id != self.identity.installation {
             return Err(Reason::IdentityChanged);
@@ -396,6 +408,73 @@ fn admission_reason(error: PortError, end: Instant, otherwise: Reason) -> Reason
         PortError::WriterBusy(_) if Instant::now() >= end => Reason::Timeout,
         PortError::WriterBusy(_) => Reason::NativeBusy,
         _ => otherwise,
+    }
+}
+
+/// Run one control operation under the command's original end. The adapter's
+/// default 250ms budget must not cut off a still-live command, and a typed Busy
+/// retry must not reset that end. Identity/schema errors are never retried.
+fn control_before<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    loop {
+        if end.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(PortError::WriterBusy("autostart deadline reached".into()));
+        }
+        match control.with_runtime_deadline(end, &mut operation) {
+            Err(PortError::WriterBusy(_)) => std::thread::sleep(
+                Duration::from_millis(2).min(end.saturating_duration_since(Instant::now())),
+            ),
+            result => return result,
+        }
+    }
+}
+
+/// Keep a live-authority refusal typed so the control retry cannot erase the
+/// more specific reason (identity, maintenance or deadline) behind a Busy.
+fn port_reason(reason: Reason) -> PortError {
+    match reason {
+        Reason::Timeout => PortError::WriterBusy("autostart deadline reached".into()),
+        Reason::IdentityChanged => PortError::SnapshotChanged("autostart identity changed".into()),
+        Reason::MaintenanceActive => {
+            PortError::GenerationMismatch("autostart maintenance is active".into())
+        }
+        _ => PortError::Backend("autostart authority is unavailable".into()),
+    }
+}
+
+/// A control mutation can commit and then report Busy from the adapter's
+/// trailing deadline check. Retain the committed acknowledgement instead of
+/// replaying it as if nothing happened; only an uncommitted Busy is retried.
+fn committed_control<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    loop {
+        if end.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(PortError::WriterBusy("autostart deadline reached".into()));
+        }
+        let mut committed = None;
+        let result = control.with_runtime_deadline(end, || {
+            committed = Some(operation()?);
+            Ok(())
+        });
+        if let Some(value) = committed {
+            return Ok(value);
+        }
+        match result {
+            // Re-read the current sequence in the caller before replaying a CAS.
+            Err(PortError::WriterBusy(_)) => std::thread::sleep(Duration::from_millis(2)),
+            Err(error) => return Err(error),
+            Ok(()) => {
+                return Err(PortError::Backend(
+                    "autostart control mutation returned without a result".into(),
+                ));
+            }
+        }
     }
 }
 /// A Busy result can be replayed only if the manager executed no native call
@@ -475,13 +554,22 @@ fn execute(
             .bind_control_root(&owner)
             .map_err(|_| Reason::IdentityChanged)?;
         if options.action == Action::Enable {
-            live.control
-                .record_verified_installation_prefix(&install.prefix, &prefix_lock, &bound, end)
-                .map_err(|_| Reason::InstallationBindingChanged)?;
+            committed_control(&live.control, end, || {
+                live.control.record_verified_installation_prefix(
+                    &install.prefix,
+                    &prefix_lock,
+                    &bound,
+                    end,
+                )
+            })
+            .map_err(|error| admission_reason(error, end, Reason::InstallationBindingChanged))?;
         } else {
-            live.control
-                .bind_installation(&install.prefix, &prefix_lock)
-                .map_err(|_| Reason::InstallationBindingChanged)?;
+            committed_control(&live.control, end, || {
+                live.control
+                    .bind_installation(&install.prefix, &prefix_lock)?;
+                Ok(())
+            })
+            .map_err(|error| admission_reason(error, end, Reason::InstallationBindingChanged))?;
         }
         summary.installation_bound = true;
         drop(owner);
@@ -695,20 +783,25 @@ fn set_intent(live: &LiveAuthority, enabled: bool, end: Instant) -> Result<(), R
     live.control
         .bind_control_root(&owner)
         .map_err(|_| Reason::IdentityChanged)?;
-    for _ in 0..MAX_RETRIES {
-        let status = live.status(end)?;
-        match live
-            .control
-            .set_autostart_enabled(status.policy.control_seq, enabled)
-        {
+    loop {
+        let status =
+            control_before(&live.control, end, || live.status(end).map_err(port_reason))
+                .map_err(|error| admission_reason(error, end, Reason::ManagedStateUnavailable))?;
+        match committed_control(&live.control, end, || {
+            live.control
+                .set_autostart_enabled(status.policy.control_seq, enabled)
+        }) {
             Ok(_) => return Ok(()),
-            Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => std::thread::sleep(
-                Duration::from_millis(2).min(end.saturating_duration_since(Instant::now())),
-            ),
-            Err(_) => return Err(Reason::ManagedStateUnavailable),
+            Err(PortError::GenerationMismatch(_)) => {}
+            Err(error) => {
+                return Err(admission_reason(
+                    error,
+                    end,
+                    Reason::ManagedStateUnavailable,
+                ));
+            }
         }
     }
-    Err(Reason::NativeBusy)
 }
 fn journal_root(location: &NativeLocation, root: &Path, installation: &str) -> PathBuf {
     match location {

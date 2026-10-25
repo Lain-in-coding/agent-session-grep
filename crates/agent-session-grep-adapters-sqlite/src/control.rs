@@ -29,10 +29,22 @@ thread_local! {
     static RUNTIME_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     static RUNTIME_BUSY_END: Cell<Option<Instant>> = const { Cell::new(None) };
     static RUNTIME_BUSY_ALLOWANCE: Cell<Duration> = const { Cell::new(BUSY_TIMEOUT) };
+    static RUNTIME_COMMIT_SEQ: Cell<u64> = const { Cell::new(0) };
 }
 
 fn runtime_deadline() -> Option<Instant> {
     RUNTIME_DEADLINE.with(Cell::get)
+}
+fn runtime_commit_seq() -> u64 {
+    RUNTIME_COMMIT_SEQ.with(Cell::get)
+}
+/// Record a durable mutation completed inside the current runtime scope.
+/// Trailing deadline checks must not turn a committed change into a retryable
+/// Busy result. A caller without a scope has no trailing runtime check to skip.
+pub(crate) fn mark_runtime_committed() {
+    if runtime_deadline().is_some() {
+        RUNTIME_COMMIT_SEQ.with(|slot| slot.set(slot.get().wrapping_add(1)));
+    }
 }
 fn runtime_tick() -> PortResult<()> {
     if runtime_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
@@ -48,6 +60,7 @@ fn runtime_capacity() -> PortError {
 struct RuntimeDeadlineScope {
     previous: Option<Instant>,
     previous_busy: Duration,
+    entry_commit_seq: u64,
 }
 impl RuntimeDeadlineScope {
     fn enter(deadline: Instant) -> PortResult<Self> {
@@ -70,7 +83,12 @@ impl RuntimeDeadlineScope {
         Ok(Self {
             previous,
             previous_busy,
+            entry_commit_seq: runtime_commit_seq(),
         })
+    }
+
+    fn committed_since_entry(&self) -> bool {
+        runtime_commit_seq() != self.entry_commit_seq
     }
 }
 impl Drop for RuntimeDeadlineScope {
@@ -770,13 +788,16 @@ impl SqliteControlStore {
         operation: impl FnOnce() -> PortResult<T>,
     ) -> PortResult<T> {
         let scope = RuntimeDeadlineScope::enter(deadline)?;
+        let entry_commit_seq = scope.entry_commit_seq;
         let mut reset = RuntimeDeadlineReset {
             store: self,
             scope: Some(scope),
         };
         configure_runtime_deadline(&self.conn.borrow())?;
         let result = operation().and_then(|value| {
-            runtime_tick()?;
+            if runtime_commit_seq() == entry_commit_seq {
+                runtime_tick()?;
+            }
             Ok(value)
         });
         let restored = reset.restore();
@@ -808,7 +829,9 @@ impl SqliteControlStore {
     ) -> PortResult<Self> {
         let scope = RuntimeDeadlineScope::enter(deadline)?;
         let result = Self::open_existing(root, installation, writable).and_then(|store| {
-            runtime_tick()?;
+            if !scope.committed_since_entry() {
+                runtime_tick()?;
+            }
             Ok(store)
         });
         drop(scope);
@@ -1008,13 +1031,16 @@ impl SqliteControlStore {
         operation: impl FnOnce() -> PortResult<T>,
     ) -> PortResult<T> {
         let scope = RuntimeDeadlineScope::enter_with_busy(deadline, Duration::from_millis(1))?;
+        let entry_commit_seq = scope.entry_commit_seq;
         let mut reset = RuntimeDeadlineReset {
             store: self,
             scope: Some(scope),
         };
         configure_runtime_deadline(&self.conn.borrow())?;
         let result = operation().and_then(|value| {
-            runtime_tick()?;
+            if runtime_commit_seq() == entry_commit_seq {
+                runtime_tick()?;
+            }
             Ok(value)
         });
         let restored = reset.restore();
@@ -1058,6 +1084,7 @@ impl SqliteControlStore {
         let result = load_purge_job_status(&tx, job_id)?;
         runtime_tick()?;
         tx.commit().map_err(sql_error)?;
+        mark_runtime_committed();
         Ok(result)
     }
 
@@ -1186,6 +1213,7 @@ impl SqliteControlStore {
         tx.pragma_update(None, "user_version", VERSION)
             .map_err(sql_error)?;
         tx.commit().map_err(sql_error)?;
+        mark_runtime_committed();
         let store = Self {
             conn: RefCell::new(conn),
             handle_lease,
@@ -1228,6 +1256,15 @@ impl SqliteControlStore {
     /// receipts are preserved. All policy/worker changes remain explicit.
     pub fn open_current_writable(private_root: &Path) -> PortResult<Self> {
         Self::open_existing(private_root, None, true)
+    }
+
+    /// Writable open scoped to the caller's original deadline instead of the
+    /// adapter's short default budget.
+    pub fn open_current_writable_with_deadline(
+        private_root: &Path,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        Self::open_existing_with_deadline(private_root, None, true, deadline)
     }
 
     fn open_existing(
@@ -1300,7 +1337,9 @@ impl SqliteControlStore {
         }
         load_status(&tx)?;
         runtime_tick()?;
-        tx.commit().map_err(sql_error)
+        tx.commit()
+            .map_err(sql_error)
+            .inspect(|_| mark_runtime_committed())
     }
 
     fn validate_guard(&self, guard: &ExclusiveGuard, kind: LockKind) -> PortResult<()> {
@@ -1556,6 +1595,7 @@ impl SqliteControlStore {
         load_status(&tx)?;
         runtime_tick()?;
         tx.commit().map_err(sql_error)?;
+        mark_runtime_committed();
         Ok(ControlChange {
             control_seq: seq(next_seq)?,
             policy_epoch: epoch(next_epoch)?,
@@ -5569,6 +5609,26 @@ mod runtime_deadline_tests {
         )
         .unwrap();
         (temp, control)
+    }
+
+    #[test]
+    fn committed_mutation_survives_trailing_deadline_expiry() {
+        let (_temp, control) = fixture();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = control.with_runtime_deadline(deadline, || {
+            let change = control.mutate(ControlSeq::new(0).unwrap(), |_, _| {
+                Ok((false, false, "committed-value"))
+            })?;
+            assert_eq!(change.value, "committed-value");
+            // The commit above was durable; simulate the trailing wall-clock
+            // check observing that the original deadline has passed.
+            RUNTIME_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+            assert!(matches!(runtime_tick(), Err(PortError::WriterBusy(_))));
+            Ok(change)
+        });
+        let change = result.expect("committed result must not become WriterBusy");
+        assert_eq!(change.value, "committed-value");
+        assert_eq!(control.status().unwrap().policy.control_seq.get(), 0);
     }
 
     #[test]

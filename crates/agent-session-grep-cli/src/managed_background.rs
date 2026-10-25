@@ -1014,9 +1014,17 @@ fn run_cycle(
 ) -> PortResult<bool> {
     // The same live worker may have reported Busy/Deferred after a refused
     // completion. Restore activity under current intent/fence before finish,
-    // whose control admission rejects those advisory states. The real CAS and
-    // authority checks still refuse a concurrent pause, stop or maintenance.
+    // whose control admission rejects those advisory states. A pause, stop or
+    // maintenance fence is a permanent refusal for this attempt: report it
+    // immediately instead of retrying the heartbeat until the caller deadline,
+    // which would consume the whole observation budget on every cadence.
     control_change_before(control, end, |seq| {
+        let current = control.status()?;
+        if current.desired_updates != DesiredUpdates::Running
+            || current.policy.maintenance.state != MaintenanceState::Idle
+        {
+            return Err(changed());
+        }
         control.heartbeat_worker(seq, authority, UpdateState::Running, None, app_clock_ms())
     })?;
     finish_pending_cycle(control, authority, pending, end)?;
@@ -3232,7 +3240,10 @@ mod control_deadline_tests {
             committed,
             "synthetic start did not reach its durable side effect"
         );
-        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        // The committed acknowledgement now survives the trailing deadline
+        // expiry instead of surfacing as WriterBusy; the pending intent still
+        // guards the Observation state until the worker finishes its cycle.
+        assert!(matches!(&result, Ok(cycle) if cycle.token == queued.token));
         assert_eq!(
             control.cycle(queued.token.cycle_seq).unwrap().state,
             CycleState::Observing
@@ -3330,7 +3341,8 @@ mod control_deadline_tests {
                 BarrierState::Blocked
             );
             if change != "revoke" {
-                assert!(
+                let started = Instant::now();
+                assert!(matches!(
                     run_cycle(
                         &fixture.db,
                         control,
@@ -3339,8 +3351,12 @@ mod control_deadline_tests {
                         0,
                         fixture.scope_end,
                         &mut pending,
-                    )
-                    .is_err()
+                    ),
+                    Err(PortError::SnapshotChanged(_))
+                ));
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "policy refusal must not retry the heartbeat to the observation deadline"
                 );
                 assert_eq!(control.status().unwrap(), before);
             } else {

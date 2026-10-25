@@ -268,7 +268,7 @@ pub(crate) fn run(
     } else if data["local_asg"]["mcp_initialized"] == true {
         match NativeLocation::current_user()
             .map_err(|_| invalid_install("native location"))
-            .and_then(|location| setup_native(&install, &catalog, &identity, location))
+            .and_then(|location| setup_native(&install, &catalog, &identity, location, deadline))
         {
             Ok(summary) => summary,
             Err(_) => json!({"status":"incomplete","reason":"native_setup_failed"}),
@@ -493,6 +493,7 @@ fn setup_native(
     catalog: &Path,
     identity: &SetupIdentity,
     location: NativeLocation,
+    command_end: Instant,
 ) -> Result<Value, CliError> {
     use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
     let root = catalog
@@ -514,7 +515,7 @@ fn setup_native(
     };
     let store = NativeAutostartStore::open(location.clone(), &journal, installation.as_str())
         .map_err(invalid_install)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = command_end;
     identity.validate().map_err(invalid_install)?;
     let recovered = match store.recover_pending(deadline) {
         Ok(value) => value,
@@ -927,7 +928,14 @@ mod identity_tests {
         let install = install(&base.join("pkg"));
         let registry = RegistryFixture::new();
         let _unrelated_holder = fixture_guard(path.parent().unwrap(), LockKind::Supervisor);
-        let report = setup_native(&install, &path, &identity, registry.location()).unwrap();
+        let report = setup_native(
+            &install,
+            &path,
+            &identity,
+            registry.location(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(report["configuration"], "present");
         assert_eq!(report["status"], "incomplete");
         assert!(report["supervisor_running"].is_null());
@@ -958,7 +966,16 @@ mod identity_tests {
         fs::rename(base.join("data"), base.join("original")).unwrap();
         fs::rename(replacement, base.join("data")).unwrap();
         assert!(record_inventory(&path, &identity, "setup-hosts", json!({"receipts":[]})).is_err());
-        assert!(setup_native(&install, &path, &identity, registry.location()).is_err());
+        assert!(
+            setup_native(
+                &install,
+                &path,
+                &identity,
+                registry.location(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .is_err()
+        );
         assert!(!base.join("data/native-autostart").exists());
         assert!(!fs::read_dir(base.join("data")).unwrap().any(|e| {
             e.unwrap()
