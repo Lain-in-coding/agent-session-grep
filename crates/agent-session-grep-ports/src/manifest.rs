@@ -8,8 +8,10 @@ use crate::capability::{ProviderCapability, ProviderCapabilityMatrix, ProviderMa
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamingSupport {
-    /// The source is parsed incrementally line-by-line; memory is bounded by
-    /// `max_record_size` (the largest single record), not by file size.
+    /// The source is parsed incrementally by record, including decoded records
+    /// from bounded compressed streams. `max_record_size` bounds record buffers;
+    /// compressed-input, decoded-total and decoder-window limits remain explicit
+    /// adapter limitations rather than a claim of whole-source buffering.
     RecordStream,
     /// The format requires a complete payload (whole-document JSON, Markdown,
     /// SQLite); production reads are hard-capped by `max_source_size`.
@@ -23,6 +25,9 @@ pub const STREAM_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const JSON_FAMILY_MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum SQLite source copied through the bounded whole-source path (128 MiB).
 pub const SQLITE_MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+/// ZCode logical graph images have a separate 256 MiB source ceiling. This does
+/// not widen the generic SQLite snapshot or any other provider's accepted input.
+pub const ZCODE_MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Machine-readable metadata for one implemented provider adapter.
 ///
@@ -39,7 +44,8 @@ pub struct AdapterManifest {
     pub maturity: ProviderMaturity,
     /// Authoritative per-field capability row for this provider.
     pub capabilities: ProviderCapability,
-    /// Revision from a provider golden fixture's `PROVENANCE.md`, if one exists.
+    /// Revision supplied by an adapter from its synthetic/golden fixture
+    /// provenance, if one exists. Registration never invents this evidence.
     pub fixture_revision: Option<u32>,
     /// Named targets from successful certification workflow runs.
     pub last_certified_targets: Vec<String>,
@@ -76,8 +82,15 @@ fn source_consumption(provider_id: &str) -> (StreamingSupport, Option<u64>, Opti
             Some(SQLITE_MAX_SOURCE_BYTES),
             None,
         ),
-        // Line-delimited JSON transcripts: production parse streams records,
-        // so memory is bounded by the largest record, not the file size.
+        // ZCode's separately bounded session/message/part graph does not widen
+        // the generic SQLite source path.
+        "zcode" => (
+            StreamingSupport::BoundedWholeSource,
+            Some(ZCODE_MAX_SOURCE_BYTES),
+            None,
+        ),
+        // WorkBuddy JSONL and DSH decoded v4 records stream just as JSONL does;
+        // DSH additionally declares input/decoded/window bounds in limitations.
         _ => (
             StreamingSupport::RecordStream,
             None,
@@ -129,7 +142,7 @@ pub fn manifest_for(
 mod tests {
     use super::*;
 
-    const IMPLEMENTED_PROVIDERS: [&str; 14] = [
+    const IMPLEMENTED_PROVIDERS: [&str; 17] = [
         "claude-code",
         "codex",
         "grok-build",
@@ -144,25 +157,28 @@ mod tests {
         "tencent-codebuddy",
         "cline",
         "aider",
+        "workbuddy",
+        "zcode",
+        "deepseek-harness",
     ];
-
-    fn fixture_revision(provider_id: &str) -> Option<u32> {
-        // All 14 implemented providers carry a golden fixture (revision 1);
-        // the two deferred providers (deepseek-harness/zcode) are not in this list.
-        match provider_id {
-            "claude-code" | "codex" | "grok-build" | "antigravity" | "opencode" | "pi"
-            | "hermes" | "cursor" | "kimi-code" | "openclaw" | "qoder" | "tencent-codebuddy"
-            | "cline" | "aider" => Some(1),
-            _ => None,
-        }
-    }
 
     #[test]
     fn implemented_manifests_match_authoritative_capability_rows() {
         let matrix = ProviderCapabilityMatrix::current();
+        let registered: std::collections::BTreeSet<_> = matrix
+            .providers
+            .iter()
+            .filter(|row| row.maturity != ProviderMaturity::Unsupported)
+            .map(|row| row.provider_id.as_str())
+            .collect();
+        assert_eq!(
+            registered,
+            IMPLEMENTED_PROVIDERS.into_iter().collect(),
+            "manifest tests must cover every implemented matrix row"
+        );
 
         for provider_id in IMPLEMENTED_PROVIDERS {
-            let manifest = manifest_for(provider_id, fixture_revision(provider_id), &[]);
+            let manifest = manifest_for(provider_id, None, &[]);
             let capability = matrix
                 .find(provider_id)
                 .unwrap_or_else(|| panic!("missing matrix row for {provider_id}"));
@@ -203,7 +219,7 @@ mod tests {
         // honesty contract: no adapter may silently claim streaming while its
         // parser needs the complete source.
         for provider_id in IMPLEMENTED_PROVIDERS {
-            let manifest = manifest_for(provider_id, fixture_revision(provider_id), &[]);
+            let manifest = manifest_for(provider_id, None, &[]);
             let line_based = matches!(
                 provider_id,
                 "claude-code"
@@ -215,6 +231,8 @@ mod tests {
                     | "openclaw"
                     | "qoder"
                     | "tencent-codebuddy"
+                    | "workbuddy"
+                    | "deepseek-harness"
             );
             assert_eq!(
                 manifest.streaming_support,
@@ -229,13 +247,40 @@ mod tests {
     }
 
     #[test]
-    fn only_provenance_backed_fixture_revisions_are_declared() {
+    fn fixture_revision_is_never_inferred_from_provider_registration() {
+        // The actual adapter's revision is checked with its provenance by the
+        // CLI matrix suite. Ports cannot fabricate one from a provider name.
         for provider_id in IMPLEMENTED_PROVIDERS {
-            let manifest = manifest_for(provider_id, fixture_revision(provider_id), &[]);
+            let manifest = manifest_for(provider_id, None, &[]);
+            assert_eq!(manifest.fixture_revision, None, "{provider_id}");
+        }
+    }
+
+    #[test]
+    fn zcode_source_limit_does_not_widen_generic_sqlite_or_record_streams() {
+        assert_eq!(SQLITE_MAX_SOURCE_BYTES, 128 * 1024 * 1024);
+        assert_eq!(ZCODE_MAX_SOURCE_BYTES, 256 * 1024 * 1024);
+        for (id, limit) in [
+            ("opencode", SQLITE_MAX_SOURCE_BYTES),
+            ("cursor", SQLITE_MAX_SOURCE_BYTES),
+            ("zcode", ZCODE_MAX_SOURCE_BYTES),
+        ] {
+            let manifest = manifest_for(id, None, &[]);
             assert_eq!(
-                manifest.fixture_revision,
-                Some(1),
-                "{provider_id} should carry fixture_revision 1"
+                manifest.streaming_support,
+                StreamingSupport::BoundedWholeSource
+            );
+            assert_eq!(manifest.max_source_size, Some(limit), "{id}");
+            assert_eq!(manifest.max_record_size, None, "{id}");
+        }
+        for id in ["workbuddy", "deepseek-harness"] {
+            let manifest = manifest_for(id, None, &[]);
+            assert_eq!(manifest.streaming_support, StreamingSupport::RecordStream);
+            assert_eq!(manifest.max_source_size, None, "{id}");
+            assert_eq!(
+                manifest.max_record_size,
+                Some(STREAM_RECORD_MAX_BYTES),
+                "{id}"
             );
         }
     }

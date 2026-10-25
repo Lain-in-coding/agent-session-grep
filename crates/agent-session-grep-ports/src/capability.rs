@@ -34,14 +34,14 @@ impl ProviderMaturity {
     }
 
     /// 目标分级（路线图），不是当前实现状态。
-    /// Deferred provider（无 transcript 证据）不声明目标，返回 None。
+    /// 未登记 provider 不声明目标，返回 None。
     pub fn target_for(provider_id: &str) -> Option<Self> {
         match provider_id {
             "claude-code" | "codex" => Some(Self::Certified),
             "grok-build" | "opencode" | "pi" | "antigravity" | "kimi-code" | "openclaw"
-            | "hermes" | "qoder" | "tencent-codebuddy" => Some(Self::Beta),
+            | "hermes" | "qoder" | "tencent-codebuddy" | "workbuddy" | "zcode"
+            | "deepseek-harness" => Some(Self::Beta),
             "aider" | "cline" | "cursor" => Some(Self::Experimental),
-            // deepseek-harness / zcode: 无证据 deferred，不设目标
             _ => None,
         }
     }
@@ -94,7 +94,8 @@ pub struct ProviderCapability {
     /// 身份、无 per-provider 分支。因此"能否装出带证据的 pack"只取决于消息是否
     /// 落库并带 source placement——`parse` 可用即成立。
     ///
-    /// 故 14 个已实现 provider 一律 `Derived`（由已落库内容确定性派生），
+    /// 已实现 provider 的 `Derived` 表示由已落库内容确定性派生；
+    /// M2 adapter 合成证据不等于真实宿主或原生平台验收。
     /// 此前全列 `Unsupported` 是少报：`asg handoff` 是已发布命令，对 codex
     /// （JSONL）、aider（markdown，native_id 恒空）、opencode（SQLite）三种结构
     /// 迥异的真实 golden 源实测均产出 `confidence: high` 的带证据 pack。
@@ -116,8 +117,8 @@ pub struct ProviderCapability {
     /// `commit_source_batches_if_changed` 做内容级 no-op 判定、不推进 generation。
     /// 这条链上没有任何 per-provider 分支，adapter 也不参与。
     ///
-    /// 故 14 个已实现 provider 一律 `Derived`——由源字节确定性派生，而非 provider
-    /// 原生提供。此前 claude-code/codex 记 `Native`、其余 12 个记 `Unsupported`
+    /// 已实现 provider 使用 `Derived`——由源字节确定性派生，而非 provider
+    /// 原生提供；M2 的发现/删除接入与真实增量验收仍单独待办。此前 claude-code/codex 记 `Native`、其余 12 个记 `Unsupported`
     /// 都不准：前者把 store 层能力误记为 provider 原生，后者是少报（12 个
     /// provider 的真实 golden 源实测 resync 均为 `committed=0` /
     /// `unchanged=N` / generation 不变）。由 e2e
@@ -209,9 +210,8 @@ pub fn search_provider_filter_values() -> Vec<&'static str> {
 }
 
 impl ProviderCapabilityMatrix {
-    /// 返回当前 16 个 provider 的能力矩阵（14 个已实现 + 2 个 deferred）。
-    /// deferred provider（deepseek-harness/zcode）无 transcript 证据，
-    /// 保持 Unsupported 不宣传。
+    /// 当前 17 个独立 provider 的实现事实；M2 的三份冻结 adapter 只据
+    /// 合成解析/逻辑快照证据登记为 Experimental，Beta 是目标而非验收结果。
     pub fn current() -> Self {
         Self {
             providers: vec![
@@ -627,36 +627,67 @@ impl ProviderCapabilityMatrix {
                     incremental: CapabilityLevel::Derived,
                 },
                 ProviderCapability {
-                    provider_id: "deepseek-harness".into(),
-                    variant_id: String::new(),
-                    maturity: ProviderMaturity::Unsupported,
-                    discover: CapabilityLevel::Unknown,
-                    probe: CapabilityLevel::Unknown,
-                    parse: CapabilityLevel::Unknown,
-                    search: CapabilityLevel::Unknown,
-                    context: CapabilityLevel::Unknown,
+                    // Separate WorkBuddy product/source lifecycle from CodeBuddy
+                    // CLI, despite the shared record vocabulary.
+                    provider_id: "workbuddy".into(),
+                    variant_id: "workbuddy/project-jsonl-v1".into(),
+                    maturity: ProviderMaturity::Experimental,
+                    // Cloud/orphan classification and authoritative soft deletion
+                    // still require runtime logical-snapshot integration.
+                    discover: CapabilityLevel::Partial,
+                    probe: CapabilityLevel::Native,
+                    parse: CapabilityLevel::Partial,
+                    search: CapabilityLevel::Partial,
+                    // Native IDs/cwd are not parent edges or a verified resume call.
+                    context: CapabilityLevel::Unsupported,
                     resume: CapabilityLevel::Unknown,
-                    handoff: CapabilityLevel::Unknown,
-                    tool_activity: CapabilityLevel::Unknown,
-                    usage: CapabilityLevel::Unknown,
-                    source_span: CapabilityLevel::Unknown,
-                    incremental: CapabilityLevel::Unknown,
+                    handoff: CapabilityLevel::Derived,
+                    // Explicit current messageId + callId only, no output inference.
+                    tool_activity: CapabilityLevel::Partial,
+                    usage: CapabilityLevel::Unsupported,
+                    source_span: CapabilityLevel::Native,
+                    incremental: CapabilityLevel::Derived,
+                },
+                ProviderCapability {
+                    provider_id: "deepseek-harness".into(),
+                    variant_id: "deepseek-harness/session-jsonl-zstd-v4".into(),
+                    maturity: ProviderMaturity::Experimental,
+                    // Highest canonical generation selection under .dsh, host
+                    // loading and deletion evidence remain separate integrations.
+                    discover: CapabilityLevel::Partial,
+                    // The decoded header identifies a candidate; full integrity
+                    // and required vocabulary are checked only by parsing.
+                    probe: CapabilityLevel::Partial,
+                    parse: CapabilityLevel::Partial,
+                    search: CapabilityLevel::Partial,
+                    context: CapabilityLevel::Unsupported,
+                    resume: CapabilityLevel::Unknown,
+                    handoff: CapabilityLevel::Derived,
+                    tool_activity: CapabilityLevel::Unsupported,
+                    usage: CapabilityLevel::Unsupported,
+                    // Decompressed offsets are not original-byte source spans.
+                    source_span: CapabilityLevel::Unsupported,
+                    incremental: CapabilityLevel::Derived,
                 },
                 ProviderCapability {
                     provider_id: "zcode".into(),
-                    variant_id: String::new(),
-                    maturity: ProviderMaturity::Unsupported,
-                    discover: CapabilityLevel::Unknown,
-                    probe: CapabilityLevel::Unknown,
-                    parse: CapabilityLevel::Unknown,
-                    search: CapabilityLevel::Unknown,
-                    context: CapabilityLevel::Unknown,
+                    variant_id: "zcode/sqlite-v1".into(),
+                    maturity: ProviderMaturity::Experimental,
+                    // Live DB/WAL capture and complete-scan deletion are outside
+                    // the frozen parser's synthetic acceptance evidence.
+                    discover: CapabilityLevel::Partial,
+                    probe: CapabilityLevel::Native,
+                    parse: CapabilityLevel::Partial,
+                    search: CapabilityLevel::Partial,
+                    // Native session parents are not message parent edges.
+                    // Emitted IDs preserve reversible zcode:<native-id> provenance.
+                    context: CapabilityLevel::Unsupported,
                     resume: CapabilityLevel::Unknown,
-                    handoff: CapabilityLevel::Unknown,
-                    tool_activity: CapabilityLevel::Unknown,
-                    usage: CapabilityLevel::Unknown,
-                    source_span: CapabilityLevel::Unknown,
-                    incremental: CapabilityLevel::Unknown,
+                    handoff: CapabilityLevel::Derived,
+                    tool_activity: CapabilityLevel::Partial,
+                    usage: CapabilityLevel::Unsupported,
+                    source_span: CapabilityLevel::Unsupported,
+                    incremental: CapabilityLevel::Derived,
                 },
             ],
         }
@@ -685,7 +716,7 @@ mod tests {
     fn implemented_providers_are_experimental() {
         let m = ProviderCapabilityMatrix::current();
         for p in &m.providers {
-            // Deferred providers (deepseek-harness/zcode) 保持 Unsupported 无证据，跳过。
+            // Future unsupported rows require separate implementation evidence.
             if p.maturity == ProviderMaturity::Unsupported {
                 continue;
             }
@@ -713,7 +744,7 @@ mod tests {
             }
             let target = ProviderMaturity::target_for(&p.provider_id);
             assert!(target.is_some(), "{} should have a target", p.provider_id);
-            // Providers whose target IS experimental (cline, aider, zcode, cursor)
+            // Providers whose target IS experimental (cline, aider, cursor)
             // may have target == current; all others should have target strictly
             // higher than the current experimental maturity.
             if target.unwrap() != ProviderMaturity::Experimental {
@@ -752,17 +783,21 @@ mod tests {
                 Some(ProviderMaturity::Experimental)
             );
         }
-        // zcode 无证据 deferred，与 deepseek-harness 一致：不声明目标
-        assert!(ProviderMaturity::target_for("zcode").is_none());
+        for id in ["workbuddy", "zcode", "deepseek-harness"] {
+            assert_eq!(
+                ProviderMaturity::target_for(id),
+                Some(ProviderMaturity::Beta)
+            );
+        }
     }
 
     #[test]
-    fn current_matrix_has_all_sixteen_providers() {
+    fn current_matrix_has_all_seventeen_providers() {
         let m = ProviderCapabilityMatrix::current();
         assert_eq!(
             m.providers.len(),
-            16,
-            "matrix must list all 16 providers, got {}",
+            17,
+            "matrix must list all 17 providers, got {}",
             m.providers.len()
         );
     }
@@ -783,7 +818,7 @@ mod tests {
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 14);
+        assert_eq!(accepted, 17);
         assert_eq!(
             crate::SearchProvider::parse("claude"),
             Some(crate::SearchProvider::Claude)
@@ -805,7 +840,7 @@ mod tests {
         );
         // codex：token_count 累计量经单调校验转为增量（Derived）。
         assert_eq!(m.find("codex").unwrap().usage, CapabilityLevel::Derived);
-        // 其余 12 个已实现 provider：本切片不宣称 usage 能力（诚实不宣传；
+        // 其余已实现 provider：本切片不宣称 usage 能力（诚实不宣传；
         // 格式有无用量事实见各行的注释证据）。
         for id in [
             "aider",
@@ -820,6 +855,9 @@ mod tests {
             "qoder",
             "tencent-codebuddy",
             "cline",
+            "workbuddy",
+            "deepseek-harness",
+            "zcode",
         ] {
             assert_eq!(
                 m.find(id).unwrap().usage,
@@ -827,29 +865,64 @@ mod tests {
                 "{id}"
             );
         }
-        // deferred：未评估。
-        for id in ["deepseek-harness", "zcode"] {
-            assert_eq!(m.find(id).unwrap().usage, CapabilityLevel::Unknown, "{id}");
-        }
     }
 
     #[test]
-    fn deepseek_harness_and_zcode_are_deferred() {
-        let m = ProviderCapabilityMatrix::current();
-        for id in &["deepseek-harness", "zcode"] {
-            let p = m
-                .find(id)
-                .unwrap_or_else(|| panic!("{id} should be in matrix"));
+    fn m2_frozen_provider_rows_have_exact_variants_and_open_runtime_gates() {
+        let matrix = ProviderCapabilityMatrix::current();
+        for (id, variant, span, tool) in [
+            (
+                "workbuddy",
+                "workbuddy/project-jsonl-v1",
+                CapabilityLevel::Native,
+                CapabilityLevel::Partial,
+            ),
+            (
+                "zcode",
+                "zcode/sqlite-v1",
+                CapabilityLevel::Unsupported,
+                CapabilityLevel::Partial,
+            ),
+            (
+                "deepseek-harness",
+                "deepseek-harness/session-jsonl-zstd-v4",
+                CapabilityLevel::Unsupported,
+                CapabilityLevel::Unsupported,
+            ),
+        ] {
+            let row = matrix.find(id).unwrap();
+            assert_eq!(row.variant_id, variant);
+            assert_eq!(row.maturity, ProviderMaturity::Experimental);
             assert_eq!(
-                p.maturity,
-                ProviderMaturity::Unsupported,
-                "{id} must remain unsupported/deferred until real transcript evidence exists"
+                ProviderMaturity::target_for(id),
+                Some(ProviderMaturity::Beta)
             );
-            assert!(
-                p.variant_id.is_empty(),
-                "{id} variant must be empty when deferred, got {}",
-                p.variant_id
-            );
+            assert_eq!(row.discover, CapabilityLevel::Partial);
+            assert_eq!(row.parse, CapabilityLevel::Partial);
+            assert_eq!(row.search, CapabilityLevel::Partial);
+            assert_eq!(row.context, CapabilityLevel::Unsupported);
+            assert_eq!(row.resume, CapabilityLevel::Unknown);
+            assert_eq!(row.handoff, CapabilityLevel::Derived);
+            assert_eq!(row.incremental, CapabilityLevel::Derived);
+            assert_eq!(row.source_span, span);
+            assert_eq!(row.tool_activity, tool);
+            assert_eq!(row.usage, CapabilityLevel::Unsupported);
+            assert_eq!(crate::SearchProvider::parse(id).unwrap().as_str(), id);
+        }
+        let cli = matrix.find("tencent-codebuddy").unwrap();
+        assert_eq!(cli.variant_id, "tencent-codebuddy/cli-jsonl-v1");
+        assert_ne!(
+            cli.provider_id,
+            matrix.find("workbuddy").unwrap().provider_id
+        );
+        for wrong in [
+            "deepseek",
+            "deepseek-harness-cli",
+            "work-buddy",
+            "codebuddy",
+            "z-code",
+        ] {
+            assert!(crate::SearchProvider::parse(wrong).is_none());
         }
     }
 

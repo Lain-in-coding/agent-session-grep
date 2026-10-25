@@ -5,9 +5,12 @@
 //!
 //! 分层依赖不变量：domain ← ports ← application ← adapters。
 
+pub mod control;
 pub mod maintenance;
+pub mod managed;
 pub mod redact;
 pub mod relocation;
+pub mod source_context;
 
 use agent_session_grep_domain::{
     DomainError, DomainResult, PlacementId, SessionContextGraph, StableId, ToolActivity,
