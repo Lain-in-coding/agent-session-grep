@@ -311,17 +311,26 @@ impl Fixture {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let control = self.control();
-            let result = match ManagedStore::open(&self.db, &control) {
+            let opened = ManagedStore::open(&self.db, &control);
+            // Windows briefly denies sidecar handles while the child worker
+            // checkpoints; retry within this bounded read budget instead of
+            // treating a transient open as terminal validation failure.
+            let mut result = match opened {
                 Ok(store) => {
                     store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
                         read.query_lexical(text, &ProjectionQuery::default(), 16)
                     })
                 }
-                Err(PortError::Backend(reason)) => {
+                Err(PortError::Backend(reason)) if !reason.contains("code=5") => {
                     panic!("managed catalog private-file validation failed: {reason}")
                 }
                 Err(error) => Err(error),
             };
+            if let Err(PortError::Backend(reason)) = &result {
+                if !reason.contains("code=5") {
+                    panic!("managed catalog private-file validation failed: {reason}")
+                }
+            }
             match result {
                 Ok(page) => {
                     return page
@@ -330,6 +339,9 @@ impl Fixture {
                         .any(|h| h.projection.message.text.contains(text));
                 }
                 Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(PortError::Backend(_)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 Err(PortError::WriterBusy(_)) => {
