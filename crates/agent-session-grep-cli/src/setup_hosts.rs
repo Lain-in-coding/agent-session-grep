@@ -325,13 +325,7 @@ pub(crate) fn remove_owned_registration(
     }
     McpRegistration::new(expected.command.clone(), expected.args.clone())?;
     let value = expected.value(locator.host);
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&value)
-                .map_err(|_| HostConfigError::from(ErrorCode::RecoveryRequired))?
-        )
-    );
+    let digest = crate::host_config::canonical_value_hash(&value);
     if original.owned_value_sha256.as_deref() != Some(digest.as_str()) {
         return Err(ErrorCode::Unowned.into());
     }

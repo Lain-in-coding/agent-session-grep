@@ -595,9 +595,94 @@ fn unix_mode_is_preserved() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn xattr_namespace_classification_only_refuses_unknown_namespaces() {
+    // SELinux/Fedora and macOS quarantine files must open; only attributes
+    // that cannot be classified or copied stay a refusal.
+    use platform::xattr::Namespace;
+    let labels = [
+        "security.selinux",
+        "system.nfs4_acl",
+        "com.apple.quarantine",
+    ];
+    for name in labels {
+        assert!(
+            matches!(platform::xattr::namespace(name), Namespace::Label),
+            "{name}"
+        );
+    }
+    assert!(matches!(
+        platform::xattr::namespace("user.trusted"),
+        Namespace::Known
+    ));
+    assert!(matches!(
+        platform::xattr::namespace("trusted.unknown"),
+        Namespace::Unknown
+    ));
+}
+
 fn m2_json_hosts() -> [Host; 3] {
     [Host::ZCode, Host::WorkBuddy, Host::Antigravity]
 }
+
+#[test]
+fn m2_json_host_edits_preserve_unrelated_key_order_and_exact_numbers() {
+    // Claude Code rewrites its own config without sorting keys and stores
+    // numeric option values (level ids, token budgets) that exceed f64
+    // precision. Reordered or rounded unrelated settings would be a
+    // destructive host edit, so the JSON DOM must preserve both exactly.
+    let unrelated = r#""zebra":9007199254740993,"alpha":-9223372036854775807,"middle":{"last":18446744073709551615,"first":0.30000000000000004}"#;
+    let initial = format!(r#"{{{unrelated},"mcpServers":{{"other":{{"command":"other"}}}}}}"#);
+    for host in m2_json_hosts() {
+        let f = Fixture::new(host, Some(&initial));
+        let registration = f.registration();
+        let receipt = f.store.install(&registration, None).unwrap();
+        let after = fs::read_to_string(&f.config).unwrap();
+        let doc = f.document();
+        assert_eq!(doc.node(), Some(registration.value(host)));
+        assert!(
+            after.contains(r#""zebra": 9007199254740993"#),
+            "{host:?}: {after}"
+        );
+        assert!(
+            after.contains(r#""alpha": -9223372036854775807"#),
+            "{host:?}: {after}"
+        );
+        assert!(
+            after.contains(
+                r#""last": 18446744073709551615,
+    "first": 0.30000000000000004"#
+            ),
+            "{host:?}: {after}"
+        );
+        let removed = f.store.remove(&receipt).unwrap();
+        assert_eq!(removed.status, EditStatus::Removed);
+        let restored = fs::read_to_string(&f.config).unwrap();
+        // Exact numeric values and the original unrelated key order survive a
+        // full round-trip; the pretty-printed envelope is the documented JSON
+        // edit shape, so only the unrelated prefix is compared byte-for-byte.
+        // Key order inside every object and the exact digits of every number
+        // survive the round-trip; serde_json pretty-printing owns the
+        // envelope spacing, so assertions target ordered token substrings.
+        let order = [
+            r#""zebra": 9007199254740993,"#,
+            r#""alpha": -9223372036854775807,"#,
+            r#""middle": {"#,
+            r#""last": 18446744073709551615,"#,
+            r#""first": 0.30000000000000004"#,
+        ];
+        let mut search_from = 0;
+        for token in order {
+            let at = restored
+                .find(token)
+                .unwrap_or_else(|| panic!("{host:?}: missing {token} in {restored}"));
+            assert!(at >= search_from, "{host:?}: order regressed in {restored}");
+            search_from = at + token.len();
+        }
+    }
+}
+
 fn m2_initial(host: Host) -> &'static str {
     if host == Host::ZCode {
         r#"{"plugins":{"enabled":["private-other"]},"mcp":{"timeoutMs":1700,"servers":{"other":{"command":"other","env":{"PRIVATE_SETTING":"unchanged"}}}}}"#

@@ -197,8 +197,11 @@ allowed_redirect() {
 }
 
 header_location() {
-    awk 'BEGIN { IGNORECASE = 1 }
-         /^[[:space:]]*location:/ {
+    # IGNORECASE is a gawk extension; mawk/BSD awk silently treat it as an
+    # unset variable, so match header names with an explicit tolower
+    # comparison instead.
+    awk '{
+             if (tolower($0) !~ /^[[:space:]]*location:/) next
              sub(/^[^:]*:[[:space:]]*/, "")
              sub(/\r$/, "")
              print
@@ -207,8 +210,8 @@ header_location() {
 }
 
 last_locations() {
-    awk 'BEGIN { IGNORECASE = 1 }
-         /^[[:space:]]*location:/ {
+    awk '{
+             if (tolower($0) !~ /^[[:space:]]*location:/) next
              sub(/^[^:]*:[[:space:]]*/, "")
              sub(/\r$/, "")
              print
@@ -300,6 +303,10 @@ else
     bytes=0
     while :; do
         check_time
+        # wget follows redirects internally and downloads along the way, so
+        # the allowlist must be enforced on the URL BEFORE each request, not
+        # only on the recorded Location headers afterwards.
+        allowed_redirect "$current_url" || fail redirect_rejected 6
         : > "$headers"
         set +e
         wget --https-only --max-redirect=3 --tries=1 \

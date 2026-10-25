@@ -1,9 +1,16 @@
 version: 2
 updates:
+  # Automation commits must pass the governance scoped-header policy
+  # (scripts/governance/policy.py): "type(scope): subject" with a lower-case
+  # scope. A bare "chore" subject would fail check_commit; the scoped prefix
+  # keeps Dependabot's dependency commits conforming.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

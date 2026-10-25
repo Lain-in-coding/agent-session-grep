@@ -184,9 +184,52 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 fn node_hash(node: &Option<Value>) -> Result<Option<String>> {
-    node.as_ref()
-        .map(|value| serde_json::to_vec(value).map(|b| hash(&b)).map_err(io))
-        .transpose()
+    Ok(node.as_ref().map(canonical_value_hash))
+}
+
+/// Key-order-independent content hash for a JSON node. With preserve_order an
+/// object's serialization follows its insertion order, so hashing raw bytes
+/// would make the same registration owned under one key order conflict with
+/// the same registration written under another. Ownership identity is about
+/// the JSON content, not the byte layout the file happens to keep.
+pub(crate) fn canonical_value_hash(value: &serde_json::Value) -> String {
+    fn canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
+        use serde_json::value::Value as V;
+        match value {
+            V::Object(map) => {
+                out.push(b'{');
+                let mut members: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                members.sort_by_key(|(left, _)| *left);
+                for (index, (key, member)) in members.into_iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(
+                        serde_json::to_string(key).unwrap_or_default().as_bytes(),
+                    );
+                    out.push(b':');
+                    canonical(member, out);
+                }
+                out.push(b'}');
+            }
+            V::Array(items) => {
+                out.push(b'[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    canonical(item, out);
+                }
+                out.push(b']');
+            }
+            other => {
+                out.extend_from_slice(serde_json::to_string(other).unwrap_or_default().as_bytes())
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    canonical(value, &mut bytes);
+    hash(&bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1037,9 +1080,6 @@ fn strict_json(text: &str) -> Result<Value> {
                 fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Unique, E> {
                     Ok(Unique(v.into()))
                 }
-                fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Unique, E> {
-                    Ok(Unique(json!(v)))
-                }
                 fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Unique, E> {
                     Ok(Unique(v.into()))
                 }
@@ -1060,11 +1100,32 @@ fn strict_json(text: &str) -> Result<Value> {
                     self,
                     mut a: A,
                 ) -> std::result::Result<Unique, A::Error> {
+                    // A bare number arrives under arbitrary_precision as the
+                    // documented "$serde_json::private::Number" map whose
+                    // only value is the raw numeric token; rebuilding it
+                    // keeps the exact digits without a float round-trip.
+                    let mut number = String::new();
+                    let mut is_number = false;
                     let mut result = Map::new();
-                    while let Some((key, Unique(value))) = a.next_entry::<String, Unique>()? {
-                        if result.insert(key, value).is_some() {
+                    while let Some(key) = a.next_key::<String>()? {
+                        if key == "$serde_json::private::Number" && number.is_empty() {
+                            is_number = true;
+                            number = a.next_value::<String>()?;
+                            continue;
+                        }
+                        if is_number {
+                            return Err(serde::de::Error::custom("invalid number"));
+                        }
+                        let value: Unique = a.next_value()?;
+                        if result.insert(key, value.0).is_some() {
                             return Err(serde::de::Error::custom("duplicate key"));
                         }
+                    }
+                    if is_number {
+                        let number: serde_json::Number = number
+                            .parse()
+                            .map_err(|_| serde::de::Error::custom("invalid number"))?;
+                        return Ok(Unique(number.into()));
                     }
                     Ok(Unique(result.into()))
                 }
@@ -1952,6 +2013,123 @@ mod platform {
             io::AsRawFd,
         },
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) mod xattr {
+        use std::{collections::BTreeMap, ffi::CString, io};
+
+        use libc::{c_char, c_int, c_void, size_t, ssize_t};
+
+        // macOS xattr symbols live in libSystem rather than the libc crate's
+        // apple bindings, so they are declared directly here.
+        #[cfg_attr(target_os = "macos", link(name = "System", kind = "dylib"))]
+        unsafe extern "C" {
+            #[link_name = "flistxattr"]
+            fn flistxattr_shim(fd: c_int, list: *mut c_char, size: size_t) -> ssize_t;
+            #[link_name = "fgetxattr"]
+            fn fgetxattr_shim(
+                fd: c_int,
+                name: *const c_char,
+                value: *mut c_void,
+                size: size_t,
+            ) -> ssize_t;
+            #[link_name = "fsetxattr"]
+            fn fsetxattr_shim(
+                fd: c_int,
+                name: *const c_char,
+                value: *const c_void,
+                size: size_t,
+            ) -> c_int;
+        }
+
+        fn result(call: impl FnOnce() -> ssize_t) -> io::Result<usize> {
+            match call() {
+                size if size >= 0 => Ok(size as usize),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }
+
+        fn attrs(fd: c_int) -> io::Result<Vec<String>> {
+            let size = result(|| unsafe { flistxattr_shim(fd, std::ptr::null_mut(), 0) })?;
+            let mut names = vec![0u8; size];
+            loop {
+                let filled =
+                    result(|| unsafe { flistxattr_shim(fd, names.as_mut_ptr().cast(), size) })?;
+                if filled <= size {
+                    names.truncate(filled);
+                    break;
+                }
+                names.resize(filled, 0);
+            }
+            Ok(names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect())
+        }
+
+        fn value(fd: c_int, name: &str) -> io::Result<Vec<u8>> {
+            let target = CString::new(name).map_err(|_| unsupported_error())?;
+            let size =
+                result(|| unsafe { fgetxattr_shim(fd, target.as_ptr(), std::ptr::null_mut(), 0) })?;
+            let mut buffer = vec![0u8; size];
+            let filled = result(|| unsafe {
+                fgetxattr_shim(fd, target.as_ptr(), buffer.as_mut_ptr().cast(), size)
+            })?;
+            if filled > size {
+                return Err(unsupported_error());
+            }
+            buffer.truncate(filled);
+            Ok(buffer)
+        }
+
+        pub(super) fn copy_labels(fd: c_int) -> io::Result<()> {
+            let names = attrs(fd)?;
+            let mut labels: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+            for name in &names {
+                match namespace(name) {
+                    Namespace::Label => {
+                        labels.insert(name, value(fd, name)?);
+                    }
+                    Namespace::Known => {}
+                    Namespace::Unknown => return Err(unsupported_error()),
+                }
+            }
+            for (name, data) in labels {
+                let target = CString::new(name).map_err(|_| unsupported_error())?;
+                let written = unsafe {
+                    fsetxattr_shim(fd, target.as_ptr(), data.as_ptr().cast(), data.len())
+                };
+                if written != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        pub(crate) enum Namespace {
+            Label,
+            Known,
+            Unknown,
+        }
+
+        pub(crate) fn namespace(name: &str) -> Namespace {
+            let label = |prefix: &str| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            };
+            if label("security") || label("system") || label("com.apple") {
+                Namespace::Label
+            } else if label("user") {
+                Namespace::Known
+            } else {
+                Namespace::Unknown
+            }
+        }
+
+        fn unsupported_error() -> io::Error {
+            io::Error::from(io::ErrorKind::Unsupported)
+        }
+    }
     fn unsupported() -> std::io::Error {
         std::io::ErrorKind::Unsupported.into()
     }
@@ -1980,16 +2158,13 @@ mod platform {
         if !meta.is_file() || meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
             return Err(unsupported());
         }
-        // Mode-only replacement cannot promise ACL/xattr preservation. Refuse
-        // such files until an audited native metadata-copy path exists.
+        // Mode-only replacement cannot promise ACL/xattr preservation. Label
+        // namespaces are copied onto the replacement when the platform
+        // permits; anything else stays a refusal.
         #[cfg(target_os = "linux")]
-        let attrs = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+        xattr::copy_labels(file.as_raw_fd())?;
         #[cfg(target_os = "macos")]
-        let attrs = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if attrs != 0 {
-            return Err(unsupported());
-        }
+        xattr::copy_labels(file.as_raw_fd())?;
         Ok(file)
     }
     pub(super) fn create_private(path: &Path) -> std::io::Result<File> {

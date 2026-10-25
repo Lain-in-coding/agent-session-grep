@@ -77,6 +77,29 @@ class UpdateCheckHelperSourceTests(unittest.TestCase):
         self.assertIn("command -v wget", sh)
         self.assertIn("mktemp", sh)
 
+    def test_shell_header_matching_is_portable_case_insensitive_awk(self) -> None:
+        # IGNORECASE is a gawk extension; mawk and BSD awk silently treat an
+        # assignment as an unset variable, so header matching must use an
+        # explicit tolower comparison instead.
+        source = SH.read_text(encoding="utf-8")
+        code = executable_text(source)
+        self.assertNotIn("IGNORECASE", code)
+        self.assertIn("tolower($0)", code)
+        self.assertEqual(
+            code.count('tolower($0) !~ /^[[:space:]]*location:/'), 2,
+            "both header_location and last_locations must match case-insensitively",
+        )
+
+    def test_wget_enforces_allowlist_before_each_download(self) -> None:
+        # wget follows redirects internally and downloads along the way; the
+        # allowlist check must run on the URL before every request, not only
+        # on recorded Location headers after success.
+        code = executable_text(SH.read_text(encoding="utf-8"))
+        self.assertIn('allowed_redirect "$current_url" || fail redirect_rejected 6', code)
+        pre_request = code.index('allowed_redirect "$current_url"')
+        wget_call = code.index("wget --https-only")
+        self.assertLess(pre_request, wget_call)
+
 
 class UpdateCheckHelperExecutionTests(unittest.TestCase):
     def test_shell_helper_rejects_invalid_repository(self) -> None:

@@ -13,7 +13,7 @@ rust-version = "1.90"
 blake3 = "1.5"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 crossterm = "0.29"
 # Optional local semantic stack (feature semantic-candle). Pinned to versions

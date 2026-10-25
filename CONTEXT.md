@@ -336,10 +336,13 @@ _Avoid_: support level, compatibility
   budget/truncation/redaction recorded, reproducible) and is preview-only —
   never silent injection.
 - **Privacy (ADR-0009)**: zero telemetry, zero upload, offline by default
-  (`--offline`, CI-enforced); catalog keeps原文; cross-boundary outputs
-  (Web UI, handoff pack, MCP, Robot, HTTP API) are redacted by default with
-  explicit audited reveal, while local CLI/TUI human output stays unredacted
-  per ADR-0004.
+  (`--offline`, CI-enforced; the one network exception is the explicit
+  user-triggered `update check`, which fetches public release metadata through
+  shipped curl/wget/HttpClient helpers against allowlisted GitHub release
+  hosts — the static egress audit cannot see shell helpers); catalog keeps
+  原文; cross-boundary outputs (Web UI, handoff pack, MCP, Robot, HTTP API)
+  are redacted by default with explicit audited reveal, while local CLI/TUI
+  human output stays unredacted per ADR-0004.
 - **Hooks**: Claude Code hooks (SessionStart/UserPromptSubmit) ship with the
   product but are OFF by default (owner revised from recommendation); when
   enabled they obey max_tokens, provider/time filters, decay, and one-switch
