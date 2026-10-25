@@ -14,16 +14,57 @@
 //! 参数解析刻意手写、不引第三方 CLI 框架——切片阶段只需最小可用面。
 //! 输出走 Robot-JSON 雏形（每行一个 JSON 对象），为后续 CONTRACT 对齐留口。
 
+mod autostart_command;
 mod hooks;
+pub mod host_config;
 mod human;
 mod maintenance;
+mod managed_background;
+mod managed_control;
+pub mod managed_emit;
+mod managed_mcp;
+mod managed_purge;
+mod managed_read;
+mod managed_source_discovery;
+pub mod managed_source_parse;
+pub mod managed_supervisor;
 mod mcp;
+mod migrate_command;
+pub mod native_autostart;
+mod native_manager;
+mod package_installation;
+mod path_command;
 mod protocol;
 mod redaction;
 mod repo_identity;
 mod serve;
+mod setup_command;
+pub mod setup_hosts;
 mod trace;
 mod tui;
+mod uninstall_command;
+mod update_bundle;
+pub mod update_check;
+#[cfg(test)]
+mod update_check_tests;
+mod update_command;
+mod update_state;
+
+#[cfg(test)]
+pub(crate) fn retry_fixture_busy<T>(
+    mut attempt: impl FnMut() -> agent_session_grep_ports::PortResult<T>,
+) -> T {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match attempt() {
+            Ok(value) => return value,
+            Err(PortError::WriterBusy(_)) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => panic!("synthetic fixture setup failed: {error:?}"),
+        }
+    }
+}
 
 use agent_session_grep_adapters_sqlite::{
     INDEX_PROJECTION_VERSION, PARSER_SEMANTIC_VERSION, SourceActivity, SourceBatch, SourceUsage,
@@ -55,6 +96,7 @@ use agent_session_grep_provider_cline::ClineAdapter;
 use agent_session_grep_provider_codebuddy::CodeBuddyAdapter;
 use agent_session_grep_provider_codex::CodexAdapter;
 use agent_session_grep_provider_cursor::CursorAdapter;
+use agent_session_grep_provider_dsh::DeepSeekHarnessAdapter;
 use agent_session_grep_provider_grok::GrokBuildAdapter;
 use agent_session_grep_provider_hermes::OpenHermesAdapter;
 use agent_session_grep_provider_kimi::KimiCodeAdapter;
@@ -62,6 +104,8 @@ use agent_session_grep_provider_openclaw::OpenClawAdapter;
 use agent_session_grep_provider_opencode::OpenCodeAdapter;
 use agent_session_grep_provider_pi::PiAdapter;
 use agent_session_grep_provider_qoder::QoderAdapter;
+use agent_session_grep_provider_workbuddy::WorkBuddyAdapter;
+use agent_session_grep_provider_zcode::ZCodeAdapter;
 use protocol::{CanonicalCode, ProtocolError};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -110,6 +154,19 @@ impl From<ProtocolError> for CliError {
 }
 
 pub fn run_cli() {
+    let native_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = managed_emit::intercept(&native_args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = managed_purge::intercept(&native_args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = managed_background::intercept(&native_args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = uninstall_command::intercept(&native_args) {
+        std::process::exit(code);
+    }
     // command 名先解析出来供错误 envelope 使用；失败时也要标注是哪个命令。
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = command_name(&args);
@@ -234,6 +291,10 @@ fn extract_offline_flag(args: &[String]) -> bool {
         }
         // 其它带值 flag 跳过其取值，避免把取值误当命令名。
         match a.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--db"
             | "--output"
             | "--request-id"
@@ -258,6 +319,12 @@ fn extract_offline_flag(args: &[String]) -> bool {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next();
             }
@@ -301,6 +368,10 @@ fn extract_request_id(args: &[String]) -> Result<Option<String>, String> {
         }
         // 其它带值 flag 跳过其取值，避免把取值误当位置参数提前终止扫描。
         match a.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--db"
             | "--output"
             | "--cursor"
@@ -324,6 +395,12 @@ fn extract_request_id(args: &[String]) -> Result<Option<String>, String> {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next();
             }
@@ -343,6 +420,10 @@ fn command_name(args: &[String]) -> String {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--db"
             | "--output"
             | "--cursor"
@@ -367,6 +448,12 @@ fn command_name(args: &[String]) -> String {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next(); // 消费其取值
             }
@@ -445,6 +532,10 @@ fn intercept_help_or_version(args: &[String]) -> Option<HelpRequest> {
             return None;
         }
         match token.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--help" | "-h" => prefix_help = true,
             "--version" | "-V" => prefix_version = true,
             // 裸 flag（无取值）不改变拦截判定：--robot/--no-color/--offline 等同理。
@@ -474,6 +565,12 @@ fn intercept_help_or_version(args: &[String]) -> Option<HelpRequest> {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next();
             }
@@ -520,6 +617,13 @@ fn run(
         }
         return Ok(protocol::Outcome::Success);
     }
+    if args == ["__asg-build-info"] {
+        protocol::write_stdout_line(&serde_json::json!({"schema":"asg.build-info/v1","product":PRODUCT_NAME,
+            "version":env!("CARGO_PKG_VERSION"),"target":agent_session_grep_launcher::metadata::BUILD_TARGET,
+            "catalog_schema":agent_session_grep_adapters_sqlite::SCHEMA_VERSION,
+            "control_schema":agent_session_grep_adapters_sqlite::control::CONTROL_SCHEMA_VERSION,"launcher_protocol":1}).to_string());
+        return Ok(protocol::Outcome::Success);
+    }
     if command_name(args) == "doctor" {
         return doctor(args, mode, request_id, offline);
     }
@@ -554,6 +658,51 @@ fn run(
     }
 
     let (db, rest) = parse_db_flag(args)?;
+    if rest.first().is_some_and(|command| command == "update") {
+        return update_command::run(&db, &rest, mode, request_id, offline);
+    }
+    if path_command::is_command(&rest) {
+        return path_command::run(&db, &rest, mode, request_id);
+    }
+    if migrate_command::is_command(&rest) {
+        return migrate_command::run(&db, &rest, mode, request_id);
+    }
+    if uninstall_command::is_command(&rest) {
+        return uninstall_command::run(&db, &rest, mode, request_id);
+    }
+    if rest.first().is_some_and(|command| command == "setup") {
+        return setup_command::run(&db, &rest, mode, request_id);
+    }
+    if autostart_command::is_command(&rest) {
+        return autostart_command::run(&db, &rest, mode, request_id);
+    }
+    if rest
+        .first()
+        .is_some_and(|command| managed_control::is_control(command))
+    {
+        return managed_control::run(&db, &rest, mode, request_id);
+    }
+    let managed_root = std::path::Path::new(&db)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match std::fs::symlink_metadata(managed_root.join("control.db")) {
+        Ok(_) => {
+            if rest.first().is_some_and(|command| command == "mcp") {
+                no_extra_args(&rest, 0, "mcp")?;
+                return mcp::serve_managed(std::path::Path::new(&db), offline);
+            }
+            return managed_read::run(&db, &rest, mode, request_id, started);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(ProtocolError::new(
+                CanonicalCode::SchemaIncompatible,
+                "managed control state is unavailable",
+            )
+            .into());
+        }
+    }
     if rest.first().is_some_and(|command| command == "journal") {
         return maintenance::run(&db, &rest, mode, request_id);
     }
@@ -1292,6 +1441,10 @@ USAGE:
     agent-session-grep --help | --version
 
 COMMANDS:
+    update                显式检查、离线升级与失败恢复（update --help）
+    setup                 初始化私有 managed catalog（开发候选；逐项报告未完成接入）
+    sources list|add|revoke 选择或撤销历史范围（add 需要 --provider 和目录/文件）
+    background status|pause|resume|stop 查看或修改持久后台更新意图
     ingest <file>          解析单个 transcript 文件并入库（只读源）
     sync <file>...          原子扫描多个 transcript 文件；无变化时不生成新 generation
     sync --discover          自动发现各 provider 数据根下的源并同步（jsonl/json/db；只读源）
@@ -1451,6 +1604,13 @@ fn help_envelope(command: &str, data: serde_json::Value, request_id: Option<&str
 /// 提示都读这一份清单。两处各自手写会漂移——新增命令只改了一处时，帮助里
 /// 存在的命令会被"可用命令"提示否认（新手照提示改写反而更错）。
 const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "setup",
+    "sources",
+    "background",
+    "update",
+    "migrate",
+    "path",
+    "uninstall",
     "ingest",
     "sync",
     "relocate",
@@ -1486,6 +1646,13 @@ fn known_subcommand(cmd: &str) -> bool {
 /// 触发——顶层 --help 只给全局概览，子命令帮助给单命令的用法。
 fn subcommand_help_text(cmd: &str) -> &'static str {
     match cmd {
+        "setup" => setup_command::HELP,
+        "update" => update_command::HELP,
+        "migrate" => migrate_command::HELP,
+        "path" => path_command::HELP,
+        "uninstall" => uninstall_command::HELP,
+        "sources" => managed_control::SOURCES_HELP,
+        "background" => managed_control::BACKGROUND_HELP,
         "journal" => maintenance::HELP,
         "search" => {
             "search <query>：全文检索历史会话，按相关性降序返回命中。\n\
@@ -1493,6 +1660,7 @@ fn subcommand_help_text(cmd: &str) -> &'static str {
                      flag（放子命令后）：--max-items <n> 页大小、--cursor <token> 翻页、--max-bytes <n> 预算；\n\
                      过滤：--provider claude|claude-code|codex（可重复，OR）、--since/--until <RFC3339 或 1h|1d|1w>（半开区间 [since, until)）、\n\
                      --repo <host/owner/name>（会话仓库 slug，逐字相等；与 status 的 repos 清单一致）；\n\
+                     managed 范围为所选历史与上述过滤的交集；--latest [--max-wait-ms 0..30000] 等待新观察，暂停不会被恢复；\n\
                      检索模式：--mode lexical|semantic|hybrid（默认 lexical）。semantic/hybrid 需先跑 `index embeddings`；\n\
                      默认向量化器是 fuzzy lexical vector（bigram-hash，模糊词法相似、非语义模型）；\n\
                      semantic 候选在融合前按相似度下限过滤（低于下限的候选不占 top-k 名额）；\n\
@@ -1505,7 +1673,8 @@ fn subcommand_help_text(cmd: &str) -> &'static str {
         "get-message" => {
             "get-message <msg-id>：返回一个消息及其同会话主线邻居。\n\
                           示例：agent-session-grep --db <path> get-message msg_v1_... --session ses_v1_... --around 2\n\
-                          flag：--session <ses-id>、--around <n>、--max-items <n>、--max-bytes <n>"
+                          flag：--session <ses-id>、--around <n>、--max-items <n>、--max-bytes <n>；\n\
+                          managed 支持 --provider/--repo/--since/--until 范围交集与 --latest [--max-wait-ms 0..30000]"
         }
         "handoff" => {
             "handoff <query>：为查询生成 handoff pack（handoff-pack/v1）。\n\
@@ -1513,7 +1682,8 @@ fn subcommand_help_text(cmd: &str) -> &'static str {
                      检索命中后组装：原文证据（evidence）与推断（inference）严格分栏；\n\
                      deterministic 默认（无 LLM 调用）；dry-run——只输出 pack 与建议命令，不注入任何 agent。\n\
                      flag：--max-evidence <n> 证据条数上限（默认 20）、--max-tokens <n> token 预算（默认 8000）、\n\
-                     --max-bytes <n> 序列化字节预算（默认 2000000）；截断时 exit 10"
+                     --max-bytes <n> 序列化字节预算（legacy 默认 2000000）；截断时 exit 10；\n\
+                     managed 默认 5 条证据、2048 估计 tokens、8192 字节；支持 --provider/--repo/--since/--until 范围交集、--latest [--max-wait-ms 0..30000]"
         }
         "get" => {
             "get <wire-id>：按实体 ID 取回原始 payload。\n\
@@ -1795,7 +1965,17 @@ fn is_known_flag_name(token: &str) -> bool {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--history"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds"
+            | "--latest"
+            | "--no-autostart"
+            | "--keep-data"
             | "--apply"
     )
 }
@@ -1845,6 +2025,10 @@ fn extract_db_flag_impl(args: &[String], prefix_only: bool) -> Result<Option<Str
             db = Some(value.clone());
         }
         match a.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--output"
             | "--request-id"
             | "--cursor"
@@ -1867,6 +2051,12 @@ fn extract_db_flag_impl(args: &[String], prefix_only: bool) -> Result<Option<Str
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next();
             }
@@ -1954,6 +2144,10 @@ fn bare_positionals(args: &[String]) -> Vec<String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--history" => {
+                it.next();
+                it.next();
+            }
             "--db"
             | "--output"
             | "--request-id"
@@ -1977,6 +2171,12 @@ fn bare_positionals(args: &[String]) -> Vec<String> {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next(); // 消费其取值
             }
@@ -3521,6 +3721,9 @@ fn provider_registry() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(ClaudeCodeAdapter::new()),
         Box::new(AiderAdapter::new()),
         Box::new(CodexAdapter::new()),
+        Box::new(WorkBuddyAdapter::new()),
+        Box::new(ZCodeAdapter::new()),
+        Box::new(DeepSeekHarnessAdapter::new()),
         Box::new(GrokBuildAdapter::new()),
         Box::new(PiAdapter::new()),
         Box::new(QoderAdapter::new()),
@@ -3814,6 +4017,38 @@ fn provider_for_source_path(path: &str) -> Option<&'static str> {
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Canonical M2 layouts are hint-only: their exact-file/metadata rules live in
+/// managed discovery and must not be widened into recursive legacy discovery.
+fn managed_provider_for_source_path(path: &str) -> Option<&'static str> {
+    let normalized = source_path_identity(path);
+    let segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let window = |root: &[&str]| {
+        segments
+            .windows(root.len())
+            .enumerate()
+            .any(|(start, candidate)| candidate == root && start + root.len() < segments.len())
+    };
+    let file = segments.last().copied();
+    if window(&[".zcode", "cli", "db"]) && file == Some("db.sqlite") {
+        return Some("zcode");
+    }
+    if window(&[".dsh", "sessions"])
+        && file.is_some_and(|name| {
+            name == "session.jsonl.zstd"
+                || name.starts_with("session.v") && name.ends_with(".jsonl.zstd")
+        })
+    {
+        return Some("deepseek-harness");
+    }
+    if window(&[".workbuddy", "projects"]) && file.is_some_and(|name| name.ends_with(".jsonl")) {
+        return Some("workbuddy");
+    }
+    None
 }
 
 fn source_path_identity(path: &str) -> String {
@@ -4770,7 +5005,8 @@ fn ingest_file(
     let hint = registered
         .get(path)
         .map(String::as_str)
-        .or_else(|| provider_for_source_path(path));
+        .or_else(|| provider_for_source_path(path))
+        .or_else(|| managed_provider_for_source_path(path));
     let (staged, variant) = stage_with_source(&source, hint)?;
 
     // 3) 提交前复核：源在 stage 期间被改写则拒绝提交（RFC-0002 §4）。
@@ -5001,7 +5237,8 @@ fn sync_files_inner(
             .get(path)
             .map(String::as_str)
             .or_else(|| registered_providers.get(path).map(String::as_str))
-            .or_else(|| provider_for_source_path(path));
+            .or_else(|| provider_for_source_path(path))
+            .or_else(|| managed_provider_for_source_path(path));
         let trace_started = trace::begin();
         let resolved_namespace = hint
             .map(|provider| {
@@ -5718,9 +5955,12 @@ mod tests {
             let id = provider.provider_id.as_str();
             let claims_discover = provider.discover != CapabilityLevel::Unsupported
                 && provider.discover != CapabilityLevel::Unknown;
+            // The M2 providers use managed provider-specific traversal roots
+            // and exact descriptor rules instead of this legacy root table.
+            let provider_specific = matches!(id, "workbuddy" | "zcode" | "deepseek-harness");
             assert_eq!(
                 claims_discover,
-                wired.contains(id),
+                wired.contains(id) || provider_specific,
                 "{id}: capability.rs discover={:?} 与 PROVIDER_DISCOVERY_ROOTS 登记状态\
                  （{}）不一致——有 root 就不能记 Unsupported，无 root 就不能宣称可发现",
                 provider.discover,
@@ -5825,6 +6065,13 @@ mod tests {
             "tencent-codebuddy",
             include_bytes!("../../agent-session-grep-provider-codebuddy/tests/golden/basic.jsonl"),
         ),
+        (
+            "workbuddy",
+            br#"{"type":"session-meta","sessionId":"synthetic-wb-session","timestamp":0,"meta":{"codebuddy.ai/hostKind":"workbuddy"}}
+{"type":"message","id":"synthetic-wb-user","sessionId":"synthetic-wb-session","cwd":"/synthetic/project","timestamp":1,"role":"user","content":[{"type":"text","text":"  original prompt  "}],"__codebuddyLocal":{}}
+{"type":"message","id":"synthetic-wb-assistant","sessionId":"synthetic-wb-session","cwd":"/synthetic/project","timestamp":2,"role":"assistant","content":[{"type":"text","text":"response"}],"__codebuddyLocal":{}}
+"#,
+        ),
     ];
 
     /// 对一份字节跑全 registry probe，返回并列最高置信度的 variant 集合。
@@ -5868,9 +6115,10 @@ mod tests {
     }
 
     #[test]
-    fn twin_fixture_table_covers_every_record_stream_provider() {
-        // 新增 provider 而未登记 fixture 时立即失败，否则下面的 twin 守卫会静默
-        // 漏检新来者——pi/openclaw 的碰撞正是"没人对照过"才活到运行期的。
+    fn twin_fixture_table_covers_every_raw_record_stream_provider() {
+        // Raw record-stream adapters that share the content probe space need a
+        // twin fixture. Whole-file SQLite and compressed/encoded streams are
+        // covered by their provider-specific parser suites.
         let matrix = ProviderCapabilityMatrix::current();
         let covered: BTreeSet<&str> = TWIN_FIXTURES.iter().map(|(id, _)| *id).collect();
         assert_eq!(
@@ -5878,18 +6126,20 @@ mod tests {
             TWIN_FIXTURES.len(),
             "TWIN_FIXTURES 不得有重复 provider id"
         );
-        // 整档 SQLite 源单列：probe 靠 magic header + 表结构，不与 JSONL 争同一字节。
-        let whole_file_sqlite: BTreeSet<&str> = ["opencode", "cursor"].into_iter().collect();
+        // Separate physical formats cannot share these raw-byte twins.
+        let separate_format: BTreeSet<&str> = ["opencode", "cursor", "zcode", "deepseek-harness"]
+            .into_iter()
+            .collect();
         let implemented: BTreeSet<&str> = matrix
             .providers
             .iter()
             .filter(|p| p.maturity != ProviderMaturity::Unsupported)
             .map(|p| p.provider_id.as_str())
-            .filter(|id| !whole_file_sqlite.contains(id))
+            .filter(|id| !separate_format.contains(id))
             .collect();
         assert_eq!(
             covered, implemented,
-            "TWIN_FIXTURES 必须恰好覆盖除整档 SQLite 源外的全部已实现 provider"
+            "TWIN_FIXTURES 必须恰好覆盖全部原始 record-stream provider"
         );
     }
 
@@ -5917,17 +6167,21 @@ mod tests {
             if variants.len() == 1 {
                 continue;
             }
-            // 并列：每个并列 provider 都必须有登记根，否则其源不可索引。
+            // 并列：每个并列 provider 都必须有登记根或专用 managed traversal
+            // 布局事实，否则其源不可索引。
             let claimants: Vec<&str> = variants
                 .iter()
                 .map(|v| v.split('/').next().unwrap_or(v))
                 .collect();
             for claimant in &claimants {
+                let provider_specific =
+                    matches!(*claimant, "workbuddy" | "zcode" | "deepseek-harness");
                 assert!(
-                    wired.contains(claimant),
+                    wired.contains(claimant) || provider_specific,
                     "{provider_id} 的 fixture 被 {claimants:?} 并列认领（生产路径会\
-                     整源拒绝），但 `{claimant}` 未登记规范根——该 provider 的源\
-                     既无法靠内容区分也无路径事实可依，属可发布缺陷"
+                     整源拒绝），但 `{claimant}` 既未登记规范根，也没有专用\
+                     managed traversal 布局事实——该 provider 的源无法消歧，\
+                     属可发布缺陷"
                 );
             }
         }
@@ -6832,15 +7086,16 @@ mod tests {
     }
 
     #[test]
-    fn deferred_provider_output_has_null_maturity_target() {
+    fn m2_provider_output_has_beta_targets() {
         let output = provider_matrix_data();
         let rows = output["providers"].as_array().expect("providers array");
-        for provider_id in ["deepseek-harness", "zcode"] {
+        for provider_id in ["workbuddy", "deepseek-harness", "zcode"] {
             let row = rows
                 .iter()
                 .find(|row| row["provider_id"] == provider_id)
-                .unwrap_or_else(|| panic!("missing deferred provider {provider_id}"));
-            assert!(row["maturity_target"].is_null(), "{row}");
+                .unwrap_or_else(|| panic!("missing M2 provider {provider_id}"));
+            assert_eq!(row["maturity"], "experimental");
+            assert_eq!(row["maturity_target"], "beta", "{row}");
         }
     }
 

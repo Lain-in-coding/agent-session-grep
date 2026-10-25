@@ -417,6 +417,11 @@ fn physical_evidence(message_count: usize) {
     let before_db = fs::metadata(&f.db).unwrap().len();
     let before_total = bytes(f.root.path());
     let before_search = f.ok(&["search", "retention"]);
+    let before_schema = scalar(&f.db, "PRAGMA user_version");
+    assert_eq!(
+        before_schema,
+        agent_session_grep_adapters_sqlite::SCHEMA_VERSION
+    );
     let generation = scalar(
         &f.db,
         "SELECT active_generation FROM store_metadata WHERE singleton=1",
@@ -448,7 +453,7 @@ fn physical_evidence(message_count: usize) {
         ),
         generation
     );
-    assert_eq!(scalar(&f.db, "PRAGMA user_version"), 19);
+    assert_eq!(scalar(&f.db, "PRAGMA user_version"), before_schema);
     assert_eq!(f.submit(&token), id, "completed token remains idempotent");
     f.stopped();
     let after_db = fs::metadata(&f.db).unwrap().len();

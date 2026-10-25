@@ -3399,12 +3399,12 @@ fn providers_robot_output_is_a_stable_matrix_envelope() {
                 .expect("serialize maturity target")
         );
     }
-    for deferred in ["deepseek-harness", "zcode"] {
+    for m2 in ["workbuddy", "deepseek-harness", "zcode"] {
         let row = rows
             .iter()
-            .find(|row| row["provider_id"] == deferred)
-            .unwrap_or_else(|| panic!("missing deferred provider {deferred}"));
-        assert!(row["maturity_target"].is_null(), "{row}");
+            .find(|row| row["provider_id"] == m2)
+            .unwrap_or_else(|| panic!("missing M2 provider {m2}"));
+        assert_eq!(row["maturity_target"], "beta", "{row}");
     }
 }
 
@@ -3423,7 +3423,7 @@ fn providers_human_output_uses_the_human_renderer() {
         "{text}"
     );
     assert!(text.contains("maturity=experimental"), "{text}");
-    assert!(text.contains("target=—"), "{text}");
+    assert!(text.contains("target=beta"), "{text}");
     assert!(text.contains("tool_activity="), "{text}");
     assert!(text.contains("incremental="), "{text}");
 }
@@ -7285,7 +7285,150 @@ const GOLDEN_SOURCES: &[(&str, &str)] = &[
         "tencent-codebuddy",
         "../agent-session-grep-provider-codebuddy/tests/golden/basic.jsonl",
     ),
+    // The M2 adapters have runtime-generated synthetic fixtures. Keeping the
+    // marker here makes the matrix guard require all three without committing
+    // private provider databases or binary transcripts.
+    ("workbuddy", "@workbuddy-runtime"),
+    ("zcode", "@zcode-runtime"),
+    ("deepseek-harness", "@dsh-runtime"),
 ];
+
+/// Materialize a pinned source or one of the three M2 runtime fixtures. The
+/// generated paths deliberately match each provider's registered layout so an
+/// explicit `sync <file>` resolves the same provider hint as discovery.
+fn materialize_golden_source(provider_id: &str, relative: &str, dir: &Path) -> std::path::PathBuf {
+    if relative == "@workbuddy-runtime" {
+        let root = dir.join(".workbuddy/projects/synthetic-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("basic.jsonl");
+        let header = serde_json::json!({
+            "type": "session-meta", "id": "synthetic-wb-header",
+            "sessionId": "synthetic-wb-session", "timestamp": 0,
+            "meta": {"codebuddy.ai/hostKind": "workbuddy"}
+        });
+        let message = serde_json::json!({
+            "type": "message", "id": "synthetic-wb-message",
+            "sessionId": "synthetic-wb-session", "cwd": "/synthetic/project",
+            "timestamp": 1_700_000_000_123_i64, "role": "user",
+            "content": [{"type": "text", "text": "workbuddy original evidence"}],
+            "__codebuddyLocal": {"sensitiveUserInputReviewed": true}
+        });
+        let bytes = format!("{}\n{}\n", header, message);
+        std::fs::write(&path, bytes).unwrap();
+        return path;
+    }
+    if relative == "@zcode-runtime" {
+        let root = dir.join(".zcode/cli/db");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE session(id TEXT PRIMARY KEY,project_id TEXT,parent_id TEXT,directory TEXT,version TEXT,time_created INTEGER,time_updated INTEGER,revert TEXT);
+             CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,time_created INTEGER,time_updated INTEGER,data TEXT,sequence INTEGER);
+             CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE,session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,time_created INTEGER,time_updated INTEGER,data TEXT,sequence INTEGER);
+             CREATE TABLE session_entry(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,data TEXT);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO session VALUES(?1,?2,NULL,?3,?4,1,2,NULL)",
+            rusqlite::params![
+                "synthetic-zcode-session",
+                "synthetic-project",
+                "/synthetic/project",
+                "0.16.9"
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES(?1,?2,1,1,?3,0)",
+            rusqlite::params![
+                "synthetic-zcode-message",
+                "synthetic-zcode-session",
+                "{\"role\":\"user\"}"
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO part VALUES(?1,?2,?3,1,1,?4,0)",
+            rusqlite::params![
+                "synthetic-zcode-part",
+                "synthetic-zcode-message",
+                "synthetic-zcode-session",
+                "{\"type\":\"text\",\"text\":\"zcode original evidence\"}"
+            ],
+        )
+        .unwrap();
+        db.close().unwrap();
+        return path;
+    }
+    if relative == "@dsh-runtime" {
+        let root = dir.join(".dsh/sessions/synthetic-dsh-session");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl.zstd");
+        let rows = [
+            serde_json::json!({"type":"session","version":4,"id":"synthetic-dsh-session","createdAt":0,"cwd":"/synthetic/project","isSeeded":false,"delegationDepth":0}),
+            serde_json::json!({"type":"user/message","seq":0,"time":1_700_000_000_123_u64,"data":{"id":"synthetic-dsh-message","role":"user","content":[{"type":"text","text":"deepseek harness original evidence"}],"source":{"kind":"user"}},"surfaceOp":"append"}),
+        ];
+        let mut plain = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut plain, &row).unwrap();
+            plain.push(b'\n');
+        }
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&plain).unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        return path;
+    }
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    let root_relative = match provider_id {
+        "pi" => Some(".pi/agent/sessions"),
+        "openclaw" => Some(".openclaw/agents"),
+        _ => None,
+    };
+    let staged = match root_relative {
+        Some(root) => dir.join(root),
+        None => dir.to_path_buf(),
+    };
+    std::fs::create_dir_all(&staged).unwrap();
+    let source = staged.join(golden.file_name().unwrap());
+    std::fs::copy(&golden, &source).unwrap();
+    source
+}
+
+fn golden_query(provider_id: &str, relative: &str) -> String {
+    if relative == "@workbuddy-runtime" {
+        return "evidence".into();
+    }
+    if relative == "@zcode-runtime" {
+        return "zcode".into();
+    }
+    if relative == "@dsh-runtime" {
+        return "deepseek".into();
+    }
+    let expected_relative = relative
+        .rsplit_once('/')
+        .map(|(dir, _)| format!("{dir}/basic.expected.json"))
+        .unwrap_or_else(|| {
+            panic!("{provider_id}: golden path should contain a directory: {relative}")
+        });
+    let expected_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(expected_relative);
+    let expected: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&expected_path)
+            .unwrap_or_else(|error| panic!("{provider_id}: read expected fixture: {error}")),
+    )
+    .unwrap();
+    expected["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{provider_id}: expected fixture has no messages"))
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .flat_map(|body| body.split(|c: char| !c.is_ascii_alphanumeric()))
+        .find(|token| token.len() >= 3 && token.chars().all(|c| c.is_ascii_alphabetic()))
+        .unwrap_or_else(|| panic!("{provider_id}: no ASCII query token in golden body"))
+        .to_ascii_lowercase()
+}
 
 /// `incremental` 声明必须与真实 resync 行为一致（逐 provider 用其 pinned golden
 /// 源实测）。
@@ -7297,11 +7440,11 @@ const GOLDEN_SOURCES: &[(&str, &str)] = &[
 /// parse**（`unchanged` 上报已存消息数），再由
 /// `commit_source_batches_if_changed` 做内容级 no-op 判定、不推进 generation。
 /// 这条链上没有任何 per-provider 分支，adapter 也不参与——`incremental` 因此
-/// 只取决于"源是否有稳定字节身份"，对全部 14 个已实现 provider 一致成立。
+/// 只取决于"源是否有稳定字节身份"，对全部 17 个已实现 provider 一致成立。
 /// 此前的 `Unsupported` 是少报，本测试把它钉成可执行断言。
 ///
 /// 断言形态与既有 `sync_commits_then_reports_unchanged_on_resync`（claude）/
-/// `..._codex` 同构，只是覆盖全部 14 个 provider 的真实 golden 源：
+/// `..._codex` 同构，只是覆盖全部 17 个 provider 的真实 golden 源：
 /// 首次 sync 提交 N 条并推进 generation，二次 sync `committed=0` /
 /// `unchanged=N` / generation 不变。
 #[test]
@@ -7316,14 +7459,14 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
         .iter()
         .filter(|p| p.maturity != ProviderMaturity::Unsupported)
         .collect();
-    assert_eq!(implemented.len(), 14, "已实现 provider 应为 14 个");
+    assert_eq!(implemented.len(), 17, "已实现 provider 应为 17 个");
     let mut covered: Vec<&str> = GOLDEN_SOURCES.iter().map(|(id, _)| *id).collect();
     let mut expected: Vec<&str> = implemented.iter().map(|p| p.provider_id.as_str()).collect();
     covered.sort_unstable();
     expected.sort_unstable();
     assert_eq!(
         covered, expected,
-        "GOLDEN_SOURCES 必须恰好覆盖 capability.rs 的 14 个已实现 provider"
+        "GOLDEN_SOURCES 必须恰好覆盖 capability.rs 的 17 个已实现 provider"
     );
 
     for cap in implemented {
@@ -7332,7 +7475,6 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
             .find(|(id, _)| *id == cap.provider_id)
             .expect("covered above")
             .1;
-        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
         let provider_id = cap.provider_id.as_str();
 
         // 每个 provider 独立 db + 独立源副本：pi/openclaw 是同格式孪生，必须
@@ -7340,19 +7482,7 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
         // `explicit_sync_resolves_twin_formats_by_registered_root`）。这里用
         // `<tmp>/<home-relative-root>/basic.<ext>` 复刻该布局。
         let (dir, db) = temp_db(&format!("incr-{provider_id}"));
-        let root_relative = match provider_id {
-            "pi" => Some(".pi/agent/sessions"),
-            "openclaw" => Some(".openclaw/agents"),
-            _ => None,
-        };
-        let staged = match root_relative {
-            Some(root) => dir.path().join(root),
-            None => dir.path().to_path_buf(),
-        };
-        std::fs::create_dir_all(&staged).expect("create staging root");
-        let file_name = golden.file_name().expect("golden file name");
-        let source = staged.join(file_name);
-        std::fs::copy(&golden, &source).expect("copy golden source");
+        let source = materialize_golden_source(provider_id, relative, dir.path());
         let path = source.to_string_lossy().into_owned();
 
         // 首次 sync：提交 N 条消息，generation 推进到 1。
@@ -7425,7 +7555,7 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
 
 /// `search` 声明必须与真实检索行为一致（逐 provider 用其 pinned golden 源实测）。
 ///
-/// 起因：`search` 对全部 14 个已实现 provider 声明 `Native`，但此前只有
+/// 起因：`search` 对全部 17 个已实现 provider 声明非 `Unsupported`，但此前只有
 /// doc↔`capability.rs` 一致性守护，没有任何测试把"某 provider 的正文真的能被检索
 /// 到"钉成断言。这是能力列里风险最实的一种漏检：`parse` 落库与 `search` 可检索之
 /// 间还隔着 FTS 索引写入与查询投影，任一环节对某种正文（CJK、emoji、超长行、
@@ -7434,7 +7564,7 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
 ///
 /// 断言形态：sync 该 provider 的真实 golden 源 → 从**它自己的** golden 正文里取一
 /// 个词做 query → 要求命中非空、命中正文确实包含该词、且命中 id 是 `msg_v1_`
-/// 形态。query 取自 golden 自身而非固定单词，因为 14 个 fixture 的语言不同
+/// 形态。query 取自 golden 自身而非固定单词，因为 17 个 fixture 的语言不同
 /// （codex 是中文 + emoji、claude-code 混中英），固定英文词会在非英文 fixture 上
 /// 假失败——那是 harness 缺陷而非能力缺陷。
 #[test]
@@ -7449,7 +7579,7 @@ fn capability_search_claim_matches_real_retrieval_for_every_provider() {
         .iter()
         .filter(|p| p.maturity != ProviderMaturity::Unsupported)
         .collect();
-    assert_eq!(implemented.len(), 14, "已实现 provider 应为 14 个");
+    assert_eq!(implemented.len(), 17, "已实现 provider 应为 17 个");
 
     for cap in implemented {
         let provider_id = cap.provider_id.as_str();
@@ -7458,23 +7588,9 @@ fn capability_search_claim_matches_real_retrieval_for_every_provider() {
             .find(|(id, _)| *id == provider_id)
             .unwrap_or_else(|| panic!("{provider_id}: GOLDEN_SOURCES 缺少条目"))
             .1;
-        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-
         // 与 incremental 守护同一布局：pi/openclaw 是同格式孪生，身份来自登记根。
         let (dir, db) = temp_db(&format!("search-{provider_id}"));
-        let root_relative = match provider_id {
-            "pi" => Some(".pi/agent/sessions"),
-            "openclaw" => Some(".openclaw/agents"),
-            _ => None,
-        };
-        let staged = match root_relative {
-            Some(root) => dir.path().join(root),
-            None => dir.path().to_path_buf(),
-        };
-        std::fs::create_dir_all(&staged).expect("create staging root");
-        let file_name = golden.file_name().expect("golden file name");
-        let source = staged.join(file_name);
-        std::fs::copy(&golden, &source).expect("copy golden source");
+        let source = materialize_golden_source(provider_id, relative, dir.path());
         let path = source.to_string_lossy().into_owned();
 
         let out = run(&db, &["sync", &path]);
@@ -7495,35 +7611,7 @@ fn capability_search_claim_matches_real_retrieval_for_every_provider() {
         // 从该 provider 自己的 pinned 基线正文里取一个可查询词：≥3 字符的
         // ASCII 字母 token（FTS5 默认 unicode61 分词器对 ASCII 词的切分稳定，
         // 对 CJK 逐字切分，故只取 ASCII token 以保证 query 语义确定）。
-        let expected_relative = relative
-            .rsplit_once('/')
-            .map(|(dir, _)| format!("{dir}/basic.expected.json"))
-            .unwrap_or_else(|| panic!("{provider_id}: golden 路径应含目录: {relative}"));
-        let expected_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&expected_relative);
-        let expected_raw = std::fs::read_to_string(&expected_path)
-            .unwrap_or_else(|e| panic!("{provider_id}: 读取 {expected_relative} 失败: {e}"));
-        let expected: serde_json::Value = serde_json::from_str(&expected_raw)
-            .unwrap_or_else(|e| panic!("{provider_id}: expected.json 非合法 JSON: {e}"));
-        let bodies: Vec<String> = expected["messages"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{provider_id}: expected.json 缺少 messages 数组"))
-            .iter()
-            .filter_map(|m| m["text"].as_str().map(str::to_owned))
-            .collect();
-        let query = bodies
-            .iter()
-            .flat_map(|body| {
-                body.split(|c: char| !c.is_ascii_alphanumeric())
-                    .filter(|token| {
-                        token.len() >= 3 && token.chars().all(|c| c.is_ascii_alphabetic())
-                    })
-                    .map(str::to_lowercase)
-                    .collect::<Vec<_>>()
-            })
-            .next()
-            .unwrap_or_else(|| {
-                panic!("{provider_id}: pinned golden 正文里找不到可查询的 ASCII 词，无法实测检索")
-            });
+        let query = golden_query(provider_id, relative);
 
         let out = run(&db, &["search", &query]);
         match cap.search {

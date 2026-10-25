@@ -1074,6 +1074,9 @@ fn protocol_error(error: crate::protocol::ProtocolError) -> HttpResponse {
         crate::protocol::CanonicalCode::CapabilityNotSupported => {
             "capability not supported in this mode"
         }
+        crate::protocol::CanonicalCode::UpdateRecoveryRequired => {
+            "program update recovery is required"
+        }
         crate::protocol::CanonicalCode::Internal => "internal operation failed",
     };
     redacted_json(

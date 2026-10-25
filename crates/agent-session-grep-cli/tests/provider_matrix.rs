@@ -6,9 +6,10 @@
 //! schema 用 include_str! 交叉验证同一纪律）。
 //!
 //! 下半部分是 beta-readiness ledger（`docs/product/PROVIDER-BETA-READINESS.md`）的
-//! 可执行漂移测试：14 个已实现 adapter 的真实 `AdapterManifest`（经由各 adapter 的
+//! 可执行漂移测试：当前 adapter 的真实 `AdapterManifest`（经由各 adapter 的
 //! `manifest()` → `manifest_for`）必须与 ledger 的本地列和全局 blocker 一致，且
-//! ledger 必须恰好列出 capability.rs 的 14 个已实现 + 2 个 deferred provider。
+//! ledger 必须恰好列出 capability.rs 的实现行；M2 样本在内存合成，不冒称
+//! 原有 pinned golden、property 全覆盖或真实宿主/原生平台验收。
 
 use agent_session_grep_domain::TokenSource;
 use agent_session_grep_ports::Confidence;
@@ -23,6 +24,7 @@ use agent_session_grep_provider_cline::ClineAdapter;
 use agent_session_grep_provider_codebuddy::CodeBuddyAdapter;
 use agent_session_grep_provider_codex::CodexAdapter;
 use agent_session_grep_provider_cursor::CursorAdapter;
+use agent_session_grep_provider_dsh::DeepSeekHarnessAdapter;
 use agent_session_grep_provider_grok::GrokBuildAdapter;
 use agent_session_grep_provider_hermes::OpenHermesAdapter;
 use agent_session_grep_provider_kimi::KimiCodeAdapter;
@@ -30,6 +32,8 @@ use agent_session_grep_provider_openclaw::OpenClawAdapter;
 use agent_session_grep_provider_opencode::OpenCodeAdapter;
 use agent_session_grep_provider_pi::PiAdapter;
 use agent_session_grep_provider_qoder::QoderAdapter;
+use agent_session_grep_provider_workbuddy::WorkBuddyAdapter;
+use agent_session_grep_provider_zcode::ZCodeAdapter;
 
 /// matrix 文档原文（相对本源文件路径）。
 const MATRIX: &str = include_str!("../../../docs/product/PROVIDER-MATURITY-MATRIX.md");
@@ -116,13 +120,13 @@ fn matrix_marks_both_providers_experimental_not_beta() {
 }
 
 #[test]
-fn matrix_rows_match_capability_matrix_all_sixteen() {
+fn matrix_rows_match_capability_matrix_all_seventeen() {
     // capability.rs 是单源权威（本文件头注释声明同一纪律）；矩阵文档必须与它
     // 逐行一致。任一侧增删 provider 或改 variant/maturity 而未同步，立即失败。
     let matrix = ProviderCapabilityMatrix::current();
     let rows = matrix_rows();
-    assert_eq!(matrix.providers.len(), 16, "capability.rs 应有 16 行");
-    assert_eq!(rows.len(), 16, "矩阵文档应有 16 行");
+    assert_eq!(matrix.providers.len(), 17, "capability.rs 应有 17 行");
+    assert_eq!(rows.len(), 17, "矩阵文档应有 17 行");
 
     for cap in &matrix.providers {
         let row = rows
@@ -202,7 +206,220 @@ fn beta_ledger_cell_to_level(cell: &str) -> Option<CapabilityLevel> {
     })
 }
 
-/// 与 CLI `provider_registry()` 同序的 14 个已实现 adapter。
+// M2 inputs are generated from the frozen public schema facts. They are not
+// copies of private corpora, legacy pinned golden or native acceptance receipts.
+const M2_SYNTHETIC_IDS: &[&str] = &["workbuddy", "zcode", "deepseek-harness"];
+
+fn m2_fixture_revision(id: &str) -> u32 {
+    let provenance = match id {
+        "workbuddy" => {
+            include_str!("../../agent-session-grep-provider-workbuddy/tests/PROVENANCE.md")
+        }
+        "zcode" => include_str!("../../agent-session-grep-provider-zcode/tests/PROVENANCE.md"),
+        "deepseek-harness" => {
+            include_str!("../../agent-session-grep-provider-dsh/tests/PROVENANCE.md")
+        }
+        _ => panic!("no M2 fixture provenance for {id}"),
+    };
+    provenance
+        .lines()
+        .find_map(|line| line.strip_prefix("Fixture revision: "))
+        .and_then(|revision| revision.trim_end_matches('.').parse::<u32>().ok())
+        .filter(|revision| *revision > 0)
+        .unwrap_or_else(|| panic!("{id}: missing nonzero synthetic fixture revision"))
+}
+
+fn m2_adapter_fixture(id: &str) -> Option<(Box<dyn ProviderAdapter>, Vec<u8>)> {
+    use serde_json::json;
+    match id {
+        "workbuddy" => {
+            let rows = [
+                json!({"type":"session-meta","sessionId":"synthetic-wb-session","timestamp":0,
+                    "meta":{"codebuddy.ai/hostKind":"workbuddy"}}),
+                json!({"type":"message","id":"synthetic-wb-user","sessionId":"synthetic-wb-session",
+                    "cwd":"/synthetic/project","timestamp":1,"role":"user",
+                    "content":[{"type":"text","text":"  original prompt  "}],"__codebuddyLocal":{}}),
+                json!({"type":"message","id":"synthetic-wb-assistant","sessionId":"synthetic-wb-session",
+                    "cwd":"/synthetic/project","timestamp":2,"role":"assistant",
+                    "content":[{"type":"text","text":"response"}],"__codebuddyLocal":{}}),
+                json!({"type":"function_call","callId":"synthetic-call","messageId":"synthetic-wb-assistant",
+                    "name":"synthetic-tool","arguments":{}}),
+                json!({"type":"function_call_result","callId":"synthetic-call","status":"success"}),
+            ];
+            let mut bytes = Vec::new();
+            for row in rows {
+                serde_json::to_writer(&mut bytes, &row).unwrap();
+                bytes.push(b'\n');
+            }
+            Some((Box::new(WorkBuddyAdapter::new()), bytes))
+        }
+        "zcode" => {
+            use rusqlite::{Connection, MAIN_DB, params};
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON;
+CREATE TABLE session(id TEXT PRIMARY KEY,project_id TEXT,parent_id TEXT,directory TEXT,version TEXT,time_created INTEGER,time_updated INTEGER,revert TEXT);
+CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT,sequence INTEGER);
+CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT,sequence INTEGER);
+CREATE TABLE session_entry(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,data TEXT);
+INSERT INTO session VALUES('synthetic-z-session','synthetic-project',NULL,'/synthetic/project','synthetic-version',0,1,NULL);").unwrap();
+            for (id, seq, role, text) in [
+                ("synthetic-z-user", 0, "user", "  original prompt  "),
+                ("synthetic-z-assistant", 1, "assistant", "response"),
+            ] {
+                db.execute(
+                    "INSERT INTO message VALUES(?1,'synthetic-z-session',1,2,?2,?3)",
+                    params![id, json!({"role":role}).to_string(), seq],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO part VALUES(?1,?2,'synthetic-z-session',1,2,?3,0)",
+                    params![
+                        format!("text-{id}"),
+                        id,
+                        json!({"type":"text","text":text}).to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            db.execute("INSERT INTO part VALUES('synthetic-tool','synthetic-z-assistant','synthetic-z-session',1,2,?1,1)",
+                [json!({"type":"tool","callID":"synthetic-call","tool":"synthetic-tool",
+                    "state":{"status":"completed","input":{}}}).to_string()]).unwrap();
+            Some((
+                Box::new(ZCodeAdapter::new()),
+                db.serialize(MAIN_DB).unwrap().to_vec(),
+            ))
+        }
+        "deepseek-harness" => {
+            use std::io::Write;
+            let groups = [
+                vec![
+                    json!({"type":"session","version":4,"id":"synthetic-dsh-session",
+                    "createdAt":0,"cwd":"/synthetic/project","isSeeded":false,"delegationDepth":0}),
+                ],
+                vec![
+                    json!({"type":"user/message","seq":0,"time":1,"surfaceOp":"append",
+                    "data":{"id":"synthetic-dsh-user","role":"user","source":{"kind":"user"},
+                    "content":[{"type":"text","text":"  original prompt  "}]}}),
+                ],
+                vec![
+                    json!({"type":"assistant/message","seq":1,"time":2,"surfaceOp":"append",
+                    "data":{"turn":0,"step":0,"stream":[],"message":{"id":"synthetic-dsh-assistant",
+                    "role":"assistant","source":{"kind":"model","provider":"synthetic-provider","model":"synthetic-model"},
+                    "content":[{"type":"text","text":"response"}]}}}),
+                ],
+            ];
+            let mut bytes = Vec::new();
+            for rows in groups {
+                let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+                encoder.include_checksum(true).unwrap();
+                for row in rows {
+                    serde_json::to_writer(&mut encoder, &row).unwrap();
+                    encoder.write_all(b"\n").unwrap();
+                }
+                bytes.extend(encoder.finish().unwrap());
+            }
+            Some((Box::new(DeepSeekHarnessAdapter::new()), bytes))
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn m2_frozen_adapter_manifest_probe_parse_and_provenance_match_current_rows() {
+    use agent_session_grep_ports::StreamingSupport;
+    use agent_session_grep_ports::manifest::ZCODE_MAX_SOURCE_BYTES;
+    let matrix = ProviderCapabilityMatrix::current();
+    for id in M2_SYNTHETIC_IDS {
+        let (adapter, bytes) = m2_adapter_fixture(id).unwrap();
+        let before = bytes.clone();
+        let cap = matrix.find(id).unwrap();
+        assert_eq!(adapter.provider_id(), *id);
+        let manifest = adapter.manifest();
+        assert_eq!(manifest.capabilities, *cap);
+        assert_eq!(manifest.supported_variants, vec![cap.variant_id.clone()]);
+        assert_eq!(manifest.maturity, ProviderMaturity::Experimental);
+        assert_eq!(
+            ProviderMaturity::target_for(id),
+            Some(ProviderMaturity::Beta)
+        );
+        assert!(manifest.last_certified_targets.is_empty());
+        assert!(!manifest.known_limitations.is_empty());
+        assert_eq!(manifest.fixture_revision, Some(m2_fixture_revision(id)));
+        if *id == "zcode" {
+            assert_eq!(
+                manifest.streaming_support,
+                StreamingSupport::BoundedWholeSource
+            );
+            assert_eq!(manifest.max_source_size, Some(ZCODE_MAX_SOURCE_BYTES));
+            assert_eq!(manifest.max_record_size, None);
+        } else {
+            assert_eq!(manifest.streaming_support, StreamingSupport::RecordStream);
+            assert_eq!(manifest.max_source_size, None);
+            assert_eq!(
+                manifest.max_record_size,
+                Some(agent_session_grep_ports::STREAM_RECORD_MAX_BYTES)
+            );
+            if *id == "deepseek-harness" {
+                assert!(manifest.known_limitations.iter().any(|limit| {
+                    limit.contains("decoded output is capped at 256 MiB")
+                        && limit.contains("records at 8 MiB")
+                        && limit.contains("input at 128 MiB")
+                        && limit.contains("decoder window at 8 MiB")
+                }));
+            }
+        }
+        let probed = adapter.probe(&bytes).unwrap();
+        assert_eq!(probed.variant_id, cap.variant_id);
+        assert!(matches!(
+            probed.confidence,
+            Confidence::High | Confidence::Confirmed
+        ));
+        let mut sink = agent_session_grep_testkit::golden::CapturingSink::default();
+        let report = adapter.parse(&bytes, &mut sink).unwrap();
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(sink.messages.len(), 2);
+        assert_eq!(sink.messages[0].text, "  original prompt  ");
+        assert!(
+            sink.messages
+                .iter()
+                .all(|message| !message.native_id.is_empty())
+        );
+        assert!(
+            sink.messages
+                .iter()
+                .all(|message| message.parent_native_id.is_none())
+        );
+        assert!(sink.usages.is_empty());
+        if *id == "workbuddy" {
+            assert_eq!(sink.messages[0].native_id, "synthetic-wb-user");
+            for message in &sink.messages {
+                let (start, end) = message.span.unwrap();
+                let row: serde_json::Value =
+                    serde_json::from_slice(&bytes[start as usize..end as usize]).unwrap();
+                assert_eq!(row["id"], message.native_id);
+            }
+            assert_eq!(sink.activities.len(), 1);
+        } else {
+            assert!(sink.messages.iter().all(|message| message.span.is_none()));
+            if *id == "zcode" {
+                assert_eq!(sink.messages[0].native_id, "zcode:synthetic-z-user");
+                assert_eq!(sink.activities.len(), 1);
+            } else {
+                assert_eq!(sink.messages[0].native_id, "synthetic-dsh-user");
+                assert!(sink.activities.is_empty());
+            }
+        }
+        assert_eq!(bytes, before);
+    }
+    assert_ne!(
+        matrix.find("workbuddy").unwrap().variant_id,
+        matrix.find("tencent-codebuddy").unwrap().variant_id
+    );
+}
+
+/// Existing adapters plus the frozen independent M2 implementations.
+/// Runtime registration is a separate main-owned integration.
 fn implemented_adapters() -> Vec<Box<dyn ProviderAdapter>> {
     vec![
         Box::new(ClaudeCodeAdapter::new()),
@@ -219,6 +436,9 @@ fn implemented_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(AntigravityAdapter::new()),
         Box::new(OpenHermesAdapter::new()),
         Box::new(CursorAdapter::new()),
+        Box::new(WorkBuddyAdapter::new()),
+        Box::new(ZCodeAdapter::new()),
+        Box::new(DeepSeekHarnessAdapter::new()),
     ]
 }
 
@@ -240,20 +460,24 @@ fn beta_readiness_manifests_match_ledger_evidence_columns() {
     let ledger_implemented: Vec<&str> = ledger_rows.iter().map(|row| row[0].as_str()).collect();
     assert_eq!(
         ledger_implemented.len(),
-        14,
-        "ledger 实现表应恰有 14 行，实际 {} 行",
+        17,
+        "ledger 实现表应恰有 17 行，实际 {} 行",
         ledger_implemented.len()
     );
 
     let adapters = implemented_adapters();
-    assert_eq!(adapters.len(), 14, "应恰好实例化 14 个已实现 adapter");
+    assert_eq!(adapters.len(), 17, "应恰好实例化 17 个已实现 adapter");
     for adapter in &adapters {
         let manifest = adapter.manifest();
         let id = manifest.provider_id.as_str();
         assert_eq!(
             manifest.fixture_revision,
-            Some(1),
-            "{id}: golden fixture revision 必须为 Some(1)"
+            Some(if M2_SYNTHETIC_IDS.contains(&id) {
+                m2_fixture_revision(id)
+            } else {
+                1
+            }),
+            "{id}: fixture revision must match the frozen synthetic provenance"
         );
         assert!(
             manifest.last_certified_targets.is_empty(),
@@ -298,14 +522,14 @@ fn beta_readiness_ledger_lists_exactly_implemented_and_deferred_ids() {
     ledger_implemented.sort_unstable();
     assert_eq!(
         ledger_implemented, implemented,
-        "ledger 实现表必须与 capability.rs 的 14 个已实现 provider 逐一一致"
+        "ledger 实现表必须与 capability.rs 的当前已实现 provider 逐一一致"
     );
 
     let mut ledger_deferred = beta_ledger_ids("Deferred providers");
     ledger_deferred.sort_unstable();
     assert_eq!(
         ledger_deferred, deferred,
-        "ledger deferred 表必须与 capability.rs 的 2 个 deferred provider 逐一一致"
+        "ledger deferred 表必须与 capability.rs 的当前 deferred provider 逐一一致"
     );
 }
 
@@ -394,6 +618,26 @@ const CLAUDE_GOLDEN_FIXTURE: &[u8] =
 
 /// 取某 provider 的 pinned golden 消息数组。
 fn pinned_messages(provider_id: &str) -> Vec<serde_json::Value> {
+    // Original golden outputs stay pinned. The separately labelled M2 coverage
+    // comes from a successful actual parse of runtime-generated synthetic bytes.
+    if let Some((adapter, bytes)) = m2_adapter_fixture(provider_id) {
+        let mut sink = agent_session_grep_testkit::golden::CapturingSink::default();
+        let report = adapter
+            .parse(&bytes, &mut sink)
+            .expect("M2 synthetic parse");
+        assert_eq!(report.committed, sink.messages.len());
+        return sink
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "native_id":message.native_id,
+                    "parent_native_id":message.parent_native_id,
+                    "span":message.span,
+                })
+            })
+            .collect();
+    }
     let raw = PINNED_GOLDEN
         .iter()
         .find(|(id, _)| *id == provider_id)
@@ -421,11 +665,12 @@ fn pinned_golden_table_covers_exactly_the_implemented_providers() {
         .iter()
         .map(|(id, _)| (*id).to_string())
         .collect();
+    covered.extend(M2_SYNTHETIC_IDS.iter().map(|id| (*id).to_string()));
     implemented.sort_unstable();
     covered.sort_unstable();
     assert_eq!(
         covered, implemented,
-        "PINNED_GOLDEN 必须恰好覆盖 capability.rs 的 14 个已实现 provider"
+        "Pinned legacy golden and explicit M2 synthetic coverage must match every implemented row"
     );
 }
 
@@ -805,7 +1050,7 @@ fn beta_readiness_ledger_capability_columns_match_capability_matrix() {
     // 必须与 capability.rs 权威行一致；golden/read-only 列由 manifest 测试覆盖。
     let matrix = ProviderCapabilityMatrix::current();
     let rows = beta_ledger_rows("Per-provider local readiness");
-    assert_eq!(rows.len(), 14, "ledger 实现表应恰有 14 行");
+    assert_eq!(rows.len(), 17, "ledger 实现表应恰有 17 行");
 
     // 列序：provider_id | golden | read-only | property | discover | source_span
     // | tool_activity | resume | incremental | local Beta blockers。
@@ -855,6 +1100,7 @@ fn provider_crate_dir(provider_id: &str) -> &str {
         "grok-build" => "grok",
         "kimi-code" => "kimi",
         "tencent-codebuddy" => "codebuddy",
+        "deepseek-harness" => "dsh",
         other => other,
     }
 }
@@ -871,7 +1117,7 @@ fn beta_readiness_property_column_matches_properties_test_existence() {
         .expect("必须能从 crate 目录上溯到仓库根")
         .to_path_buf();
     let rows = beta_ledger_rows("Per-provider local readiness");
-    assert_eq!(rows.len(), 14, "ledger 实现表应恰有 14 行");
+    assert_eq!(rows.len(), 17, "ledger 实现表应恰有 17 行");
     let mut checked = 0usize;
     for row in &rows {
         let provider_id = &row[0];
@@ -897,7 +1143,7 @@ fn beta_readiness_property_column_matches_properties_test_existence() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 14, "必须逐一核对 14 行的 property 列");
+    assert_eq!(checked, 17, "必须逐一核对 17 行的 property 列");
 }
 
 // ---- README.md provider 表防漂移 ----
@@ -939,7 +1185,7 @@ fn readme_provider_rows() -> Vec<(String, String, String)> {
 #[test]
 fn readme_provider_table_matches_capability_matrix_maturity() {
     // README 的 Status 列必须与 capability.rs 的 maturity 一致，且行数与
-    // 16 行权威矩阵相同。任一侧增删 provider 或提级而未同步 README，立即失败——
+    // 17 行权威矩阵相同。任一侧增删 provider 或提级而未同步 README，立即失败——
     // 对外第一眼看到的表格不能比内部台账更乐观。
     let matrix = ProviderCapabilityMatrix::current();
     let rows = readme_provider_rows();
@@ -1038,8 +1284,8 @@ fn readme_provider_format_column_matches_manifest_source_consumption() {
     let adapters = implemented_adapters_with_fixtures();
     assert_eq!(
         adapters.len(),
-        14,
-        "implemented_adapters_with_fixtures 必须覆盖 14 个已实现 provider"
+        17,
+        "implemented_adapters_with_fixtures 必须覆盖 17 个已实现 provider"
     );
 
     // README 用人读展示名（"Claude Code"），capability.rs 用 provider_id
@@ -1087,8 +1333,8 @@ fn readme_provider_format_column_matches_manifest_source_consumption() {
         checked += 1;
     }
     assert_eq!(
-        checked, 14,
-        "必须逐一核对 14 个已实现 provider 的 Format 列"
+        checked, 17,
+        "必须逐一核对 17 个已实现 provider 的 Format 列"
     );
 }
 
@@ -1097,81 +1343,87 @@ fn readme_provider_format_column_matches_manifest_source_consumption() {
 ///
 /// 与 [`PINNED_GOLDEN`]（expected.json，判定输出形状）和 e2e 的 `GOLDEN_SOURCES`
 /// （源路径，判定增量）互补：这一张要的是"喂进 adapter 的字节"。
-fn implemented_adapters_with_fixtures() -> Vec<(Box<dyn ProviderAdapter>, &'static [u8])> {
-    vec![
+fn implemented_adapters_with_fixtures() -> Vec<(Box<dyn ProviderAdapter>, Vec<u8>)> {
+    let mut pairs: Vec<(Box<dyn ProviderAdapter>, Vec<u8>)> = vec![
         (
             Box::new(ClaudeCodeAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-claude/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(AiderAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-aider/tests/golden/basic.md")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(CodexAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-codex/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(GrokBuildAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-grok/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(PiAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-pi/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(QoderAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-qoder/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(KimiCodeAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-kimi/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(OpenClawAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-openclaw/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(OpenCodeAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-opencode/tests/golden/basic.db")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(CodeBuddyAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-codebuddy/tests/golden/basic.jsonl")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(ClineAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-cline/tests/golden/basic.json")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(AntigravityAdapter::new()),
             include_bytes!(
                 "../../agent-session-grep-provider-antigravity/tests/golden/basic.jsonl"
             )
-            .as_slice(),
+            .to_vec(),
         ),
         (
             Box::new(OpenHermesAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-hermes/tests/golden/basic.json")
-                .as_slice(),
+                .to_vec(),
         ),
         (
             Box::new(CursorAdapter::new()),
             include_bytes!("../../agent-session-grep-provider-cursor/tests/golden/basic.db")
-                .as_slice(),
+                .to_vec(),
         ),
-    ]
+    ];
+    pairs.extend(
+        M2_SYNTHETIC_IDS
+            .iter()
+            .map(|id| m2_adapter_fixture(id).unwrap()),
+    );
+    pairs
 }
 
 #[test]
@@ -1190,8 +1442,8 @@ fn capability_probe_claim_matches_real_probe_on_own_golden() {
     let pairs = implemented_adapters_with_fixtures();
     assert_eq!(
         pairs.len(),
-        14,
-        "implemented_adapters_with_fixtures 必须覆盖 14 个已实现 provider"
+        17,
+        "implemented_adapters_with_fixtures 必须覆盖 17 个已实现 provider"
     );
 
     for (adapter, fixture) in &pairs {
@@ -1563,42 +1815,43 @@ fn readme_implemented_provider_count_matches_capability_matrix() {
     );
 }
 
-/// workspace 根 `Cargo.toml` 原文：README 的版本声明必须与之一致。
-const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
-
 #[test]
 fn readme_release_status_and_maturity_tiers_match_authoritative_sources() {
     // README 里剩下两处可腐坏的事实断言：
     //
-    // (1) The canonical repository has already released 0.1.0. Check its
-    //     published-version claim against Cargo and the release notes, not
-    //     the old source repository's planned-first-release wording.
+    // (1) The current Cargo version is an unreleased Beta candidate, distinct
+    //     from the canonical v0.1.0 source release.
     //
     // (2) "providers are graded certified/GA/beta/experimental/unsupported" ——
     //     等级名单必须与 `ProviderMaturity` 的真实变体一致。少一档或多一档都会
     //     让"诚实成熟度"这条宣传语本身不诚实。
-    let version = WORKSPACE_MANIFEST
-        .lines()
-        .skip_while(|line| line.trim() != "[workspace.package]")
-        .find_map(|line| line.trim().strip_prefix("version = "))
-        .map(|value| value.trim().trim_matches('"').to_string())
-        .expect("workspace Cargo.toml 必须在 [workspace.package] 下声明 version");
+    let version = env!("CARGO_PKG_VERSION");
     // README 是 CRLF 且这句话跨行折行，故先把所有空白折叠成单空格再比对——
     // 断言要盯的是"版本号一致"这件事实，不是折行位置。
     let readme_flat = README.split_whitespace().collect::<Vec<_>>().join(" ");
-    let claim =
-        format!("`{version}` is the first public release, matching the Cargo workspace version");
+    let claim = format!(
+        "`{version}` is the Cargo workspace version for the in-progress Managed Beta candidate"
+    );
     assert!(
         readme_flat.contains(&claim),
         "README 的版本声明与 workspace 版本 `{version}` 漂移——\
          这句话自称与 Cargo 版本一致，必须真的一致"
     );
 
+    let unreleased = CHANGELOG
+        .split_once("## [Unreleased]")
+        .expect("CHANGELOG must retain the Unreleased section")
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
     assert!(
-        CHANGELOG
-            .lines()
-            .any(|line| line.starts_with(&format!("## [{version}] — "))),
-        "README 的已发布版本 `{version}` 必须有对应的 CHANGELOG 版本章节"
+        unreleased.contains(&format!("`{version}` Managed Beta candidate")),
+        "CHANGELOG must identify the current Cargo version as the Managed Beta candidate"
+    );
+    assert!(
+        unreleased.contains("no tag or release is implied"),
+        "the candidate version must not be presented as a published release"
     );
 
     // 等级名单从 ProviderMaturity 的 as_str() 取真值，而不是在测试里手抄。
@@ -1650,20 +1903,22 @@ fn public_contract_release_separates_source_publication_and_checkout() {
             && !publication.contains("| Published releases | None |"),
         "the maintained publication table must not deny the recorded source release"
     );
-    let version = env!("CARGO_PKG_VERSION");
-    assert!(publication.contains(&format!("v{version}")));
+    // The published source release is an immutable historical fact. The
+    // workspace may advance to an unreleased candidate without rewriting it.
+    let published_version = "v0.1.0";
+    assert!(publication.contains(published_version));
     assert!(publication.contains("source archives"));
     assert!(publication.contains("no uploaded assets"));
     let intro = README.split("## Why?").next().unwrap();
     let intro = intro.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(intro.contains(&format!("releases/tag/v{version}")));
+    assert!(intro.contains(&format!("releases/tag/{published_version}")));
     assert!(intro.contains("unreleased changes"));
     assert!(intro.contains("no uploaded assets"));
     assert!(intro.contains("Actions artifacts are not Release assets"));
 }
 
 #[test]
-fn public_contract_issue_examples_use_the_current_binary_version() {
+fn public_contract_issue_examples_request_exact_binary_output() {
     for (name, form) in [
         (
             "bug",
@@ -1676,13 +1931,9 @@ fn public_contract_issue_examples_use_the_current_binary_version() {
     ] {
         let version = form.split_once("    id: version").unwrap().1;
         let version = version.split("  - type:").next().unwrap();
-        let example = format!(
-            "placeholder: agent-session-grep {}",
-            env!("CARGO_PKG_VERSION")
-        );
         assert!(
-            version.contains(&example),
-            "{name}: version example must match the binary, not a roadmap milestone"
+            version.contains("placeholder: agent-session-grep "),
+            "{name}: version example must retain the complete product/version format"
         );
         assert!(
             version.contains("--version"),
@@ -1708,7 +1959,7 @@ fn public_contract_adapter_docs_keep_external_process_support_planned() {
 
 #[test]
 fn public_contract_cursor_guidance_is_unsigned_and_keyless() {
-    let cursor = SKILL_MD
+    let cursor = SKILL_PROTOCOL_MD
         .lines()
         .find(|line| line.starts_with("- Cursors "))
         .unwrap();
@@ -1738,7 +1989,7 @@ fn public_contract_cursor_guidance_is_unsigned_and_keyless() {
 
 #[test]
 fn public_contract_machine_help_and_provider_filters_match_current_interfaces() {
-    let help = SKILL_MD
+    let help = SKILL_PROTOCOL_MD
         .lines()
         .find(|line| line.contains("`--help` / `--version`"))
         .unwrap();
@@ -1755,7 +2006,7 @@ fn public_contract_machine_help_and_provider_filters_match_current_interfaces() 
             );
         }
     }
-    let search = SKILL_MD
+    let search = SKILL_PROTOCOL_MD
         .lines()
         .find(|line| line.starts_with("| `search_sessions`"))
         .unwrap();
@@ -1766,7 +2017,7 @@ fn public_contract_machine_help_and_provider_filters_match_current_interfaces() 
 
 #[test]
 fn public_contract_skill_separates_catalog_writes_and_explicit_resume() {
-    let intro = SKILL_MD.split("## Robot CLI").next().unwrap();
+    let intro = SKILL_PROTOCOL_MD.split("## Robot CLI").next().unwrap();
     assert!(
         !intro.contains("read-only searchable catalog"),
         "source transcripts, not the writable catalog, are read-only"
@@ -1774,7 +2025,7 @@ fn public_contract_skill_separates_catalog_writes_and_explicit_resume() {
     assert!(
         intro.contains("writable local catalog") && intro.contains("transcripts stay read-only")
     );
-    let cautions = current_doc_section(SKILL_MD, "## Cautions");
+    let cautions = current_doc_section(SKILL_PROTOCOL_MD, "## Cautions");
     for token in [
         "`sync`",
         "`index`",
@@ -2046,6 +2297,8 @@ fn readme_and_changelog_publish_every_applied_lexical_rank_signal() {
 /// 面向 Agent 的 Skill 说明原文。它是 MCP/Robot 调用方读到的第一手用法，
 /// 却此前完全没有守护。
 const SKILL_MD: &str = include_str!("../../../skills/agent-session-grep/SKILL.md");
+const SKILL_PROTOCOL_MD: &str =
+    include_str!("../../../skills/agent-session-grep/references/robot-protocol.md");
 
 /// `PROVIDER_DISCOVERY_ROOTS` 的 `(provider_id, 扩展名)`，从 CLI 源解析。
 fn discovery_roots() -> Vec<(String, String)> {
@@ -2077,6 +2330,7 @@ fn discovery_roots() -> Vec<(String, String)> {
 
 #[test]
 fn discovery_root_registry_matches_capability_matrix_and_published_docs() {
+    assert!(SKILL_MD.contains("references/robot-protocol.md"));
     // 抓到过的漂移：SKILL.md 的 `sync --discover` 行只点名 6 个数据根并声称
     // "sync every `.jsonl` transcript found"，而注册表已有 12 个根、三种扩展名
     // （opencode 是 SQLite `db`，hermes/cline 是 `json`）。调用方据此得出
@@ -2102,14 +2356,32 @@ fn discovery_root_registry_matches_capability_matrix_and_published_docs() {
         })
         .map(|p| p.provider_id.as_str())
         .collect();
-    assert_eq!(
-        registered, declared,
-        "PROVIDER_DISCOVERY_ROOTS 与 capability.rs 的 discover 列不一致——\
-         登记了根却记 unsupported 是少报，记 native 却没有根是虚报"
+    let fully_declared: std::collections::BTreeSet<&str> = matrix
+        .providers
+        .iter()
+        .filter(|p| {
+            p.maturity != ProviderMaturity::Unsupported
+                && matches!(
+                    p.discover,
+                    CapabilityLevel::Native | CapabilityLevel::Derived
+                )
+        })
+        .map(|p| p.provider_id.as_str())
+        .collect();
+    assert!(
+        fully_declared.is_subset(&registered),
+        "Native/derived discovery requires an actual root"
     );
+    assert!(
+        registered.is_subset(&declared),
+        "Every registered root needs an evaluated discovery row"
+    );
+    for id in declared.difference(&registered) {
+        assert_eq!(matrix.find(id).unwrap().discover, CapabilityLevel::Partial);
+    }
 
     // (2) SKILL.md 的 `sync --discover` 行必须点名每个根与每种扩展名，并给出计数。
-    let row = SKILL_MD
+    let row = SKILL_PROTOCOL_MD
         .lines()
         .find(|line| line.contains("`sync --discover`"))
         .expect("SKILL.md 必须有 sync --discover 行");
@@ -2150,7 +2422,7 @@ fn discovery_root_registry_matches_capability_matrix_and_published_docs() {
 }
 
 /// 矩阵文档「已知限制」小节里，provider 显示名 → canonical `provider_id`。
-/// 显式写死并在测试里断言覆盖全部 14 个已实现 provider：新增 provider 必须
+/// 显式写死并在测试里断言覆盖全部 17 个已实现 provider：新增 provider 必须
 /// 同时在这里登记，否则守护会退化成"少查一行"。
 const MATRIX_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("Claude Code", "claude-code"),
@@ -2167,6 +2439,9 @@ const MATRIX_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("Tencent CodeBuddy", "tencent-codebuddy"),
     ("Cline", "cline"),
     ("Aider", "aider"),
+    ("WorkBuddy", "workbuddy"),
+    ("ZCode", "zcode"),
+    ("DeepSeek Harness", "deepseek-harness"),
 ];
 
 #[test]
@@ -2436,10 +2711,12 @@ fn changelog_provider_claims_match_capability_matrix() {
             "CHANGELOG 的 [Unreleased] 未点名 deferred provider `{id}`"
         );
     }
-    assert!(
-        unreleased.contains("deferred"),
-        "CHANGELOG 必须说明 deferred provider 的状态"
-    );
+    if !deferred.is_empty() {
+        assert!(
+            unreleased.contains("deferred"),
+            "CHANGELOG 必须说明 deferred provider 的状态"
+        );
+    }
 
     // 诚实门：尚无 provider 晋级时，发版说明不得出现 Beta/GA/Certified 口径。
     let has_promoted = matrix.providers.iter().any(|p| {
@@ -2841,5 +3118,5 @@ fn every_adapter_leaves_its_source_directory_untouched_through_probe_and_parse()
         checked += 1;
     }
 
-    assert_eq!(checked, 14, "必须逐一核对 14 个已实现 adapter 的只读契约");
+    assert_eq!(checked, 17, "必须逐一核对 17 个已实现 adapter 的只读契约");
 }

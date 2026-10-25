@@ -74,6 +74,8 @@ pub enum CanonicalCode {
     CursorExpired,
     /// Cursor 携带的 generation 与活动 generation 不一致 → exit 9。
     GenerationMismatch,
+    /// 已持久化的程序升级需要恢复或后续动作 → exit 10。
+    UpdateRecoveryRequired,
     /// 未分类内部错误（不变量违反等 bug 信号）→ exit 70。
     Internal,
 }
@@ -95,6 +97,7 @@ impl CanonicalCode {
             CanonicalCode::CursorInvalid => "cursor_invalid",
             CanonicalCode::CursorExpired => "cursor_expired",
             CanonicalCode::GenerationMismatch => "generation_mismatch",
+            CanonicalCode::UpdateRecoveryRequired => "update_recovery_required",
             CanonicalCode::Internal => "internal",
         }
     }
@@ -112,6 +115,7 @@ impl CanonicalCode {
             CanonicalCode::CatalogError | CanonicalCode::WriterBusy => 6,
             CanonicalCode::ProviderError | CanonicalCode::CapabilityNotSupported => 7,
             CanonicalCode::SchemaIncompatible | CanonicalCode::GenerationMismatch => 9,
+            CanonicalCode::UpdateRecoveryRequired => 10,
             CanonicalCode::Internal => 70,
         }
     }
@@ -149,6 +153,9 @@ impl CanonicalCode {
             }
             CanonicalCode::WriterBusy => {
                 "另一个进程正在写入数据库，等待其结束（或结束残留的 agent-session-grep 进程）后重试"
+            }
+            CanonicalCode::UpdateRecoveryRequired => {
+                "运行 update status 核对持久状态，再对同一安装与 catalog 运行 update recover"
             }
             CanonicalCode::SchemaIncompatible => {
                 "数据库版本与当前程序不兼容：升级程序，或对旧库重新执行完整同步"
@@ -357,6 +364,10 @@ pub fn parse_output_mode(args: &[String]) -> Result<OutputMode, String> {
                 }
                 chosen = Some(mode);
             }
+            "--history" => {
+                it.next();
+                it.next();
+            }
             // 其它带值 flag 及其取值不在本层消费，跳过取值避免误判。
             // 列表必须与 main.rs 各前缀扫描器（extract_request_id/command_name/
             // intercept_help_or_version/extract_db_flag_impl）保持一致，漏掉一个
@@ -383,6 +394,12 @@ pub fn parse_output_mode(args: &[String]) -> Result<OutputMode, String> {
             | "--alias-ttl-days"
             | "--plan"
             | "--backup"
+            | "--host"
+            | "--install-prefix"
+            | "--channel"
+            | "--manifest"
+            | "--checksums"
+            | "--max-wait-ms"
             | "--max-write-seconds" => {
                 it.next();
             }
@@ -629,6 +646,7 @@ mod tests {
             CanonicalCode::CursorInvalid,
             CanonicalCode::CursorExpired,
             CanonicalCode::GenerationMismatch,
+            CanonicalCode::UpdateRecoveryRequired,
             CanonicalCode::Internal,
         ] {
             assert!(!code.operator_action().is_empty(), "{}", code.as_str());
@@ -1047,6 +1065,7 @@ mod tests {
             CanonicalCode::CursorInvalid,
             CanonicalCode::CursorExpired,
             CanonicalCode::GenerationMismatch,
+            CanonicalCode::UpdateRecoveryRequired,
             CanonicalCode::Internal,
         ];
         assert_eq!(published.len(), runtime.len());
@@ -1109,6 +1128,93 @@ mod tests {
         assert_eq!(
             facets_schema["properties"]["tool_name"]["type"],
             json!(["string", "null"])
+        );
+        // Managed freshness is a complete, bounded disclosure projection. Pin
+        // the runtime-emitted enums and required counters so schema changes
+        // cannot silently reject ordinary, retained, or partial evidence.
+        let freshness = &schema["$defs"]["managedFreshness"];
+        assert_eq!(freshness["additionalProperties"], false);
+        let required = freshness["required"]
+            .as_array()
+            .expect("managed freshness required must be an array");
+        for field in [
+            "coverage",
+            "update_state",
+            "latest_requested",
+            "latest_satisfied",
+            "reason",
+            "selected_scopes",
+            "complete_scopes",
+            "contributing_sources",
+            "verified_sources",
+            "pending_sources",
+            "failed_sources",
+            "last_verified_observation_at_ms",
+        ] {
+            assert!(
+                required.iter().any(|value| value == field),
+                "managed freshness missing {field}"
+            );
+        }
+        assert_eq!(
+            freshness["properties"]["coverage"]["enum"],
+            json!(["empty", "partial", "complete"])
+        );
+        assert_eq!(
+            freshness["properties"]["update_state"]["enum"],
+            json!([
+                "running",
+                "idle",
+                "paused",
+                "stopped",
+                "offline",
+                "busy",
+                "failed",
+                "deferred",
+                "upgrading"
+            ])
+        );
+        assert_eq!(
+            freshness["properties"]["reason"]["enum"],
+            json!([
+                "verified",
+                "as_of_verified",
+                "discovery_pending",
+                "paused",
+                "stopped",
+                "offline",
+                "busy",
+                "failed",
+                "deferred",
+                "upgrading",
+                "policy_changed",
+                "timeout",
+                "scope_unverified",
+                "source_changed",
+                "worker_restarted",
+                "catalog_changed",
+                "rewrite_pending",
+                "deletion_pending"
+            ])
+        );
+        for field in [
+            "selected_scopes",
+            "complete_scopes",
+            "contributing_sources",
+            "verified_sources",
+            "pending_sources",
+            "failed_sources",
+        ] {
+            assert_eq!(freshness["properties"][field]["type"], "integer");
+            assert_eq!(freshness["properties"][field]["minimum"], 0);
+        }
+        assert_eq!(
+            freshness["properties"]["last_verified_observation_at_ms"]["type"],
+            json!(["integer", "null"])
+        );
+        assert!(
+            freshness["allOf"][0].get("else").is_none(),
+            "ordinary as-of reads are not always unknown coverage"
         );
         assert_eq!(
             schema["$defs"]["searchHit"]["properties"]["why_matched"]["maxItems"],

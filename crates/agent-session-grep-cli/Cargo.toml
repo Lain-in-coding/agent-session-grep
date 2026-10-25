@@ -30,6 +30,10 @@ path = "src/bin/agent-session-grep.rs"
 name = "asg"
 path = "src/bin/asg.rs"
 
+[[bin]]
+name = "asg-supervisor"
+path = "src/bin/asg-supervisor.rs"
+
 # Test-only fake provider for the resume smoke e2e test (never shipped to users).
 [[bin]]
 name = "resume-smoke-provider"
@@ -40,6 +44,7 @@ agent-session-grep-domain = { path = "../agent-session-grep-domain" }
 agent-session-grep-ports = { path = "../agent-session-grep-ports" }
 agent-session-grep-application = { path = "../agent-session-grep-application" }
 agent-session-grep-adapters-sqlite = { path = "../agent-session-grep-adapters-sqlite" }
+agent-session-grep-launcher = { path = "../agent-session-grep-launcher" }
 agent-session-grep-provider-aider = { path = "../agent-session-grep-provider-aider" }
 agent-session-grep-provider-antigravity = { path = "../agent-session-grep-provider-antigravity" }
 agent-session-grep-provider-claude = { path = "../agent-session-grep-provider-claude" }
@@ -54,14 +59,33 @@ agent-session-grep-provider-opencode = { path = "../agent-session-grep-provider-
 agent-session-grep-provider-codebuddy = { path = "../agent-session-grep-provider-codebuddy" }
 agent-session-grep-provider-pi = { path = "../agent-session-grep-provider-pi" }
 agent-session-grep-provider-qoder = { path = "../agent-session-grep-provider-qoder" }
+agent-session-grep-provider-workbuddy = { path = "../agent-session-grep-provider-workbuddy" }
+agent-session-grep-provider-zcode = { path = "../agent-session-grep-provider-zcode" }
+agent-session-grep-provider-dsh = { path = "../agent-session-grep-provider-dsh" }
 serde = { workspace = true }
 serde_json.workspace = true
+blake3.workspace = true
+# Preserve Codex TOML comments and table layout while editing the owned MCP node.
+toml_edit = { version = "=0.23.7", features = ["serde"] }
+# Validate Cordis YAML and splice only the owned row; never evaluate tags.
+yaml-rust2 = { version = "=0.13.0", default-features = false }
+sha2 = "=0.10.9"
+semver = "=1.0.28"
+# Offline bundle verification only; no HTTP client or external unpack process.
+zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2"] }
+tar = { version = "=0.4.46", default-features = false }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+time = { version = "=0.3.55", default-features = false, features = ["formatting", "parsing"] }
+# Parse launchctl XML readback without an external entity resolver or I/O.
+roxmltree = { version = "=0.21.1", default-features = false, features = ["std"] }
 ratatui.workspace = true
 crossterm.workspace = true
 # 平台 CSPRNG(serve 会话 token 生成;getrandom 已在 lock 图中,经 tempfile dev-dep)
 getrandom = "0.4"
 
 [dev-dependencies]
+# Synthetic DSH fixtures use the same bounded decoder version as the adapter.
+zstd = { version = "=0.13.3", default-features = false }
 # default-features = false 与 adapters-sqlite 保持一致,避免 test 图的特性
 # 统一把 cache/ffi-sqlite-wasm-rs 重新拉回来。
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
@@ -74,4 +98,4 @@ agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_WindowsProgramming", "Win32_System_Registry"] }
