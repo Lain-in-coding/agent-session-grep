@@ -799,13 +799,13 @@ fn installed_shim_derives_prefix_without_cwd_and_exits_clean_on_stop() {
             process.0.try_wait().unwrap().is_none(),
             "installed supervisor exited before ready"
         );
-        if fixture
-            .control()
-            .background_status()
-            .unwrap()
-            .worker
-            .boot_id
-            .is_some()
+        if fixture_retry(|| {
+            let control = fixture.control();
+            control
+                .with_runtime_deadline(Instant::now() + seconds(5), || control.background_status())
+                .map(|status| status.worker.boot_id.is_some())
+        })
+        .unwrap()
         {
             break;
         }
