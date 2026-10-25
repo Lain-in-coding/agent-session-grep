@@ -72,7 +72,7 @@ yaml-rust2 = { version = "=0.13.0", default-features = false }
 sha2 = "=0.10.9"
 semver = "=1.0.28"
 # Offline bundle verification only; no HTTP client or external unpack process.
-zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "=9.1.0", default-features = false, features = ["deflate-flate2"] }
 tar = { version = "=0.4.46", default-features = false }
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 time = { version = "=0.3.55", default-features = false, features = ["formatting", "parsing"] }

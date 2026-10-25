@@ -556,6 +556,7 @@ fn write_zip(path: &Path, entries: &[(String, Vec<u8>, u16)], stored: bool) {
             } else {
                 zip::CompressionMethod::Deflated
             })
+            .system(zip::System::Unix)
             .unix_permissions(u32::from(*mode));
         zip.start_file(name, options).expect("start zip file");
         zip.write_all(content).expect("write zip file");
@@ -941,6 +942,7 @@ fn rejects_zip_symlink_member() {
         let full = format!("{}/{}", fixture.archive_root, name);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
+            .system(zip::System::Unix)
             .unix_permissions(u32::from(*mode));
         if name == "README.md" {
             zip.add_symlink(&full, "CHANGELOG.md", options)

@@ -590,6 +590,8 @@ fn zip_inventory(file: &mut File, deadline: Instant) -> Result<Vec<ArchiveEntry>
         let raw_mode = entry
             .unix_mode()
             .ok_or_else(|| reject("missing unix member mode"))?;
+        // zip 9 keeps the S_IFREG type bits that zip 7 stripped; both forms
+        // must pass the same regular-file gate.
         let kind = raw_mode & 0o170000;
         ensure(kind == 0 || kind == 0o100000, "archive special member type")?;
         let permissions = raw_mode & 0o777;
@@ -601,7 +603,7 @@ fn zip_inventory(file: &mut File, deadline: Instant) -> Result<Vec<ArchiveEntry>
             "archive compressed size",
         )?;
         entries.push(ArchiveEntry {
-            name: entry.name().to_owned(),
+            name: entry.name().map_err(|_| reject("zip member name"))?.to_string(),
             size,
             mode: permissions as u16,
         });
@@ -1170,7 +1172,10 @@ impl VerifiedBundle {
                     let mut entry = archive
                         .by_index(index)
                         .map_err(|_| reject("zip member record"))?;
-                    let name = entry.name().to_owned();
+                    let name = entry
+                        .name()
+                        .map_err(|_| reject("zip member name"))?
+                        .to_string();
                     let member = self.member(&name)?;
                     ensure(written.insert(member.relative.clone()), "duplicate member")?;
                     let path = stage_member_path(&stage_path, &member.relative)?;
@@ -1639,7 +1644,10 @@ fn verify_member_digests(
                 let mut entry = zip
                     .by_index(index)
                     .map_err(|_| reject("zip member record"))?;
-                let name = entry.name().to_owned();
+                let name = entry
+                    .name()
+                    .map_err(|_| reject("zip member name"))?
+                    .to_string();
                 let relative = name
                     .strip_prefix(&manifest.archive.root)
                     .and_then(|value| value.strip_prefix('/'))
