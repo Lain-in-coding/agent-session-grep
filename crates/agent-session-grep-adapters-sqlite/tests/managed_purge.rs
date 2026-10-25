@@ -695,7 +695,9 @@ fn corrupted_registered_backup_is_quarantined_with_accounting_and_never_silently
         );
         let record = f.control.backup_records().unwrap().remove(0);
         assert_eq!(record.state, BackupState::Quarantined);
-        assert_eq!(record.digest, None);
+        // Terminal quarantine keeps the last verified digest so rollback
+        // accounting survives; the corrupted replacement is never deleted.
+        assert!(record.digest.is_some());
         assert_eq!(record.source_ids, vec![id("source-a"), id("source-b")]);
         assert_eq!(
             f.control.artifact_records().unwrap()[0].source_ids,
@@ -714,6 +716,108 @@ fn corrupted_registered_backup_is_quarantined_with_accounting_and_never_silently
             .is_err()
         );
     }
+}
+
+#[test]
+fn legacy_digestless_quarantine_does_not_block_remaining_backups_or_job_completion() {
+    let f = Fixture::new();
+    let prefix = verified_prefix(&f);
+    let install_lock = acquire(
+        &prefix,
+        LockKind::MaintenanceJob(
+            agent_session_grep_adapters_sqlite::managed_locks::JobLockKey::parse(
+                "installation-update",
+            )
+            .unwrap(),
+        ),
+    );
+    let installation = f.control.bind_installation(&prefix, &install_lock).unwrap();
+    assert!(matches!(
+        create_backup(&f, &installation, "legacy-digestless"),
+        BackupOutcome::Created(_)
+    ));
+    // Reproduce the historical digest-less quarantine tombstone exactly as an
+    // older build wrote it: state flips, digest/size are cleared.
+    {
+        let conn = Connection::open(SqliteControlStore::path(&f.root)).unwrap();
+        conn.execute(
+            "UPDATE backup_manifests SET state='quarantined',digest='',size_bytes=0 WHERE backup_id='legacy-digestless'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE private_artifacts SET state='quarantined',digest=NULL,owner_nonce=NULL WHERE artifact_id='legacy-digestless'",
+            [],
+        )
+        .unwrap();
+    }
+    let job = f.revoke();
+    let report = f.run("digestless-contained");
+    // The digest-less tombstone is contained rather than deletable, but the
+    // withdrawn source and every other stage must still finish cleanly.
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        f.control.purge_job_status(&job).unwrap().job.state,
+        PurgeState::Complete
+    );
+    let record = f
+        .control
+        .backup_records()
+        .unwrap()
+        .into_iter()
+        .find(|backup| backup.backup_id == id("legacy-digestless"))
+        .unwrap();
+    assert_eq!(record.state, BackupState::Quarantined);
+    assert_eq!(record.digest, None);
+}
+
+#[test]
+fn transient_backend_verification_failure_never_quarantines_a_rollback_backup() {
+    let f = Fixture::new();
+    let prefix = verified_prefix(&f);
+    let install_lock = acquire(
+        &prefix,
+        LockKind::MaintenanceJob(
+            agent_session_grep_adapters_sqlite::managed_locks::JobLockKey::parse(
+                "installation-update",
+            )
+            .unwrap(),
+        ),
+    );
+    let installation = f.control.bind_installation(&prefix, &install_lock).unwrap();
+    assert!(matches!(
+        create_backup(&f, &installation, "transient-io"),
+        BackupOutcome::Created(_)
+    ));
+    let job = f.revoke();
+    let manifest = f.root.join("backups/transient-io/manifest.json");
+    let original = fs::read(&manifest).unwrap();
+    // A directory replacement turns the sidecar read into a transient OS
+    // I/O refusal (Backend on Windows), never a typed artifact defect.
+    fs::remove_file(&manifest).unwrap();
+    fs::create_dir(&manifest).unwrap();
+    let report = f.run("transient-io-owner");
+    assert_eq!(report.backups, PurgeStage::Pending(PurgeFailure::Storage));
+    assert_eq!(
+        f.control.purge_job_status(&job).unwrap().job.state,
+        PurgeState::Blocked
+    );
+    let record = f.control.backup_records().unwrap().remove(0);
+    assert_eq!(record.state, BackupState::Complete);
+    assert!(record.digest.is_some());
+    // Removing the obstruction lets verification classify the artifact again;
+    // this fixture intentionally has no installation authority for deletion.
+    fs::remove_dir(&manifest).unwrap();
+    fs::write(&manifest, &original).unwrap();
+    let recovered = f.run("transient-io-retry");
+    assert_ne!(
+        recovered.backups,
+        PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact)
+    );
+    assert_ne!(
+        f.control.backup_records().unwrap().remove(0).state,
+        BackupState::Quarantined
+    );
 }
 #[test]
 fn genuine_cached_candidates_are_retired_and_physical_private_cache_contains_no_withdrawn_text() {
@@ -1065,7 +1169,7 @@ fn quarantined_backup_replacement_after_partial_unlink_is_retained_as_unknown() 
     );
     let record = f.control.backup_records().unwrap().remove(0);
     assert_eq!(record.state, BackupState::Quarantined);
-    assert_eq!(record.digest, None);
+    assert!(record.digest.is_some());
     assert_eq!(record.source_ids, vec![id("source-a"), id("source-b")]);
     assert_eq!(
         fs::read(&path).unwrap(),

@@ -25,7 +25,9 @@ fn bounded<T>(control: &SqliteControlStore, operation: impl FnOnce() -> PortResu
         .unwrap()
 }
 fn assert_capacity<T>(result: PortResult<T>) {
-    assert!(matches!(result, Err(PortError::WriterBusy(reason))
+    // Capacity is a terminal refusal: a genuine overage must not masquerade
+    // as contention that callers retry forever.
+    assert!(matches!(result, Err(PortError::Backend(reason))
         if reason == "control runtime dependency capacity exceeded"));
 }
 fn assert_corrupt<T>(result: PortResult<T>) {
