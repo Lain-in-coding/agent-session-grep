@@ -365,6 +365,15 @@ fn check(deadline: Instant) -> PortResult<()> {
         Ok(())
     }
 }
+/// Only typed classification/manifest-integrity failures justify quarantine.
+/// Transient storage/IO and snapshot races remain retryable errors so a
+/// passing lock or busy filesystem cannot destroy rollback capability.
+fn backup_classification_is_terminal(error: &PortError) -> bool {
+    matches!(
+        error,
+        PortError::SchemaIncompatible(_) | PortError::InvalidRequest(_)
+    )
+}
 fn sql(error: rusqlite::Error) -> PortError {
     match error.sqlite_error_code() {
         Some(
@@ -1177,6 +1186,7 @@ fn purge_backups(
                     })
                 }
                 Err(error @ PortError::WriterBusy(_)) => return Err(error),
+                Err(error) if !backup_classification_is_terminal(&error) => return Err(error),
                 Err(_) => {
                     let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
                     let bound = control.bind_control_root(&lock)?;
@@ -1185,6 +1195,7 @@ fn purge_backups(
                         owner,
                         &bound,
                         &backup.backup_id,
+                        backup.digest.as_deref().zip(Some(backup.size_bytes)),
                     )?;
                     return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
                 }
@@ -1194,7 +1205,9 @@ fn purge_backups(
             continue;
         }
         if backup.digest.is_none() {
-            return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
+            // Legacy digest-less quarantine cannot authorize deletion, but it
+            // is already contained; it must not block every other backup.
+            continue;
         }
         let Some(installation) = installation else {
             return Ok(PurgeStage::Pending(PurgeFailure::BackupAuthorityMissing));
@@ -1220,6 +1233,7 @@ fn purge_backups(
                     owner,
                     &bound,
                     &backup.backup_id,
+                    backup.digest.as_deref().zip(Some(backup.size_bytes)),
                 )?;
                 return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
             }

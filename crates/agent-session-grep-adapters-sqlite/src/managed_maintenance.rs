@@ -65,6 +65,16 @@ fn sql(error: rusqlite::Error) -> PortError {
     }
 }
 
+/// A verification error is transient when it reflects the environment rather
+/// than the backup's own bytes: IO failures (CANTOPEN on a momentarily locked
+/// or scanned file, IOERR read failures, full disks) can clear on retry, so
+/// they must not quarantine a verified backup. Typed classification failures
+/// (identity/integrity/coverage mismatch, malformed manifest) remain
+/// quarantine-worthy.
+pub fn verification_is_transient(error: &PortError) -> bool {
+    matches!(error, PortError::SourceIo(_) | PortError::Backend(_))
+}
+
 /// Conservative refusal reasons surfaced to the update journal. None of these
 /// is reported as a successful backup/restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

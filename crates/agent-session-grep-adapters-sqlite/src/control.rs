@@ -55,7 +55,7 @@ fn runtime_tick() -> PortResult<()> {
     Ok(())
 }
 fn runtime_capacity() -> PortError {
-    PortError::WriterBusy("control runtime dependency capacity exceeded".into())
+    PortError::Backend("control runtime dependency capacity exceeded".into())
 }
 struct RuntimeDeadlineScope {
     previous: Option<Instant>,
@@ -1541,6 +1541,7 @@ impl SqliteControlStore {
             if count != 1 {
                 return Err(conflict());
             }
+            prune_runtime_dependencies(conn, &current.policy)?;
             intent.state = RevocationState::Settled;
             intent.settled_at_ms = Some(now_ms);
             Ok((true, false, intent))
@@ -4128,6 +4129,7 @@ impl SqliteControlStore {
         owner: &PurgeOwner<'_>,
         control: &ControlRootGuard<'_>,
         backup_id: &ControlId,
+        verified: Option<(&str, u64)>,
     ) -> PortResult<ControlChange<StoredBackup>> {
         owner.validate(self)?;
         control.validate(self)?;
@@ -4135,14 +4137,21 @@ impl SqliteControlStore {
             let prior = load_backups(conn, current.policy.policy_epoch)?.into_iter()
                 .find(|backup| backup.backup_id == *backup_id).ok_or_else(missing)?;
             if prior.state == BackupState::PurgedByPolicy
-                || (prior.state == BackupState::Quarantined && prior.digest.is_none()) {
+                || (prior.state == BackupState::Quarantined && prior.digest.is_none())
+                || (prior.state == BackupState::Quarantined
+                    && verified.is_some_and(|(digest, size)| {
+                        prior.digest.as_deref() == Some(digest) && prior.size_bytes == size
+                    })) {
                 return Ok((false, false, prior));
             }
-            // A missing verified digest is the typed unclassified-quarantine
-            // sentinel. Preserve its source accounting; later purge cannot
-            // mistake this for an authorized policy-quarantined image.
-            conn.execute("UPDATE backup_manifests SET state='quarantined',digest='',size_bytes=0 WHERE backup_id=?1", [backup_id.as_str()]).map_err(sql_error)?;
-            conn.execute("UPDATE private_artifacts SET state='quarantined',digest=NULL,owner_nonce=NULL WHERE artifact_id=?1", [backup_id.as_str()]).map_err(sql_error)?;
+            let (digest, size) = verified.ok_or_else(conflict)?;
+            if prior.digest.as_deref() != Some(digest) || prior.size_bytes != size {
+                return Err(conflict());
+            }
+            // Retain the verified digest/size: the artifact stays reviewable
+            // and restorable-by-owner, while quarantine blocks later reuse.
+            conn.execute("UPDATE backup_manifests SET state='quarantined' WHERE backup_id=?1", [backup_id.as_str()]).map_err(sql_error)?;
+            conn.execute("UPDATE private_artifacts SET state='quarantined',owner_nonce=NULL WHERE artifact_id=?1", [backup_id.as_str()]).map_err(sql_error)?;
             let backup = load_backups(conn, current.policy.policy_epoch)?.into_iter()
                 .find(|backup| backup.backup_id == *backup_id).ok_or_else(corrupt)?;
             Ok((true, false, backup))
@@ -4688,6 +4697,7 @@ impl BackgroundControl for SqliteControlStore {
                 return Ok((false, false, progress));
             }
             write_source(conn, &progress)?;
+            prune_runtime_dependencies(conn, &status.policy)?;
             Ok((true, false, progress))
         })
     }
@@ -4715,6 +4725,83 @@ impl BackgroundControl for SqliteControlStore {
     }
 }
 
+/// Runtime rows are bounded working state, not an append-only audit log. A
+/// policy snapshot taken by `mutate` decides retention inside the same guarded
+/// transaction that records new progress or settles a revocation. A source row
+/// is retired only when control itself can prove no current policy can ever
+/// readmit it: its provider has no enabled selection left, or an exact
+/// source-identity exclusion names it. Locator coverage is deliberately not
+/// guessed from the source id, so rows under a live provider stay fail-closed.
+/// Settled intents and terminal jobs are compacted only when nothing is
+/// outstanding, keeping each selection's latest job and its intent because
+/// `revoke_selection` dedup and status decoding still require both.
+fn prune_runtime_dependencies(conn: &Connection, policy: &ReadPolicy) -> PortResult<()> {
+    runtime_tick()?;
+    let retired: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT source_id,provider_id FROM source_updates ORDER BY source_id")
+            .map_err(sql_error)?;
+        let mut rows = stmt.query([]).map_err(sql_error)?;
+        let mut retired = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            runtime_tick()?;
+            let source = id(row.get::<_, String>(0).map_err(sql_error)?)?;
+            let provider = provider(row.get::<_, String>(1).map_err(sql_error)?)?;
+            let provider_live = policy
+                .selections
+                .iter()
+                .any(|s| s.enabled && s.region.provider == provider);
+            let source_denied = policy.exclusions.iter().any(|e| {
+                matches!(
+                    &e.region,
+                    ExcludedRegion::SourceIdentity {
+                        provider: p,
+                        source_id,
+                    } if *p == provider && source_id == &source
+                )
+            });
+            if !provider_live || source_denied {
+                retired.push(source.as_str().to_owned());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        retired
+    };
+    for source in &retired {
+        runtime_tick()?;
+        conn.execute(
+            "DELETE FROM source_updates WHERE source_id=?1",
+            [source.as_str()],
+        )
+        .map_err(sql_error)?;
+    }
+    let outstanding = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM revocation_intents WHERE state!='settled')
+             OR EXISTS(SELECT 1 FROM purge_jobs WHERE state NOT IN ('complete','blocked'))",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    if !outstanding {
+        conn.execute(
+            "DELETE FROM purge_jobs WHERE job_id NOT IN(
+                 SELECT job_id FROM purge_jobs p
+                 WHERE p.policy_epoch=(SELECT MAX(policy_epoch) FROM purge_jobs
+                                        WHERE selection_id IS p.selection_id))",
+            [],
+        )
+        .map_err(sql_error)?;
+        conn.execute(
+            "DELETE FROM revocation_intents WHERE state='settled'
+             AND policy_epoch NOT IN(SELECT policy_epoch FROM purge_jobs)",
+            [],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
+}
 fn write_source(conn: &Connection, p: &SourceProgress) -> PortResult<()> {
     let receipt = p.receipt.as_ref();
     let confirmation = p.confirmation.as_ref();
@@ -5600,6 +5687,21 @@ mod runtime_deadline_tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    fn cid(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    fn running_fixture() -> (tempfile::TempDir, SqliteControlStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let control = SqliteControlStore::create(
+            &temp.path().join("private"),
+            &cid("synthetic-deadline-installation"),
+            DesiredUpdates::Running,
+        )
+        .unwrap();
+        (temp, control)
+    }
+
     fn fixture() -> (tempfile::TempDir, SqliteControlStore) {
         let temp = tempfile::tempdir().unwrap();
         let control = SqliteControlStore::create(
@@ -5609,6 +5711,50 @@ mod runtime_deadline_tests {
         )
         .unwrap();
         (temp, control)
+    }
+
+    struct ScopedWorker {
+        installation: ControlId,
+        boot: ControlId,
+        root: RootIdentity,
+        lock: ExclusiveGuard,
+    }
+    impl WorkerAuthority for ScopedWorker {
+        fn installation_id(&self) -> &ControlId {
+            &self.installation
+        }
+        fn boot_id(&self) -> &ControlId {
+            &self.boot
+        }
+        fn root_binding(&self) -> PhysicalRootBinding {
+            self.lock.root_identity().binding()
+        }
+        fn validate(&self) -> PortResult<()> {
+            if self.lock.kind() != &LockKind::Background || self.lock.root_identity() != self.root {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+    }
+
+    fn insert_source_row(control: &SqliteControlStore, source: &str, provider: &str) {
+        let conn = control.conn.borrow();
+        conn.execute(
+            "INSERT INTO source_updates(source_id,provider_id,coverage,update_state,backfill_state)
+             VALUES(?1,?2,'empty','offline','pending')",
+            params![source, provider],
+        )
+        .unwrap();
+    }
+
+    fn source_row_count(control: &SqliteControlStore, source: &str) -> i64 {
+        let conn = control.conn.borrow();
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_updates WHERE source_id=?1",
+            [source],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5631,6 +5777,203 @@ mod runtime_deadline_tests {
         assert_eq!(control.status().unwrap().policy.control_seq.get(), 0);
     }
 
+    #[test]
+    fn acknowledge_prunes_only_proven_retired_source_updates() {
+        let (temp, control) = running_fixture();
+        let root = temp.path().join("private");
+        #[cfg(windows)]
+        let locator_a = CanonicalLocator::parse(r"C:\synthetic-a").unwrap();
+        #[cfg(not(windows))]
+        let locator_a = CanonicalLocator::parse("/synthetic-a").unwrap();
+        #[cfg(windows)]
+        let locator_b = CanonicalLocator::parse(r"C:\synthetic-b").unwrap();
+        #[cfg(not(windows))]
+        let locator_b = CanonicalLocator::parse("/synthetic-b").unwrap();
+        let revoked = control
+            .add_selection(
+                ControlSeq::new(0).unwrap(),
+                SelectionRequest {
+                    region: ScopeRegion {
+                        provider: SearchProvider::Claude,
+                        locator: locator_a,
+                        kind: RootKind::Exact,
+                    },
+                    root_identity: Some(cid("root-a")),
+                    now_ms: 1,
+                },
+            )
+            .unwrap();
+        let retained = control
+            .add_selection(
+                revoked.control_seq,
+                SelectionRequest {
+                    region: ScopeRegion {
+                        provider: SearchProvider::Claude,
+                        locator: locator_b,
+                        kind: RootKind::Exact,
+                    },
+                    root_identity: Some(cid("root-b")),
+                    now_ms: 2,
+                },
+            )
+            .unwrap();
+        let worker = ScopedWorker {
+            installation: cid("synthetic-deadline-installation"),
+            boot: cid("boot_prune"),
+            root: RootIdentity::read(&root).unwrap(),
+            lock: ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap(),
+        };
+        let current = || control.status().unwrap().policy.control_seq;
+        control.register_worker(current(), &worker, 7, 3).unwrap();
+        insert_source_row(&control, "denied_source", "claude-code");
+        insert_source_row(&control, "orphan_provider", "codex");
+        insert_source_row(&control, "locator_revoked", "claude-code");
+        control
+            .revoke_selection(current(), &revoked.value.id, Some(&cid("denied_source")), 4)
+            .unwrap();
+        let retained_revision = SelectionRevision {
+            selection_id: retained.value.id.clone(),
+            revision: retained.value.revision,
+            root_identity: cid("root-b"),
+        };
+        let barrier = match control
+            .admit_latest(
+                current(),
+                LatestRequest {
+                    selections: vec![retained_revision.clone()],
+                    max_wait_ms: 1,
+                    now_ms: 5,
+                },
+            )
+            .unwrap()
+            .value
+        {
+            LatestAdmission::Queued(barrier) => barrier,
+            blocked => panic!("expected a queued barrier, got {blocked:?}"),
+        };
+        let cycle = control
+            .start_cycle(current(), &worker, barrier.required_cycle_seq, 6)
+            .unwrap()
+            .value;
+        // The retained selection stayed enabled through the revoke, so this
+        // acknowledgement is a normal observation mutation after the deny.
+        control
+            .acknowledge_source(
+                current(),
+                &worker,
+                SourceAcknowledgement {
+                    source_id: cid("locator_revoked"),
+                    provider: SearchProvider::Claude,
+                    token: cycle.token.clone(),
+                    selection: retained_revision,
+                    attempted_at_ms: 7,
+                    coverage: Coverage::Partial,
+                    update_state: UpdateState::Deferred,
+                    backfill_state: BackfillState::Pending,
+                    error: None,
+                    receipt: None,
+                    confirmation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(source_row_count(&control, "denied_source"), 0);
+        assert_eq!(source_row_count(&control, "orphan_provider"), 0);
+        // Only an exact source-identity exclusion can retire this row: the
+        // revoked selection covered a different locator and claude still has
+        // an enabled selection, so control must not guess its location.
+        assert_eq!(source_row_count(&control, "locator_revoked"), 1);
+    }
+
+    #[test]
+    fn settle_revocation_compacts_terminal_intents_and_jobs_per_selection() {
+        let (temp, control) = running_fixture();
+        let root = temp.path().join("private");
+        let exact = |locator: &str| SelectionRequest {
+            region: ScopeRegion {
+                provider: SearchProvider::Claude,
+                locator: CanonicalLocator::parse(locator).unwrap(),
+                kind: RootKind::Exact,
+            },
+            root_identity: Some(cid("synthetic-root")),
+            now_ms: 1,
+        };
+        #[cfg(windows)]
+        let (locator_a, locator_b) = (r"C:\synthetic-a", r"C:\synthetic-b");
+        #[cfg(not(windows))]
+        let (locator_a, locator_b) = ("/synthetic-a", "/synthetic-b");
+        let first = control
+            .add_selection(ControlSeq::new(0).unwrap(), exact(locator_a))
+            .unwrap();
+        let second = control
+            .add_selection(first.control_seq, exact(locator_b))
+            .unwrap();
+        let revoked_first = control
+            .revoke_selection(second.control_seq, &first.value.id, None, 2)
+            .unwrap();
+        // Revive/revoke the same selection so it owns two epochs and the
+        // compaction must keep only its latest job for revoke dedup.
+        let revived = control
+            .add_selection(revoked_first.control_seq, exact(locator_a))
+            .unwrap();
+        let revoked_again = control
+            .revoke_selection(revived.control_seq, &revived.value.id, None, 3)
+            .unwrap();
+        let revoked_second = control
+            .revoke_selection(revoked_again.control_seq, &second.value.id, None, 4)
+            .unwrap();
+        let conn = control.conn.borrow();
+        let terminal = "UPDATE purge_jobs SET state='complete',attempts=1,
+            progress_key='asg.purge/v1:artifacts_verified',owner_nonce=NULL WHERE state!='complete'";
+        conn.execute(terminal, []).unwrap();
+        drop(conn);
+        let owner = ExclusiveGuard::try_acquire(&root, LockKind::PolicyOwner).unwrap();
+        let drained = ExclusiveGuard::try_acquire(&root, LockKind::PolicyEmission).unwrap();
+        for intent in [
+            &revoked_first.value.intent,
+            &revoked_again.value.intent,
+            &revoked_second.value.intent,
+        ] {
+            control
+                .settle_revocation(
+                    control.status().unwrap().policy.control_seq,
+                    &owner,
+                    &drained,
+                    &intent.id,
+                    5,
+                )
+                .unwrap();
+        }
+        drop(drained);
+        drop(owner);
+        let jobs: Vec<PurgeJob> = control.purge_jobs().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.state == PurgeState::Complete));
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.selection_id == Some(revived.value.id.clone()))
+                .count(),
+            1
+        );
+        // load_status_core requires every surviving intent to pair with a job.
+        assert_eq!(
+            control.status().unwrap().policy.revocations.len(),
+            jobs.len()
+        );
+        // Revoke dedup still finds each selection's latest epoch/job.
+        let reduplicate = control
+            .revoke_selection(
+                control.status().unwrap().policy.control_seq,
+                &revived.value.id,
+                None,
+                6,
+            )
+            .unwrap();
+        assert!(!reduplicate.changed);
+        assert_eq!(
+            reduplicate.value.purge_job.policy_epoch,
+            revoked_again.value.purge_job.policy_epoch
+        );
+    }
     #[test]
     fn sql_progress_interrupts_long_statement_and_restores_connection_handler() {
         let (_temp, control) = fixture();

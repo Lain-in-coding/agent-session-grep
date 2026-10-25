@@ -264,6 +264,40 @@ fn interrupted_after_exchange_can_recover_without_replacing_newer_settings() {
 }
 
 #[test]
+fn recover_pending_repairs_an_interrupted_journal_for_later_changes() {
+    let f = Fixture::new(Host::ClaudeCode, Some(r#"{"preserve":true}"#));
+    let error = f
+        .store
+        .change(
+            Some(f.registration().value(Host::ClaudeCode)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Exchanged) {
+                    return Err(ErrorCode::Io.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Io);
+    // A later install no longer wedges on the interrupted journal.
+    assert_eq!(f.store.recover_pending().unwrap(), 1);
+    // The recovered transaction carries ownership, so an idempotent reinstall
+    // reports Unchanged with the same owned value.
+    let receipt = f.store.install(&f.registration(), None).unwrap();
+    assert_eq!(receipt.status, EditStatus::Unchanged);
+    assert!(receipt.owned_value_sha256.is_some());
+    // Both journals remain retained as provenance; neither is interrupted.
+    assert!(
+        f.store
+            .inspect_recovery()
+            .unwrap()
+            .iter()
+            .all(|info| matches!(info.phase, Phase::Verified | Phase::Settled))
+    );
+}
+
+#[test]
 fn retained_old_handle_write_is_detected_and_reconciled_before_success() {
     let f = Fixture::new(Host::ClaudeCode, Some(r#"{"before":1}"#));
     let mut old = OpenOptions::new().write(true).open(&f.config).unwrap();

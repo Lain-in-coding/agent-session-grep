@@ -1201,6 +1201,24 @@ impl HostConfigStore {
         };
         self.inspect_locked()
     }
+
+    /// Try to settle every outstanding interrupted transaction before a new
+    /// configuration change. A host that briefly held its config open during
+    /// a previous setup otherwise leaves a Conflict journal that blocks all
+    /// later setup and uninstall attempts with no production repair path.
+    pub fn recover_pending(&self) -> Result<usize> {
+        let infos = self.inspect_recovery()?;
+        let mut recovered = 0;
+        for info in &infos {
+            if matches!(info.phase, Phase::Verified | Phase::Settled) {
+                continue;
+            }
+            if self.recover(&info.transaction_id).is_ok() {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
     fn inspect_locked(&self) -> Result<Vec<RecoveryInfo>> {
         let mut result = Vec::new();
         for entry in fs::read_dir(&self.root).map_err(io)? {

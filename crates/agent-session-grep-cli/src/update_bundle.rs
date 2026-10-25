@@ -603,7 +603,10 @@ fn zip_inventory(file: &mut File, deadline: Instant) -> Result<Vec<ArchiveEntry>
             "archive compressed size",
         )?;
         entries.push(ArchiveEntry {
-            name: entry.name().map_err(|_| reject("zip member name"))?.to_string(),
+            name: entry
+                .name()
+                .map_err(|_| reject("zip member name"))?
+                .to_string(),
             size,
             mode: permissions as u16,
         });
