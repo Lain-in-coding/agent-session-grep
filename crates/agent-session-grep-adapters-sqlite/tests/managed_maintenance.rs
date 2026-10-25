@@ -369,9 +369,9 @@ fn interrupted_backup_is_owned_before_content_and_is_not_silently_overwritten() 
     };
     {
         let guard = acquire(&f.root, LockKind::PolicyOwner);
-        let bound = f.control.bind_control_root(&guard).unwrap();
-        f.control
-            .register_backup(
+        let bound = retry_expected_success(|| f.control.bind_control_root(&guard)).unwrap();
+        retry_expected_success(|| {
+            f.control.register_backup(
                 f.control.status().unwrap().policy.control_seq,
                 &id("owner"),
                 &bound,
@@ -379,7 +379,8 @@ fn interrupted_backup_is_owned_before_content_and_is_not_silently_overwritten() 
                 &registration,
                 2,
             )
-            .unwrap();
+        })
+        .unwrap();
     }
     let path = f.root.join(&registration.relative_locator);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

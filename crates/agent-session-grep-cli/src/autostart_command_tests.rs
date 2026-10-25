@@ -7,7 +7,7 @@ use agent_session_grep_launcher::{
     metadata::{self, CurrentPointer, ReleaseMetadata},
     verify_installation,
 };
-use agent_session_grep_ports::control::{ControlId, ControlStatus};
+use agent_session_grep_ports::control::{ControlChange, ControlId, ControlStatus, DesiredUpdates};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
@@ -565,13 +565,22 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
                     rechecked = true;
                     let control = SqliteControlStore::open_current_writable(&f.root).unwrap();
                     let seq = control_status(&control).policy.control_seq;
-                    if paused {
-                        control
-                            .set_desired_updates(seq, DesiredUpdates::Paused)
-                            .unwrap();
-                    } else {
-                        control.set_autostart_enabled(seq, false).unwrap();
-                    }
+                    control
+                        .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                            if paused {
+                                control.set_desired_updates(seq, DesiredUpdates::Paused)
+                            } else {
+                                control.set_autostart_enabled(seq, false).map(|change| {
+                                    ControlChange {
+                                        control_seq: change.control_seq,
+                                        policy_epoch: change.policy_epoch,
+                                        changed: change.changed,
+                                        value: DesiredUpdates::Running,
+                                    }
+                                })
+                            }
+                        })
+                        .unwrap();
                 }
                 Ok(response)
             },
@@ -707,6 +716,66 @@ fn transient_native_owner_contention_reads_one_verified_receipt_without_rewritin
 }
 
 #[test]
+fn native_launch_observes_the_original_autostart_deadline() {
+    let f = Fixture::new(DesiredUpdates::Running);
+    let end = Instant::now() + Duration::from_secs(3);
+    let mut observed = false;
+    let result = execute(
+        f.catalog.to_str().unwrap(),
+        Options {
+            action: Action::Enable,
+            prefix: None,
+        },
+        end,
+        &mut |_| Ok(f.installation(true)),
+        &mut || Ok(f.location.clone()),
+        &mut |_, args, _| {
+            if args.iter().any(|arg| arg == "ExecStart") {
+                assert_eq!(SqliteControlStore::effective_runtime_deadline(end), end);
+                observed = true;
+            }
+            Ok(f.response(args))
+        },
+    );
+    assert!(observed, "reason={:?}", result.reason);
+    assert_eq!(result.status, "complete", "reason={:?}", result.reason);
+}
+
+#[test]
+fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
+    let f = Fixture::new(DesiredUpdates::Running);
+    let end = Instant::now() + Duration::from_secs(2);
+    let (locked, acquired) = std::sync::mpsc::channel();
+    let root = f.root.clone();
+    let holder = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(root.join("control.db")).unwrap();
+        connection.busy_timeout(Duration::from_secs(2)).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        // Outlive the adapter's 250ms busy allowance, then release so the
+        // command must recover with its original two-second end.
+        std::thread::sleep(Duration::from_millis(600));
+        connection.execute_batch("ROLLBACK").unwrap();
+    });
+    acquired.recv_timeout(Duration::from_secs(2)).unwrap();
+    let result = execute(
+        f.catalog.to_str().unwrap(),
+        Options {
+            action: Action::Enable,
+            prefix: None,
+        },
+        end,
+        &mut |_| Ok(f.installation(true)),
+        &mut || Ok(f.location.clone()),
+        &mut |_, args, _| Ok(f.response(args)),
+    );
+    holder.join().unwrap();
+    assert_eq!(result.status, "complete", "reason={:?}", result.reason);
+    assert!(result.intent_recorded);
+    assert!(control_status(&f.control()).autostart_enabled);
+}
+
+#[test]
 fn retry_helpers_never_replay_a_recorded_transaction_or_an_executed_native_call() {
     let end = Instant::now() + Duration::from_secs(1);
     let mut attempts = 0;
@@ -803,7 +872,9 @@ fn live_authority_holds_both_database_lifetimes_and_rechecks_current_intent() {
     let control = SqliteControlStore::open_current_writable(&f.root).unwrap();
     let seq = control_status(&control).policy.control_seq;
     control
-        .set_desired_updates(seq, DesiredUpdates::Paused)
+        .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+            control.set_desired_updates(seq, DesiredUpdates::Paused)
+        })
         .unwrap();
     assert_eq!(
         live.status(end).unwrap().desired_updates,

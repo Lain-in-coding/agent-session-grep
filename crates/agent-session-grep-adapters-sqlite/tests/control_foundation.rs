@@ -36,8 +36,16 @@ fn request(provider: SearchProvider, relative: &str, kind: RootKind) -> Selectio
 fn setup() -> (tempfile::TempDir, std::path::PathBuf, SqliteControlStore) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("private");
-    let store =
-        SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let store = loop {
+        match SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running) {
+            Ok(store) => break store,
+            Err(PortError::WriterBusy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => panic!("expected noncontended control setup: {error:?}"),
+        }
+    };
     (temp, root, store)
 }
 fn allowed(policy: &ReadPolicy, provider: SearchProvider, relative: &str) -> bool {
