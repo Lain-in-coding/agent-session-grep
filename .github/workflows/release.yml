@@ -296,7 +296,10 @@ jobs:
           import hashlib
           import os
           import subprocess
-          import tomllib
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
           from pathlib import Path
 
           if __name__ == "__main__":
@@ -489,7 +492,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo build --locked --release --no-default-features --target $env:TARGET `
-            -p agent-session-grep-cli --bin agent-session-grep
+            -p agent-session-grep-cli -p agent-session-grep-launcher `
+            --bin agent-session-grep --bin agent-session-grep-launcher --bin asg-supervisor
           git diff --exit-code -- Cargo.toml Cargo.lock
 
       - name: Verify exact binary version
@@ -523,10 +527,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $binary = (Resolve-Path -LiteralPath "target/$env:TARGET/release/$env:BINARY").Path
+          $suffix = [IO.Path]::GetExtension($env:BINARY)
+          $launcher = (Resolve-Path -LiteralPath "target/$env:TARGET/release/agent-session-grep-launcher$suffix").Path
+          $supervisor = (Resolve-Path -LiteralPath "target/$env:TARGET/release/asg-supervisor$suffix").Path
           # In release-verify the v<version> string is only an archive component;
           # packaging never creates a Git ref or a GitHub Release.
           python scripts/release/build-manifest.py package `
-            --workspace . --binary $binary `
+            --workspace . --binary $binary --managed-layout --launcher $launcher --supervisor $supervisor `
+            --schemas-from-source --git-package-inputs --verify-native `
             --dependency-json 'release-inputs/THIRD-PARTY-DEPENDENCIES.json' `
             --dependency-csv 'release-inputs/THIRD-PARTY-DEPENDENCIES.csv' `
             --target $env:TARGET --tag $env:RELEASE_TAG --version $env:VERSION `
@@ -865,11 +873,13 @@ jobs:
           import time
           import zipfile
 
-          def validate_archive_members(path, archive, binary, dependency_hashes, source_date_epoch):
+          def validate_archive_members(path, archive, binary, dependency_hashes, source_date_epoch, managed=None):
               root = archive["root"]
               modes = {root + "/" + name: "0644" for name in (*DOCUMENTS, *DEPENDENCIES)}
               modes[root + "/" + binary] = "0755"
               records = archive.get("files")
+              if managed is not None and isinstance(records, list):
+                  modes = managed_modes(root, records, managed["release"])
               if not isinstance(records, list) or len(records) != len(modes):
                   raise ValueError("archive member manifest is incomplete")
               by_name = {}
@@ -889,11 +899,24 @@ jobs:
               if set(by_name) != set(modes):
                   raise ValueError("archive member set differs from the packaging contract")
 
+              content = {}
               def check_member(name, size, mode, handle):
                   record = by_name[name]
                   if size != record["size_bytes"] or mode != int(record["mode"], 8):
                       raise ValueError("archive member size or mode mismatch")
-                  digest, actual_size = hash_stream(handle)
+                  if managed is not None:
+                      # Keep a bounded prefix for identity checks, stream the rest.
+                      prefix = handle.read(65536)
+                      content[name] = prefix
+                      hasher, actual_size = hashlib.sha256(prefix), len(prefix)
+                      for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                          hasher.update(chunk)
+                          actual_size += len(chunk)
+                      digest = hasher.hexdigest()
+                      if name.endswith(("current.json", "/release.json")) and actual_size > 8192:
+                          raise ValueError("managed metadata exceeds launcher bound")
+                  else:
+                      digest, actual_size = hash_stream(handle)
                   if digest != record["sha256"] or actual_size != record["size_bytes"]:
                       raise ValueError("archive member content hash mismatch")
 
@@ -931,7 +954,127 @@ jobs:
                           with packed.extractfile(member) as handle:
                               check_member(member.name, member.size, member.mode, handle)
 
-          def validate_artifacts(root, tag, version, source_commit, source_date_epoch, cargo_lock_sha256):
+              if managed is not None:
+                  return validate_managed_content(archive, by_name, content, managed)
+
+
+          def managed_modes(root, records, release):
+              version, binary = release["version"], TARGETS[release["target"]][1]
+              supervisor = "asg-supervisor.exe" if binary.endswith(".exe") else "asg-supervisor"
+              apps = [item for item in records if isinstance(item, dict)
+                      and isinstance(item.get("name"), str)
+                      and re.fullmatch(re.escape(root + "/versions/" + version) + r"-[0-9a-f]{12}/" + re.escape(binary), item["name"])]
+              if len(apps) != 1 or not re.fullmatch(r"[0-9a-f]{64}", str(apps[0].get("sha256"))):
+                  raise ValueError("managed application inventory is invalid")
+              digest = apps[0]["sha256"]
+              directory = "versions/" + version + "-" + digest[:12]
+              if apps[0]["name"] != root + "/" + directory + "/" + binary:
+                  raise ValueError("managed version directory digest mismatch")
+              modes = {root + "/" + name: "0644" for name in (*DOCUMENTS, *DEPENDENCIES,
+                       "current.json", directory + "/release.json", "INSTALL-AND-UPGRADE.md",
+                       "package-install.ps1", "PACKAGE-MANIFEST.tsv")}
+              for name in (binary, "asg.exe" if binary.endswith(".exe") else "asg",
+                           directory + "/" + binary, directory + "/" + supervisor, "package-install.sh"):
+                  modes[root + "/" + name] = "0755"
+              modes[root + "/" + directory + "/helpers/update-check.sh"] = "0755"
+              for name in ("update-check.ps1", "package-uninstall.ps1"):
+                  modes[root + "/" + directory + "/helpers/" + name] = "0644"
+              return modes
+
+          def executable_target(header):
+              import struct
+              if len(header) >= 64 and header[:2] == b"MZ":
+                  offset = struct.unpack_from("<I", header, 60)[0]
+                  if (len(header) >= offset + 26 and header[offset:offset + 4] == b"PE\0\0"
+                          and struct.unpack_from("<H", header, offset + 4)[0] == 0x8664
+                          and struct.unpack_from("<H", header, offset + 24)[0] == 0x20b):
+                      return "x86_64-pc-windows-msvc"
+              if (len(header) >= 64 and header[:6] == b"\x7fELF\x02\x01"
+                      and struct.unpack_from("<H", header, 16)[0] in (2, 3)
+                      and struct.unpack_from("<H", header, 18)[0] == 62):
+                  return "x86_64-unknown-linux-gnu"
+              if len(header) >= 32 and header[:4] == b"\xcf\xfa\xed\xfe":
+                  cpu, _, kind = struct.unpack_from("<III", header, 4)
+                  if kind == 2 and cpu in (0x01000007, 0x0100000c):
+                      return ("x86_64" if cpu == 0x01000007 else "aarch64") + "-apple-darwin"
+              raise ValueError("managed executable target header is invalid")
+
+          def validate_managed_content(archive, by_name, content, manifest):
+              import datetime
+              release, root = manifest["release"], archive["root"]
+              binary = TARGETS[release["target"]][1]
+              supervisor = "asg-supervisor.exe" if binary.endswith(".exe") else "asg-supervisor"
+              def blob(name):
+                  return content[root + "/" + name]
+              pointer = json.loads(blob("current.json"), object_pairs_hook=unique_object)
+              app_digest = pointer.get("app_sha256") if isinstance(pointer, dict) else None
+              if not isinstance(app_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", app_digest):
+                  raise ValueError("managed pointer digest is invalid")
+              directory = "versions/" + release["version"] + "-" + app_digest[:12]
+              timestamp = datetime.datetime.fromtimestamp(release["source_date_epoch"], datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              expected_pointer = {
+                  "schema": "asg.current/v1", "generation": 1, "version": release["version"],
+                  "dir": directory, "app": binary, "app_sha256": app_digest,
+                  "launcher_protocol": 1, "activated_at": timestamp,
+              }
+              if (pointer != expected_pointer or type(pointer["generation"]) is not int
+                      or type(pointer["launcher_protocol"]) is not int or len(directory.removeprefix("versions/")) > 64):
+                  raise ValueError("managed current pointer mismatch")
+              version = json.loads(blob(directory + "/release.json"), object_pairs_hook=unique_object)
+              if not isinstance(version, dict):
+                  raise ValueError("managed release metadata is invalid")
+              schemas = tuple(version.get(key) for key in ("catalog_schema", "control_schema"))
+              if any(type(value) is not int or not 1 <= value <= 0xffffffff for value in schemas):
+                  raise ValueError("managed schema versions are invalid")
+              expected_version = {
+                  "schema": "asg.version/v1", "version": release["version"], "target": release["target"],
+                  "source_commit": release["source_commit"], "app_sha256": app_digest,
+                  "catalog_schema": schemas[0], "control_schema": schemas[1],
+                  "launcher_protocol_min": 1, "launcher_protocol_max": 1, "built_at": timestamp,
+              }
+              if (version != expected_version or type(version["launcher_protocol_min"]) is not int
+                      or type(version["launcher_protocol_max"]) is not int):
+                  raise ValueError("managed release metadata mismatch")
+              alias = "asg.exe" if binary.endswith(".exe") else "asg"
+              launcher_digest = by_name[root + "/" + binary]["sha256"]
+              if (by_name[root + "/" + alias]["sha256"] != launcher_digest
+                      or by_name[root + "/" + directory + "/" + binary]["sha256"] != app_digest
+                      or launcher_digest == app_digest):
+                  raise ValueError("managed launcher/application identity mismatch")
+              supervisor_digest = by_name[root + "/" + directory + "/" + supervisor]["sha256"]
+              if supervisor_digest in (launcher_digest, app_digest):
+                  raise ValueError("supervisor must be a distinct executable")
+              for name in (binary, alias, directory + "/" + binary, directory + "/" + supervisor):
+                  if executable_target(blob(name)) != release["target"]:
+                      raise ValueError("managed executable target mismatch")
+              if binary.endswith(".exe"):
+                  import struct
+                  header = blob(directory + "/" + supervisor)
+                  offset = struct.unpack_from("<I", header, 60)[0]
+                  if (len(header) < offset + 94
+                          or struct.unpack_from("<H", header, offset + 20)[0] < 70
+                          or struct.unpack_from("<H", header, offset + 92)[0] != 2):
+                      raise ValueError("Windows supervisor must use GUI subsystem")
+              lines = [
+                  "asg.package-files/v1", "version\t" + release["version"],
+                  "target\t" + release["target"], "source_commit\t" + release["source_commit"],
+                  "app\t" + binary, "app_sha256\t" + app_digest, "dir\t" + directory,
+                  "supervisor\t" + supervisor, "supervisor_sha256\t" + supervisor_digest,
+                  "launcher_protocol\t1", "catalog_schema\t" + str(schemas[0]),
+                  "control_schema\t" + str(schemas[1]), "built_at\t" + timestamp,
+              ]
+              for name, record in sorted(by_name.items()):
+                  relative = name.removeprefix(root + "/")
+                  if relative != "PACKAGE-MANIFEST.tsv":
+                      lines.append("file\t" + record["sha256"] + "\t" + record["mode"] + "\t" +
+                                   str(record["size_bytes"]) + "\t" + relative)
+              expected_inventory = ("\n".join(lines) + "\n").encode("ascii")
+              if (blob("PACKAGE-MANIFEST.tsv") != expected_inventory
+                      or hashlib.sha256(expected_inventory).hexdigest() != manifest["install_manifest_sha256"]):
+                  raise ValueError("managed install inventory mismatch")
+              return schemas
+
+          def validate_artifacts(root, tag, version, source_commit, source_date_epoch, cargo_lock_sha256, expected_layout="legacy"):
               root = Path(root)
               if validate_tag(tag) != "v" + validate_version(version):
                   raise ValueError("bundle tag and version mismatch")
@@ -954,13 +1097,22 @@ jobs:
                       or dependency_report["dependency_count"] != len(dependency_report["dependencies"])):
                   raise ValueError("common dependency inventory contract mismatch")
               dependency_hashes = {name: sha256_file(root / name) for name in DEPENDENCIES}
-              shared_hashes = None
+              shared_hashes, shared_schemas = None, None
+              if expected_layout not in ("legacy", "managed"):
+                  raise ValueError("unsupported expected package layout")
               for target, (archive_format, binary) in TARGETS.items():
                   base = f"agent-session-grep-{tag}-{target}"
                   manifest = json.loads((root / (base + ".manifest.json")).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
-                  if (not isinstance(manifest, dict) or set(manifest) != {"schema", "release", "archive", "inputs", "provenance"}
+                  expected_keys = {"schema", "release", "archive", "inputs", "provenance"}
+                  if expected_layout == "managed":
+                      expected_keys.update({"layout", "install_manifest_sha256"})
+                  if (not isinstance(manifest, dict) or set(manifest) != expected_keys
                       or manifest.get("schema") != "agent-session-grep.release-archive-manifest/v1"):
                       raise ValueError("unsupported archive manifest schema")
+                  if expected_layout == "managed" and (manifest.get("layout") != "asg.managed-candidate/v1"
+                          or not isinstance(manifest.get("install_manifest_sha256"), str)
+                          or not re.fullmatch(r"[0-9a-f]{64}", manifest["install_manifest_sha256"])):
+                      raise ValueError("managed layout identity mismatch")
                   release = manifest.get("release")
                   if (not isinstance(release, dict) or release != {"tag": tag, "version": version, "target": target,
                           "source_commit": source_commit, "source_date_epoch": source_date_epoch, "unsigned": True}
@@ -982,9 +1134,14 @@ jobs:
                           or type(archive.get("size_bytes")) is not int or archive["size_bytes"] != (root / filename).stat().st_size
                           or archive.get("sha256") != sha256_file(root / filename)):
                       raise ValueError("archive metadata or digest mismatch")
-                  validate_archive_members(root / filename, archive, binary, dependency_hashes, source_date_epoch)
+                  schemas = validate_archive_members(root / filename, archive, binary, dependency_hashes, source_date_epoch,
+                                                     manifest if expected_layout == "managed" else None)
+                  if expected_layout == "managed":
+                      if shared_schemas is not None and shared_schemas != schemas:
+                          raise ValueError("managed schema versions differ between targets")
+                      shared_schemas = schemas
                   document_hashes = {entry["name"].split("/")[-1]: entry["sha256"] for entry in archive["files"]
-                                     if entry["name"].split("/")[-1] in DOCUMENTS}
+                                     if entry["name"].split("/")[-1] in (*DOCUMENTS, "INSTALL-AND-UPGRADE.md", "package-install.ps1", "package-install.sh")}
                   if shared_hashes is not None and document_hashes != shared_hashes:
                       raise ValueError("release documents differ between target archives")
                   shared_hashes = document_hashes
@@ -993,7 +1150,7 @@ jobs:
 
           if __name__ == "__main__":
               validate_artifacts("dist", os.environ["RELEASE_TAG"], os.environ["VERSION"], os.environ["SOURCE_COMMIT"],
-                                 int(os.environ["SOURCE_DATE_EPOCH"]), os.environ["CARGO_LOCK_SHA256"])
+                                 int(os.environ["SOURCE_DATE_EPOCH"]), os.environ["CARGO_LOCK_SHA256"], expected_layout="managed")
 
       - name: Upload complete temporary unsigned bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -1346,11 +1503,13 @@ jobs:
 
           import zipfile
 
-          def validate_archive_members(path, archive, binary, dependency_hashes, source_date_epoch):
+          def validate_archive_members(path, archive, binary, dependency_hashes, source_date_epoch, managed=None):
               root = archive["root"]
               modes = {root + "/" + name: "0644" for name in (*DOCUMENTS, *DEPENDENCIES)}
               modes[root + "/" + binary] = "0755"
               records = archive.get("files")
+              if managed is not None and isinstance(records, list):
+                  modes = managed_modes(root, records, managed["release"])
               if not isinstance(records, list) or len(records) != len(modes):
                   raise ValueError("archive member manifest is incomplete")
               by_name = {}
@@ -1370,11 +1529,24 @@ jobs:
               if set(by_name) != set(modes):
                   raise ValueError("archive member set differs from the packaging contract")
 
+              content = {}
               def check_member(name, size, mode, handle):
                   record = by_name[name]
                   if size != record["size_bytes"] or mode != int(record["mode"], 8):
                       raise ValueError("archive member size or mode mismatch")
-                  digest, actual_size = hash_stream(handle)
+                  if managed is not None:
+                      # Keep a bounded prefix for identity checks, stream the rest.
+                      prefix = handle.read(65536)
+                      content[name] = prefix
+                      hasher, actual_size = hashlib.sha256(prefix), len(prefix)
+                      for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                          hasher.update(chunk)
+                          actual_size += len(chunk)
+                      digest = hasher.hexdigest()
+                      if name.endswith(("current.json", "/release.json")) and actual_size > 8192:
+                          raise ValueError("managed metadata exceeds launcher bound")
+                  else:
+                      digest, actual_size = hash_stream(handle)
                   if digest != record["sha256"] or actual_size != record["size_bytes"]:
                       raise ValueError("archive member content hash mismatch")
 
@@ -1412,7 +1584,127 @@ jobs:
                           with packed.extractfile(member) as handle:
                               check_member(member.name, member.size, member.mode, handle)
 
-          def validate_artifacts(root, tag, version, source_commit, source_date_epoch, cargo_lock_sha256):
+              if managed is not None:
+                  return validate_managed_content(archive, by_name, content, managed)
+
+
+          def managed_modes(root, records, release):
+              version, binary = release["version"], TARGETS[release["target"]][1]
+              supervisor = "asg-supervisor.exe" if binary.endswith(".exe") else "asg-supervisor"
+              apps = [item for item in records if isinstance(item, dict)
+                      and isinstance(item.get("name"), str)
+                      and re.fullmatch(re.escape(root + "/versions/" + version) + r"-[0-9a-f]{12}/" + re.escape(binary), item["name"])]
+              if len(apps) != 1 or not re.fullmatch(r"[0-9a-f]{64}", str(apps[0].get("sha256"))):
+                  raise ValueError("managed application inventory is invalid")
+              digest = apps[0]["sha256"]
+              directory = "versions/" + version + "-" + digest[:12]
+              if apps[0]["name"] != root + "/" + directory + "/" + binary:
+                  raise ValueError("managed version directory digest mismatch")
+              modes = {root + "/" + name: "0644" for name in (*DOCUMENTS, *DEPENDENCIES,
+                       "current.json", directory + "/release.json", "INSTALL-AND-UPGRADE.md",
+                       "package-install.ps1", "PACKAGE-MANIFEST.tsv")}
+              for name in (binary, "asg.exe" if binary.endswith(".exe") else "asg",
+                           directory + "/" + binary, directory + "/" + supervisor, "package-install.sh"):
+                  modes[root + "/" + name] = "0755"
+              modes[root + "/" + directory + "/helpers/update-check.sh"] = "0755"
+              for name in ("update-check.ps1", "package-uninstall.ps1"):
+                  modes[root + "/" + directory + "/helpers/" + name] = "0644"
+              return modes
+
+          def executable_target(header):
+              import struct
+              if len(header) >= 64 and header[:2] == b"MZ":
+                  offset = struct.unpack_from("<I", header, 60)[0]
+                  if (len(header) >= offset + 26 and header[offset:offset + 4] == b"PE\0\0"
+                          and struct.unpack_from("<H", header, offset + 4)[0] == 0x8664
+                          and struct.unpack_from("<H", header, offset + 24)[0] == 0x20b):
+                      return "x86_64-pc-windows-msvc"
+              if (len(header) >= 64 and header[:6] == b"\x7fELF\x02\x01"
+                      and struct.unpack_from("<H", header, 16)[0] in (2, 3)
+                      and struct.unpack_from("<H", header, 18)[0] == 62):
+                  return "x86_64-unknown-linux-gnu"
+              if len(header) >= 32 and header[:4] == b"\xcf\xfa\xed\xfe":
+                  cpu, _, kind = struct.unpack_from("<III", header, 4)
+                  if kind == 2 and cpu in (0x01000007, 0x0100000c):
+                      return ("x86_64" if cpu == 0x01000007 else "aarch64") + "-apple-darwin"
+              raise ValueError("managed executable target header is invalid")
+
+          def validate_managed_content(archive, by_name, content, manifest):
+              import datetime
+              release, root = manifest["release"], archive["root"]
+              binary = TARGETS[release["target"]][1]
+              supervisor = "asg-supervisor.exe" if binary.endswith(".exe") else "asg-supervisor"
+              def blob(name):
+                  return content[root + "/" + name]
+              pointer = json.loads(blob("current.json"), object_pairs_hook=unique_object)
+              app_digest = pointer.get("app_sha256") if isinstance(pointer, dict) else None
+              if not isinstance(app_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", app_digest):
+                  raise ValueError("managed pointer digest is invalid")
+              directory = "versions/" + release["version"] + "-" + app_digest[:12]
+              timestamp = datetime.datetime.fromtimestamp(release["source_date_epoch"], datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              expected_pointer = {
+                  "schema": "asg.current/v1", "generation": 1, "version": release["version"],
+                  "dir": directory, "app": binary, "app_sha256": app_digest,
+                  "launcher_protocol": 1, "activated_at": timestamp,
+              }
+              if (pointer != expected_pointer or type(pointer["generation"]) is not int
+                      or type(pointer["launcher_protocol"]) is not int or len(directory.removeprefix("versions/")) > 64):
+                  raise ValueError("managed current pointer mismatch")
+              version = json.loads(blob(directory + "/release.json"), object_pairs_hook=unique_object)
+              if not isinstance(version, dict):
+                  raise ValueError("managed release metadata is invalid")
+              schemas = tuple(version.get(key) for key in ("catalog_schema", "control_schema"))
+              if any(type(value) is not int or not 1 <= value <= 0xffffffff for value in schemas):
+                  raise ValueError("managed schema versions are invalid")
+              expected_version = {
+                  "schema": "asg.version/v1", "version": release["version"], "target": release["target"],
+                  "source_commit": release["source_commit"], "app_sha256": app_digest,
+                  "catalog_schema": schemas[0], "control_schema": schemas[1],
+                  "launcher_protocol_min": 1, "launcher_protocol_max": 1, "built_at": timestamp,
+              }
+              if (version != expected_version or type(version["launcher_protocol_min"]) is not int
+                      or type(version["launcher_protocol_max"]) is not int):
+                  raise ValueError("managed release metadata mismatch")
+              alias = "asg.exe" if binary.endswith(".exe") else "asg"
+              launcher_digest = by_name[root + "/" + binary]["sha256"]
+              if (by_name[root + "/" + alias]["sha256"] != launcher_digest
+                      or by_name[root + "/" + directory + "/" + binary]["sha256"] != app_digest
+                      or launcher_digest == app_digest):
+                  raise ValueError("managed launcher/application identity mismatch")
+              supervisor_digest = by_name[root + "/" + directory + "/" + supervisor]["sha256"]
+              if supervisor_digest in (launcher_digest, app_digest):
+                  raise ValueError("supervisor must be a distinct executable")
+              for name in (binary, alias, directory + "/" + binary, directory + "/" + supervisor):
+                  if executable_target(blob(name)) != release["target"]:
+                      raise ValueError("managed executable target mismatch")
+              if binary.endswith(".exe"):
+                  import struct
+                  header = blob(directory + "/" + supervisor)
+                  offset = struct.unpack_from("<I", header, 60)[0]
+                  if (len(header) < offset + 94
+                          or struct.unpack_from("<H", header, offset + 20)[0] < 70
+                          or struct.unpack_from("<H", header, offset + 92)[0] != 2):
+                      raise ValueError("Windows supervisor must use GUI subsystem")
+              lines = [
+                  "asg.package-files/v1", "version\t" + release["version"],
+                  "target\t" + release["target"], "source_commit\t" + release["source_commit"],
+                  "app\t" + binary, "app_sha256\t" + app_digest, "dir\t" + directory,
+                  "supervisor\t" + supervisor, "supervisor_sha256\t" + supervisor_digest,
+                  "launcher_protocol\t1", "catalog_schema\t" + str(schemas[0]),
+                  "control_schema\t" + str(schemas[1]), "built_at\t" + timestamp,
+              ]
+              for name, record in sorted(by_name.items()):
+                  relative = name.removeprefix(root + "/")
+                  if relative != "PACKAGE-MANIFEST.tsv":
+                      lines.append("file\t" + record["sha256"] + "\t" + record["mode"] + "\t" +
+                                   str(record["size_bytes"]) + "\t" + relative)
+              expected_inventory = ("\n".join(lines) + "\n").encode("ascii")
+              if (blob("PACKAGE-MANIFEST.tsv") != expected_inventory
+                      or hashlib.sha256(expected_inventory).hexdigest() != manifest["install_manifest_sha256"]):
+                  raise ValueError("managed install inventory mismatch")
+              return schemas
+
+          def validate_artifacts(root, tag, version, source_commit, source_date_epoch, cargo_lock_sha256, expected_layout="legacy"):
               root = Path(root)
               if validate_tag(tag) != "v" + validate_version(version):
                   raise ValueError("bundle tag and version mismatch")
@@ -1435,13 +1727,22 @@ jobs:
                       or dependency_report["dependency_count"] != len(dependency_report["dependencies"])):
                   raise ValueError("common dependency inventory contract mismatch")
               dependency_hashes = {name: sha256_file(root / name) for name in DEPENDENCIES}
-              shared_hashes = None
+              shared_hashes, shared_schemas = None, None
+              if expected_layout not in ("legacy", "managed"):
+                  raise ValueError("unsupported expected package layout")
               for target, (archive_format, binary) in TARGETS.items():
                   base = f"agent-session-grep-{tag}-{target}"
                   manifest = json.loads((root / (base + ".manifest.json")).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
-                  if (not isinstance(manifest, dict) or set(manifest) != {"schema", "release", "archive", "inputs", "provenance"}
+                  expected_keys = {"schema", "release", "archive", "inputs", "provenance"}
+                  if expected_layout == "managed":
+                      expected_keys.update({"layout", "install_manifest_sha256"})
+                  if (not isinstance(manifest, dict) or set(manifest) != expected_keys
                       or manifest.get("schema") != "agent-session-grep.release-archive-manifest/v1"):
                       raise ValueError("unsupported archive manifest schema")
+                  if expected_layout == "managed" and (manifest.get("layout") != "asg.managed-candidate/v1"
+                          or not isinstance(manifest.get("install_manifest_sha256"), str)
+                          or not re.fullmatch(r"[0-9a-f]{64}", manifest["install_manifest_sha256"])):
+                      raise ValueError("managed layout identity mismatch")
                   release = manifest.get("release")
                   if (not isinstance(release, dict) or release != {"tag": tag, "version": version, "target": target,
                           "source_commit": source_commit, "source_date_epoch": source_date_epoch, "unsigned": True}
@@ -1463,9 +1764,14 @@ jobs:
                           or type(archive.get("size_bytes")) is not int or archive["size_bytes"] != (root / filename).stat().st_size
                           or archive.get("sha256") != sha256_file(root / filename)):
                       raise ValueError("archive metadata or digest mismatch")
-                  validate_archive_members(root / filename, archive, binary, dependency_hashes, source_date_epoch)
+                  schemas = validate_archive_members(root / filename, archive, binary, dependency_hashes, source_date_epoch,
+                                                     manifest if expected_layout == "managed" else None)
+                  if expected_layout == "managed":
+                      if shared_schemas is not None and shared_schemas != schemas:
+                          raise ValueError("managed schema versions differ between targets")
+                      shared_schemas = schemas
                   document_hashes = {entry["name"].split("/")[-1]: entry["sha256"] for entry in archive["files"]
-                                     if entry["name"].split("/")[-1] in DOCUMENTS}
+                                     if entry["name"].split("/")[-1] in (*DOCUMENTS, "INSTALL-AND-UPGRADE.md", "package-install.ps1", "package-install.sh")}
                   if shared_hashes is not None and document_hashes != shared_hashes:
                       raise ValueError("release documents differ between target archives")
                   shared_hashes = document_hashes
@@ -1602,7 +1908,8 @@ jobs:
           if __name__ == "__main__":
               require_success(json.loads(os.environ["NEEDS_JSON"]), ["prepare", "quality", "build", "assemble", "gate"])
               tag, version, source = os.environ["RELEASE_TAG"], os.environ["VERSION"], os.environ["SOURCE_COMMIT"]
-              validate_artifacts("dist", tag, version, source, int(os.environ["SOURCE_DATE_EPOCH"]), os.environ["CARGO_LOCK_SHA256"])
+              # Developer managed candidates are deliberately ineligible for publication.
+              validate_artifacts("dist", tag, version, source, int(os.environ["SOURCE_DATE_EPOCH"]), os.environ["CARGO_LOCK_SHA256"], expected_layout="legacy")
               repo = os.environ["GH_REPO"]
               identity = api_get(f"/repos/{repo}")
               if not isinstance(identity, dict) or str(identity.get("id")) != os.environ["REPOSITORY_ID"]:

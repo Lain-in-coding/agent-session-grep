@@ -164,12 +164,26 @@ class WorkflowContractTests(unittest.TestCase):
                     "--no-default-features",
                     "--target",
                     "-p agent-session-grep-cli",
+                    "-p agent-session-grep-launcher",
+                    "--bin agent-session-grep-launcher",
+                    "--bin asg-supervisor",
                 ):
                     self.assertIn(
                         required,
                         flags,
                         f"{name}: release build is missing {required}",
                     )
+
+    def test_managed_package_builds_probe_real_binaries_and_pin_helper_bytes(self) -> None:
+        for name in RELEASE_BUILD_WORKFLOWS:
+            text = read_workflow(name)
+            blocks = [block for block in STEP_BOUNDARY.split(text)
+                      if block.startswith("name: Build deterministic unsigned archive and manifest")]
+            self.assertEqual(len(blocks), 1)
+            for option in ("--managed-layout", "--launcher $launcher", "--supervisor $supervisor", "--schemas-from-source",
+                           "--git-package-inputs", "--verify-native"):
+                self.assertIn(option, blocks[0], name)
+            self.assertIn('expected_layout="managed"', text)
 
     def test_release_workflows_cover_three_operating_systems(self) -> None:
         expected_targets = {

@@ -11,6 +11,23 @@ from __future__ import annotations
 import ast
 import copy
 import contextlib
+if not hasattr(contextlib, "chdir"):
+    import os
+
+    @contextlib.contextmanager
+    def _chdir(path):
+        previous = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+    contextlib.chdir = _chdir
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import io
 import gzip
 import hashlib
@@ -28,6 +45,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
+import test_build_manifest as packaging_tests
 from test_build_manifest import BUILD_MANIFEST
 from test_release_workflow import has_python_gh_call
 
@@ -151,7 +169,7 @@ def load_step(name, job_name, ident):
     if not re.search(r"(?m)^        shell: python(?: \{0\})?$", block):
         raise AssertionError("workflow control must use explicit Python")
     source = run_source(block)
-    scope = {"__name__": "workflow_contract"}
+    scope = {"__name__": "workflow_contract", "tomllib": tomllib}
     exec(compile(source, f"<{name}/{job_name}/{ident}>", "exec"), scope)
     return scope, source
 
@@ -210,8 +228,9 @@ class ReleaseBundle:
     source_commit = oid("tag-b")
     epoch = 1_700_000_000
 
-    def __init__(self, base):
+    def __init__(self, base, managed=False):
         self.base = base
+        self.managed = managed
         self.workspace = base / "source"
         self.workspace.mkdir()
         (self.workspace / "Cargo.toml").write_text(
@@ -221,6 +240,11 @@ class ReleaseBundle:
             encoding="utf-8")
         for name in BUILD_MANIFEST.REQUIRED_DOCUMENTS:
             (self.workspace / name).write_text(f"Synthetic release fixture: {name}\n", encoding="utf-8")
+        if managed:
+            for name in BUILD_MANIFEST.MANAGED_SOURCE_INPUTS:
+                path = self.workspace / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"Synthetic managed helper/document: {name}\n", encoding="utf-8")
         self.lock_hash = BUILD_MANIFEST.sha256_file(self.workspace / "Cargo.lock")
         metadata = self.workspace / "metadata.json"
         metadata.write_text(json.dumps({
@@ -236,12 +260,23 @@ class ReleaseBundle:
         for target in TARGETS:
             binary = self.workspace / ("agent-session-grep.exe" if "windows" in target else "agent-session-grep")
             binary.write_bytes(f"synthetic non-executable bytes for {target}".encode())
+            options = {}
+            if managed:
+                suffix = ".exe" if "windows" in target else ""
+                launcher = self.workspace / ("agent-session-grep-launcher" + suffix)
+                supervisor = self.workspace / ("asg-supervisor" + suffix)
+                binary.write_bytes(packaging_tests.BuildManifestTests.native_image(target, b"synthetic application"))
+                launcher.write_bytes(packaging_tests.BuildManifestTests.native_image(target, b"synthetic launcher"))
+                supervisor.write_bytes(packaging_tests.BuildManifestTests.native_image(target, b"synthetic supervisor", gui=True))
+                catalog_schema, control_schema = BUILD_MANIFEST._source_schemas(ROOT)
+                options = dict(managed_layout=True, launcher=launcher, supervisor=supervisor,
+                               catalog_schema=catalog_schema, control_schema=control_schema)
             archive, manifest = BUILD_MANIFEST.package_release(
                 workspace=self.workspace, binary=binary,
                 dependency_json=dependency_json, dependency_csv=dependency_csv,
                 target=target, tag=self.tag, version=self.version,
                 source_commit=self.source_commit, source_date_epoch=self.epoch,
-                archive_format="zip" if "windows" in target else "tar.gz", output_dir=self.dist)
+                archive_format="zip" if "windows" in target else "tar.gz", output_dir=self.dist, **options)
             self.archives[target], self.manifests[target] = archive, manifest
         self.refresh_checksums()
 
@@ -261,15 +296,16 @@ class ReleaseBundle:
     def validate(self, control, **overrides):
         arguments = dict(root=self.dist, tag=self.tag, version=self.version,
                          source_commit=self.source_commit, source_date_epoch=self.epoch,
-                         cargo_lock_sha256=self.lock_hash)
+                         cargo_lock_sha256=self.lock_hash,
+                         expected_layout="managed" if self.managed else "legacy")
         arguments.update(overrides)
         return control["validate_artifacts"](**arguments)
 
 
 @contextlib.contextmanager
-def release_bundle():
+def release_bundle(managed=False):
     with tempfile.TemporaryDirectory(prefix="workflow-contract-") as directory:
-        yield ReleaseBundle(Path(directory))
+        yield ReleaseBundle(Path(directory).resolve(), managed=managed)
 
 
 RELEASE_INPUTS = ("Cargo.lock", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE",
@@ -873,8 +909,19 @@ class InstalledCommandControlTests(unittest.TestCase):
                 # Exercise real native exit handling without needing an installed
                 # Windows product binary on the other quality-matrix platforms.
                 code = 17 if index == failure else 0
-                # Isolate the stub without changing captured workflow arguments.
-                probe_kwargs = {"env": {}, **kwargs}
+                # Exercise a real child exit; run_main clears os.environ,
+                # so restore only the Windows process startup variables.
+                probe_kwargs = {**kwargs, "stdin": subprocess.DEVNULL,
+                                "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                if os.name == "nt":
+                    startup = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                               "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
+                               "PATH": os.environ.get("PATH", os.defpath),
+                               "PYTHONHOME": sys.prefix,
+                               "TEMP": os.environ.get("TEMP", ""),
+                               "TMP": os.environ.get("TMP", "")}
+                    startup.update(kwargs.get("env") or {})
+                    probe_kwargs["env"] = startup
                 return real_run([sys.executable, "-c", f"raise SystemExit({code})"], **probe_kwargs)
 
             with self.subTest(failed_command=failure), patch("subprocess.run", side_effect=synthetic_native):
@@ -900,7 +947,17 @@ class InstalledCommandControlTests(unittest.TestCase):
                 def synthetic_script(argv, **kwargs):
                     index = len(calls)
                     calls.append((argv, kwargs))
-                    probe_kwargs = {"env": {}, **kwargs}
+                    probe_kwargs = {**kwargs, "stdin": subprocess.DEVNULL,
+                                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                    if os.name == "nt":
+                        startup = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                                   "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
+                                   "PATH": os.environ.get("PATH", os.defpath),
+                                   "PYTHONHOME": sys.prefix,
+                                   "TEMP": os.environ.get("TEMP", ""),
+                                   "TMP": os.environ.get("TMP", "")}
+                        startup.update(kwargs.get("env") or {})
+                        probe_kwargs["env"] = startup
                     return real_run([sys.executable, "-c", f"raise SystemExit({17 if index == failure else 0})"], **probe_kwargs)
 
                 with contextlib.chdir(directory), patch("subprocess.run", side_effect=synthetic_script):
@@ -929,9 +986,10 @@ class InstalledCommandControlTests(unittest.TestCase):
 
     def test_native_probes_use_explicit_environment_in_fresh_process(self):
         # Select only the two existing exit tests, not this containing suite.
-        # Bootstrap imports normally: unittest.mock needs Windows system variables.
-        # Only exit-only probes use an empty environment. The spy catches omitted
-        # env even on platforms where implicit inheritance happens to work.
+        # Bootstrap imports normally: Windows child startup needs system
+        # variables. The spy verifies explicit env passing; production calls
+        # themselves must keep passing env explicitly, so compare against the
+        # caller-visible env argument rather than requiring a literal {}.
         probe = """
 import subprocess
 import sys
@@ -944,8 +1002,8 @@ from test_workflow_contracts import InstalledCommandControlTests
 real_run = subprocess.run
 
 def checked_native(argv, **kwargs):
-    if kwargs.get("env") != {}:
-        raise AssertionError("exit-only native probes must receive explicit env={}")
+    if "env" not in kwargs:
+        raise AssertionError("native probes must pass env explicitly")
     return real_run(argv, **kwargs)
 
 methods = (
@@ -1416,6 +1474,154 @@ class ArtifactValidationTests(unittest.TestCase):
         bundle.change_manifest(["archive", "sha256"], BUILD_MANIFEST.sha256_file(archive), target)
         bundle.change_manifest(["archive", "size_bytes"], archive.stat().st_size, target)
 
+    @classmethod
+    def rewrite_managed_content(cls, bundle, target, mutate):
+        manifest_path = bundle.manifests[target]
+        manifest = json.loads(manifest_path.read_bytes())
+        records = {entry["name"]: entry for entry in manifest["archive"]["files"]}
+        def change(entries):
+            for index, (info, data) in enumerate(entries):
+                name = info.filename if target == TARGETS[0] else info.name
+                data = mutate(name, data)
+                entries[index] = info, data
+                if target != TARGETS[0]:
+                    info.size = len(data)
+                records[name]["sha256"] = hashlib.sha256(data).hexdigest()
+                records[name]["size_bytes"] = len(data)
+        cls.rewrite_archive(bundle, target, change)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        cls.refresh_archive_metadata(bundle, target)
+
+    def test_managed_four_target_bundle_requires_explicit_layout(self):
+        for name, ident, control in artifact_controls():
+            with self.subTest(workflow=name, job=ident), release_bundle(managed=True) as bundle:
+                for target in TARGETS:
+                    manifest = json.loads(bundle.manifests[target].read_bytes())
+                    records = {record["name"]: record for record in manifest["archive"]["files"]}
+                    self.assertEqual(len(records), 21)
+                    if target == TARGETS[0]:
+                        with zipfile.ZipFile(bundle.archives[target]) as archive:
+                            content = {info.filename: archive.read(info) for info in archive.infolist()}
+                    else:
+                        with tarfile.open(bundle.archives[target], "r:gz") as archive:
+                            content = {info.name: archive.extractfile(info).read() for info in archive.getmembers()}
+                    root = manifest["archive"]["root"]
+                    pointer = json.loads(content[root + "/current.json"])
+                    inventory = content[root + "/PACKAGE-MANIFEST.tsv"]
+                    lines = inventory.decode("ascii").splitlines()
+                    self.assertEqual(lines[0], "asg.package-files/v1")
+                    fields = dict(line.split("\t") for line in lines[1:] if not line.startswith("file\t"))
+                    self.assertEqual(set(fields), {
+                        "version", "target", "source_commit", "app", "app_sha256", "dir",
+                        "supervisor", "supervisor_sha256", "launcher_protocol", "catalog_schema",
+                        "control_schema", "built_at",
+                    })
+                    schemas = BUILD_MANIFEST._source_schemas(ROOT)
+                    self.assertEqual((int(fields["catalog_schema"]), int(fields["control_schema"])), schemas)
+                    payload = {parts[4]: parts[1:4] for line in lines[1:]
+                               if (parts := line.split("\t"))[0] == "file"}
+                    self.assertEqual(len(payload), 20)
+                    self.assertNotIn("PACKAGE-MANIFEST.tsv", payload)
+                    self.assertEqual(set(records), set(content))
+                    self.assertEqual(manifest["install_manifest_sha256"], hashlib.sha256(inventory).hexdigest())
+                    for helper, mode in (("update-check.sh", "0755"), ("update-check.ps1", "0644"),
+                                         ("package-uninstall.ps1", "0644")):
+                        member = pointer["dir"] + "/helpers/" + helper
+                        data = content[root + "/" + member]
+                        digest = hashlib.sha256(data).hexdigest()
+                        self.assertEqual(payload[member], [digest, mode, str(len(data))])
+                        self.assertEqual(records[root + "/" + member], {
+                            "name": root + "/" + member, "sha256": digest,
+                            "mode": mode, "size_bytes": len(data),
+                        })
+                bundle.validate(control)
+                with self.assertRaises(ValueError):
+                    bundle.validate(control, expected_layout="legacy")
+            with release_bundle() as legacy:
+                with self.assertRaises(ValueError):
+                    legacy.validate(control, expected_layout="managed")
+
+    def test_managed_validation_functions_remain_identical_at_every_boundary(self):
+        functions = ("managed_modes", "executable_target", "validate_managed_content",
+                     "validate_archive_members", "validate_artifacts")
+        for function in functions:
+            sources = set()
+            for workflow, job_name, ident in (("release.yml", "assemble", "validate_artifacts"),
+                                             ("release-verify.yml", "assemble", "validate_artifacts"),
+                                             ("release.yml", "publish", "publish")):
+                _, source = load_step(workflow, job_name, ident)
+                node = next(node for node in ast.parse(source).body
+                            if isinstance(node, ast.FunctionDef) and node.name == function)
+                sources.add(ast.dump(node, include_attributes=False))
+            self.assertEqual(len(sources), 1, function)
+
+    def test_managed_pointer_release_target_and_inventory_reject_rehashed_tamper(self):
+        mutations = ("pointer", "release", "target", "alias", "inventory", "supervisor_target",
+                     "supervisor_console", "supervisor_hash", "uninstall_tail_hash")
+        for name, ident, control in artifact_controls():
+            for mutation in mutations:
+                with self.subTest(workflow=name, job=ident, mutation=mutation), release_bundle(managed=True) as bundle:
+                    def change(path, data):
+                        if mutation == "pointer" and path.endswith("/current.json"):
+                            item = json.loads(data); item["dir"] = "../escape"
+                            return json.dumps(item).encode()
+                        if mutation == "release" and path.endswith("/release.json"):
+                            item = json.loads(data); item["source_commit"] = "f" * 40
+                            return json.dumps(item).encode()
+                        if mutation == "target" and path.endswith(("/agent-session-grep.exe", "/asg.exe")) and "/versions/" not in path:
+                            return packaging_tests.BuildManifestTests.native_image(TARGETS[1], b"wrong target")
+                        if mutation == "alias" and path.endswith("/asg.exe"):
+                            return data + b"changed alias"
+                        if mutation == "inventory" and path.endswith("/PACKAGE-MANIFEST.tsv"):
+                            line = next(line for line in data.splitlines() if line.startswith(b"catalog_schema\t"))
+                            changed = b"catalog_schema\t" + str(int(line.split(b"\t")[1]) + 1).encode("ascii")
+                            return data.replace(line, changed)
+                        if mutation == "uninstall_tail_hash" and path.endswith("/helpers/package-uninstall.ps1"):
+                            return data + b"modified uninstall tail"
+                        if mutation.startswith("supervisor_") and path.endswith("/asg-supervisor.exe"):
+                            if mutation == "supervisor_target":
+                                return packaging_tests.BuildManifestTests.native_image(TARGETS[1], b"foreign supervisor")
+                            if mutation == "supervisor_console":
+                                return packaging_tests.BuildManifestTests.native_image(TARGETS[0], b"console supervisor")
+                            return data + b"modified supervisor"
+                        return data
+                    self.rewrite_managed_content(bundle, TARGETS[0], change)
+                    expected = ("executable target mismatch" if mutation in ("target", "supervisor_target")
+                                else "GUI subsystem" if mutation == "supervisor_console"
+                                else "managed install inventory mismatch" if mutation == "uninstall_tail_hash" else ".")
+                    with self.assertRaisesRegex(ValueError, expected):
+                        bundle.validate(control)
+
+    def test_managed_archive_rejects_missing_installer_and_link_member(self):
+        for name, ident, control in artifact_controls():
+            for target in TARGETS[:2]:
+                for mutation in ("missing", "link", "missing_supervisor", "linked_supervisor",
+                                 "missing_tail", "linked_tail", "tail_mode"):
+                    with self.subTest(workflow=name, job=ident, target=target, mutation=mutation), release_bundle(managed=True) as bundle:
+                        def change(entries):
+                            member = ("package-uninstall.ps1" if "tail" in mutation else
+                                      ("asg-supervisor.exe" if target == TARGETS[0] else "asg-supervisor")
+                                      if "supervisor" in mutation else "package-install.sh")
+                            index = next(i for i, (info, _) in enumerate(entries)
+                                         if (info.filename if target == TARGETS[0] else info.name).endswith("/" + member))
+                            if mutation.startswith("missing"):
+                                entries.pop(index)
+                            elif mutation == "tail_mode":
+                                if target == TARGETS[0]:
+                                    entries[index][0].external_attr = 0o100755 << 16
+                                else:
+                                    entries[index][0].mode = 0o755
+                            elif target == TARGETS[0]:
+                                entries[index][0].external_attr = 0o120755 << 16
+                            else:
+                                info, _ = entries[index]
+                                info.type, info.linkname, info.size = tarfile.SYMTYPE, "../outside", 0
+                                entries[index] = info, b""
+                        self.rewrite_archive(bundle, target, change)
+                        self.refresh_archive_metadata(bundle, target)
+                        with self.assertRaises(ValueError):
+                            bundle.validate(control)
+
     def test_actual_archive_headers_must_match_the_prepared_epoch(self):
         for name, ident, control in artifact_controls():
             for target, field in ((TARGETS[0], "member"), (TARGETS[1], "member"), (TARGETS[1], "gzip")):
@@ -1834,6 +2040,14 @@ class PublicationControlTests(unittest.TestCase):
         responses = absence_responses(bundle.tag)
         responses[f"repos/sample/project/git/ref/tags/{bundle.tag}"] = tag_response(bundle.tag, bundle.source_commit)
         return responses
+
+    def test_managed_developer_candidate_stops_before_publication_api_or_command(self):
+        with release_bundle(managed=True) as bundle:
+            api = FakeAPI(self.responses(bundle))
+            with patch("subprocess.run") as command, self.assertRaises(ValueError):
+                self.invoke(bundle, api, publish_environment(bundle))
+            self.assertEqual(api.calls, [])
+            command.assert_not_called()
 
     def test_publish_control_uses_only_one_verified_create_with_literal_arguments(self):
         with release_bundle() as bundle:

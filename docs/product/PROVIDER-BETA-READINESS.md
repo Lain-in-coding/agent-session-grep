@@ -7,7 +7,9 @@
 > repository-local gaps from external/owner gates. Do not promote from this
 > file alone.
 
-Last updated: 2026-10-06 (lifecycle wave (B5) — provider-level append / shrink / same-length rewrite / fork evidence for `claude-code` and `codex` landed in each crate (see the lifecycle section below); no maturity, capability or blocker column changes).
+Last updated: 2026-10-19 (M2 independent WorkBuddy/ZCode/DeepSeek Harness adapters registered as Experimental with synthetic evidence only; previous 14-provider evidence retains its original scope. All global/native promotion gates remain open).
+
+Previous pass: 2026-10-06 (B5 lifecycle evidence for Claude Code/Codex only; no promotion).
 
 Previous pass, 2026-09-29 (provider coverage wave: `hermes` gained the additive
 `hermes/sqlite-state-v1` variant for `~/.hermes/state.db` and
@@ -109,9 +111,9 @@ Synthetic fixtures only; this section adds anchors, not promotions.
 | ADR-0010 accepted_at | owner/approver | Rollback policy is Proposed only |
 | Independent owner promotion decision | owner | RFC-0002 §6 forbids code-existence promotion |
 
-## Per-provider local readiness (implemented 14)
+## Per-provider local readiness (implemented 17)
 
-Legend for local columns: `ok` = present with tests; `partial` = present with known holes; `missing` = not implemented / unsupported in capability matrix. `property` = seeded randomized property suite (`tests/properties.rs`, mirroring claude-code/codex).
+Legend for local columns: `ok` = present with tests; `partial` = present with known holes; `missing` = not implemented / unsupported in capability matrix. `golden=partial` identifies the new M2 runtime-generated synthetic schema tests, not the original pinned golden family. `property` = seeded randomized suite (`tests/properties.rs`); M2 tests do not claim that separate suite. Native host, actual lifecycle coverage and target acceptance remain distinct gates.
 
 | provider_id | golden | read-only | property | discover | source_span | tool_activity | resume | incremental | local Beta blockers (beyond global) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -129,13 +131,14 @@ Legend for local columns: `ok` = present with tests; `partial` = present with kn
 | tencent-codebuddy | ok | ok | ok | native | ok (native) | missing | derived | derived | the VS Code extension surface stays unimplemented for lack of format evidence, not for lack of work: every reference project that reads CodeBuddy (AgentRecall's `codebuddyAdapter` in `format-adapters.ts`, ctx, cc-switch) parses the same `type: "message"` transcript-JSONL shape this adapter already handles, and none documents a separate extension store. Guessing that layout would be fabrication; documented format knowledge carries no structured tool-call records either, so tool_activity is honestly Unsupported |
 | cline | ok | ok | ok | native | missing | missing | unsupported | derived | no session id / span; discovery covers the `~/.cline/data/tasks` tree only (the VS Code extension `globalStorage` tree is not home-relative and is not registered) |
 | aider | ok | ok | ok | missing | derived | missing | unsupported | derived | approximate spans; no resume; no discovery root by construction — `.aider.chat.history.md` lives at the root of each user repository, so upstream agentsview discovers it by walking working trees rather than one canonical home directory; no tool_activity (blockquote tool output is folded into assistant text, no structured call/result records) |
+| workbuddy | partial | ok | missing | partial | ok (native) | partial | unknown | derived | Independent `workbuddy/project-jsonl-v1`, fixture revision 2; JSONL17 plus single/batch-state16 synthetic tests. One deserialize per batch, 65,536-row/32 MiB ID-cwd bounds and original deadline; duplicate IDs or malformed fields reject the entire batch. Native ID/body/span retained; tool calls require explicit message/call anchors. Already-logical Backup API 2/2 headers normalize only in private deserialize bytes. Actual softdelete/cloud/orphan discovery, host loading and native resume remain pending; file presence and read failure are not deletion evidence |
+| zcode | partial | ok | missing | partial | missing | partial | unknown | derived | Independent `zcode/sqlite-v1`; coherent logical DB/WAL image only, with a separate central 256 MiB ZCode source cap (generic SQLite stays 128 MiB). Message provenance is reversible `zcode:<native-id>` with explicit session membership, no raw SQLite byte span or fabricated message parent edge. Unknown/malformed message parts defer their whole message and completed-scan authority is separate. Live acquisition/discovery/deletion/native host acceptance remain pending |
+| deepseek-harness | partial | ok | missing | partial | missing | missing | unknown | derived | Independent `deepseek-harness/session-jsonl-zstd-v4`, synthetic19 evidence. Multi-frame zstd, 128 MiB input/256 MiB decoded/8 MiB record and window bounds. Torn final frame returns complete rows with incomplete report; corrupt or unknown required records refuse. Highest generation under the actual .dsh deployment, source deletion, live host/native resume and current-surface replay remain separate |
 
 ## Deferred providers (not Beta candidates)
 
-| provider_id | status | blocker |
-|---|---|---|
-| deepseek-harness | Unsupported | no transcript evidence |
-| zcode | Unsupported | no transcript evidence |
+No current matrix row is deferred. New M2 rows are **Experimental**, not Beta:
+implementation and synthetic evidence do not satisfy the following global gates.
 
 ## Honest promotion rule
 
@@ -146,4 +149,4 @@ A provider may be advertised as **Beta** only when:
 3. ADR-0010 is Accepted; and
 4. the owner records the promotion decision with evidence paths.
 
-Until then the public matrix stays **Experimental** for all 14 implemented providers.
+Until then the public matrix stays **Experimental** for all 17 implemented providers. WorkBuddy, ZCode and DeepSeek Harness have a confirmed Beta target, not completed Beta/native acceptance.

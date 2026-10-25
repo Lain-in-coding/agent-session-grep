@@ -8,16 +8,73 @@ message graphs, then serves full-text retrieval, resume, and handoff through
 CLI, MCP, Robot, TUI, and loopback Web UI surfaces — all sharing one
 Application ADT.
 
-**Release status:** `0.1.0` is the first public release, matching the Cargo
-workspace version. Provider adapters are Experimental maturity and the optional
-semantic backend carries no quality claim — see
+**Release status:** `0.2.0-beta.1` is the Cargo workspace version for the
+in-progress Managed Beta candidate; it is not yet a published release or a
+maturity certification. The canonical public release remains the
+[v0.1.0 Release](https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0),
+with GitHub-generated source archives and no uploaded assets (no prebuilt
+binaries). This checkout contains unreleased changes beyond that tag; record
+`git rev-parse HEAD` with source-build results. Provider adapters are
+Experimental maturity and the optional semantic backend carries no quality claim — see
 [`docs/product/PROVIDER-MATURITY-MATRIX.md`](docs/product/PROVIDER-MATURITY-MATRIX.md).
-The canonical [v0.1.0 Release](https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0)
-has GitHub-generated source archives and no uploaded assets (no prebuilt
-binaries). This checkout contains unreleased changes beyond that tag even
-though Cargo still reports 0.1.0; record `git rev-parse HEAD` with source-build
-results. Unsigned Actions artifacts are not Release assets or signed/notarized
-binary distribution.
+Unsigned Actions artifacts are not Release assets or signed/notarized binary
+distribution.
+
+Managed public Beta development is in progress. This checkout includes selected
+history updates, scoped original evidence and user-triggered package-update
+commands; their complete installation and recovery acceptance remains pending.
+The [managed contracts](docs/contracts/CONTRACT-cli-robot-mcp-draft.md#12-managed-beta-contracts-implementation-in-progress)
+describe that work; they do not certify this checkout as a complete Beta.
+The published v0.1.0 installation instructions below remain the source path
+until a verified package is released.
+
+For isolated development profiles, `asg --db <new-private-dir>/catalog.db setup`
+initializes a managed catalog. A verified installed candidate also supports
+`setup --host claude --host codex` with explicit
+`--history claude <root>`/`--history codex <root>`, preserving unrelated host settings and
+registering its native login configuration. The same explicit registration
+command also accepts `workbuddy`, `zcode`, `deepseek-harness` and `antigravity`;
+provider-specific managed history integration remains in progress. Linux verifies the effective unit
+and exact program arguments through the user service manager; macOS verifies
+its GUI manager and program arguments. Missing managers, configuration changes
+or timeouts leave setup incomplete (exit 10). Actual login and host model calls
+remain separate acceptance stages. `sources add --provider <id> <root-or-file>`,
+`sources list`, `sources revoke <selection-id>` and
+`background start|status|pause|resume|stop` operate on persisted policy.
+Selecting history while updates are running starts a worker; resume also starts
+it. Existing legacy catalogs are never silently adopted by setup.
+`background autostart enable|disable` controls owned future login registration
+and preserves desired updates. Verified package installers can forward selected
+hosts/histories and the owned user PATH step without manual JSON edits.
+`migrate --from <legacy-catalog>` receives a new explicit --db side path; it
+preserves the legacy inode and starts paused with no permissions. Copied merged
+facts remain hidden until selected histories reimport.
+
+Managed CLI and stdio MCP reads use the same permitted source evidence. A
+`--latest` request waits for a post-request source/discovery observation within
+its budget and reports a partial reason when it cannot complete; it never
+starts or resumes updates. Pause preserves permitted stored evidence; incomplete
+or unstable sources keep the last verified projection and leave latest unmet.
+Worker liveness and heartbeat never establish source freshness.
+
+A verified managed candidate provides `asg update check [--channel beta|stable]`,
+`asg --db <catalog> update apply --from <archive>`, `update status` and
+`update recover`. Check uses only the installed, hash-verified HTTPS helper for
+public release metadata; apply uses the local archive, its sibling manifest and
+`SHA256SUMS`
+offline. The current apply path requires a newer version with unchanged catalog
+and control schemas. Forward completion starts the verified next-version
+supervisor only for running intent and preserves current pause/stop. Recovery
+retains scope policy and reports freshness unknown until sources are observed
+again. `background autostart enable|disable` manages the owned login entry.
+`uninstall` removes proven ASG-owned state; `--keep-data` retains catalog and
+policy together. Locked executables, unfinished cleanup or missing verified
+helpers remain pending (exit 10). Native uninstall/recovery acceptance is still
+pending. See the
+[managed update procedure](docs/operations/INSTALL-AND-UPGRADE.md#developer-candidate-user-triggered-program-update)
+for validation, interrupted-update handling and remaining limits. These are
+unreleased development commands; local synthetic coverage does not establish
+six-host, four-target native or measured five-second acceptance.
 
 ## Why?
 
@@ -113,7 +170,9 @@ for confirmation, the 30-second soft write budget, pause/retry and recovery.
 
 ## Providers
 
-Currently implemented (14/16 planned; 2 deferred — no transcript evidence):
+Currently implemented (17/17 planned; 0 deferred): all remain Experimental. The first managed Beta targets
+Claude Code, Codex, WorkBuddy, ZCode, DeepSeek Harness and Antigravity; actual
+six-host and four-native-package acceptance is still pending.
 
 | Provider | Status | Format |
 |---|---|---|
@@ -131,11 +190,12 @@ Currently implemented (14/16 planned; 2 deferred — no transcript evidence):
 | Tencent CodeBuddy | Experimental | OpenAI-style JSONL (`role`/`content`/`sessionId`) |
 | Cline | Experimental | JSON (`api_conversation_history.json`) |
 | Aider | Experimental | Markdown chat history (`#### ` user prompts) |
-| DeepSeek Harness | Deferred | — (no transcript evidence yet) |
-| ZCode | Deferred | — (no transcript evidence yet) |
+| WorkBuddy | Experimental | project JSONL (native session/message IDs, epoch-ms timestamps) |
+| DeepSeek Harness | Experimental | v4 session JSONL in concatenated checksummed zstd frames |
+| ZCode | Experimental | SQLite `cli/db/db.sqlite` (full session/message/part graph, logical WAL snapshot) |
 
 See [Provider Maturity Matrix](docs/product/PROVIDER-MATURITY-MATRIX.md) for
-the full 16-provider roadmap and capability details.
+the current 17-provider matrix and capability details.
 
 ## Architecture
 
@@ -154,13 +214,11 @@ domain ← ports ← application ← adapters
   across source locations. Existing `ses_v1` session namespaces still depend on
   the installation path; cross-machine relocation needs an explicit alias
   migration and is not currently automatic.
-- **Evidence-first**: a search hit carries the source span it was read from
-  wherever the provider's format has one, so the match can be verified against
-  the original bytes. Four of the fourteen adapters cannot supply one — two
-  read a SQLite source, where a record's text lives in B-tree cell payloads
-  that spill across overflow pages and move on any page split, and two read a
-  whole-document JSON file. Those hits report no span rather than a synthesised
-  offset that would point at the wrong bytes. The per-provider column is in the
+- **Evidence-first**: a search hit carries the source span where its format
+  provides a contiguous original byte range. SQLite records, whole-document
+  JSON and compressed DSH records cannot always provide such a range; those
+  hits report an unavailable span while preserving original text and source
+  revision proof. The per-provider column is in the
   [Provider Beta Readiness Ledger](docs/product/PROVIDER-BETA-READINESS.md).
 - **Recency- and repo-aware lexical ranking**: lexical search hits are scored
   as `max(0, RRF × recency decay − sidechain penalty + current-repo boost)`.

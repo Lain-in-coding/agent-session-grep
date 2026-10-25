@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-session-grep.dev/schemas/robot/v1.1/envelope.schema.json",
   "title": "agent-session-grep Robot Protocol Envelope v1.1",
-  "description": "A complete agent-session-grep JSON or JSONL protocol frame. Additive evolution of the frozen v1 envelope: searchHit gains occurrences and resume_available; searchData gains an optional facets echo.",
+  "description": "A complete agent-session-grep JSON or JSONL protocol frame. Managed responses add bounded canonical provenance, snapshot and explicitly unverified freshness; legacy fields remain compatible.",
   "oneOf": [
     { "$ref": "#/$defs/success" },
     { "$ref": "#/$defs/error" },
@@ -62,8 +62,66 @@
         },
         "generation": { "type": "integer", "minimum": 0 },
         "truncation": { "$ref": "#/$defs/truncation" },
-        "facets": { "$ref": "#/$defs/searchFacets" }
+        "facets": { "$ref": "#/$defs/searchFacets" },
+        "provenance": { "$ref": "#/$defs/managedProvenance" },
+        "snapshot": { "$ref": "#/$defs/managedSnapshot" },
+        "freshness": { "$ref": "#/$defs/managedFreshness" }
       }
+    },
+    "managedProvenance": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entity_id", "provider_id", "session_id", "message_id", "placement_id", "document_id", "revision_digest", "precision", "related_revision_digests"],
+        "properties": {
+          "entity_id": { "type": "string", "pattern": "^(msg|ses|doc)_v1_", "maxLength": 256 },
+          "provider_id": { "type": ["string", "null"], "maxLength": 64 },
+          "session_id": { "type": ["string", "null"], "pattern": "^ses_v1_", "maxLength": 256 },
+          "message_id": { "type": ["string", "null"], "pattern": "^msg_v1_", "maxLength": 256 },
+          "placement_id": { "type": ["string", "null"], "maxLength": 256 },
+          "document_id": { "type": ["string", "null"], "pattern": "^doc_v1_", "maxLength": 256 },
+          "revision_digest": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "precision": { "enum": ["byte", "unknown"] },
+          "related_revision_digests": {
+            "type": "array", "maxItems": 1024, "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        }
+      }
+    },
+    "managedSnapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generation", "destructive_epoch", "policy_epoch"],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 0 },
+        "destructive_epoch": { "type": "integer", "minimum": 0 },
+        "policy_epoch": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "managedFreshness": {
+      "type": "object", "additionalProperties": false,
+      "description": "Latest is proved by matching discovery and source receipts in the output snapshot. Generation and worker heartbeat are never freshness proof.",
+      "required": ["coverage", "update_state", "latest_requested", "latest_satisfied", "reason", "selected_scopes", "complete_scopes", "contributing_sources", "verified_sources", "pending_sources", "failed_sources", "last_verified_observation_at_ms"],
+      "properties": {
+        "coverage": { "enum": ["empty", "partial", "complete"] },
+        "update_state": { "enum": ["running", "idle", "paused", "stopped", "offline", "busy", "failed", "deferred", "upgrading"] },
+        "latest_requested": { "type": "boolean" },
+        "latest_satisfied": { "type": "boolean" },
+        "reason": { "enum": ["verified", "as_of_verified", "discovery_pending", "paused", "stopped", "offline", "busy", "failed", "deferred", "upgrading", "policy_changed", "timeout", "scope_unverified", "source_changed", "worker_restarted", "catalog_changed", "rewrite_pending", "deletion_pending"] },
+        "selected_scopes": { "type": "integer", "minimum": 0 },
+        "complete_scopes": { "type": "integer", "minimum": 0 },
+        "contributing_sources": { "type": "integer", "minimum": 0 },
+        "verified_sources": { "type": "integer", "minimum": 0 },
+        "pending_sources": { "type": "integer", "minimum": 0 },
+        "failed_sources": { "type": "integer", "minimum": 0 },
+        "last_verified_observation_at_ms": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "allOf": [{
+        "if": { "properties": { "latest_satisfied": { "const": true } }, "required": ["latest_satisfied"] },
+        "then": { "properties": { "latest_requested": { "const": true }, "coverage": { "const": "complete" }, "reason": { "const": "verified" } } }
+      }]
     },
     "searchFacets": {
       "type": "object",
@@ -194,6 +252,22 @@
           "then": {
             "properties": {
               "data": { "$ref": "#/$defs/searchData" }
+            }
+          }
+        },
+        {
+          "properties": {
+            "data": {
+              "if": { "type": "object", "required": ["snapshot"] },
+              "then": {
+                "type": "object",
+                "required": ["provenance", "snapshot", "freshness"],
+                "properties": {
+                  "provenance": { "$ref": "#/$defs/managedProvenance" },
+                  "snapshot": { "$ref": "#/$defs/managedSnapshot" },
+                  "freshness": { "$ref": "#/$defs/managedFreshness" }
+                }
+              }
             }
           }
         }

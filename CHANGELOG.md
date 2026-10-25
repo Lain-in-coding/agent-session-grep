@@ -6,16 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Product changes reconciled after the existing `0.1.0` release; no new tag or
-release is implied. Historical release notes below remain unchanged.
+These changes form the `0.2.0-beta.1` Managed Beta candidate. That version
+names the current build under acceptance; no tag or release is implied, and
+the open six-host, native-package, measurement, owner, and publication gates
+remain unfulfilled. Historical `0.1.0` release notes and evidence below remain
+unchanged.
 Measurements quoted in the new entries are source-side historical reports,
 not a fresh benchmark or certification of this canonical candidate.
 
-Current provider scope is unchanged: the 16-provider capability matrix retains
-adapters for the 14 implemented, Experimental providers: `claude-code`, `codex`,
-`grok-build`, `antigravity`, `opencode`, `pi`, `hermes`, `cursor`, `kimi-code`,
-`openclaw`, `qoder`, `tencent-codebuddy`, `cline`, and `aider`. The two providers
-`deepseek-harness` and `zcode` remain deferred; no provider is promoted here.
+The 17-provider capability matrix includes the 17 implemented Experimental
+providers: `claude-code`, `codex`, `grok-build`, `antigravity`, `opencode`, `pi`,
+`hermes`, `cursor`, `kimi-code`, `openclaw`, `qoder`, `tencent-codebuddy`, `cline`,
+`aider`, `workbuddy`, `zcode` and `deepseek-harness`; 0 providers remain deferred.
+WorkBuddy is independent of Tencent CodeBuddy; ZCode adds a bounded full SQLite
+graph and DeepSeek Harness adds its v4 checksummed zstd stream. The historical
+14-provider release notes below remain unchanged. Antigravity's supported
+conversation-DB Step subset is separately qualified from its primary JSONL
+variant. Parser/configuration tests do not establish six-host managed flows,
+four native packages or Beta maturity; no provider is promoted here.
 
 ### Added
 

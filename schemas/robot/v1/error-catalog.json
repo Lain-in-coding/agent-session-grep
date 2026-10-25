@@ -140,6 +140,16 @@
       "robot_ok": false,
       "redaction": "full",
       "operator_action": "Collect safe diagnostics and report a defect."
+    },
+    {
+      "code": "update_recovery_required",
+      "layer": "application",
+      "retryable": false,
+      "partial_allowed": true,
+      "cli_exit_code": 10,
+      "robot_ok": false,
+      "redaction": "path",
+      "operator_action": "Inspect update status and run update recover for the same installation and catalog."
     }
   ]
 }

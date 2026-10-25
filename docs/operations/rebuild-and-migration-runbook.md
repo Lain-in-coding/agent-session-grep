@@ -1,11 +1,14 @@
 # Rebuild and migration runbook
 
 Scope: operator procedures for an existing agent-session-grep data root — schema
-upgrades, full index rebuild, store reconstruction, write-contention
-recovery, and the generation/cursor semantics behind them.
+upgrades, managed program-update reconciliation, full index rebuild, store
+reconstruction, write-contention recovery, and the generation/cursor semantics
+behind them. Managed recovery retains current permission/pause policy; the
+legacy reconstruction procedures below do not reset that policy.
 
-Every command below exists in the current CLI; examples use `--robot` so the
-output is the JSON envelope, not the human rendering. Paths are placeholders.
+Commands below follow the current source CLI; inspect the newly built verified
+candidate's `--help` before use, since older artifacts can lack update commands.
+Examples use `--robot` for JSON envelopes. Paths are placeholders.
 
 ## Command reference
 
@@ -16,18 +19,122 @@ output is the JSON envelope, not the human rendering. Paths are placeholders.
 | `agent-session-grep --robot --db <path> ingest <file>` | yes | Ingest one source file. |
 | `agent-session-grep --robot --db <path> index rebuild` | yes | Reproject the FTS index from the catalog. |
 | `agent-session-grep --robot --db <path> status` | no | Report catalog entity count and active generation. |
-| `agent-session-grep --robot --db <path> search <query>` | no | Full-text search over the current generation. |
+| `agent-session-grep --robot --db <path> search <query>` | no catalog write | Full-text search over the permitted catalog snapshot. |
+| `asg --robot update check [--channel beta\|stable]` | public metadata transport | Explicit bounded release check; no archive download or program replacement. |
+| `asg --robot --db <path> update apply --from <archive>` | yes | Verified offline current catalog22/control2 managed program update. |
+| `asg --robot --db <path> update status` | journal reconciliation only | Inspect the retained update journal; no catalog recovery or worker start. |
+| `asg --robot --db <path> update recover` | yes | Reconcile the recorded update under installation/catalog ownership. |
+| `asg --robot --db <path> background status` | control observation | Distinguish desired ingestion intent from worker liveness; not a freshness proof. |
 
 Error and exit-code mapping: usage or cursor errors exit `2`, not-found `4`,
 source I/O and source-changed `5`, catalog errors and `writer_busy` `6`,
 provider errors `7`, `schema_incompatible` `9` (as is a cursor whose
 generation no longer matches), internal errors `70`, and a truncated but
-usable result exits `10`. The envelope's `error.code` is the stable spelling.
+usable result exits `10`. `update_recovery_required` also exits `10`, with
+`retryable: false`; it asks for explicit recorded-update reconciliation rather
+than blind retry. The envelope's `error.code` is the stable spelling.
+
+## Managed program update and interrupted recovery
+
+These commands require a verified installed managed candidate and its existing
+managed catalog. Legacy adoption and schema-changing catalog migration are
+separate from an executable program update.
+`update check` uses only a hash-verified versioned helper for public HTTPS
+metadata, while `update apply --from` validates a local archive, its sibling
+manifest and `SHA256SUMS` without network access. See
+[Install and upgrade](INSTALL-AND-UPGRADE.md#developer-candidate-user-triggered-program-update)
+for the helper whitelist and exact package checks.
+
+The current apply path supports a strictly newer SemVer on the same native
+target only when the installed and candidate programs and the managed catalog
+all use catalog22/control2. The first public managed package uses22/2; no
+catalog21/control2 managed program has shipped. Schema-changing pairs are
+refused before maintenance or catalog mutation. Ordinary managed opens also
+refuse older schema rather than migrating during a read or sync.
+
+The internal maintenance seam still supports the additive managed catalog
+migration and exact schema restore under its own ownership and transaction
+contracts. It can run canonical catalog21-to22 units after an exact owned21
+backup is verified, and it can restore that exact21 image for coordinated
+recovery. It preserves generation, incarnation, namespace and current control
+policy without changing policy or granting current source proof. This is not an
+old-program executor handoff, and the public `update` command does not expose
+that schema-changing path.
+
+For an interrupted update:
+
+1. Keep the prefix's private update journal, versions, receipt, owned backups and
+   current control intact. Use the same `--db <path>` and, when needed,
+   `--install-prefix <prefix>` used by apply.
+2. Run `asg --robot --db <path> update status`. It inspects the retained journal
+   and may reconcile interrupted journal-file publication under the real lock.
+   A fresh install with no journal has no idle-status response yet. Inspect
+   `phase` and `error_code`; an inspection of terminal `failed`/`rolled_back`
+   is not a successful upgrade. Nonterminal state returns partial (exit 10).
+3. Run `asg --robot --db <path> update recover`. It verifies the selected
+   catalog and installation identity, owns the maintenance fence, drains
+   cooperating catalog handles and reconciles recorded metadata effects. A
+   verified switched candidate may finish forward. For the supported public
+   catalog22/control2 program path, rollback rotates the catalog incarnation
+   and restores old metadata. A recorded schema-changing pair is refused rather
+   than treated as an executable old-program handoff; the internal exact21
+   restore seam remains separately owned. A busy live owner or changed or
+   unverified identity is a reason to stop and resolve the reported failure,
+   never to delete a lock/fence or overwrite metadata by hand.
+4. Recheck `update status`, both command versions and `background status`.
+   Forward completion starts the verified next-version supervisor only for
+   running intent, using the owned native registration or a hidden detached
+   launch when login startup is disabled. It rechecks current pause/stop;
+   `restart_failed` while still running leaves a recoverable partial state.
+   Rollback also restarts the verified old supervisor only for current running
+   intent; restart failure remains partial and recoverable. `background start` preserves intent;
+   `background resume` explicitly changes paused/stopped intent to running.
+5. Run a permitted evidence read with `--latest` to obtain a new post-request
+   observation. Update status always reports `freshness: unknown`; package
+   identity, a heartbeat and catalog generation cannot establish source coverage.
+   Update journals replacement/recovery of its proven owned native supervisor
+   registration without adopting unowned entries or enabling autostart. Inspect
+   explicit selected-host setup if registration or host loading needs repair;
+   update does not restart host processes or verify their loaded MCP image.
+
+Recovery never copies an older `control.db` over the current one or clears a
+revoke/pause to make rollback possible. Rollback reconciliation invalidates old
+progress, barriers, pending rewrite/deletion confirmations and continuation
+proofs. The initial checkpoint stays immutable; a separate post-drain checkpoint
+binds
+backup to the actual drained catalog/control identity. Failed candidate process
+exit or incorrect active pointer generation rejects self-check even when other
+identity fields match. The current equal-schema path retains the live catalog
+and reconciles metadata; it is not a general catalog backup-restore interface. The verified
+WAL-aware catalog backup excludes control and provider histories. Generic
+schema-changing restore and legacy-to-managed migration remain separate work.
+Setup history selection still uses `sources add` separately. Public background
+autostart enable/disable, managed uninstall/default purge and keep-data are not
+yet implemented.
+
+The worker writes an incomplete discovery receipt before source I/O and only
+finalizes the exact current-cycle source set after complete verification.
+Confirmed absence participates in that set; failed discovery cannot resurrect
+an older complete receipt. Empty, malformed and unstable rewrites retain the
+last verified evidence and leave latest partial. Valid nonempty complete
+rewrites, including shrinking JSONL, and deletion require two qualifying cycles
+at least five monotonic seconds apart. Restart or changed proof/policy/root
+restarts confirmation; offline/unreadable roots are never deletion proof.
+This is a correctness grace window, not a measured update-latency claim.
+
+## Legacy catalog procedures
+
+The procedures below describe the unmanaged write-open migration, merged
+catalog and stateless cursor path. Managed commands enforce selected scopes and
+pause, use per-source receipts and fail closed on missing/corrupt control.
+Managed index rebuild does not bypass an update fence or regrant a source.
+Do not delete/recreate a managed catalog, restore control or run an old unscoped
+binary to apply the legacy procedures.
 
 ## Reading doctor
 
 ```
-agent-session-grep --robot doctor --db C:/data/example.db
+agent-session-grep --robot doctor --db <path>
 ```
 
 `data.db` is `"ok"` when the store opens, or `"not-checked"` when no `--db`
@@ -57,20 +164,31 @@ does not perform an upgrade.
 
 ## Procedure 1: Schema upgrade
 
-There is no separate upgrade subcommand. Read-only opens (`doctor`, search,
-MCP) require the supported schema and never migrate an older catalog. An
+For an unmanaged catalog, schema migration occurs on write open rather than
+through a dedicated schema-migration command. Managed program updates use the
+separate `update` commands above and currently refuse schema changes. Read-only
+opens (`doctor`, search, MCP) require the supported schema and never migrate an
+older catalog. An
 explicit write path such as `index rebuild`, `sync`, or `ingest` takes the
 writer lease and migrates before its own operation. It may also refresh stale
 index projections; choose and authorize that write deliberately.
 
-`SCHEMA_VERSION` is currently 19. The additive steps include v8 resume claims,
+`SCHEMA_VERSION` is currently 22. The additive steps include v8 resume claims,
 v9 source-scan provider id, v10 semantic vectors, v11 session-metadata search,
 v12 tool activity, v13 session titles, v14 parser version, v15 token usage,
 v16 repo identity, v17 index-projection version, v18 installation/relocation
-records, and v19 journal-compaction records. `PRAGMA user_version` gates the
-steps in `crates/agent-session-grep-adapters-sqlite/src/lib.rs`
-(`migrate_v7_to_v8` through `migrate_v18_to_v19`); the v17 → v18 implementation
-is in `crates/agent-session-grep-adapters-sqlite/src/relocation.rs`.
+records, v19 journal-compaction records, v20 managed catalog/source
+projections, v21 retained exact-receipt lineage for verified recovery, and v22
+source-publication context with its dependency and atomic provider-source
+authority records. The v21 table is empty when migrated; neither v21 nor v22
+backfills observations, permission or currentness proof. Migration adds their
+schema; it does not select histories or complete managed setup. `PRAGMA
+user_version` gates the steps in
+`crates/agent-session-grep-adapters-sqlite/src/lib.rs`
+(`migrate_v7_to_v8` through `migrate_v19_to_v20`); the additive managed tail
+through v22 is completed by `migrate_managed_in_transaction` in that file. The
+v17 → v18 implementation is in
+`crates/agent-session-grep-adapters-sqlite/src/relocation.rs`.
 The v5 → v6 (`migration-v5-to-v6.md`) and v6 → v7 (`migration-v6-to-v7.md`)
 records remain historical; those stores upgrade on an explicit write open.
 
@@ -93,7 +211,7 @@ Operational sequence:
    `agent-session-grep --robot --db <path> index rebuild`. Check its exit code;
    stop and inspect on failure rather than assuming the whole chain rolled back.
 4. Run `agent-session-grep --robot doctor --db <path>` again. This read-only
-   verification must report `data.schema: 19` and `data.db: "ok"`.
+   verification must report `data.schema: 22` and `data.db: "ok"`.
 5. Re-ingest sources (`sync`) to lift legacy rows to current fidelity.
    Migration never fabricates data; rows created before v6 have no session or
    span attribution until re-ingested. `context` remains disabled with
@@ -264,7 +382,7 @@ on legacy rows, rebuild the data root from the sources. Sources are the
 ground truth and ingestion is read-only against them.
 
 ```
-agent-session-grep --robot --db C:/data/example-new.db sync <file1.jsonl> <file2.jsonl>
+agent-session-grep --robot --db <new-unmanaged-catalog> sync <file1.jsonl> <file2.jsonl>
 ```
 
 Semantics that make this safe to reason about:
@@ -343,7 +461,7 @@ library built by an older binary: every `sync` failed this way, while a full
 relative to the value, so the remedy is to rebuild rather than to patch rows:
 
 ```
-agent-session-grep --db C:/data/rebuilt.db sync --discover
+agent-session-grep --db <new-unmanaged-catalog> sync --discover
 ```
 
 Compare `status` on both stores, then swap the new file in and keep the old one
@@ -351,6 +469,12 @@ until you are satisfied. An `index rebuild` does **not** help here: it reproject
 the catalog it already has and never re-parses a source.
 
 ## Procedure 5: Generation and cursor semantics
+
+These stateless cursor rules describe the unmanaged path. Managed continuation
+proofs are also bound to policy, catalog incarnation and destructive change;
+append generation alone is not proof of invalidation or freshness. Recovery
+invalidates those proofs. Inspect the current managed tool capability report
+before assuming a cursor is supported.
 
 Every committed write batch advances the store's generation by one. The
 current value is in the `data.generation` field of `status`, `search`,
@@ -380,11 +504,13 @@ rebuilds.
 
 ## Storage-model limits
 
-- There is one store per data root: the catalog table plus its FTS index in
-  one SQLite database. Backup means a consistent copy of the whole data root
-  while no writer is live; a production snapshot API does not exist yet.
-- Deleting the store file and re-ingesting is a supported recovery path
-  because identity is derived from content (procedure 3), not from the
-  store's internal state.
-- This runbook assumes the current single-binary CLI. It does not cover
-  upgrading between protocol contract majors.
+- Unmanaged catalog and FTS facts occupy one SQLite database. Managed mode also
+  has separate policy/control, continuation and owned-artifact state. A managed
+  catalog backup is WAL-aware and does not back up or restore control.
+- Unmanaged reconstruction by re-ingest has the identity limits in procedure 3.
+  Managed identity/namespace and permission state are not recreated by deleting
+  a database; recovery requires their verified ownership records.
+- The current managed update path coordinates the stable launcher and immutable
+  application/supervisor/helper versions for equal schemas. Schema-changing and
+  protocol-major upgrades, native four-target recovery and actual host-loaded
+  acceptance remain unverified; a local synthetic pass is not those receipts.
