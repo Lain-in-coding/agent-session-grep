@@ -156,7 +156,8 @@ fn add(db: &Path, path: &Path) -> Value {
 
 fn setup_paused(db: &Path) {
     data(&run(db, &["setup"]), 10);
-    data(&run(db, &["background", "pause"]), 10);
+    // No worker has run yet, so the pause transition completes immediately.
+    data(&run(db, &["background", "pause"]), 0);
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -180,7 +181,7 @@ fn setup_selection_pause_revoke_and_reopen_preserve_policy_and_sources() {
     assert_eq!(setup["stages"]["host_registration"], "pending");
     let again = data(&run(&db, &["setup"]), 10);
     assert_eq!(again["control_seq"], setup["control_seq"]);
-    data(&run(&db, &["background", "pause"]), 10);
+    data(&run(&db, &["background", "pause"]), 0);
     let selected = data(
         &run(
             &db,
@@ -210,7 +211,7 @@ fn setup_selection_pause_revoke_and_reopen_preserve_policy_and_sources() {
     );
     assert_eq!(repeat["changed"], false);
     assert_eq!(repeat["id"], id);
-    let paused = data(&run(&db, &["background", "pause"]), 10);
+    let paused = data(&run(&db, &["background", "pause"]), 0);
     assert_eq!(paused["desired_updates"], "paused");
     let revoked = data(&run(&db, &["sources", "revoke", id]), 0);
     assert_eq!(revoked["status"], "revoked");

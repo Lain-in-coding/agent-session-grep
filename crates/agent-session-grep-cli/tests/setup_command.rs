@@ -634,7 +634,8 @@ fn explicit_history_setup_selects_only_requested_root_and_keeps_paused_intent() 
         .args(["background", "pause"])
         .output()
         .unwrap();
-    assert_eq!(paused.status.code(), Some(10));
+    // No worker has run yet, so the pause transition completes immediately.
+    assert_eq!(paused.status.code(), Some(0));
     let output = f
         .command(Path::new(BIN))
         .args([

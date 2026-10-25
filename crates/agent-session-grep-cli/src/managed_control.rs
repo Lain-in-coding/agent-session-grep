@@ -691,7 +691,18 @@ pub(crate) fn run(
                     data["background_start"] = report;
                     outcome
                 } else {
-                    Outcome::Partial
+                    // A stop/pause intent that already matches observation is a
+                    // completed transition, not pending work. Only an observed
+                    // state that still differs keeps exit 10 meaningful.
+                    match status_data(&control, &path) {
+                        Ok(actual)
+                            if actual["desired_updates"] == json!(desired(target))
+                                && actual["running"] == json!(false) =>
+                        {
+                            Outcome::Success
+                        }
+                        _ => Outcome::Partial,
+                    }
                 };
                 // The desired-state write is durable even when observation fails.
                 match status_data(&control, &path) {
