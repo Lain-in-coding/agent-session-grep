@@ -57,6 +57,15 @@ class UpdateCheckHelperSourceTests(unittest.TestCase):
             self.assertIn("capability", source)
             self.assertIn("redirect", source.lower())
 
+    def test_powershell_timeout_is_set_before_any_request(self) -> None:
+        # HttpClient forbids modifying Timeout after the first SendAsync; the
+        # redirect loop must not try to set it per iteration.
+        source = PS1.read_text(encoding="utf-8")
+        loop = source[source.index("while ($true)"):]
+        self.assertNotIn(".Timeout", loop.split("\n}\n")[0])
+        self.assertLess(source.index("$client.Timeout"),
+                        source.index("SendAsync"))
+
     def test_helpers_require_no_extra_runtime_or_execution_policy_changes(self) -> None:
         ps1 = PS1.read_text(encoding="utf-8")
         sh = SH.read_text(encoding="utf-8")

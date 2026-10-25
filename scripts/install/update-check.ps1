@@ -154,6 +154,9 @@ function Invoke-Helper {
         [System.Net.DecompressionMethods]::GZip -bor `
         [System.Net.DecompressionMethods]::Deflate
     $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
+    # HttpClient forbids changing Timeout after the first request, so set it
+    # once here; per-iteration budget enforcement stays with Get-RemainingSeconds.
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
 
     $script:Clock = [Diagnostics.Stopwatch]::StartNew()
     $currentUrl = $url
@@ -170,7 +173,6 @@ function Invoke-Helper {
         while ($true) {
             $remaining = Get-RemainingSeconds
             if ($remaining -le 0) { Write-HelperError 'timeout' 4 }
-            $client.Timeout = [TimeSpan]::FromSeconds([Math]::Min($remaining, 10))
 
             $request = New-Object -TypeName System.Net.Http.HttpRequestMessage `
                 -ArgumentList ([System.Net.Http.HttpMethod]::Get), $currentUrl
