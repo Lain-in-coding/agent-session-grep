@@ -303,3 +303,234 @@ fn event_msg_mirrors_of_copied_prefix_stay_excluded() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].native_id, "lifecycle-cx-1");
 }
+
+// Native 0.163-shaped envelopes, with wholly synthetic ids, paths and text.
+// Additional usage/metadata fields are not authoritative conversations.
+fn native_0163_metadata_rollout() -> Vec<Value> {
+    let mut meta = session_meta();
+    meta["payload"]["id"] = json!(SESSION);
+    meta["payload"]["cli_version"] = json!("0.163.0");
+    let mut records = vec![
+        meta,
+        envelope(
+            "synthetic-environment-injection",
+            "user",
+            "<environment_context>\n  <cwd>/synthetic/lifecycle</cwd>\n  <shell>powershell</shell>\n</environment_context>",
+        ),
+        json!({
+            "timestamp": "2026-07-26T09:00:00.000Z",
+            "type": "token_usage_record",
+            "payload": {
+                "input_tokens": 37,
+                "output_tokens": 11,
+                "future_usage": {"counter": 3, "content": null},
+            },
+        }),
+        json!({
+            "timestamp": "2026-07-26T09:00:00.000Z",
+            "type": "turn_context",
+            "payload": {
+                "cwd": "/synthetic/turn-only",
+                "future_context": {"role": "user", "text": "opaque metadata"},
+            },
+        }),
+        json!({
+            "timestamp": "2026-07-26T09:00:00.000Z",
+            "type": "response_item",
+            "payload": {"type": "reasoning", "content": null, "future_reasoning": [1, 2]},
+        }),
+    ];
+    for (id, role, text) in [
+        (
+            "native-0163-1",
+            "developer",
+            "Keep the explanation concise.",
+        ),
+        (
+            "native-0163-2",
+            "user",
+            "Explain how a queue processes an item.",
+        ),
+        (
+            "native-0163-3",
+            "assistant",
+            "A producer enqueues the item.",
+        ),
+        ("native-0163-4", "user", "What happens next?"),
+        (
+            "native-0163-5",
+            "assistant",
+            "The consumer handles and acknowledges it.",
+        ),
+    ] {
+        let mut message = envelope(id, role, text);
+        message["payload"]["future_message"] = json!({"labels": ["synthetic"], "data": null});
+        records.push(message);
+        if role != "developer" {
+            records.push(json!({
+                "timestamp": "2026-07-26T09:00:00.500Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": if role == "user" { "user_message" } else { "agent_message" },
+                    "message": text,
+                    "future_mirror": {"flags": [false, true]},
+                },
+            }));
+        }
+    }
+    records
+}
+
+#[test]
+fn native_0163_metadata_omissions_leave_completed_rollout_complete() {
+    let snapshot = render(&native_0163_metadata_rollout());
+    let before = snapshot.clone();
+    assert!(snapshot.ends_with(b"\n"));
+    let (report, messages) = parse_ok(&snapshot);
+
+    assert_eq!(
+        report.committed, 5,
+        "only authoritative conversations count"
+    );
+    assert_eq!(
+        report.skipped, 0,
+        "recognized omission is not incomplete parsing"
+    );
+    assert_eq!(report.session_native_id.as_deref(), Some(SESSION));
+    assert!(report.session_observation.pair_observed);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(report.diagnostics[0].contains("environment-context"));
+    assert!(report.diagnostics[0].ends_with(", omitted"));
+    for private_marker in [
+        "/synthetic/lifecycle",
+        "synthetic-environment-injection",
+        "<cwd>",
+    ] {
+        assert!(!report.diagnostics[0].contains(private_marker));
+    }
+    assert_eq!(
+        messages.len(),
+        5,
+        "event mirrors must not duplicate conversations"
+    );
+    for (seq, message) in messages.iter().enumerate() {
+        assert_eq!(message.seq as usize, seq);
+        assert_eq!(message.native_id, format!("native-0163-{}", seq + 1));
+        assert_eq!(message.timestamp, None);
+        assert_eq!(message.parent_native_id, None);
+        assert!(!message.is_sidechain);
+        let (start, end) = message.span.expect("authoritative occurrence span");
+        let occurrence: Value = serde_json::from_slice(&snapshot[start as usize..end as usize])
+            .expect("span must address the original complete envelope");
+        assert_eq!(occurrence["payload"]["id"], message.native_id);
+        assert_eq!(occurrence["payload"]["role"], message.role);
+        assert_eq!(occurrence["payload"]["content"][0]["text"], message.text);
+    }
+    let (replayed_report, replayed_messages) = parse_ok(&snapshot);
+    assert_eq!(replayed_report, report);
+    assert_eq!(replayed_messages, messages);
+    assert_eq!(
+        snapshot, before,
+        "metadata omission must not rewrite source bytes"
+    );
+}
+
+#[test]
+fn native_0163_metadata_append_keeps_authoritative_prefix_stable() {
+    let base = render(&native_0163_metadata_rollout());
+    let before = base.clone();
+    let (base_report, base_messages) = parse_ok(&base);
+    let mut appended = base.clone();
+    appended.extend(render(&[
+        envelope(
+            "synthetic-next-environment",
+            "user",
+            "<environment_context>\n  <cwd>/synthetic/lifecycle</cwd>\n</environment_context>",
+        ),
+        envelope(
+            "native-0163-6",
+            "assistant",
+            "Another item can now be handled.",
+        ),
+    ]));
+    let (report, messages) = parse_ok(&appended);
+
+    assert_eq!(base_report.skipped, 0);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.committed, 6);
+    assert_eq!(
+        report.diagnostics.len(),
+        2,
+        "both recognized omissions remain observable"
+    );
+    assert_eq!(messages[..5], base_messages);
+    assert_eq!(messages[5].seq, 5);
+    assert_eq!(messages[5].native_id, "native-0163-6");
+    assert!(messages[5].span.unwrap().0 >= base.len() as u64);
+    assert_eq!(base, before);
+    assert_eq!(appended[..base.len()], base);
+}
+
+#[test]
+fn native_0163_metadata_does_not_mask_bad_conversations_or_torn_tail() {
+    let base = render(&native_0163_metadata_rollout());
+    let (_, complete_messages) = parse_ok(&base);
+    let environment =
+        "<environment_context>\n  <cwd>/synthetic/lifecycle</cwd>\n</environment_context>";
+    let mut null_content = envelope("synthetic-null-content", "user", environment);
+    null_content["payload"]["content"] = Value::Null;
+    let mut invalid_content = envelope("synthetic-invalid-content", "user", environment);
+    invalid_content["payload"]["content"] = json!(true);
+    let mut missing_content = envelope("synthetic-missing-content", "user", environment);
+    missing_content["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("content");
+
+    let mut failures = vec![
+        (
+            "unknown role",
+            render(&[envelope("synthetic-unknown-role", "function", environment)]),
+        ),
+        (
+            "empty role",
+            render(&[envelope("synthetic-empty-role", "", environment)]),
+        ),
+        ("null content", render(&[null_content])),
+        ("invalid content", render(&[invalid_content])),
+        ("missing content", render(&[missing_content])),
+        ("malformed row", b"not a JSON record\n".to_vec()),
+    ];
+    let mut torn = render(&[envelope("synthetic-torn-tail", "user", environment)]);
+    torn.truncate(torn.len() - 3);
+    failures.push(("torn injected-looking tail", torn));
+
+    for (scenario, suffix) in failures {
+        let mut snapshot = base.clone();
+        snapshot.extend_from_slice(&suffix);
+        let before = snapshot.clone();
+        let (report, messages) = parse_ok(&snapshot);
+        assert_eq!(
+            report.committed, 5,
+            "{scenario} must not fabricate a conversation"
+        );
+        assert_eq!(
+            report.skipped, 1,
+            "{scenario} must still mark the source incomplete"
+        );
+        assert_eq!(
+            report.diagnostics.len(),
+            2,
+            "{scenario}: omission plus recoverable failure"
+        );
+        assert!(report.diagnostics[1].contains("skipped"), "{scenario}");
+        assert_eq!(
+            messages, complete_messages,
+            "{scenario} must retain the verified prefix"
+        );
+        assert_eq!(
+            snapshot, before,
+            "{scenario} must not repair or rewrite source bytes"
+        );
+    }
+}

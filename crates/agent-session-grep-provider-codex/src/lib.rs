@@ -1038,15 +1038,14 @@ impl ProviderAdapter for CodexAdapter {
                 continue;
             };
 
-            // 伪 user 消息过滤（检索层保守白名单）：Codex rollout 会以 user
-            // 角色注入项目指令与环境上下文（出处见 codex_user_noise_kind）。
-            // 只按明确前缀过滤，命中计入 skipped（不进索引），绝不语义猜测。
+            // Recognized user metadata is intentionally omitted from search.
+            // Only the existing explicit prefixes qualify (codex_user_noise_kind);
+            // a successful omission is not an incomplete conversation parse.
             if payload.role == "user"
                 && let Some(kind) = codex_user_noise_kind(body.trim())
             {
-                report.skipped += 1;
                 report.diagnostics.push(format!(
-                    "line {}: user message with injected noise envelope ({kind}), skipped",
+                    "line {}: recognized user metadata envelope ({kind}), omitted",
                     line_no + 1
                 ));
                 continue;
@@ -1504,8 +1503,10 @@ mod tests {
             )
             .expect("parse string-shaped noise");
         assert_eq!(report.committed, 0, "string-shaped noise must be filtered");
-        assert_eq!(report.skipped, 1);
-        assert!(report.diagnostics[0].contains("injected noise envelope"));
+        assert_eq!(report.skipped, 0, "recognized metadata is not incomplete");
+        assert!(report.diagnostics[0].contains("recognized user metadata envelope"));
+        assert!(report.diagnostics[0].ends_with(", omitted"));
+        assert!(sink.messages.is_empty());
 
         let mut sink = CollectingSink::default();
         let report = CodexAdapter::new()
@@ -1530,13 +1531,21 @@ mod tests {
                 report.committed, 0,
                 "noise must not be committed: {noise:?}"
             );
-            assert_eq!(report.skipped, 1, "noise must be skipped: {noise:?}");
+            assert_eq!(
+                report.skipped, 0,
+                "recognized metadata must not mark the source incomplete: {noise:?}"
+            );
             assert!(texts.is_empty(), "noise must not be indexed: {noise:?}");
             assert_eq!(
                 report.diagnostics.len(),
                 1,
-                "one diagnostic per skip: {noise:?}"
+                "one content-free diagnostic per omission: {noise:?}"
             );
+            assert!(report.diagnostics[0].contains("recognized user metadata envelope"));
+            assert!(report.diagnostics[0].ends_with(", omitted"));
+            assert!(!report.diagnostics[0].contains(noise));
+            assert!(!report.diagnostics[0].contains("/tmp/project"));
+            assert!(!report.diagnostics[0].contains("/workspace/fixture-project"));
         }
     }
 
