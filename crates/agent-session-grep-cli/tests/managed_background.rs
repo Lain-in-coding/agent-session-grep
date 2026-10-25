@@ -315,7 +315,7 @@ impl Fixture {
             // Windows briefly denies sidecar handles while the child worker
             // checkpoints; retry within this bounded read budget instead of
             // treating a transient open as terminal validation failure.
-            let mut result = match opened {
+            let result = match opened {
                 Ok(store) => {
                     store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
                         read.query_lexical(text, &ProjectionQuery::default(), 16)
@@ -326,10 +326,10 @@ impl Fixture {
                 }
                 Err(error) => Err(error),
             };
-            if let Err(PortError::Backend(reason)) = &result {
-                if !reason.contains("code=5") {
-                    panic!("managed catalog private-file validation failed: {reason}")
-                }
+            if let Err(PortError::Backend(reason)) = &result
+                && !reason.contains("code=5")
+            {
+                panic!("managed catalog private-file validation failed: {reason}")
             }
             match result {
                 Ok(page) => {
