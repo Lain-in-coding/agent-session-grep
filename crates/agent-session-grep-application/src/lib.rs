@@ -29,6 +29,7 @@ pub mod guidance;
 pub mod handoff_pack;
 pub mod hybrid;
 pub mod maintenance;
+pub mod managed;
 pub mod peek;
 pub mod ranking;
 pub mod relocation;
@@ -485,7 +486,7 @@ fn stage_probed(
     }
     let mut sink = StagingSink::default();
     let report = adapter.parse(bytes, &mut sink)?;
-    Ok(staged_batch(sink, report))
+    staged_batch(sink, report)
 }
 
 /// Reader-aware variant of [`stage_probed`]: parses via a fresh bounded reader,
@@ -502,20 +503,54 @@ fn stage_source_probed(
     }
     let mut sink = StagingSink::default();
     let report = adapter.parse_source(source, &mut sink)?;
-    Ok(staged_batch(sink, report))
+    staged_batch(sink, report)
 }
 
-fn staged_batch(sink: StagingSink, report: ParseReport) -> StagedBatch {
+/// Stage one caller-selected source and retain typed evidence from that parse.
+///
+/// The parser is called exactly once with the original source and the existing
+/// in-memory staging sink. This function does not probe, open, verify or publish
+/// the source, and it makes no completeness, authorization or freshness claim.
+/// The caller supplies those checks and its original deadline to the parser,
+/// then uses the returned `T` when deciding whether publication is eligible.
+/// A successful report with zero skipped records alone does not prove a source
+/// complete; typed incomplete evidence is returned unchanged.
+///
+/// All message, activity, usage and session facts use the same staging path as
+/// [`stage`] and [`select_and_stage_source`]. A parser or propagated sink error,
+/// or a mismatch between reported committed messages and emitted messages,
+/// discards the buffered events and returns no batch or typed evidence. No
+/// catalog or index write occurs here.
+pub fn stage_source_with_parser<T>(
+    source: &dyn ReadOnlySource,
+    parser: impl FnOnce(
+        &dyn ReadOnlySource,
+        &mut dyn CanonicalEventSink,
+    ) -> Result<(ParseReport, T), ProviderError>,
+) -> Result<(StagedBatch, T), AppError> {
+    let mut sink = StagingSink::default();
+    let (report, evidence) = parser(source, &mut sink)?;
+    let batch = staged_batch(sink, report)?;
+    Ok((batch, evidence))
+}
+
+fn staged_batch(sink: StagingSink, report: ParseReport) -> Result<StagedBatch, AppError> {
+    if report.committed != sink.buffered.len() {
+        return Err(ProviderError::StructuralFatal(
+            "provider committed count does not match staged message count".into(),
+        )
+        .into());
+    }
     // 镜像到兼容别名（见 StagedBatch::session_native_id 文档）：唯一权威来源
     // 是 report.session_native_id。
     let session_native_id = report.session_native_id.clone();
-    StagedBatch {
+    Ok(StagedBatch {
         messages: sink.buffered,
         activities: sink.activities,
         usage_events: sink.usage_events,
         report,
         session_native_id,
-    }
+    })
 }
 
 /// 从多个 provider adapter 中选出匹配的那个，再 stage（RFC-0002 §3 provider 选择）。

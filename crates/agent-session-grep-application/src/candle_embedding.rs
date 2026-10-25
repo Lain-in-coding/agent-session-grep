@@ -392,7 +392,7 @@ fn sha256(msg: &[u8]) -> [u8; 32] {
         buf.push(0);
     }
     buf.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in buf.chunks_exact(64) {
+    for chunk in buf.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([

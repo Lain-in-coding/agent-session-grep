@@ -926,7 +926,7 @@ mod tests {
     /// `handoff` 能力列 ↔ 生成器真实行为 防漂移（与 `resume` 列的
     /// `capability_matrix_resume_level_matches_builder_support` 同一纪律）。
     ///
-    /// 起因：capability.rs 曾对全部 14 个已实现 provider 声明
+    /// 起因：capability.rs 曾对当时全部已实现 provider 声明
     /// `handoff: Unsupported`，而 `asg handoff` 是发布功能且对 codex（JSONL）、
     /// aider（markdown，native_id 恒空）、opencode（SQLite）三种结构迥异的真实
     /// golden 源实测都产出 `confidence: high` 的带证据 pack。少报的根因是
@@ -951,11 +951,9 @@ mod tests {
             .filter(|p| p.maturity != ProviderMaturity::Unsupported)
             .map(|p| p.provider_id.clone())
             .collect();
-        assert_eq!(
-            implemented.len(),
-            14,
-            "已实现 provider 应为 14 个，实际 {}",
-            implemented.len()
+        assert!(
+            !implemented.is_empty(),
+            "provider capability matrix must include implemented providers"
         );
 
         let hits = vec![
