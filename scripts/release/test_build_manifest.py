@@ -825,6 +825,43 @@ class BuildManifestTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(supervisor.read_text(), "unrelated supervisor")
 
+    def test_shell_installer_native_image_gate_accepts_macho_filetype(self) -> None:
+        # Byte-level regression for the installer's Mach-O header check:
+        # MH_EXECUTE lives at offset 12, not at ncmds (offset 16). The old
+        # check read ncmds as the filetype and rejected every real binary.
+        fixture = self.workspace / "macho-gate"
+        fixture.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            wsl = shutil.which("wsl")
+            if not wsl:
+                self.skipTest("native POSIX host unavailable")
+            invoke = ["wsl", "--exec"]
+            def native_path(path):
+                absolute = str(path.resolve()).replace("\\", "/")
+                return "/mnt/" + absolute[0].lower() + absolute[2:]
+        else:
+            invoke = []
+            native_path = lambda path: str(path)
+        script = fixture / "gate.sh"
+        installer = (Path(__file__).parent.parent / "install" / "package-install.sh").resolve()
+        source = installer.read_text(encoding="utf-8")
+        regular = "regular() { test -f \"$1\"; }\n"
+        start = source.index("native_image() {")
+        end = source.index("\n}\n", start) + 3
+        script.write_text("#!/bin/sh\n" + regular + source[start:end], encoding="utf-8", newline="\n")
+        for target, cputype in (("x86_64-apple-darwin", 7), ("aarch64-apple-darwin", 12)):
+            header = bytearray(64)
+            header[:4] = b"\xcf\xfa\xed\xfe"
+            struct.pack_into("<III", header, 4, 0x01000000 | cputype, 0, 2)
+            struct.pack_into("<I", header, 16, 0x30)  # ncmds: any plausible value
+            image = fixture / f"app-{cputype}.bin"
+            image.write_bytes(header)
+            probe = ["sh", native_path(script), image.name, target]
+            if invoke:
+                probe = invoke + probe
+            result = subprocess.run(probe, cwd=fixture, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_shell_six_host_history_forwarding_records_literal_argv_and_legacy_repeat(self) -> None:
         schemas = BUILD_MANIFEST._source_schemas(MODULE_PATH.parents[2])
         self.assertEqual(schemas, (22, 2))
