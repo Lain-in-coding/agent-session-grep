@@ -3,8 +3,14 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "agent-session-grep-adapters-sqlite"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-application",
  "agent-session-grep-domain",
@@ -20,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-application"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -38,11 +44,12 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-cli"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-adapters-sqlite",
  "agent-session-grep-application",
  "agent-session-grep-domain",
+ "agent-session-grep-launcher",
  "agent-session-grep-ports",
  "agent-session-grep-provider-aider",
  "agent-session-grep-provider-antigravity",
@@ -51,6 +58,7 @@ dependencies = [
  "agent-session-grep-provider-codebuddy",
  "agent-session-grep-provider-codex",
  "agent-session-grep-provider-cursor",
+ "agent-session-grep-provider-dsh",
  "agent-session-grep-provider-grok",
  "agent-session-grep-provider-hermes",
  "agent-session-grep-provider-kimi",
@@ -58,21 +66,34 @@ dependencies = [
  "agent-session-grep-provider-opencode",
  "agent-session-grep-provider-pi",
  "agent-session-grep-provider-qoder",
+ "agent-session-grep-provider-workbuddy",
+ "agent-session-grep-provider-zcode",
  "agent-session-grep-testkit",
+ "blake3",
  "crossterm",
+ "flate2",
  "getrandom 0.4.3",
  "libc",
  "ratatui",
+ "roxmltree",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
+ "time",
+ "toml_edit",
  "windows-sys 0.61.2",
+ "yaml-rust2",
+ "zip",
+ "zstd",
 ]
 
 [[package]]
 name = "agent-session-grep-domain"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "blake3",
  "serde",
@@ -81,8 +102,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-session-grep-launcher"
+version = "0.2.0-beta.1"
+dependencies = [
+ "libc",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "agent-session-grep-ports"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "serde",
@@ -92,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-aider"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -104,19 +139,20 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-antigravity"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
  "blake3",
+ "rusqlite",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "agent-session-grep-provider-claude"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -128,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-cline"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -140,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-codebuddy"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -152,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-codex"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -164,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-cursor"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
@@ -175,8 +211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-session-grep-provider-dsh"
+version = "0.2.0-beta.1"
+dependencies = [
+ "agent-session-grep-ports",
+ "agent-session-grep-testkit",
+ "serde_json",
+ "time",
+ "zstd",
+]
+
+[[package]]
 name = "agent-session-grep-provider-grok"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -188,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-hermes"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
@@ -200,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-kimi"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -212,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-openclaw"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -224,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-opencode"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -237,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-pi"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -249,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-qoder"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -260,8 +307,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-session-grep-provider-workbuddy"
+version = "0.2.0-beta.1"
+dependencies = [
+ "agent-session-grep-domain",
+ "agent-session-grep-ports",
+ "agent-session-grep-testkit",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "agent-session-grep-provider-zcode"
+version = "0.2.0-beta.1"
+dependencies = [
+ "agent-session-grep-domain",
+ "agent-session-grep-ports",
+ "agent-session-grep-testkit",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "agent-session-grep-testkit"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -312,6 +385,12 @@ checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayref"
@@ -530,6 +609,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c89588d05638b5b4594a3348a2d6c20277e43a7f5c5202b05cc56888475a47b8"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -964,6 +1045,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +1071,16 @@ name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
+
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "float8"
@@ -1231,6 +1332,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,6 +1410,16 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
 
 [[package]]
 name = "js-sys"
@@ -1465,6 +1585,16 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
 
 [[package]]
 name = "mio"
@@ -2087,6 +2217,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2234,6 +2373,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2280,6 +2428,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "siphasher"
@@ -2406,6 +2560,16 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "walkdir",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]
@@ -2550,6 +2714,7 @@ dependencies = [
  "powerfmt",
  "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -2557,6 +2722,16 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-macros"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tokenizers"
@@ -2590,6 +2765,45 @@ dependencies = [
  "unicode-segmentation",
  "unicode_categories",
 ]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.23.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6485ef6d0d9b5d0ec17244ff7eb05310113c3f316f2d14200d4de56b3cb98f8d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
+dependencies = [
+ "winnow 1.0.4",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tracing"
@@ -2985,10 +3199,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "yaml-rust2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57e5b818a27a4cd30884ea380857a5e56f7ec3ba24a3990a3cc0b95af3238e18"
+dependencies = [
+ "arraydeque",
+ "hashlink",
+]
 
 [[package]]
 name = "yoke"
@@ -3061,6 +3300,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "typed-path",
@@ -3071,3 +3311,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.16+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

@@ -11,6 +11,7 @@ agent-session-grep-domain = { path = "../agent-session-grep-domain" }
 agent-session-grep-ports = { path = "../agent-session-grep-ports" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "serialize", "limits", "backup"] }
 
 [dev-dependencies]
 agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }

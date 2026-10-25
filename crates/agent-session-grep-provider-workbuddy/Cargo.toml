@@ -1,0 +1,22 @@
+[package]
+name = "agent-session-grep-provider-workbuddy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Existing workspace SQLite version; deserialize only an already-logical image.
+# No source path, temporary database, backup acquisition or live WAL read here.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks", "serialize"] }
+
+[dev-dependencies]
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
+# Online-backup regression uses disposable synthetic WAL databases only.
+rusqlite = { version = "0.40.2", default-features = false, features = ["backup"] }
+tempfile = "3"

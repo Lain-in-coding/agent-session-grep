@@ -1,0 +1,21 @@
+[package]
+name = "agent-session-grep-provider-zcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-domain = { path = "../agent-session-grep-domain" }
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+# Parses an already-logical, standalone image; never opens provider files.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks", "serialize"] }
+
+[dev-dependencies]
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
+# Synthetic WAL acquisition test only; no provider runtime file API.
+rusqlite = { version = "0.40.2", default-features = false, features = ["backup"] }
+tempfile = "3"

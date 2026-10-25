@@ -1,0 +1,18 @@
+[package]
+name = "agent-session-grep-provider-dsh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-session-grep-ports = { path = "../agent-session-grep-ports" }
+serde_json = { workspace = true }
+# Standard concatenated-frame decoder; no legacy formats, training or threads.
+zstd = { version = "0.13.3", default-features = false }
+# Existing locked workspace version; Gregorian conversion stays in the library.
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
