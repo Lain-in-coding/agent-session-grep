@@ -129,7 +129,14 @@ fn assert_locator_remapping(before: &State, after: &State, mappings: &[(&str, &s
         .filter(|(_, table)| table.columns.iter().any(|column| column == "source_path"))
         .map(|(name, _)| name.as_str())
         .collect();
-    assert_eq!(actual_tables, EXPECTED_LOCATOR_TABLES);
+    // Schema v20 adds managed bindings. Legacy relocation must never fabricate
+    // or remap those: managed catalogs use their own policy-aware workflow.
+    let expected_tables: Vec<_> = std::iter::once("source_bindings")
+        .chain(EXPECTED_LOCATOR_TABLES)
+        .collect();
+    assert_eq!(actual_tables, expected_tables);
+    assert!(before["source_bindings"].rows.is_empty());
+    assert_eq!(before["source_bindings"], after["source_bindings"]);
     for name in EXPECTED_LOCATOR_TABLES {
         let mut expected = before[name].clone();
         assert!(!expected.rows.is_empty(), "fixture must exercise {name}");

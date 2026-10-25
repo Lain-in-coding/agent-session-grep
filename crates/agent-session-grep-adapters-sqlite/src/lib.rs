@@ -12,17 +12,35 @@
 //! Application 的纯路径/计划策略。SQL、文件读取及持久化仍只在适配器中。
 
 mod cas;
+pub mod control;
 mod lease;
 pub mod maintenance;
 pub mod maintenance_queue;
+pub mod managed;
+pub mod managed_cache;
+pub mod managed_control_lifetime;
+mod managed_discovery;
+pub mod managed_history;
+pub mod managed_locks;
+pub mod managed_maintenance;
+pub mod managed_migration;
+pub mod managed_purge;
+mod managed_receipt;
+#[cfg(test)]
+mod managed_receipt_tests;
+pub mod managed_source_context;
+pub mod managed_store;
 mod relocation;
 mod source_fs;
 mod trace;
 
 pub use cas::{cas_activate, read_current, write_current};
+pub use control::SqliteControlStore;
 pub use lease::WriterLease;
 pub use source_fs::{
-    FileSource, SnapshotFs, capture, open_snapshot_source, read_verified, verify_snapshot,
+    FileSource, SnapshotFs, capture, capture_with_deadline, open_snapshot_source,
+    open_snapshot_source_with_deadline, read_verified, verify_snapshot,
+    verify_snapshot_with_deadline,
 };
 
 use agent_session_grep_application::{bounded_index_text, fts_tokens_cjk, parse_search_instant};
@@ -36,6 +54,7 @@ use agent_session_grep_ports::{
     SearchQuery, SemanticIndex, SessionResumeMetadata, SidechainFacet, SourcePlacement,
     SourceResumeClaim, TOOL_ACTIVITY_TARGET_MAX_CHARS, UsageTotals,
 };
+use managed_locks::{LockKind, RootIdentity, SharedGuard};
 use relocation::{InstallationAssignment, RelocationManifest};
 use rusqlite::{Connection, OptionalExtension};
 use std::any::Any;
@@ -1701,6 +1720,36 @@ pub struct SqliteStore {
     /// Staging reservations only; persisted with the matching source replacement.
     pending_installations: RefCell<BTreeMap<String, InstallationAssignment>>,
     relocation_clock: fn() -> PortResult<i64>,
+    /// Declared last: the SQLite connection and writer lease must close before
+    /// this capability releases. Do not reorder or move the guard out early.
+    _catalog_handles: Option<SharedGuard>,
+}
+
+/// Expected catalog identity obtained after acquiring the shared lifetime gate.
+/// Managed admission alone does not turn legacy CatalogStore methods into a
+/// scoped read facade; callers must use verified per-source projection reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogOpenIdentity {
+    Unmanaged,
+    Managed {
+        installation_id: agent_session_grep_ports::control::ControlId,
+        catalog_incarnation: agent_session_grep_ports::control::ControlId,
+    },
+}
+
+/// Composition must re-read current control maintenance/installation state and
+/// validate this physical data-root identity. Called while the shared OS gate is
+/// held, before any SQLite handle or writer lease is opened. Returning a cached
+/// policy/receipt is not a valid implementation of this contract.
+pub trait CatalogOpenAdmission {
+    fn recheck(&self, root: RootIdentity) -> PortResult<CatalogOpenIdentity>;
+}
+
+fn catalog_open_error() -> PortError {
+    PortError::SchemaIncompatible("catalog identity or managed admission is incompatible".into())
+}
+fn catalog_open_io<E>(_: E) -> PortError {
+    PortError::Backend("catalog open failed".into())
 }
 
 /// 一批源路径的指纹缓存项：捕获时长度与内容指纹。
@@ -1730,8 +1779,29 @@ struct CatalogStateSnapshot<'a> {
 impl SqliteStore {
     /// 只读打开（不抢 writer lease）。供 search/get/doctor 等读路径。
     pub fn open(path: &str) -> PortResult<Self> {
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(backend)?;
+        Self::open_read_inner(path, None)
+    }
+
+    /// Rechecks control/fence under the lifetime lock before opening SQLite.
+    /// This legacy facade still refuses managed_mode=1. A future scoped facade
+    /// must own the admitted connection without exposing CatalogStore fallback.
+    pub fn open_guarded(path: &str, admission: &dyn CatalogOpenAdmission) -> PortResult<Self> {
+        Self::open_read_inner(path, Some(admission))
+    }
+
+    fn open_read_inner(
+        path: &str,
+        admission: Option<&dyn CatalogOpenAdmission>,
+    ) -> PortResult<Self> {
+        let (path, handles) = Self::acquire_catalog_handles(path, false)?;
+        let expected = admission
+            .map(|a| a.recheck(handles.root_identity()))
+            .transpose()?;
+        if matches!(expected, Some(CatalogOpenIdentity::Managed { .. })) {
+            return Err(catalog_open_error());
+        }
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(catalog_open_io)?;
         conn.busy_timeout(std::time::Duration::from_secs(1))
             .map_err(backend)?;
         let current: i64 = conn
@@ -1743,6 +1813,7 @@ impl SqliteStore {
                  run index rebuild with a compatible agent-session-grep version"
             )));
         }
+        Self::validate_legacy_admission(&conn, expected.as_ref())?;
         Self::register_scalar_functions(&conn)?;
         Ok(SqliteStore {
             conn: RefCell::new(conn),
@@ -1752,6 +1823,7 @@ impl SqliteStore {
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
             pending_installations: RefCell::new(BTreeMap::new()),
             relocation_clock: unix_ms,
+            _catalog_handles: Some(handles),
         })
     }
 
@@ -1765,17 +1837,38 @@ impl SqliteStore {
     /// 组合根还没机会 [`set_repo_slug_resolver`](Self::set_repo_slug_resolver)。
     /// 因此自愈路径刻意不重派生 repo 身份投影——见 [`RepoIdentityRebuild`]。
     pub fn open_for_write(path: &str) -> PortResult<Self> {
-        let db_path = Path::new(path);
-        // 裸相对文件名（如 "catalog.db"）的 parent() 是空串 ""，create_dir_all("")
-        // 会报错；空 parent 按当前工作目录处理（与只读 open 一致，目录解析交给
-        // Connection::open / WriterLease）。
-        let data_root = match db_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
+        Self::open_write_inner(path, None)
+    }
+
+    pub fn open_for_write_guarded(
+        path: &str,
+        admission: &dyn CatalogOpenAdmission,
+    ) -> PortResult<Self> {
+        Self::open_write_inner(path, Some(admission))
+    }
+
+    fn open_write_inner(
+        path: &str,
+        admission: Option<&dyn CatalogOpenAdmission>,
+    ) -> PortResult<Self> {
+        let (path, handles) = Self::acquire_catalog_handles(path, true)?;
+        let expected = admission
+            .map(|a| a.recheck(handles.root_identity()))
+            .transpose()?;
+        if matches!(expected, Some(CatalogOpenIdentity::Managed { .. })) {
+            return Err(catalog_open_error());
+        }
+        let data_root = path.parent().ok_or_else(catalog_open_error)?;
         let lease = WriterLease::try_acquire(data_root)?;
-        let conn = Connection::open(path).map_err(backend)?;
+        // Recheck after the writer lease: setup may have reserved this path
+        // while this opener waited. SQLite must not create or adopt it.
+        managed_store::reject_creation_intent(&path)?;
+        let conn = Connection::open(&path).map_err(catalog_open_io)?;
+        // Reject a durable managed marker before migration, recovery or legacy
+        // reprojection. Missing control cannot turn a managed catalog unmanaged.
+        Self::reject_existing_managed(&conn)?;
         Self::init(&conn)?;
+        Self::validate_legacy_admission(&conn, expected.as_ref())?;
         let store = SqliteStore {
             conn: RefCell::new(conn),
             _lease: Some(lease),
@@ -1784,6 +1877,7 @@ impl SqliteStore {
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
             pending_installations: RefCell::new(BTreeMap::new()),
             relocation_clock: unix_ms,
+            _catalog_handles: Some(handles),
         };
         // lease 已到手，当前进程是唯一写者；安全收敛上次崩溃留下的无副作用 intent。
         store.recover_interrupted()?;
@@ -1806,7 +1900,132 @@ impl SqliteStore {
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
             pending_installations: RefCell::new(BTreeMap::new()),
             relocation_clock: unix_ms,
+            _catalog_handles: None,
         })
+    }
+
+    /// Resolves the actual catalog root, then owns shared catalog-handles before
+    /// opening any SQLite handle. A missing read target creates no files at all.
+    pub(crate) fn acquire_catalog_handles(
+        path: &str,
+        create_root: bool,
+    ) -> PortResult<(std::path::PathBuf, SharedGuard)> {
+        if path.is_empty() || path == ":memory:" {
+            return Err(PortError::InvalidRequest(
+                "file-backed catalog path required".into(),
+            ));
+        }
+        let path = Path::new(path);
+        managed_store::validate_catalog_path(path)?;
+        let existing = match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => true,
+            Ok(_) => return Err(catalog_open_io(())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create_root => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(catalog_open_io(e));
+            }
+            Err(e) => return Err(catalog_open_io(e)),
+        };
+        let resolved = if existing {
+            std::fs::canonicalize(path).map_err(catalog_open_io)?
+        } else {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent).map_err(catalog_open_io)?;
+            std::fs::canonicalize(parent)
+                .map_err(catalog_open_io)?
+                .join(path.file_name().ok_or_else(catalog_open_error)?)
+        };
+        let root = resolved.parent().ok_or_else(catalog_open_error)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let handles = loop {
+            match SharedGuard::try_acquire(root, LockKind::CatalogHandles) {
+                Ok(guard) => break guard,
+                Err(PortError::WriterBusy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        managed_store::reject_creation_intent(&resolved)?;
+        Ok((resolved, handles))
+    }
+
+    fn reject_existing_managed(conn: &Connection) -> PortResult<()> {
+        if conn
+            .query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))
+            .map_err(|_| catalog_open_error())?
+            == managed_store::APPLICATION_ID
+        {
+            return Err(catalog_open_error());
+        }
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='store_metadata')",[],|r|r.get(0)).map_err(|_|catalog_open_error())?;
+        if !exists {
+            return Ok(());
+        }
+        let mut columns = conn
+            .prepare("PRAGMA table_info(store_metadata)")
+            .map_err(|_| catalog_open_error())?;
+        let names = columns
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|_| catalog_open_error())?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| catalog_open_error())?;
+        if names.contains("managed_mode") {
+            let mode: i64 = conn
+                .query_row(
+                    "SELECT managed_mode FROM store_metadata WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| catalog_open_error())?;
+            if mode != 0 {
+                return Err(catalog_open_error());
+            }
+            Self::validate_legacy_admission(conn, None)?;
+        } else {
+            let identity_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='catalog_meta')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| catalog_open_error())?;
+            if identity_table {
+                return Err(catalog_open_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_legacy_admission(
+        conn: &Connection,
+        expected: Option<&CatalogOpenIdentity>,
+    ) -> PortResult<()> {
+        if conn
+            .query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))
+            .map_err(|_| catalog_open_error())?
+            == managed_store::APPLICATION_ID
+        {
+            return Err(catalog_open_error());
+        }
+        let (contract,mode,destructive):(i64,i64,i64)=conn.query_row("SELECT projection_contract_version,managed_mode,destructive_epoch FROM store_metadata WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|catalog_open_error())?;
+        if mode != 0
+            || contract != 0
+            || destructive < 0
+            || matches!(expected, Some(CatalogOpenIdentity::Managed { .. }))
+        {
+            return Err(catalog_open_error());
+        }
+        let identity_rows: i64 = conn
+            .query_row("SELECT count(*) FROM catalog_meta", [], |r| r.get(0))
+            .map_err(|_| catalog_open_error())?;
+        if identity_rows != 0 {
+            return Err(catalog_open_error());
+        }
+        Ok(())
     }
 
     /// 打开并把 schema 迁移到当前版本，为版本化 migration 与可重建索引奠基。
@@ -1820,6 +2039,7 @@ impl SqliteStore {
     fn init(conn: &Connection) -> PortResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA foreign_keys=ON;
              PRAGMA cache_size = -131072;",
         )
         .map_err(backend)?;
@@ -2057,8 +2277,42 @@ impl SqliteStore {
         if current < 19 {
             Self::migrate_v18_to_v19(conn)?;
         }
+        if current < 20 {
+            Self::migrate_v19_to_v20(conn)?;
+        }
+        if current < 22 {
+            let tx = conn.unchecked_transaction().map_err(backend)?;
+            Self::migrate_managed_in_transaction(&tx)?;
+            tx.commit().map_err(backend)?;
+        }
         // 不随 user_version 门控：旧 v7 库（本列存在前建成的）打开时同样需要。
         Self::ensure_fts_ids_rowid(conn)?;
+        Ok(())
+    }
+
+    /// Additive managed tail migration in a caller-owned maintenance transaction.
+    /// No admission, proof backfill, nested transaction or COMMIT is performed.
+    pub(crate) fn migrate_managed_in_transaction(conn: &Connection) -> PortResult<()> {
+        let current: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|_| catalog_open_error())?;
+        let foreign_keys: bool = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .map_err(|_| catalog_open_error())?;
+        if conn.is_autocommit() || !foreign_keys || !matches!(current, 20..=22) {
+            return Err(catalog_open_error());
+        }
+        if current < 21 {
+            managed::create_retained_receipt_schema(conn)?;
+        }
+        if current < 22 {
+            managed_source_context::create_schema(conn)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|_| catalog_open_error())?;
+        } else {
+            managed_source_context::validate_schema(conn)?;
+        }
+        conn.prepare("SELECT revision_id,retained_incarnation,original_incarnation,revision_digest,committed_generation,operation_id FROM retained_source_receipts LIMIT 0").map_err(|_|catalog_open_error())?;
         Ok(())
     }
 
@@ -2663,6 +2917,21 @@ impl SqliteStore {
             ));
         }
 
+        tx.commit().map_err(backend)
+    }
+
+    /// Create managed projection storage atomically without inventing source
+    /// evidence or activating managed mode on a legacy catalog.
+    fn migrate_v19_to_v20(conn: &Connection) -> PortResult<()> {
+        let tx = conn.unchecked_transaction().map_err(backend)?;
+        tx.execute_batch(
+            "ALTER TABLE store_metadata ADD COLUMN projection_contract_version INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE store_metadata ADD COLUMN managed_mode INTEGER NOT NULL DEFAULT 0 CHECK(managed_mode IN (0,1));
+             ALTER TABLE store_metadata ADD COLUMN destructive_epoch INTEGER NOT NULL DEFAULT 0;"
+        ).map_err(|_|catalog_open_error())?;
+        managed::create_schema(&tx)?;
+        tx.execute_batch("PRAGMA user_version=20;")
+            .map_err(|_| catalog_open_error())?;
         tx.commit().map_err(backend)
     }
 
@@ -8848,7 +9117,9 @@ pub const INDEX_PROJECTION_VERSION: u32 = 1;
 /// 未决行（building/search_built/cleanup_pending）的明细永久保留；旧行迁移时
 /// 回填 `full`，未知格式 fail-closed。catalog/FTS/关系与活跃 generation 水位、
 /// 恢复/重放/冲突检测语义都不因 compact 改变。
-pub const SCHEMA_VERSION: i64 = 19;
+/// v20 adds managed source projections and receipts without backfilling evidence.
+/// Explicit managed activation and a scoped read facade remain separate steps.
+pub const SCHEMA_VERSION: i64 = 22;
 
 impl CatalogStore for SqliteStore {
     fn get(&self, id: &StableId) -> PortResult<Option<Vec<u8>>> {
@@ -10706,8 +10977,9 @@ mod tests {
     /// Test migrations independently of write-open recovery/reprojection, while
     /// retaining the same exclusive lease required by production migrations.
     fn open_migration_fixture(path: &str) -> SqliteStore {
-        let lease = WriterLease::try_acquire(Path::new(path).parent().unwrap()).unwrap();
-        let conn = Connection::open(path).unwrap();
+        let (path, handles) = SqliteStore::acquire_catalog_handles(path, true).unwrap();
+        let lease = WriterLease::try_acquire(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
         SqliteStore::init(&conn).unwrap();
         SqliteStore {
             conn: RefCell::new(conn),
@@ -10717,6 +10989,7 @@ mod tests {
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
             pending_installations: RefCell::new(BTreeMap::new()),
             relocation_clock: unix_ms,
+            _catalog_handles: Some(handles),
         }
     }
 
@@ -11386,7 +11659,7 @@ mod tests {
     fn schema_v10_creates_message_vec_table() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 19);
+        assert_eq!(SCHEMA_VERSION, 22);
         let conn = store.conn.borrow();
         let count: i64 = conn
             .query_row(
@@ -21211,5 +21484,136 @@ mod tests {
             repo_slug_rows(&store, session.as_str()),
             vec!["github.com/o/app".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_tail_migration_tests {
+    use super::*;
+
+    const REMOVE_CONTEXT: &str = "DROP TABLE source_authority_tombstones; DROP TABLE source_context_heads; DROP TABLE source_dependencies; DROP TABLE source_publication_contexts; DROP TABLE source_authority_members; DROP TABLE source_authority_transitions; DROP TABLE source_authorities;";
+    fn legacy_tail(version: i64) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.borrow();
+        conn.execute_batch(REMOVE_CONTEXT).unwrap();
+        if version == 20 {
+            conn.execute_batch("DROP TABLE retained_source_receipts;")
+                .unwrap();
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+        drop(conn);
+        store
+    }
+    fn version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+    fn table(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1 AND type='table')",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn managed_tail_migration_remains_in_callers_transaction_and_rollback_restores_exact_tail() {
+        for old in [20, 21] {
+            let store = legacy_tail(old);
+            let conn = store.conn.borrow();
+            let generation: i64 = conn
+                .query_row("SELECT active_generation FROM store_metadata", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            SqliteStore::migrate_managed_in_transaction(&conn).unwrap();
+            assert!(!conn.is_autocommit());
+            assert_eq!(version(&conn), SCHEMA_VERSION);
+            assert!(table(&conn, "retained_source_receipts"));
+            assert!(table(&conn, "source_dependencies"));
+            conn.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(version(&conn), old);
+            assert_eq!(table(&conn, "retained_source_receipts"), old == 21);
+            assert!(!table(&conn, "source_dependencies"));
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            SqliteStore::migrate_managed_in_transaction(&conn).unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+            assert_eq!(version(&conn), SCHEMA_VERSION);
+            let actual: i64 = conn
+                .query_row("SELECT active_generation FROM store_metadata", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, generation);
+            for name in [
+                "retained_source_receipts",
+                "source_publication_contexts",
+                "source_dependencies",
+                "source_authorities",
+                "source_authority_transitions",
+                "source_authority_members",
+                "source_authority_tombstones",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            SqliteStore::migrate_managed_in_transaction(&conn).unwrap();
+            assert!(!conn.is_autocommit());
+            conn.execute_batch("ROLLBACK").unwrap();
+        }
+    }
+    #[test]
+    fn managed_tail_migration_refuses_autocommit_foreign_keys_off_unknown_and_partial_schema() {
+        let store = legacy_tail(21);
+        let conn = store.conn.borrow();
+        assert!(SqliteStore::migrate_managed_in_transaction(&conn).is_err());
+        assert_eq!(version(&conn), 21);
+        assert!(!table(&conn, "source_dependencies"));
+        conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE")
+            .unwrap();
+        assert!(SqliteStore::migrate_managed_in_transaction(&conn).is_err());
+        conn.execute_batch("ROLLBACK; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        for unknown in [19, 23] {
+            conn.pragma_update(None, "user_version", unknown).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(SqliteStore::migrate_managed_in_transaction(&conn).is_err());
+            assert_eq!(version(&conn), unknown);
+            assert!(!table(&conn, "source_dependencies"));
+            conn.execute_batch("ROLLBACK").unwrap();
+        }
+        conn.pragma_update(None, "user_version", 21).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_publication_contexts(revision_id TEXT); BEGIN IMMEDIATE;",
+        )
+        .unwrap();
+        assert!(SqliteStore::migrate_managed_in_transaction(&conn).is_err());
+        assert_eq!(version(&conn), 21);
+        assert!(!table(&conn, "source_dependencies"));
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+    #[test]
+    fn managed_tail_migration_ddl_failure_is_rolled_back_by_the_owner_before_reuse() {
+        let store = legacy_tail(20);
+        let conn = store.conn.borrow();
+        conn.execute_batch(
+            "CREATE VIEW source_dependencies AS SELECT 1 AS synthetic; BEGIN IMMEDIATE;",
+        )
+        .unwrap();
+        assert!(SqliteStore::migrate_managed_in_transaction(&conn).is_err());
+        assert!(!conn.is_autocommit());
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(version(&conn), 20);
+        assert!(!table(&conn, "retained_source_receipts"));
+        assert!(!table(&conn, "source_publication_contexts"));
+        conn.execute_batch("DROP VIEW source_dependencies; BEGIN IMMEDIATE;")
+            .unwrap();
+        SqliteStore::migrate_managed_in_transaction(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
     }
 }

@@ -648,24 +648,51 @@ fn legacy_v18_rows_migrate_read_and_compact() {
     }
     let identity_before = batch_identity(&db);
 
-    // 把库降级成 v18 形状：删掉 v19 的列与计划表（既有行 = 无标记的完整明细）。
+    // Reconstruct a real v18 shape, including removal of v20 managed objects.
+    // Merely changing user_version leaves a forged mixed-version catalog that
+    // identity admission must reject. Existing journal rows remain untouched.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP TABLE IF EXISTS journal_compactions;
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             DROP TABLE projection_fts;
+             DROP TABLE session_metadata_fts;
+             DROP TABLE projection_fts_stats;
+             DROP TABLE session_fts_stats;
+             DROP TABLE source_projections;
+             DROP TABLE source_occurrences;
+             DROP TABLE source_entity_projections;
+             DROP TABLE source_session_projections;
+             DROP TABLE receipt_selection_claims;
+             DROP TABLE discovery_sources;
+             DROP TABLE discovery_receipts;
+             DROP TABLE source_scope_claims;
+             DROP TABLE source_heads;
+             DROP TABLE source_revision_receipts;
+             DROP TABLE source_bindings;
+             DROP TABLE catalog_meta;
+             ALTER TABLE store_metadata DROP COLUMN projection_contract_version;
+             ALTER TABLE store_metadata DROP COLUMN managed_mode;
+             ALTER TABLE store_metadata DROP COLUMN destructive_epoch;
+             DROP TABLE journal_compactions;
              ALTER TABLE index_batches DROP COLUMN detail_summary_json;
              ALTER TABLE index_batches DROP COLUMN detail_format;
-             PRAGMA user_version = 18;",
+             PRAGMA user_version = 18;
+             COMMIT;",
         )
         .unwrap();
     }
-    // 读打开不做迁移（版本门 fail-closed）；写打开走到 v19，旧行按 full 回填。
+    // Reads never migrate; explicit writes migrate to the supported version.
     assert!(matches!(
         SqliteStore::open(&db_arg),
         Err(PortError::SchemaIncompatible(_))
     ));
     let store = SqliteStore::open_for_write(&db_arg).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 19);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        agent_session_grep_adapters_sqlite::SCHEMA_VERSION
+    );
     let operation_id = identity_before[0].1.clone();
     let legacy = store.index_batch(&operation_id).unwrap().unwrap();
     assert_eq!(legacy.detail_format, JOURNAL_DETAIL_FORMAT_FULL);

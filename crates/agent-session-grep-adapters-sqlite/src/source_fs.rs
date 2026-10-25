@@ -1,53 +1,132 @@
-//! 只读源快照读取（RFC-0002 §4, §7 bounded ingest）。
+//! Read-only source snapshots with streaming fingerprints and logical WAL backup.
 //!
-//! 打开后流式捕获 `(len, mtime_ms, fingerprint)`，只读捕获范围；提交前流式复核
-//! 三元组，任一变化返回 [`PortError::SnapshotChanged`]。capture / parse / verify
-//! 各自重新打开文件，以固定大小缓冲流式读取——不再为整个 transcript 分配 Vec。
-//!
-//! **等长异容替换**必须靠 content fingerprint——len+mtime 不足
-//! （证据：`spikes/source-snapshot/EVIDENCE.md` assertion D）。
+//! Deadline APIs retain the caller's original Instant through acquisition,
+//! hashing, verification and every FileSource reopen/read. SQLite byte limits
+//! are explicit 128/256 MiB choices. Existing APIs retain the 128 MiB limit.
+//! No source database or WAL bytes are written; SQLite may maintain SHM reader
+//! bookkeeping. A completed fingerprint observes one pinned logical snapshot,
+//! never an mtime-only freshness claim. Final verification remains mandatory.
 
 use agent_session_grep_ports::{
     JSON_FAMILY_MAX_SOURCE_BYTES, PortError, PortResult, ReadOnlySource, SourceSnapshot,
 };
+use rusqlite::{
+    Connection, OpenFlags,
+    backup::{Backup, StepResult},
+};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Fixed filesystem buffer used by capture, parse readers, and verification.
 pub const SOURCE_IO_BUFFER_BYTES: usize = 64 * 1024;
+const SQLITE_256_MIB: u64 = 256 * 1024 * 1024;
+const SQLITE_STEP_BYTES: i64 = 1024 * 1024;
+const MAX_BUSY_RETRIES: usize = 256;
 
-fn backend<E: std::fmt::Display>(e: E) -> PortError {
-    PortError::SourceIo(e.to_string())
+fn backend<E: std::fmt::Display>(_: E) -> PortError {
+    PortError::SourceIo("source snapshot I/O is unavailable".into())
+}
+fn timeout() -> PortError {
+    PortError::WriterBusy("source snapshot is busy or deadline exceeded".into())
+}
+fn sql(error: rusqlite::Error) -> PortError {
+    match error.sqlite_error_code() {
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::OperationInterrupted,
+        ) => timeout(),
+        _ => backend(error),
+    }
+}
+fn too_large() -> PortError {
+    PortError::SourceIo("SQLite source exceeds supported snapshot size".into())
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotBudget {
+    sqlite_byte_limit: u64,
+    deadline: Option<Instant>,
+}
+impl SnapshotBudget {
+    fn compatibility() -> Self {
+        Self {
+            sqlite_byte_limit: agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES,
+            deadline: None,
+        }
+    }
+    fn bounded(sqlite_byte_limit: u64, deadline: Instant) -> PortResult<Self> {
+        if sqlite_byte_limit != agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES
+            && sqlite_byte_limit != SQLITE_256_MIB
+        {
+            return Err(PortError::InvalidRequest(
+                "unsupported SQLite snapshot byte limit".into(),
+            ));
+        }
+        let budget = Self {
+            sqlite_byte_limit,
+            deadline: Some(deadline),
+        };
+        budget.check()?;
+        Ok(budget)
+    }
+    fn check(self) -> PortResult<()> {
+        if self.deadline.is_some_and(|end| Instant::now() >= end) {
+            Err(timeout())
+        } else {
+            Ok(())
+        }
+    }
+    fn pause(self) -> PortResult<()> {
+        self.check()?;
+        let duration = self.deadline.map_or(Duration::from_millis(2), |end| {
+            Duration::from_millis(2).min(end.saturating_duration_since(Instant::now()))
+        });
+        std::thread::sleep(duration);
+        self.check()
+    }
+    fn check_len(self, len: u64) -> PortResult<()> {
+        if len > self.sqlite_byte_limit {
+            Err(too_large())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn mtime_ms(meta: &std::fs::Metadata) -> PortResult<i64> {
-    let m = meta.modified().map_err(backend)?;
-    Ok(m.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64)
+    let modified = meta.modified().map_err(backend)?;
+    i64::try_from(
+        modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .map_err(backend)
 }
 
-/// Stream a reader through BLAKE3, returning `(total_bytes, hex fingerprint)`.
-///
-/// Bounded by a fixed-size chunk; the caller is responsible for limiting the
-/// read range (`std::io::Take`) so a concurrently growing file cannot blow up
-/// the fingerprint pass.
-fn fingerprint_reader(reader: &mut dyn Read) -> PortResult<(u64, String)> {
+fn fingerprint_reader(reader: &mut dyn Read, budget: SnapshotBudget) -> PortResult<(u64, String)> {
     let mut hasher = blake3::Hasher::new();
     let mut total = 0_u64;
     let mut chunk = [0_u8; SOURCE_IO_BUFFER_BYTES];
     loop {
+        budget.check()?;
         let read = reader.read(&mut chunk).map_err(backend)?;
+        budget.check()?;
         if read == 0 {
             break;
         }
         hasher.update(&chunk[..read]);
-        total = total.saturating_add(read as u64);
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| backend("byte count overflow"))?;
     }
+    budget.check()?;
     Ok((total, hasher.finalize().to_hex().to_string()))
 }
 
-/// 元数据复核：len + mtime 任一变化即 [`PortError::SnapshotChanged`]。
 fn verify_metadata(meta: &std::fs::Metadata, snap: &SourceSnapshot) -> PortResult<()> {
     if meta.len() != snap.len {
         return Err(PortError::SnapshotChanged(format!(
@@ -66,70 +145,189 @@ fn verify_metadata(meta: &std::fs::Metadata, snap: &SourceSnapshot) -> PortResul
     Ok(())
 }
 
-/// Capture `(len, mtime, BLAKE3)` with one fixed-buffer pass.
-///
-/// Text files use a streaming byte fingerprint. SQLite files use a bounded
-/// logical backup so committed WAL frames are included, with a `sqlite:`
-/// fingerprint prefix identifying the logical verification strategy.
+/// Compatibility capture: streaming files and SQLite logical images <=128 MiB.
 pub fn capture(path: &Path) -> PortResult<SourceSnapshot> {
-    let mut header = [0; 16];
+    capture_budget(path, SnapshotBudget::compatibility())
+}
+/// One original deadline for source read admission, pinned logical backup,
+/// and fixed-buffer hashing. Only 128 MiB and 256 MiB SQLite limits are supported.
+pub fn capture_with_deadline(
+    path: &Path,
+    sqlite_byte_limit: u64,
+    deadline: Instant,
+) -> PortResult<SourceSnapshot> {
+    capture_budget(path, SnapshotBudget::bounded(sqlite_byte_limit, deadline)?)
+}
+fn capture_budget(path: &Path, budget: SnapshotBudget) -> PortResult<SourceSnapshot> {
+    budget.check()?;
     let mut file = File::open(path).map_err(backend)?;
-    if file.read(&mut header).map_err(backend)? == header.len() && &header == b"SQLite format 3\0" {
-        let copy = sqlite_snapshot(path)?;
-        let mut snapshot = capture_file(&copy)?;
+    budget.check()?;
+    let mut header = [0; 16];
+    let read = file.read(&mut header).map_err(backend)?;
+    budget.check()?;
+    if read == header.len() && &header == b"SQLite format 3\0" {
+        let copy = sqlite_snapshot(path, budget)?;
+        let mut snapshot = capture_file(&copy, budget)?;
+        budget.check_len(snapshot.len)?;
         snapshot.path = path.to_string_lossy().into_owned();
         snapshot.mtime_ms = mtime_ms(&file.metadata().map_err(backend)?)?;
         snapshot.fingerprint.insert_str(0, "sqlite:");
+        budget.check()?;
         return Ok(snapshot);
     }
-    capture_file(path)
+    capture_file(path, budget)
 }
-
-/// Capture the database's logical pages, including committed WAL frames. The
-/// source connection is read-only; only the guarded destination may be written.
-fn sqlite_snapshot(path: &Path) -> PortResult<tempfile::TempPath> {
-    let source =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(backend)?;
-    source
-        .busy_timeout(std::time::Duration::from_secs(1))
-        .map_err(backend)?;
-    // Pin one read transaction before copying pages: concurrent writers cannot
-    // restart the backup indefinitely, and the size check covers that snapshot.
-    source
-        .execute_batch("BEGIN; SELECT rootpage FROM sqlite_schema LIMIT 1;")
-        .map_err(backend)?;
-    let pages: i64 = source
-        .query_row("PRAGMA page_count", [], |r| r.get(0))
-        .map_err(backend)?;
-    let page_size: i64 = source
-        .query_row("PRAGMA page_size", [], |r| r.get(0))
-        .map_err(backend)?;
-    if pages
-        .checked_mul(page_size)
-        .is_none_or(|len| len < 0 || len as u64 > agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES)
-    {
-        return Err(PortError::SourceIo(
-            "SQLite source exceeds supported snapshot size".into(),
-        ));
+fn sqlite_retry<T>(
+    budget: SnapshotBudget,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> PortResult<T> {
+    for _ in 0..MAX_BUSY_RETRIES {
+        budget.check()?;
+        match operation() {
+            Err(error)
+                if budget.deadline.is_some()
+                    && matches!(
+                        error.sqlite_error_code(),
+                        Some(
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                    ) =>
+            {
+                budget.pause()?
+            }
+            value => {
+                let value = value.map_err(sql)?;
+                budget.check()?;
+                return Ok(value);
+            }
+        }
     }
+    Err(timeout())
+}
+/// Pin a read-only WAL snapshot before the size check and stepped Backup API.
+/// The destination is disposable owned state. No SQL writes target the source.
+fn sqlite_snapshot(path: &Path, budget: SnapshotBudget) -> PortResult<tempfile::TempPath> {
+    budget.check()?;
+    let source =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql)?;
+    source
+        .busy_timeout(if budget.deadline.is_some() {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1)
+        })
+        .map_err(sql)?;
+    if let Some(end) = budget.deadline {
+        source
+            .progress_handler(1000, Some(move || Instant::now() >= end))
+            .map_err(sql)?;
+    }
+    source
+        .pragma_update(None, "cache_size", -2048)
+        .map_err(sql)?;
+    source.execute_batch("BEGIN;").map_err(sql)?;
+    sqlite_retry(budget, || {
+        source.execute_batch("SELECT rootpage FROM sqlite_schema LIMIT 1;")
+    })?;
+    let pages: i64 = sqlite_retry(budget, || {
+        source.query_row("PRAGMA page_count", [], |row| row.get(0))
+    })?;
+    let page_size: i64 = sqlite_retry(budget, || {
+        source.query_row("PRAGMA page_size", [], |row| row.get(0))
+    })?;
+    if pages < 1 || !(512..=65_536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
+        return Err(backend("invalid SQLite snapshot geometry"));
+    }
+    let expected_len = pages
+        .checked_mul(page_size)
+        .and_then(|len| u64::try_from(len).ok())
+        .ok_or_else(too_large)?;
+    budget.check_len(expected_len)?;
+    budget.check()?;
     let destination = tempfile::NamedTempFile::new()
         .map_err(backend)?
         .into_temp_path();
-    source
-        .backup(rusqlite::MAIN_DB, &destination, None)
-        .map_err(backend)?;
+    let mut target = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(sql)?;
+    target.busy_timeout(Duration::ZERO).map_err(sql)?;
+    target
+        .pragma_update(None, "page_size", page_size)
+        .map_err(sql)?;
+    target
+        .pragma_update(None, "cache_size", -2048)
+        .map_err(sql)?;
+    let max_pages =
+        i64::try_from(budget.sqlite_byte_limit / page_size as u64).map_err(|_| too_large())?;
+    target
+        .pragma_update(None, "max_page_count", max_pages)
+        .map_err(sql)?;
+    target
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
+        .map_err(sql)?;
+    if let Some(end) = budget.deadline {
+        target
+            .progress_handler(1000, Some(move || Instant::now() >= end))
+            .map_err(sql)?;
+    }
+    {
+        let backup = Backup::new(&source, &mut target).map_err(sql)?;
+        // At most 1 MiB of pages per step, independent of SQLite's page size.
+        let pages_per_step = (SQLITE_STEP_BYTES / page_size).max(1) as i32;
+        let mut busy_attempts = 0;
+        loop {
+            budget.check()?;
+            let step = backup.step(pages_per_step).map_err(sql)?;
+            budget.check()?;
+            match step {
+                StepResult::Done | StepResult::More => {
+                    let progress = backup.progress();
+                    if i64::from(progress.pagecount) != pages
+                        || progress.remaining < 0
+                        || progress.remaining > progress.pagecount
+                    {
+                        return Err(PortError::SnapshotChanged(
+                            "SQLite logical snapshot geometry changed".into(),
+                        ));
+                    }
+                    budget.check_len(progress.pagecount as u64 * page_size as u64)?;
+                    busy_attempts = 0;
+                    if step == StepResult::Done {
+                        break;
+                    }
+                }
+                StepResult::Busy | StepResult::Locked => {
+                    busy_attempts += 1;
+                    if busy_attempts >= MAX_BUSY_RETRIES {
+                        return Err(timeout());
+                    }
+                    budget.pause()?;
+                }
+                _ => return Err(backend("unsupported SQLite backup result")),
+            }
+        }
+    }
+    target.close().map_err(|(_, error)| sql(error))?;
+    budget.check()?;
+    let len = std::fs::metadata(&destination).map_err(backend)?.len();
+    if len != expected_len {
+        return Err(PortError::SnapshotChanged(
+            "SQLite logical snapshot length changed".into(),
+        ));
+    }
+    budget.check_len(len)?;
+    budget.check()?;
     Ok(destination)
 }
 
-fn capture_file(path: &Path) -> PortResult<SourceSnapshot> {
+fn capture_file(path: &Path, budget: SnapshotBudget) -> PortResult<SourceSnapshot> {
+    budget.check()?;
     let file = File::open(path).map_err(backend)?;
     let meta = file.metadata().map_err(backend)?;
+    budget.check()?;
     let len = meta.len();
     let mtime = mtime_ms(&meta)?;
-    // 固定捕获长度：若读期间文件被追加，仍只认初始 len 范围。
     let mut captured = file.take(len);
-    let (read_len, fingerprint) = fingerprint_reader(&mut captured)?;
+    let (read_len, fingerprint) = fingerprint_reader(&mut captured, budget)?;
     if read_len != len {
         return Err(PortError::SnapshotChanged(format!(
             "len changed during capture {len} -> {read_len}"
@@ -142,98 +340,175 @@ fn capture_file(path: &Path) -> PortResult<SourceSnapshot> {
         fingerprint,
     };
     post_read_verify(path, &snap)?;
+    budget.check()?;
     Ok(snap)
 }
 
-/// A repeatable, read-only view limited to the captured byte range.
+/// Repeatable read-only captured range. Clones preserve the same deadline/cap.
 #[derive(Clone)]
 pub struct FileSource {
     path: PathBuf,
     snapshot: SourceSnapshot,
     _temporary: Option<std::sync::Arc<tempfile::TempPath>>,
+    budget: SnapshotBudget,
 }
-
+fn reader_time(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "source snapshot deadline exceeded",
+        ))
+    } else {
+        Ok(())
+    }
+}
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Option<Instant>,
+}
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        reader_time(self.deadline)?;
+        let chunk_len = buf.len().min(SOURCE_IO_BUFFER_BYTES);
+        let read = self.inner.read(&mut buf[..chunk_len])?;
+        reader_time(self.deadline)?;
+        Ok(read)
+    }
+}
+impl<R: BufRead> BufRead for DeadlineReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        reader_time(self.deadline)?;
+        let buf = self.inner.fill_buf()?;
+        reader_time(self.deadline)?;
+        Ok(buf)
+    }
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
 impl ReadOnlySource for FileSource {
     fn len(&self) -> u64 {
         self.snapshot.len
     }
-
     fn open(&self) -> PortResult<Box<dyn BufRead + Send + '_>> {
+        self.budget.check()?;
+        if self._temporary.is_some() {
+            self.budget.check_len(self.snapshot.len)?;
+        }
         let file = File::open(&self.path).map_err(backend)?;
-        // 每次重开都先核对 len/mtime：并发改写（含等长替换的 mtime 变化）在此
-        // 被尽早拒绝，避免在"过期视图"上继续解析。
         verify_metadata(&file.metadata().map_err(backend)?, &self.snapshot)?;
-        Ok(Box::new(BufReader::with_capacity(
-            SOURCE_IO_BUFFER_BYTES,
-            file.take(self.snapshot.len),
-        )))
+        self.budget.check()?;
+        Ok(Box::new(DeadlineReader {
+            inner: BufReader::with_capacity(SOURCE_IO_BUFFER_BYTES, file.take(self.snapshot.len)),
+            deadline: self.budget.deadline,
+        }))
     }
 }
 
-/// Reopen a captured source without reading it eagerly.
+/// Compatibility reopening: <=128 MiB logical SQLite snapshots.
 pub fn open_snapshot_source(path: &Path, snapshot: &SourceSnapshot) -> PortResult<FileSource> {
+    open_snapshot_source_budget(path, snapshot, SnapshotBudget::compatibility())
+}
+pub fn open_snapshot_source_with_deadline(
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    sqlite_byte_limit: u64,
+    deadline: Instant,
+) -> PortResult<FileSource> {
+    open_snapshot_source_budget(
+        path,
+        snapshot,
+        SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+    )
+}
+fn open_snapshot_source_budget(
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    budget: SnapshotBudget,
+) -> PortResult<FileSource> {
+    budget.check()?;
     if snapshot.fingerprint.starts_with("sqlite:") {
-        let copy = sqlite_snapshot(path)?;
-        let current = capture_file(&copy)?;
+        budget.check_len(snapshot.len)?;
+        let copy = sqlite_snapshot(path, budget)?;
+        let current = capture_file(&copy, budget)?;
         verify_sqlite_snapshot(snapshot, &current)?;
+        budget.check()?;
         return Ok(FileSource {
             path: copy.to_path_buf(),
             snapshot: current,
             _temporary: Some(std::sync::Arc::new(copy)),
+            budget,
         });
     }
     let meta = std::fs::metadata(path).map_err(backend)?;
     verify_metadata(&meta, snapshot)?;
+    budget.check()?;
     Ok(FileSource {
         path: path.to_path_buf(),
         snapshot: snapshot.clone(),
         _temporary: None,
+        budget,
     })
 }
 
-/// Final pre-commit verification: metadata + captured-range BLAKE3, all streamed.
-pub fn verify_snapshot(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
-    if snap.fingerprint.starts_with("sqlite:") {
-        let copy = sqlite_snapshot(path)?;
-        return verify_sqlite_snapshot(snap, &capture_file(&copy)?);
+/// Final compatibility verification: metadata + full captured-range fingerprint.
+pub fn verify_snapshot(path: &Path, snapshot: &SourceSnapshot) -> PortResult<()> {
+    verify_snapshot_budget(path, snapshot, SnapshotBudget::compatibility())
+}
+pub fn verify_snapshot_with_deadline(
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    sqlite_byte_limit: u64,
+    deadline: Instant,
+) -> PortResult<()> {
+    verify_snapshot_budget(
+        path,
+        snapshot,
+        SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+    )
+}
+fn verify_snapshot_budget(
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    budget: SnapshotBudget,
+) -> PortResult<()> {
+    budget.check()?;
+    if snapshot.fingerprint.starts_with("sqlite:") {
+        budget.check_len(snapshot.len)?;
+        let copy = sqlite_snapshot(path, budget)?;
+        let current = capture_file(&copy, budget)?;
+        verify_sqlite_snapshot(snapshot, &current)?;
+        return budget.check();
     }
     let file = File::open(path).map_err(backend)?;
-    verify_metadata(&file.metadata().map_err(backend)?, snap)?;
-    let mut captured = file.take(snap.len);
-    let (read_len, current_fingerprint) = fingerprint_reader(&mut captured)?;
-    if read_len != snap.len {
+    verify_metadata(&file.metadata().map_err(backend)?, snapshot)?;
+    let mut captured = file.take(snapshot.len);
+    let (len, fingerprint) = fingerprint_reader(&mut captured, budget)?;
+    if len != snapshot.len {
         return Err(PortError::SnapshotChanged(format!(
-            "len changed during verification {} -> {read_len}",
-            snap.len
+            "len changed during verification {} -> {len}",
+            snapshot.len
         )));
     }
-    if current_fingerprint != snap.fingerprint {
+    if fingerprint != snapshot.fingerprint {
         return Err(PortError::SnapshotChanged(
             "fingerprint changed (content replaced at same len)".into(),
         ));
     }
-    // 复核读取期间（首次 stat → read 之间）源被追加/截断：内容按旧 len 截断后
-    // 指纹仍可与快照一致，等长替换也已被指纹覆盖，因此再核对一次 len+mtime 以
-    // 收窄窗口。诚实的结论是"复核读取窗口内未观察到变化"。
-    post_read_verify(path, snap)
+    post_read_verify(path, snapshot)?;
+    budget.check()
 }
-
 fn verify_sqlite_snapshot(expected: &SourceSnapshot, current: &SourceSnapshot) -> PortResult<()> {
     if expected.len != current.len
         || expected.fingerprint.strip_prefix("sqlite:") != Some(current.fingerprint.as_str())
     {
-        return Err(PortError::SnapshotChanged(
+        Err(PortError::SnapshotChanged(
             "SQLite logical content changed".into(),
-        ));
+        ))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
-
-/// 读取完成后的最终复核：源文件的 len/mtime 不得在读取窗口内变化。
-///
-/// 单独抽取为可测试函数——真实竞态（stat→read 之间追加）无法在单测里确定性
-/// 复现，但"读取后文件已变化"这一状态可以直接构造（写入新内容后本函数必须
-/// 报告 SnapshotChanged）。
 fn post_read_verify(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
     let meta_after = std::fs::metadata(path).map_err(backend)?;
     verify_metadata(&meta_after, snap).map_err(|error| match error {
@@ -243,7 +518,6 @@ fn post_read_verify(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
         other => other,
     })
 }
-
 /// Capture and return a repeatable reader source; no transcript-sized `Vec`.
 pub fn read_verified(path: &Path) -> PortResult<(SourceSnapshot, FileSource)> {
     let snapshot = capture(path)?;

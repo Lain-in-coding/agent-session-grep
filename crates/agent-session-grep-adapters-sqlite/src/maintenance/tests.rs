@@ -145,6 +145,11 @@ fn soak_physically_reclaims_and_preserves_schema_generation_fts_identity() {
     assert_eq!(job.selection.batches.len(), 21);
     let original_identity = job.target.file_identity.clone();
     let before = invariants(&fixture.connection()).unwrap();
+    let original_schema: i64 = fixture
+        .connection()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(original_schema, crate::SCHEMA_VERSION);
     let old_generation = generation(&fixture.connection()).unwrap();
     let original_bytes = fs::metadata(&fixture.path).unwrap().len();
     let mut session = fixture.adapter.acquire(&job).unwrap();
@@ -158,7 +163,7 @@ fn soak_physically_reclaims_and_preserves_schema_generation_fts_identity() {
             .connection()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        19
+        original_schema
     );
     assert!(job.metrics.after.catalog_bytes < original_bytes);
     assert!(total(&job.metrics.after) < total(&job.metrics.before));

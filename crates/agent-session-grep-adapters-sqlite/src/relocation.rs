@@ -59,6 +59,10 @@ pub(super) struct InstallationAssignment {
     created_at_ms: i64,
 }
 impl InstallationAssignment {
+    pub(super) fn namespace_id(&self) -> &str {
+        &self.namespace_id
+    }
+
     pub(super) fn canonical_value(&self) -> serde_json::Value {
         serde_json::json!({
             "namespace_id": self.namespace_id, "provider_id": self.provider_id,
@@ -526,6 +530,96 @@ impl SqliteStore {
 
     /// Resolve identity before parsing. New values are in-memory reservations;
     /// only a successful source activation can persist them.
+    /// Managed-only reservation for a caller-verified provider surface. Existing
+    /// source identities are preserved; this cannot re-key a legacy source.
+    pub(crate) fn resolve_or_allocate_surface_namespace(
+        &self,
+        provider: &str,
+        source_path: &str,
+        surface_root: &str,
+        physical_identity: &str,
+    ) -> PortResult<String> {
+        agent_session_grep_ports::control::ControlId::parse(physical_identity)?;
+        if self._lease.is_none()
+            || !agent_session_grep_application::relocation::path_is_within(
+                source_path,
+                surface_root,
+            )?
+        {
+            return Err(agent_session_grep_ports::PortError::InvalidRequest(
+                "invalid managed source surface".into(),
+            ));
+        }
+        let key = normalize_absolute_path(source_path)?;
+        let root_key = normalize_absolute_path(surface_root)?;
+        let conn = self.conn.borrow();
+        if let Some(existing) = Self::assignment_for_source(&conn, source_path)? {
+            if existing.provider_id != provider || existing.root_key != root_key {
+                return Err(agent_session_grep_ports::PortError::GenerationMismatch(
+                    "existing source namespace cannot change".into(),
+                ));
+            }
+            return Ok(existing.namespace_input);
+        }
+        let indexed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_scans WHERE source_path=?1 UNION ALL SELECT 1 FROM source_membership WHERE source_path=?1 UNION ALL SELECT 1 FROM source_bindings WHERE source_path=?1)", [source_path], |r| r.get(0)).map_err(backend)?;
+        if indexed {
+            return Err(agent_session_grep_ports::PortError::GenerationMismatch(
+                "source namespace is unresolved".into(),
+            ));
+        }
+        let expected = format!("surface-v1:{physical_identity}");
+        let retired: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM installation_locations WHERE provider_id=?1 AND root_key=?2 AND state!='current')", rusqlite::params![provider,root_key], |r|r.get(0)).map_err(backend)?;
+        if retired {
+            return Err(agent_session_grep_ports::PortError::GenerationMismatch(
+                "provider surface is retired".into(),
+            ));
+        }
+        let persisted: Option<InstallationAssignment> = conn.query_row("SELECT n.namespace_id,n.provider_id,n.namespace_input,n.origin,l.root_key,l.root_locator,n.created_at_ms FROM installation_locations l JOIN installation_namespaces n USING(namespace_id) WHERE l.provider_id=?1 AND l.root_key=?2 AND l.state='current'", rusqlite::params![provider,root_key], assignment_row).optional().map_err(backend)?;
+        let mut found = persisted;
+        if found.is_none() {
+            for a in self.pending_installations.borrow().values() {
+                if a.provider_id == provider && a.root_key == root_key {
+                    if found
+                        .as_ref()
+                        .is_some_and(|b: &InstallationAssignment| b.namespace_id != a.namespace_id)
+                    {
+                        return Err(agent_session_grep_ports::PortError::GenerationMismatch(
+                            "provider surface namespace conflicts".into(),
+                        ));
+                    }
+                    found = Some(a.clone());
+                }
+            }
+        }
+        let assignment = match found {
+            Some(a) if a.namespace_input == expected && a.origin == "allocated-v1" => a,
+            Some(_) => {
+                return Err(agent_session_grep_ports::PortError::GenerationMismatch(
+                    "provider surface identity changed".into(),
+                ));
+            }
+            None => {
+                let value: String = conn
+                    .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
+                    .map_err(backend)?;
+                InstallationAssignment {
+                    namespace_id: format!("ins_v1_{value}"),
+                    provider_id: provider.into(),
+                    namespace_input: expected,
+                    origin: "allocated-v1".into(),
+                    root_key,
+                    root_locator: surface_root.into(),
+                    created_at_ms: unix_ms()?,
+                }
+            }
+        };
+        drop(conn);
+        self.pending_installations
+            .borrow_mut()
+            .insert(key, assignment.clone());
+        Ok(assignment.namespace_input)
+    }
+
     pub fn resolve_or_allocate_installation_namespace(
         &self,
         provider_id: &str,
@@ -1625,13 +1719,13 @@ impl SqliteStore {
     /// Acquire a lease for an existing current-schema catalog without migrating
     /// or rebuilding any live projection before the relocation backup exists.
     pub fn open_for_relocation(path: &str) -> PortResult<Self> {
-        let path = Path::new(path);
+        let (path, handles) = Self::acquire_catalog_handles(path, false)?;
         let root = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let lease = WriterLease::try_acquire(root)?;
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(backend)?;
         conn.busy_timeout(std::time::Duration::from_secs(1))
             .map_err(backend)?;
@@ -1643,6 +1737,7 @@ impl SqliteStore {
                 "relocation requires the current catalog schema; run index rebuild first".into(),
             ));
         }
+        Self::validate_legacy_admission(&conn, None)?;
         Self::register_scalar_functions(&conn)?;
         let store = SqliteStore {
             conn: RefCell::new(conn),
@@ -1652,6 +1747,7 @@ impl SqliteStore {
             repo_slug_resolver: RefCell::new(Box::new(NoopRepoSlugResolver)),
             pending_installations: RefCell::new(BTreeMap::new()),
             relocation_clock: unix_ms,
+            _catalog_handles: Some(handles),
         };
         store.recover_interrupted()?;
         Ok(store)
