@@ -163,6 +163,11 @@ jobs:
               # selected from its ref even if the unavailable context is empty.
               inputs = json.loads(os.environ["INPUTS_JSON"], object_pairs_hook=unique_object) if event_name == "workflow_dispatch" else None
               tag = select_tag(event_name, os.environ["EVENT_REF"], inputs)
+              # Managed Beta candidates are rehearsal-only. Fail a tag push in
+              # prepare before any build starts; the publish step still
+              # rejects this layout as defense in depth for dispatch runs.
+              if event_name == "push":
+                  raise ValueError("managed Beta candidates are not publishable; workflow_dispatch rehearsal only")
               resolved = resolve_tag(api_get, os.environ["GITHUB_REPOSITORY"], tag)
               if os.environ["EVENT_NAME"] == "push" and resolved["source_commit"] != validate_source_commit(os.environ["CALLER_SHA"]):
                   raise ValueError("tag push commit no longer matches the existing tag")

@@ -2240,13 +2240,12 @@ class PipelineSourceTests(unittest.TestCase):
                 env = {"EVENT_NAME": "push", "EVENT_REF": "refs/tags/v1.2.3", "INPUTS_JSON": "{}",
                        "GITHUB_REPOSITORY": "sample/project", "CALLER_SHA": caller, "GITHUB_OUTPUT": str(output)}
                 with patch.dict(control, {"api_get": FakeAPI(responses)}):
-                    if caller == commit:
+                    # Managed Beta candidates fail fast on every tag push;
+                    # the peeled-commit identity check remains behind the gate
+                    # and still runs for workflow_dispatch rehearsal.
+                    with self.assertRaises(ValueError):
                         run_main(control, source, env)
-                        self.assertIn("source_commit=" + commit, output.read_text(encoding="utf-8"))
-                    else:
-                        with self.assertRaises(ValueError):
-                            run_main(control, source, env)
-                        self.assertFalse(output.exists())
+                    self.assertFalse(output.exists())
 
     def test_pr_prepare_keeps_merge_m_as_source_not_api_head_h(self):
         control, source = load_step("release-verify.yml", "prepare", "source")
@@ -2440,8 +2439,11 @@ class InputContextTests(unittest.TestCase):
                     with self.subTest(event=event, raw=raw), patch.dict(control, {"api_get": api}), \
                             patch("subprocess.run") as command, patch("os.system") as shell:
                         if event == "push":
-                            run_main(control, source, env)
-                            self.assertIn("source_commit=" + oid("tag-b"), output.read_text(encoding="utf-8"))
+                            # Managed Beta candidates fail fast on tag pushes.
+                            with self.assertRaises(ValueError):
+                                run_main(control, source, env)
+                            self.assertEqual(api.calls, [])
+                            self.assertFalse(output.exists())
                         else:
                             with self.assertRaises(ValueError):
                                 run_main(control, source, env)
