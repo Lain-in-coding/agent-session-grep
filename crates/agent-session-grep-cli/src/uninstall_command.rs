@@ -1671,10 +1671,100 @@ fn remove_file_checked(
     {
         return Err(Reason::IdentityChanged);
     }
-    fs::remove_file(&path).map_err(|_| Reason::FileLocked)?;
+    verified_remove_file(&path, &proof.identity)?;
     platform::sync_directory(path.parent().ok_or(Reason::IdentityChanged)?)
         .map_err(|_| Reason::FileLocked)?;
     Ok(())
+}
+/// Delete a verified file through a fresh handle whose identity still matches
+/// the proof, closing the verify-then-delete pathname window.
+fn verified_remove_file(path: &Path, identity: &(u64, u64)) -> Result<(), Reason> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::{
+            Win32::Foundation::HANDLE,
+            Win32::Storage::FileSystem::{
+                self, DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
+                SetFileInformationByHandle,
+            },
+        };
+        let open_delete = || {
+            fs::OpenOptions::new()
+                .access_mode(DELETE | 0x8000_0000 | FILE_READ_ATTRIBUTES)
+                .share_mode(FileSystem::FILE_SHARE_READ)
+                .custom_flags(FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .map_err(|_| Reason::FileLocked)
+        };
+        let file = open_delete()?;
+        if !file.metadata().map_err(|_| Reason::FileChanged)?.is_file()
+            || platform::identity(&file).map_err(|_| Reason::FileChanged)? != *identity
+        {
+            return Err(Reason::FileChanged);
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let mut result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileSystem::FileDispositionInfo,
+                &disposition as *const FILE_DISPOSITION_INFO as *const core::ffi::c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            // Nothing observes the pending disposition before this process
+            // closes the failed handle, so retrying on the same inode is safe.
+            drop(file);
+            let retry = open_delete()?;
+            if retry.metadata().map_err(|_| Reason::FileChanged)?.is_file()
+                && platform::identity(&retry).map_err(|_| Reason::FileChanged)? == *identity
+            {
+                result = unsafe {
+                    SetFileInformationByHandle(
+                        retry.as_raw_handle() as HANDLE,
+                        FileSystem::FileDispositionInfo,
+                        &disposition as *const FILE_DISPOSITION_INFO as *const core::ffi::c_void,
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                };
+                // Windows defers a pending disposition until the last handle
+                // closes; drop immediately so the removal is observable.
+                drop(retry);
+            }
+        }
+        if result == 0 {
+            return Err(Reason::FileLocked);
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = platform::open_file(path).map_err(|_| Reason::FileLocked)?;
+        let handle = file.metadata().map_err(|_| Reason::FileChanged)?;
+        if !handle.is_file()
+            || platform::identity(&file).map_err(|_| Reason::FileChanged)? != *identity
+        {
+            return Err(Reason::FileChanged);
+        }
+        let link = fs::symlink_metadata(path).map_err(|_| Reason::FileLocked)?;
+        let name = fs::metadata(path).map_err(|_| Reason::FileLocked)?;
+        use std::os::unix::fs::MetadataExt;
+        if (link.dev(), link.ino()) != (name.dev(), name.ino())
+            || (name.dev(), name.ino()) != (handle.dev(), handle.ino())
+        {
+            return Err(Reason::FileChanged);
+        }
+        drop(file);
+        fs::remove_file(path).map_err(|_| Reason::FileLocked)?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (path, identity);
+        Err(Reason::FileLocked)
+    }
 }
 fn sqlite_group(
     journal: &Journal,

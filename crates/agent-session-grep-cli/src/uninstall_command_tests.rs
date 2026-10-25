@@ -493,6 +493,51 @@ fn file_changed_after_durable_plan_is_preserved() {
     fixture.preserved();
 }
 #[test]
+fn verified_removal_never_deletes_an_unverified_replacement() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let policy = journal.validate(&fixture.control, deadline()).unwrap();
+    let path = fixture.root.join("synthetic-owned-artifact.json");
+    write_private(&path, b"owned verified image");
+    let proof = owned_file(
+        &fixture.root,
+        "synthetic-owned-artifact.json",
+        &policy,
+        deadline(),
+    )
+    .unwrap();
+    let evidence = path.with_extension("evidence.json");
+    fs::rename(&path, &evidence).unwrap();
+    write_private(&path, b"independent replacement image");
+    assert_eq!(
+        verified_remove_file(&path, &proof.identity),
+        Err(Reason::FileChanged)
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"independent replacement image");
+    assert_eq!(fs::read(&evidence).unwrap(), b"owned verified image");
+    fs::remove_file(&evidence).unwrap();
+    fixture.preserved();
+}
+#[cfg(windows)]
+#[test]
+fn verified_removal_deletes_the_exact_verified_handle() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let policy = journal.validate(&fixture.control, deadline()).unwrap();
+    let path = fixture.root.join("synthetic-owned-artifact.json");
+    write_private(&path, b"owned verified image");
+    let proof = owned_file(
+        &fixture.root,
+        "synthetic-owned-artifact.json",
+        &policy,
+        deadline(),
+    )
+    .unwrap();
+    assert_eq!(verified_remove_file(&path, &proof.identity), Ok(()));
+    assert!(!path.exists());
+    fixture.preserved();
+}
+#[test]
 fn source_selection_cannot_become_cleanup_authority_by_name() {
     let fixture = Fixture::new();
     let journal = fixture.fenced_journal(true);
