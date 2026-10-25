@@ -10,7 +10,8 @@
 //! 2. seq 从 0 连续，committed == emit 数 == ground truth 消息数；
 //! 3. 确定性：同一字节两次解析，事件流与报告完全一致；
 //! 4. 元数据透传：role/text 原样（chatdata 按 startTime、prompts 按 createdAt
-//!    排序）、timestamp == startTime/createdAt 的十进制串、native_id 恒空；
+//!    排序）、timestamp == startTime/createdAt 毫秒值转 RFC 3339 UTC
+//!    （越界值丢弃、消息保持无时间戳）、native_id 恒空；
 //! 5. 会话身份：session_native_id == 首个带 id 的会话（tab id 或
 //!    conversationId），多会话 fail-closed 为 Ambiguous；
 //! 6. probe 对任意字节永不 panic：Ok 时 confidence 非 Ambiguous 且 variant 恒为自身；
@@ -147,6 +148,39 @@ struct ExpectedMessage {
     timestamp: Option<String>,
 }
 
+/// Ground truth 与 adapter 共用的 epoch-ms → RFC 3339 转换边界（镜像
+/// provider 语义；越界毫秒值丢弃，消息保持无时间戳）。
+const MIN_EPOCH_MS: i64 = -62_167_219_200_000;
+const MAX_EPOCH_MS: i64 = 253_402_300_799_999;
+
+fn epoch_ms_utc(ms: i64) -> Option<String> {
+    if !(MIN_EPOCH_MS..=MAX_EPOCH_MS).contains(&ms) {
+        return None;
+    }
+    let days = ms.div_euclid(86_400_000);
+    let time = ms.rem_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        time / 3_600_000,
+        (time % 3_600_000) / 60_000,
+        (time % 60_000) / 1000,
+        time % 1000
+    ))
+}
+
 /// 一个生成的 Cursor vscdb 用例：序列化字节 + 全部预期值 + 语料覆盖度标志。
 struct Case {
     bytes: Vec<u8>,
@@ -161,6 +195,9 @@ struct Case {
     saw_untimed: bool,
     saw_prompts: bool,
     saw_prompt_only: bool,
+    /// Ground truth of out-of-range epoch-ms drops: each drop emits one
+    /// diagnostic and one `skipped`, while the message itself stays untimed.
+    dropped: usize,
 }
 
 fn gen_text(rng: &mut XorShift64Star) -> String {
@@ -237,6 +274,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
     let mut saw_untimed = false;
     let mut saw_prompts = false;
     let mut saw_prompt_only = false;
+    let mut dropped_bubbles = 0usize;
 
     // ---- chatdata：tabs → bubbles，与生产 parse_chat_data 同源判定 ----
     let n_tabs = rng.below(4); // 0..=3：约 1/4 种子没有 chatdata 输出
@@ -290,11 +328,14 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 Some((
                     role.to_string(),
                     text.to_string(),
-                    start.map(|t| t.to_string()),
+                    start.and_then(epoch_ms_utc),
                 ))
             } else {
                 None
             };
+            if emitted.is_some() && start.is_some_and(|ms| epoch_ms_utc(ms).is_none()) {
+                dropped_bubbles += 1;
+            }
             bubbles.push(PlannedBubble {
                 r#type,
                 text,
@@ -355,7 +396,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 emitted: Some((
                     "user".to_string(),
                     "forced valid record".to_string(),
-                    Some("1".to_string()),
+                    Some("1970-01-01T00:00:00.001Z".to_string()),
                 )),
             }],
         });
@@ -365,6 +406,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
     let mut expected: Vec<ExpectedMessage> = Vec::new();
     let mut session_count = 0usize;
     let mut session_id: Option<String> = None;
+    let mut dropped_prompts = 0usize;
 
     // 会话注册语义（与 register_session 同源）：计数每个会话，首个非空 id 胜出。
     let mut register = |sid: Option<&str>| {
@@ -421,18 +463,26 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
         let mut group_msgs: Vec<(String, String, Option<String>)> = Vec::new();
         for &i in &sorted {
             let p = &prompts[i];
+            if p.created_at.is_some_and(|ms| epoch_ms_utc(ms).is_none()) {
+                if p.prompt.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                    dropped_prompts += 1;
+                }
+                if p.response.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                    dropped_prompts += 1;
+                }
+            }
             if let Some(text) = p.prompt.as_deref().filter(|t| !t.trim().is_empty()) {
                 group_msgs.push((
                     "user".to_string(),
                     text.to_string(),
-                    p.created_at.map(|t| t.to_string()),
+                    p.created_at.and_then(epoch_ms_utc),
                 ));
             }
             if let Some(text) = p.response.as_deref().filter(|t| !t.trim().is_empty()) {
                 group_msgs.push((
                     "assistant".to_string(),
                     text.to_string(),
-                    p.created_at.map(|t| t.to_string()),
+                    p.created_at.and_then(epoch_ms_utc),
                 ));
             }
         }
@@ -465,7 +515,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
                 emitted: Some((
                     "user".to_string(),
                     "forced valid record".to_string(),
-                    Some("1".to_string()),
+                    Some("1970-01-01T00:00:00.001Z".to_string()),
                 )),
             }],
         });
@@ -476,7 +526,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
         expected.push(ExpectedMessage {
             role: "user".to_string(),
             text: "forced valid record".to_string(),
-            timestamp: Some("1".to_string()),
+            timestamp: Some("1970-01-01T00:00:00.001Z".to_string()),
         });
     }
 
@@ -572,6 +622,7 @@ fn build_case(seed: u64, with_big_field: bool) -> Case {
         saw_untimed,
         saw_prompts,
         saw_prompt_only,
+        dropped: dropped_bubbles + dropped_prompts,
     }
 }
 
@@ -642,8 +693,8 @@ fn prop_parse_is_deterministic() {
 }
 
 /// 性质 4：role/text 原样（chatdata 按 startTime、prompts 按 createdAt 排序）、
-/// timestamp == startTime/createdAt 十进制串、native_id 恒空（tab id 与
-/// prompt id 是会话级身份，不是消息级 id）、无 parent、无 sidechain。
+/// timestamp == startTime/createdAt 毫秒值转 RFC 3339 UTC、native_id 恒空
+/// （tab id 与 prompt id 是会话级身份，不是消息级 id）、无 parent、无 sidechain。
 #[test]
 fn prop_metadata_survives_verbatim() {
     for_each_seed(|seed, case| {
@@ -665,7 +716,7 @@ fn prop_metadata_survives_verbatim() {
             );
             assert_eq!(
                 got.timestamp, want.timestamp,
-                "seed={seed} seq={seq}: timestamp 必须等于 startTime/createdAt 十进制串"
+                "seed={seed} seq={seq}: timestamp 必须等于 startTime/createdAt 毫秒值的 RFC 3339 形式"
             );
             assert_eq!(
                 got.native_id, "",
@@ -684,7 +735,8 @@ fn prop_metadata_survives_verbatim() {
 }
 
 /// 性质 5：会话身份——session_count 与首个非空 id 与 ground truth 一致；
-/// 多会话 fail-closed 为 Ambiguous 且留下一一条诊断。
+/// 多会话 fail-closed 为 Ambiguous 且无诊断；越界时间戳丢弃数与 ground truth
+/// 一致（每处丢弃贡献一条诊断与一次 skipped）。
 #[test]
 fn prop_session_identity_matches_ground_truth() {
     for_each_seed(|seed, case| {
@@ -700,8 +752,8 @@ fn prop_session_identity_matches_ground_truth() {
         );
         assert_eq!(
             report.diagnostics.len(),
-            0,
-            "seed={seed}: supported multi-session sources need no diagnostic"
+            case.dropped,
+            "seed={seed}: 诊断必须恰为越界时间戳丢弃数"
         );
         match (case.session_id.as_deref(), multi) {
             (Some(id), false) => assert_eq!(
@@ -721,8 +773,8 @@ fn prop_session_identity_matches_ground_truth() {
             ),
         }
         assert_eq!(
-            report.skipped, 0,
-            "seed={seed}: 合成库读取不得失败（skipped 恒 0）"
+            report.skipped, case.dropped,
+            "seed={seed}: skipped 必须恰为越界时间戳丢弃数"
         );
     });
 }

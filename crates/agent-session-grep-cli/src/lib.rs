@@ -168,7 +168,19 @@ pub fn run_cli() {
         std::process::exit(code);
     }
     // command 名先解析出来供错误 envelope 使用；失败时也要标注是哪个命令。
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `std::env::args()` 对非 UTF-8 argv 会 panic：非 UTF-8 参数是用法错误
+    // （exit 2），不是进程崩溃。
+    let args: Vec<String> = match native_args_into_strings(native_args) {
+        Ok(args) => args,
+        Err(_) => {
+            let err = ProtocolError::new(
+                CanonicalCode::InvalidRequest,
+                "command-line arguments must be valid UTF-8",
+            );
+            protocol::write_stdout_line(&protocol::error_envelope("unknown", &err, None));
+            std::process::exit(err.code.exit_code());
+        }
+    };
     let command = command_name(&args);
     let mode = match protocol::parse_output_mode(&args) {
         Ok(mode) => mode,
@@ -235,6 +247,16 @@ pub fn run_cli() {
             std::process::exit(err.code.exit_code());
         }
     }
+}
+
+/// Convert raw OS args to UTF-8 strings. Non-UTF-8 argv is a usage error, not
+/// a panic: `std::env::args()` would abort the process on exactly this input.
+fn native_args_into_strings(native_args: Vec<std::ffi::OsString>) -> Result<Vec<String>, ()> {
+    native_args
+        .into_iter()
+        .map(|arg| arg.into_string())
+        .collect::<Result<Vec<String>, std::ffi::OsString>>()
+        .map_err(|_| ())
 }
 
 /// 人类模式的错误渲染：报错行（保留稳定 code 前缀）+ 一行白话"下一步"指引
@@ -5888,6 +5910,28 @@ mod tests {
     use agent_session_grep_application::{EvidenceSpanDto, StagedMessage};
     use agent_session_grep_ports::ParseReport;
     use agent_session_grep_ports::capability::CapabilityLevel;
+
+    #[test]
+    fn non_utf8_argv_is_a_usage_error_not_a_panic() {
+        // std::env::args() 对非 UTF-8 argv 直接 panic；run_cli 的转换必须
+        // 把它变成 usage error（exit 2）。
+        #[cfg(windows)]
+        fn invalid_os_arg() -> std::ffi::OsString {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0xD800])
+        }
+        #[cfg(unix)]
+        fn invalid_os_arg() -> std::ffi::OsString {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xFF])
+        }
+
+        assert_eq!(
+            native_args_into_strings(vec!["--robot".into(), "status".into()]),
+            Ok(vec!["--robot".to_string(), "status".to_string()])
+        );
+        assert_eq!(native_args_into_strings(vec![invalid_os_arg()]), Err(()));
+    }
 
     fn staged_batch(
         messages: Vec<StagedMessage>,

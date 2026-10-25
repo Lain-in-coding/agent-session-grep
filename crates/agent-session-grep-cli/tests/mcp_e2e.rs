@@ -2214,6 +2214,38 @@ fn non_utf8_line_is_a_parse_error_and_the_server_keeps_serving() {
     );
 }
 
+#[test]
+fn oversized_line_gets_an_invalid_request_error_frame_then_eof() {
+    // 曾经超长行只返回 Outcome::Partial（exit 10）就直接断开：符合 JSON-RPC
+    // 的客户端会永远等一个永远不会来的响应帧。必须先回 -32600（超长行的 id
+    // 不可信 → null），再结束 transport。
+    let (_dir, db) = temp_db("mcp-oversize");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"ping","pad":""#);
+    payload.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+    payload.extend_from_slice(br#""}"#);
+    payload.push(b'\n');
+
+    let (frames, stderr, code) = mcp_session_bytes(&db, &payload);
+    // exit 10（Outcome::Partial）：transport 被主动终止，不能伪装干净停机。
+    assert_eq!(code, Some(10), "stderr: {stderr}");
+    // 超长行唯一可归档的响应是 -32600，id 不可回显 → null。
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert!(frames[0]["id"].is_null(), "{frames:?}");
+    assert_eq!(frames[0]["error"]["code"], json!(-32600), "{frames:?}");
+    assert!(
+        frames[0]["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1 MiB"),
+        "{frames:?}"
+    );
+    assert!(
+        !stderr.contains(&db.to_string_lossy().to_string()),
+        "stderr 泄露 db 路径: {stderr}"
+    );
+}
+
 // ─── design §4 场景补充：search_sessions facet 参数（structured activity）──
 
 #[test]

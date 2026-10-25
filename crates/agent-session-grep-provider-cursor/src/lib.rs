@@ -50,6 +50,18 @@ const CHAT_DATA_KEY: &str = "workbench.panel.aichat.view.aichat.chatdata";
 /// ItemTable key holding the flat prompts history JSON array.
 const PROMPTS_KEY: &str = "aiService.prompts";
 
+/// Cursor stores epoch milliseconds (`timingInfo.startTime` / `createdAt`).
+/// Canonical timestamps are RFC 3339 date-time strings, so conversion happens
+/// at emit time; values outside the supported 0001-9999 UTC year range (the
+/// same bounds as the WorkBuddy adapter) are dropped with a diagnostic and the
+/// message stays untimed.
+const MIN_EPOCH_MS: i64 = -62_167_219_200_000;
+const MAX_EPOCH_MS: i64 = 253_402_300_799_999;
+
+/// Diagnostic cap mirroring the other providers: a pathological source cannot
+/// turn one bad field into an unbounded report.
+const MAX_DIAGNOSTICS: usize = 32;
+
 /// Cursor adapter: parses `state.vscdb` (SQLite ItemTable KV store).
 ///
 /// The adapter writes the byte stream to a temp file and opens it read-only,
@@ -126,6 +138,7 @@ impl ProviderAdapter for CursorAdapter {
                 "SQLite source has no byte spans",
                 "chatdata/prompts are multi-generation formats; version layering is not yet implemented",
                 "native message ids are not preserved (ids are derived, not native)",
+                "timestamps are epoch-ms converted to RFC 3339 UTC; values outside the 0001-9999 year range are dropped with a diagnostic and the message stays untimed",
                 "the additive `cursor/disk-kv-v1` variant reads cursorDiskKV composerData/bubbleId rows through a private read-only snapshot (one pinned read transaction); the capability row above still advertises only the ItemTable variant",
                 "disk-kv messages report no adopted native id: a bubbleId is a composer-scoped storage-key component with no official version contract, so canonical message identity stays document-scoped (the same decision as hermes rowids); verbatim composer/bubble ids appear only as observations in diagnostics and the session identity",
                 "disk-kv bubbles with no usable text or tool input, and composers whose own row is malformed, are counted in `skipped` with per-state diagnostics; a broken bubble never discards its session and a broken composer row never discards the source's other composers",
@@ -320,15 +333,8 @@ fn parse_chat_data(
         // Chronological order within the tab by bubble start time.
         bubbles.sort_by_key(|(_, _, start)| start.unwrap_or(i64::MAX));
         for (text, role, start) in bubbles {
-            emit_message(
-                sink,
-                report,
-                seq,
-                &role,
-                &text,
-                start.map(|t| t.to_string()),
-                &session,
-            )?;
+            let timestamp = epoch_ms_timestamp(report, start);
+            emit_message(sink, report, seq, &role, &text, timestamp, &session)?;
         }
     }
     Ok(())
@@ -394,15 +400,8 @@ fn parse_prompts(
         let id = (!conversation_id.trim().is_empty()).then_some(conversation_id.as_str());
         let session = register_session(report, session_count, id);
         for (role, text, created_at) in messages {
-            emit_message(
-                sink,
-                report,
-                seq,
-                &role,
-                &text,
-                created_at.map(|t| t.to_string()),
-                &session,
-            )?;
+            let timestamp = epoch_ms_timestamp(report, created_at);
+            emit_message(sink, report, seq, &role, &text, timestamp, &session)?;
         }
     }
     Ok(())
@@ -434,6 +433,56 @@ fn register_session(
             .unwrap_or_else(|| format!("anonymous-session-{}", session_count)),
         observation,
     }
+}
+
+/// Convert an epoch-ms value to the canonical RFC 3339 UTC form, or `None`
+/// (after recording one diagnostic) when it lies outside the supported year
+/// range. Raw epoch-ms strings would be silently ignored by every consumer,
+/// so they must never reach the event stream.
+fn epoch_ms_timestamp(report: &mut ParseReport, ms: Option<i64>) -> Option<String> {
+    let ms = ms?;
+    match epoch_ms_utc(ms) {
+        Some(value) => Some(value),
+        None => {
+            report.skipped += 1;
+            if report.diagnostics.len() < MAX_DIAGNOSTICS {
+                report
+                    .diagnostics
+                    .push("epoch-ms timestamp is outside the supported year range, dropped".into());
+            }
+            None
+        }
+    }
+}
+
+/// Civil-from-days conversion (Howard Hinnant's algorithm), shared shape with
+/// the WorkBuddy adapter so all epoch-ms providers emit identical strings.
+fn epoch_ms_utc(ms: i64) -> Option<String> {
+    if !(MIN_EPOCH_MS..=MAX_EPOCH_MS).contains(&ms) {
+        return None;
+    }
+    let days = ms.div_euclid(86_400_000);
+    let time = ms.rem_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        time / 3_600_000,
+        (time % 3_600_000) / 60_000,
+        (time % 60_000) / 1000,
+        time % 1000
+    ))
 }
 
 /// Emit one canonical message with a document-stable synthetic native id.
@@ -906,11 +955,17 @@ mod tests {
         assert_eq!(sink.events[0].0, 0);
         assert_eq!(sink.events[0].1, "user");
         assert_eq!(sink.events[0].2, "hello");
-        assert_eq!(sink.events[0].3.as_deref(), Some("101"));
+        assert_eq!(
+            sink.events[0].3.as_deref(),
+            Some("1970-01-01T00:00:00.101Z")
+        );
         assert_eq!(sink.events[1].0, 1);
         assert_eq!(sink.events[1].1, "assistant");
         assert_eq!(sink.events[1].2, "hi there");
-        assert_eq!(sink.events[1].3.as_deref(), Some("102"));
+        assert_eq!(
+            sink.events[1].3.as_deref(),
+            Some("1970-01-01T00:00:00.102Z")
+        );
     }
 
     #[test]
@@ -966,8 +1021,14 @@ mod tests {
             sink.events.iter().map(|e| e.2.as_str()).collect::<Vec<_>>(),
             ["q1", "a1", "q2", "a3"]
         );
-        assert_eq!(sink.events[1].3.as_deref(), Some("100"));
-        assert_eq!(sink.events[3].3.as_deref(), Some("300"));
+        assert_eq!(
+            sink.events[1].3.as_deref(),
+            Some("1970-01-01T00:00:00.100Z")
+        );
+        assert_eq!(
+            sink.events[3].3.as_deref(),
+            Some("1970-01-01T00:00:00.300Z")
+        );
     }
 
     #[test]
@@ -1033,5 +1094,75 @@ mod tests {
             "<system-reminder>reminder text</system-reminder>"
         );
         assert_eq!(sink.events[1].2, "# AGENTS.md instructions");
+    }
+
+    #[test]
+    fn parse_converts_in_range_epoch_ms_to_utc_timestamps() {
+        // The canonical timestamp contract is a date-time string; raw epoch-ms
+        // decimal strings are silently ignored by `--since`/`--until` parsing
+        // and by domain time ordering, so the adapter must convert at emit.
+        let adapter = CursorAdapter::new();
+        let chatdata = r#"{"tabs":[{"id":"tab-1","createdAt":1,
+            "bubbles":[
+              {"type":"user","text":"hello","timingInfo":{"startTime":102}},
+              {"type":"assistant","text":"hi there","timingInfo":{"startTime":101}}
+            ]}]}"#;
+        let prompts = r#"[{"id":"p1","prompt":"q1","response":"a1","createdAt":100,"conversationId":"conv-1"}]"#;
+        let db_bytes = create_cursor_db(Some(chatdata), Some(prompts));
+        let mut sink = sink();
+        let report = adapter.parse(&db_bytes, &mut sink).unwrap();
+
+        assert_eq!(report.committed, 4);
+        assert_eq!(report.skipped, 0);
+        assert!(report.diagnostics.is_empty());
+        // Chatdata bubbles first (ordered by startTime 101 -> 102), then the
+        // prompts group (createdAt 100, both records).
+        assert_eq!(
+            sink.events[0].3.as_deref(),
+            Some("1970-01-01T00:00:00.101Z")
+        );
+        assert_eq!(
+            sink.events[1].3.as_deref(),
+            Some("1970-01-01T00:00:00.102Z")
+        );
+        assert_eq!(
+            sink.events[2].3.as_deref(),
+            Some("1970-01-01T00:00:00.100Z")
+        );
+        assert_eq!(
+            sink.events[3].3.as_deref(),
+            Some("1970-01-01T00:00:00.100Z")
+        );
+    }
+
+    #[test]
+    fn parse_drops_out_of_range_epoch_ms_with_a_diagnostic() {
+        // Values outside the 0001-9999 UTC year range cannot become canonical
+        // date-times; they must be dropped with a diagnostic instead of
+        // silently emitting an unparsable raw string.
+        let adapter = CursorAdapter::new();
+        let chatdata = r#"{"tabs":[{"id":"tab-1","createdAt":1,
+            "bubbles":[
+              {"type":"user","text":"too big","timingInfo":{"startTime":253402300800000}},
+              {"type":"assistant","text":"too small","timingInfo":{"startTime":-62167219200001}},
+              {"type":"user","text":"valid","timingInfo":{"startTime":1000}}
+            ]}]}"#;
+        let prompts = r#"[{"id":"p1","prompt":"q1","response":"a1","createdAt":-62167219200001,"conversationId":"conv-1"}]"#;
+        let db_bytes = create_cursor_db(Some(chatdata), Some(prompts));
+        let mut sink = sink();
+        let report = adapter.parse(&db_bytes, &mut sink).unwrap();
+
+        // Every message survives; only the timestamps are dropped (one
+        // diagnostic + one skipped per emitted timestamp).
+        assert_eq!(report.committed, 5);
+        assert_eq!(report.skipped, 4);
+        assert_eq!(report.diagnostics.len(), 4, "{:?}", report.diagnostics);
+        let timed: Vec<Option<&str>> = sink.events.iter().map(|e| e.3.as_deref()).collect();
+        assert_eq!(
+            timed,
+            // Bubbles sorted by startTime (the two out-of-range values sort
+            // around the valid one), then the prompt pair without timestamps.
+            vec![None, Some("1970-01-01T00:00:01.000Z"), None, None, None]
+        );
     }
 }

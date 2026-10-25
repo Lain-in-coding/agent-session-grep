@@ -92,7 +92,19 @@ fn serve_backend(mut server: McpServer<'_>) -> Result<Outcome, CliError> {
             .map_err(|_| ProtocolError::new(CanonicalCode::SourceIo, "cannot read MCP input"))?;
         // A malformed or oversized frame cannot grow memory without bound.
         // End this transport; its unread remainder is not another request.
+        // A compliant client waits for a response frame, so answer -32600
+        // (id not trustworthy → null) before closing instead of leaving the
+        // request forever unanswered.
         if raw.len() > 1024 * 1024 {
+            if let Some(backend) = server.managed() {
+                backend.begin_frame();
+            }
+            let _ = server.emit(&error_frame(
+                Value::Null,
+                INVALID_REQUEST,
+                "line exceeds the 1 MiB frame limit",
+                None,
+            ));
             return Ok(Outcome::Partial);
         }
         if read == 0 {
