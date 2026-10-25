@@ -174,6 +174,18 @@ fn chunk_ids<T: AsRef<str>>(ids: &[T]) -> Vec<&[T]> {
     ids.chunks(BATCH_IN_CHUNK).collect()
 }
 
+/// Wire-id 前缀区间的排他上界。
+///
+/// `ses_v1_` 的上界是把末位 `_` 换成 ASCII 中紧随其后的 backtick（U+0060），
+/// 因此任意同前缀 id 都小于该上界，而 `msg_v1_`/`doc_v1_` 等兄弟前缀不落在
+/// 区间内。前缀是 `fmt_v1_` 形态的受控常量，只依赖这个 ASCII 不变式。
+fn upper_bound_for_prefix(prefix: &str) -> String {
+    let mut upper = prefix.to_string();
+    let last = upper.pop().unwrap_or_default();
+    upper.push(char::from_u32(u32::from(last) + 1).expect("prefix chars stay in ASCII range"));
+    upper
+}
+
 fn unix_ms() -> PortResult<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1087,6 +1099,22 @@ fn batch_manifest(
         relocation_json,
         operation_digest: hasher.finalize().to_hex().to_string(),
     })
+}
+
+/// Duplicate/overlap checks for an incoming upsert set, without hashing payload
+/// bytes. The canonical manifest hashing happens once over the merged batch
+/// after it is assembled; per-source manifests would re-hash the same stored
+/// payloads twice (once per source, once merged) purely to re-derive these two
+/// rejections.
+fn batch_validate_entry_ids(upserts: &[(StableId, Vec<u8>, String)]) -> PortResult<()> {
+    let mut ordered: Vec<&str> = upserts.iter().map(|(id, _, _)| id.as_str()).collect();
+    ordered.sort_unstable();
+    if ordered.windows(2).any(|w| w[0] == w[1]) {
+        return Err(PortError::Backend(
+            "index batch contains duplicate entity ids".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Durable outbox row for an index-generation operation.
@@ -3469,10 +3497,15 @@ impl SqliteStore {
         let conn = conn.borrow();
         // 前缀是受控常量（`ses_v1_` 等），拼进 SQL 不会引入注入面；避免按
         // `? IS NULL OR id LIKE ?` 形式传参，让查询规划器对两种形状都走索引。
+        // 前缀谓词用 range 而非 LIKE：TEXT 列默认 BINARY collation 会禁用
+        // LIKE 前缀优化，LIKE 形状会全表扫描 catalog（见 relocation.rs 的
+        // GLOB 先例）；`>= prefix AND < prefix_upper` 保持索引序扫描。
         let sql = match kind {
             Some(kind) => format!(
-                "SELECT id, payload FROM catalog WHERE id LIKE '{}%' ORDER BY id ASC LIMIT ?1",
-                kind.prefix()
+                "SELECT id, payload FROM catalog
+                 WHERE id >= '{}' AND id < '{}' ORDER BY id ASC LIMIT ?1",
+                kind.prefix(),
+                upper_bound_for_prefix(kind.prefix()),
             ),
             None => "SELECT id, payload FROM catalog ORDER BY id ASC LIMIT ?1".to_string(),
         };
@@ -3507,18 +3540,29 @@ impl SqliteStore {
     ) -> PortResult<BTreeMap<String, SourceFingerprint>> {
         let conn = self.conn.borrow();
         let mut out = BTreeMap::new();
-        for path in paths {
-            let row: Option<SourceFingerprint> = conn
-                .query_row(
-                    "SELECT len_bytes, fingerprint, parser_version
-                     FROM source_scans WHERE source_path = ?1",
-                    [path],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
+        for chunk in chunk_ids(paths) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, len_bytes, fingerprint, parser_version
+                     FROM source_scans WHERE source_path IN ({placeholders})"
+                ))
                 .map_err(backend)?;
-            if let Some(row) = row {
-                out.insert(path.clone(), row);
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ),
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (path, fingerprint) = row.map_err(backend)?;
+                out.insert(path, fingerprint);
             }
         }
         Ok(out)
@@ -3528,19 +3572,31 @@ impl SqliteStore {
     ///
     /// CLI 在指纹缓存命中、跳过 parse 时用它上报 unchanged 消息数，保持
     /// `unchanged` 与 `emitted` 同单位（消息数）。
+    ///
+    /// 行按 chunk 聚合读取；无 membership 行的路径（空源、未知路径）不在
+    /// 返回 map 中——调用方一律 `unwrap_or(0)`，语义与旧逐路径 COUNT(…)=0
+    /// 等价且省一次 GROUP BY 空组输出。
     pub fn source_message_counts(&self, paths: &[String]) -> PortResult<BTreeMap<String, usize>> {
         let conn = self.conn.borrow();
         let mut out = BTreeMap::new();
-        for path in paths {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM source_membership
-                     WHERE source_path = ?1 AND message_id LIKE 'msg_v1_%'",
-                    [path],
-                    |row| row.get(0),
-                )
+        for chunk in chunk_ids(paths) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_path, COUNT(*) FROM source_membership
+                     WHERE source_path IN ({placeholders}) AND message_id GLOB 'msg_v1_*'
+                     GROUP BY source_path",
+                ))
                 .map_err(backend)?;
-            out.insert(path.clone(), count as usize);
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (path, count) = row.map_err(backend)?;
+                out.insert(path, count as usize);
+            }
         }
         Ok(out)
     }
@@ -3606,23 +3662,25 @@ impl SqliteStore {
     ) -> PortResult<BTreeSet<String>> {
         let conn = self.conn.borrow();
         let mut out = BTreeSet::new();
-        for path in paths {
-            let missing: bool = conn
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM source_scans ss
-                         WHERE ss.source_path = ?1
-                           AND NOT EXISTS(
-                               SELECT 1 FROM source_relation_scans rs
-                               WHERE rs.source_path = ss.source_path
-                           )
-                     )",
-                    [path],
-                    |row| row.get(0),
-                )
+        for chunk in chunk_ids(paths) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT ss.source_path FROM source_scans ss
+                     WHERE ss.source_path IN ({placeholders})
+                       AND NOT EXISTS(
+                           SELECT 1 FROM source_relation_scans rs
+                           WHERE rs.source_path = ss.source_path
+                       )",
+                ))
                 .map_err(backend)?;
-            if missing {
-                out.insert(path.clone());
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(backend)?;
+            for row in rows {
+                out.insert(row.map_err(backend)?);
             }
         }
         Ok(out)
@@ -3822,13 +3880,24 @@ impl SqliteStore {
         contextual_payloads_are_derived: bool,
     ) -> PortResult<bool> {
         let conn = self.conn.borrow();
+        // prepare 提升到循环外：200K 实体 × 每实体三次 prepare/finalize 的常数
+        // 因子在批量提交里被放大（与 ensure_stored_identity_metadata_matches
+        // 的同类 hoist 一致）。
+        let mut catalog_stmt = conn
+            .prepare("SELECT payload FROM catalog WHERE id = ?1")
+            .map_err(backend)?;
+        let mut identity_stmt = conn
+            .prepare("SELECT id_json FROM fts_ids WHERE wire_id = ?1")
+            .map_err(backend)?;
+        let mut fts_stmt = conn
+            .prepare(
+                "SELECT text FROM fts
+                 WHERE rowid = (SELECT fts_rowid FROM fts_ids WHERE wire_id = ?1)",
+            )
+            .map_err(backend)?;
         for (id, payload, text) in entries {
-            let catalog_payload: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT payload FROM catalog WHERE id = ?1",
-                    [id.as_str()],
-                    |row| row.get(0),
-                )
+            let catalog_payload: Option<Vec<u8>> = catalog_stmt
+                .query_row([id.as_str()], |row| row.get(0))
                 .optional()
                 .map_err(backend)?;
             let Some(catalog_payload) = catalog_payload else {
@@ -3865,12 +3934,8 @@ impl SqliteStore {
             if !payload_is_current {
                 return Ok(false);
             }
-            let id_json: Option<String> = conn
-                .query_row(
-                    "SELECT id_json FROM fts_ids WHERE wire_id = ?1",
-                    [id.as_str()],
-                    |row| row.get(0),
-                )
+            let id_json: Option<String> = identity_stmt
+                .query_row([id.as_str()], |row| row.get(0))
                 .optional()
                 .map_err(backend)?;
             let Some(id_json) = id_json else {
@@ -3890,13 +3955,8 @@ impl SqliteStore {
             // 判定整表扫描（B1 路径 O(N²)）；改经 fts_ids 边车的 fts_rowid 按
             // rowid O(1) 定位。边车缺行或 fts_rowid 为 NULL 时按“无 fts 行”处理
             // （rowid = NULL 匹配不到行）→ 不 current，提交路径会重建该行。
-            let indexed_text: Option<String> = conn
-                .query_row(
-                    "SELECT text FROM fts
-                     WHERE rowid = (SELECT fts_rowid FROM fts_ids WHERE wire_id = ?1)",
-                    [id.as_str()],
-                    |row| row.get(0),
-                )
+            let indexed_text: Option<String> = fts_stmt
+                .query_row([id.as_str()], |row| row.get(0))
                 .optional()
                 .map_err(backend)?;
             // fts 存的是 CJK n-gram（单字 + bigram）变换后的正文（见 fts 写入侧），
@@ -3939,7 +3999,7 @@ impl SqliteStore {
         // and multiplicities before set/map comparison can erase duplicates.
         for source in &ordered_sources {
             self.installation_for_source_commit(source)?;
-            batch_manifest(&source.entries, &[], &RelationManifests::default())?;
+            batch_validate_entry_ids(&source.entries)?;
             self.ensure_stored_identity_metadata_matches(&source.entries)?;
             let mut placements = BTreeSet::new();
             let mut slots = BTreeSet::new();
@@ -16422,6 +16482,195 @@ mod tests {
                 Some("aaa".to_string()),
                 i64::from(PARSER_SEMANTIC_VERSION)
             ))
+        );
+    }
+
+    #[test]
+    fn list_sessions_uses_index_range_and_excludes_other_kinds() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let decoys = vec![
+            entity_entry(&sid(IdKind::Message, b"list-decoy-msg")),
+            entity_entry(&sid(IdKind::Document, b"list-decoy-doc")),
+        ];
+        for (id, payload, _) in &decoys {
+            store.put(id, payload).unwrap();
+        }
+        let sessions: Vec<(StableId, Vec<u8>, String)> = (0..5)
+            .map(|index| {
+                let id = sid(IdKind::Session, format!("list-session-{index}").as_bytes());
+                let payload = serde_json::json!({ "messages": [] })
+                    .to_string()
+                    .into_bytes();
+                (id, payload, String::new())
+            })
+            .collect();
+        for (id, payload, _) in &sessions {
+            store.put(id, payload).unwrap();
+        }
+        let listed = store.list_sessions(10).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(|(id, _, _)| id.as_str().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|wire| StableId::from_wire(&wire).unwrap())
+                .collect::<Vec<_>>(),
+            "session listing must return only ses_v1_ ids in wire order"
+        );
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT id, payload FROM catalog
+             WHERE id >= '{}' AND id < '{}' ORDER BY id ASC LIMIT ?1",
+            IdKind::Session.prefix(),
+            upper_bound_for_prefix(IdKind::Session.prefix()),
+        );
+        let conn = store.conn.borrow();
+        let plan: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map([10i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.to_uppercase().contains("SEARCH")),
+            "list_sessions must use the catalog primary-key index, actual plan: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.to_uppercase().contains("SCAN")),
+            "BINARY-collated LIKE prefix filters defeat the range optimization; actual plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn source_fingerprints_reads_paths_in_batched_queries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let source = SourceBatch {
+            source_path: "fp-a.jsonl".into(),
+            entries: vec![entity_entry(&sid(IdKind::Message, b"fp-msg-a"))],
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: Some(10),
+            fingerprint: Some("aaa".to_string()),
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&source))
+            .unwrap();
+        let paths = vec!["fp-a.jsonl".to_string(), "fp-b.jsonl".to_string()];
+        let statements = counted_statements(&store, || store.source_fingerprints(&paths).unwrap());
+        assert_eq!(statements, 1, "one chunked IN query, not one per path");
+        let fingerprints = store.source_fingerprints(&paths).unwrap();
+        assert_eq!(fingerprints.len(), 1);
+        assert_eq!(
+            fingerprints.get("fp-a.jsonl"),
+            Some(&(
+                Some(10),
+                Some("aaa".to_string()),
+                i64::from(PARSER_SEMANTIC_VERSION)
+            ))
+        );
+        assert!(
+            !fingerprints.contains_key("fp-b.jsonl"),
+            "never-scanned paths stay absent, matching the documented contract"
+        );
+    }
+
+    #[test]
+    fn source_message_counts_reads_paths_in_batched_queries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"count-session");
+        let document = sid(IdKind::Document, b"count-doc");
+        let messages: Vec<StableId> = (0..3)
+            .map(|index| sid(IdKind::Message, format!("count-msg-{index}").as_bytes()))
+            .collect();
+        let mut entries = vec![
+            (
+                session.clone(),
+                serde_json::json!({ "messages": [] })
+                    .to_string()
+                    .into_bytes(),
+                String::new(),
+            ),
+            (
+                document.clone(),
+                typed_document_entry(&document).1,
+                String::new(),
+            ),
+        ];
+        for message in &messages {
+            entries.push(entity_entry(message));
+        }
+        let batch = source_batch(
+            "count-a.jsonl",
+            entries,
+            vec![placement(
+                &session,
+                &document,
+                &messages[0],
+                0,
+                false,
+                Some((0, 1)),
+            )],
+            Vec::new(),
+            true,
+        );
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let paths = vec!["count-a.jsonl".to_string(), "count-b.jsonl".to_string()];
+        let statements =
+            counted_statements(&store, || store.source_message_counts(&paths).unwrap());
+        assert_eq!(statements, 1, "one chunked IN query, not one per path");
+        let counts = store.source_message_counts(&paths).unwrap();
+        assert_eq!(counts.get("count-a.jsonl"), Some(&3));
+        assert_eq!(
+            counts.get("count-b.jsonl"),
+            None,
+            "empty/unknown paths stay out of the map; callers default to zero"
+        );
+    }
+
+    #[test]
+    fn source_paths_requiring_relation_scan_reads_paths_in_batched_queries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let message = sid(IdKind::Message, b"relation-scan-msg");
+        let batch = SourceBatch {
+            source_path: "rel-a.jsonl".into(),
+            entries: vec![entity_entry(&message)],
+            placements: Vec::new(),
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            // Incomplete scan: no relation-completeness marker is written.
+            relation_complete: false,
+            len_bytes: Some(10),
+            fingerprint: Some("aaa".to_string()),
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&batch))
+            .unwrap();
+        let paths = vec!["rel-a.jsonl".to_string(), "rel-b.jsonl".to_string()];
+        let statements = counted_statements(&store, || {
+            store.source_paths_requiring_relation_scan(&paths).unwrap()
+        });
+        assert_eq!(statements, 1, "one chunked IN query, not one per path");
+        let pending = store.source_paths_requiring_relation_scan(&paths).unwrap();
+        assert_eq!(
+            pending,
+            BTreeSet::from(["rel-a.jsonl".to_string()]),
+            "known source without a relation marker is pending; unknown paths stay hidden"
         );
     }
 
