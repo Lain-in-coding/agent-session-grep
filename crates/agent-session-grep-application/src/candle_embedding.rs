@@ -68,14 +68,45 @@ impl CandleE5Model {
     /// pays the ~seconds model-load cost; every later query reuses the cached
     /// encoder. One-shot CLI invocations still pay the load once per process —
     /// that cost is reported honestly by the benchmark, not hidden.
+    ///
+    /// A failed load is not cached for the life of the process. Retrying a
+    /// full 470 MB verification on every query would be wasteful, so the
+    /// failure is remembered for a short window: importing weights into a
+    /// running MCP server then takes effect within a minute instead of
+    /// requiring a restart, and a persistent failure costs at most one
+    /// verification per window.
     pub fn load_cached(dir: impl AsRef<Path>) -> PortResult<&'static CandleE5Model> {
-        static CACHE: std::sync::OnceLock<Result<CandleE5Model, String>> =
-            std::sync::OnceLock::new();
-        let cached = CACHE
-            .get_or_init(|| CandleE5Model::load_from_dir(dir).map_err(|error| error.to_string()));
-        cached
-            .as_ref()
-            .map_err(|error| PortError::Backend(error.clone()))
+        static CACHE: std::sync::OnceLock<CandleE5Model> = std::sync::OnceLock::new();
+        if let Some(model) = CACHE.get() {
+            return Ok(model);
+        }
+        static ATTEMPT: std::sync::Mutex<Option<(std::time::Instant, String)>> =
+            std::sync::Mutex::new(None);
+        const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut attempt = ATTEMPT
+            .lock()
+            .map_err(|_| PortError::Backend("model cache lock poisoned".into()))?;
+        if let Some(model) = CACHE.get() {
+            return Ok(model);
+        }
+        if let Some((failed_at, message)) = attempt.as_ref()
+            && failed_at.elapsed() < RETRY_AFTER
+        {
+            return Err(PortError::Backend(message.clone()));
+        }
+        match CandleE5Model::load_from_dir(dir.as_ref()) {
+            Ok(model) => {
+                let _ = CACHE.set(model);
+                CACHE.get().ok_or_else(|| {
+                    PortError::Backend("model cache did not retain the loaded bundle".into())
+                })
+            }
+            Err(error) => {
+                let message = error.to_string();
+                *attempt = Some((std::time::Instant::now(), message.clone()));
+                Err(PortError::Backend(message))
+            }
+        }
     }
 
     /// Load a verified local bundle. Fails closed on any missing/mismatched file.
