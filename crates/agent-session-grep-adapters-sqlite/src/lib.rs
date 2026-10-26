@@ -5747,6 +5747,7 @@ impl SqliteStore {
         Self::stored_edges_from(&conn)
     }
 
+    #[cfg(test)]
     fn stored_placements_from(conn: &Connection) -> PortResult<BTreeMap<String, StoredPlacement>> {
         let mut stmt = conn
             .prepare(
@@ -5879,6 +5880,7 @@ impl SqliteStore {
         Ok(usages)
     }
 
+    #[cfg(test)]
     fn stored_edges_from(conn: &Connection) -> PortResult<BTreeMap<String, StoredEdge>> {
         let mut stmt = conn
             .prepare(
@@ -5904,6 +5906,121 @@ impl SqliteStore {
             edges.insert(placement_id, edge);
         }
         Ok(edges)
+    }
+
+    /// Placements and edges for the given Message/Session entities only.
+    ///
+    /// Alias regeneration used to load both tables in full (and clone every
+    /// placement twice) on every commit, so a single-file sync cost
+    /// O(catalog) time and memory. A placement is relevant exactly when its
+    /// message or session is a candidate, and an edge is keyed by its child
+    /// placement, so these indexed lookups return the same rows the full
+    /// scan did for every entity regeneration reads.
+    fn placements_and_edges_for_entities(
+        conn: &Connection,
+        entities: &BTreeSet<String>,
+    ) -> PortResult<(
+        BTreeMap<String, StoredPlacement>,
+        BTreeMap<String, StoredEdge>,
+    )> {
+        let ids: Vec<&str> = entities.iter().map(String::as_str).collect();
+        let mut placements = BTreeMap::new();
+        // Each chunk binds twice (message and session arms), so halve it to
+        // stay inside the same per-statement variable budget.
+        for chunk in ids.chunks(BATCH_IN_CHUNK / 2) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT placement_id, session_id, document_id, message_id,
+                            source_ordinal, is_sidechain, byte_start, byte_end
+                     FROM message_placements WHERE message_id IN ({placeholders})
+                     UNION
+                     SELECT placement_id, session_id, document_id, message_id,
+                            source_ordinal, is_sidechain, byte_start, byte_end
+                     FROM message_placements WHERE session_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                        ))
+                    },
+                )
+                .map_err(backend)?;
+            for row in rows {
+                let (
+                    placement_id,
+                    session_id,
+                    document_id,
+                    message_id,
+                    ordinal,
+                    sidechain,
+                    start,
+                    end,
+                ) = row.map_err(backend)?;
+                let span = match (start, end) {
+                    (None, None) => None,
+                    (Some(start), Some(end)) => Some((
+                        u64::try_from(start).map_err(backend)?,
+                        u64::try_from(end).map_err(backend)?,
+                    )),
+                    _ => {
+                        return Err(PortError::Backend(
+                            "stored placement has a partial span".into(),
+                        ));
+                    }
+                };
+                placements.insert(
+                    placement_id,
+                    StoredPlacement {
+                        session_id,
+                        document_id,
+                        message_id,
+                        source_ordinal: u32::try_from(ordinal).map_err(backend)?,
+                        is_sidechain: sidechain != 0,
+                        span,
+                    },
+                );
+            }
+        }
+        let placement_ids: Vec<&str> = placements.keys().map(String::as_str).collect();
+        let mut edges = BTreeMap::new();
+        for chunk in chunk_ids(&placement_ids) {
+            let placeholders = in_placeholders(chunk.len());
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT child_placement_id, parent_message_id, parent_native_id, relation
+                     FROM message_edges WHERE child_placement_id IN ({placeholders})"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        StoredEdge {
+                            parent_message_id: row.get(1)?,
+                            parent_native_id: row.get(2)?,
+                            relation: row.get(3)?,
+                        },
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (placement_id, edge) = row.map_err(backend)?;
+                edges.insert(placement_id, edge);
+            }
+        }
+        Ok((placements, edges))
     }
 
     fn regenerate_compatibility_aliases_in_tx(
@@ -6068,8 +6185,8 @@ impl SqliteStore {
             return Ok(());
         }
 
-        let placements = Self::stored_placements_from(tx)?;
-        let edges = Self::stored_edges_from(tx)?;
+        let (placements, edges) =
+            Self::placements_and_edges_for_entities(tx, &fully_complete_entities)?;
         let mut placements_by_message = BTreeMap::<String, Vec<(String, StoredPlacement)>>::new();
         let mut placements_by_session = BTreeMap::<String, Vec<(String, StoredPlacement)>>::new();
         for (placement_id, placement) in placements {
@@ -14235,6 +14352,79 @@ mod tests {
         assert_eq!(source_placement_claims(&store, source_path), claims_before);
         assert_eq!(store.context_stats().unwrap(), stats_before);
         assert!(relation_complete_marker(&store, source_path));
+    }
+
+    #[test]
+    fn alias_regeneration_reads_only_batch_relations_and_keeps_other_aliases() {
+        // Two independent sources. Committing the second must regenerate
+        // only its own aliases: the first source's message keeps its
+        // session/span/parent aliases byte-for-byte, and the commit never
+        // issues an unscoped scan of the placement or edge tables.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let build = |label: &str| {
+            let session = sid(IdKind::Session, format!("alias-session-{label}").as_bytes());
+            let document = sid(
+                IdKind::Document,
+                format!("alias-document-{label}").as_bytes(),
+            );
+            let parent = sid(IdKind::Message, format!("alias-parent-{label}").as_bytes());
+            let child = sid(IdKind::Message, format!("alias-child-{label}").as_bytes());
+            let parent_placement = placement(&session, &document, &parent, 0, false, Some((0, 4)));
+            let child_placement = placement(&session, &document, &child, 1, false, Some((5, 9)));
+            let source = source_batch(
+                &format!("alias-{label}.jsonl"),
+                vec![
+                    typed_message_entry(&parent, "parent body"),
+                    typed_message_entry(&child, "child body"),
+                    (
+                        session.clone(),
+                        session_payload(document.as_str(), &[parent.as_str(), child.as_str()]),
+                        String::new(),
+                    ),
+                    typed_document_entry(&document),
+                ],
+                vec![parent_placement, child_placement.clone()],
+                vec![reply_edge(&child_placement, &parent)],
+                true,
+            );
+            (source, child)
+        };
+        let (first, first_child) = build("first");
+        let (second, _) = build("second");
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&first))
+            .unwrap();
+        let first_aliases = store.get(&first_child).unwrap().expect("first child");
+
+        thread_local! { static COMMIT_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; }
+        COMMIT_SQL.with(|sql| sql.borrow_mut().clear());
+        store.conn.borrow().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+                    COMMIT_SQL.with(|queries| queries.borrow_mut().push(sql.to_owned()));
+                }
+            }),
+        );
+        store
+            .commit_source_batches_if_changed(std::slice::from_ref(&second))
+            .unwrap();
+        store
+            .conn
+            .borrow()
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let statements = COMMIT_SQL.with(|queries| queries.borrow().clone());
+        let unscoped = statements.iter().find(|sql| {
+            let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.ends_with("FROM message_placements ORDER BY placement_id")
+                || flat.ends_with("FROM message_edges ORDER BY child_placement_id")
+        });
+        assert!(
+            unscoped.is_none(),
+            "commit scanned a whole relation table: {unscoped:?}"
+        );
+
+        assert_eq!(store.get(&first_child).unwrap(), Some(first_aliases));
     }
 
     #[test]
