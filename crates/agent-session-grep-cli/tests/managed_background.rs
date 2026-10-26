@@ -1558,6 +1558,51 @@ fn completed_codex_rollout_with_known_environment_metadata_publishes_and_keeps_e
     assert_eq!(fs::read(&path).unwrap(), appended);
 }
 
+/// Codex reports cumulative session usage, converted to per-turn deltas. Two
+/// turns that each add the same tokens produce two identical session-level
+/// observations with one content-addressed id. The real worker must publish
+/// the rollout (folding the repeat) instead of rejecting it as invalid, which
+/// left every later update of an ordinary session unpublished.
+#[test]
+fn codex_rollout_with_equal_usage_deltas_still_publishes() {
+    let mut f = Fixture::new("codex");
+    let path = f.history.join("current.jsonl");
+    let token_count = |input: u64, output: u64| {
+        let mut bytes = serde_json::to_vec(
+            &json!({"timestamp":"2026-01-01T00:00:00Z","type":"event_msg",
+            "payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":input,
+            "cached_input_tokens":0,"output_tokens":output,"reasoning_output_tokens":0}}}}),
+        )
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    };
+    let mut bytes = serde_json::to_vec(
+        &json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z",
+        "payload":{"session_id":"synthetic-equal-usage","cli_version":"0.163.0"}}),
+    )
+    .unwrap();
+    bytes.push(b'\n');
+    bytes.extend(codex("first-turn", "equalusage first turn"));
+    bytes.extend(token_count(10, 2));
+    bytes.extend(codex("second-turn", "equalusage second turn"));
+    bytes.extend(token_count(20, 4));
+    bytes.extend(codex("third-turn", "equalusage third turn"));
+    bytes.extend(token_count(30, 6));
+    fs::write(&path, &bytes).unwrap();
+    f.spawn();
+    f.wait(|f| f.has_text("equalusage"));
+    f.wait(|f| {
+        ManagedStore::open(&f.db, &f.control())
+            .unwrap()
+            .background_sources(&f.control())
+            .unwrap()
+            .iter()
+            .all(|s| s.latest_receipt.as_ref().is_some_and(|r| r.published))
+    });
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
 // M2 production-worker regressions. Fixtures own every source write, while the
 // real worker must keep the original DB/WAL/transcript bytes unchanged.
 use agent_session_grep_adapters_sqlite::managed::ManagedRead;

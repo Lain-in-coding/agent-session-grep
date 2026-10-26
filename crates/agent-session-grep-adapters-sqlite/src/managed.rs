@@ -290,6 +290,12 @@ struct Prepared {
     entities: BTreeMap<(String, String), (String, Option<String>, EntityData)>,
 }
 impl Prepared {
+    /// Register one keyed entity. Tool activity and usage keys are content
+    /// addressed, so an identical repeat (two equal tool calls in one turn,
+    /// two turns with equal incremental token buckets) is the same fact
+    /// observed twice and folds into one row, matching the legacy writer. A
+    /// different value under the same key is still a conflict and rejects
+    /// the whole source; every other entity kind must be unique.
     fn entity(
         &mut self,
         kind: EntityKind,
@@ -298,17 +304,20 @@ impl Prepared {
         parent: Option<String>,
         data: EntityData,
     ) -> PortResult<()> {
-        if self
-            .entities
-            .insert(
-                (kind.as_str().into(), key),
-                (id.as_str().into(), parent, data),
-            )
-            .is_some()
-        {
-            return Err(invalid());
+        let value = (id.as_str().to_owned(), parent, data);
+        match self.entities.entry((kind.as_str().into(), key)) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(value);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(existing)
+                if matches!(kind, EntityKind::Tool | EntityKind::Usage)
+                    && existing.get() == &value =>
+            {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(invalid()),
         }
-        Ok(())
     }
     fn fingerprints(&self) -> PortResult<BTreeMap<String, String>> {
         let mut rows = BTreeMap::new();
@@ -2252,15 +2261,17 @@ impl ProjectionRead for ManagedRead<'_> {
         if count == 0 || total == 0 {
             return Ok(page);
         }
-        let mut dfs = Vec::new();
-        for phrase in fts_clauses(&expression)? {
-            self.check_deadline()?;
-            let df:i64=self.transaction.query_row("SELECT COUNT(*) FROM(SELECT DISTINCT p.session_id,p.search_digest FROM session_metadata_fts JOIN source_session_projections p ON p.session_projection_rowid=session_metadata_fts.rowid JOIN qualified_session_metadata q ON q.rowid=p.session_projection_rowid WHERE session_metadata_fts MATCH ?1)",[phrase],|r|r.get(0)).map_err(sql)?;
-            if df < 0 || df > count {
-                return Err(corrupt());
-            }
-            dfs.push(df as f64);
-        }
+        let dfs = self.scoped_phrase_counts(
+            &expression,
+            |phrase, deadline_check| {
+                deadline_check()?;
+                let df:i64=self.transaction.query_row("SELECT COUNT(*) FROM(SELECT DISTINCT p.session_id,p.search_digest FROM session_metadata_fts JOIN source_session_projections p ON p.session_projection_rowid=session_metadata_fts.rowid JOIN qualified_session_metadata q ON q.rowid=p.session_projection_rowid WHERE session_metadata_fts MATCH ?1)",[phrase],|r|r.get(0)).map_err(sql)?;
+                if df < 0 || df > count {
+                    return Err(corrupt());
+                }
+                Ok(df as f64)
+            },
+        )?;
         let mut statement=self.transaction.prepare("SELECT p.session_projection_rowid,p.session_id,e.payload_digest,p.search_digest,p.source_id,e.projection_id,managed_fts_stats(session_metadata_fts) FROM session_metadata_fts JOIN source_session_projections p ON p.session_projection_rowid=session_metadata_fts.rowid JOIN qualified_session_metadata q ON q.rowid=p.session_projection_rowid JOIN source_entity_projections e ON e.source_id=p.source_id AND e.entity_id=p.session_id AND e.kind='session' WHERE session_metadata_fts MATCH ?1").map_err(sql)?;
         let mut rows = statement.query([&expression]).map_err(sql)?;
         let mut best = BTreeMap::<String, RankedMetadataRow>::new();
@@ -2945,12 +2956,14 @@ impl ProjectionRead for ManagedRead<'_> {
                 truncated: false,
             });
         }
-        let mut dfs = Vec::new();
-        for phrase in fts_clauses(&expression)? {
-            self.check_deadline()?;
-            let df:i64=self.transaction.query_row("SELECT COUNT(*) FROM(SELECT DISTINCT p.message_id,p.index_digest FROM projection_fts JOIN source_projections p ON p.projection_rowid=projection_fts.rowid JOIN qualified_projections q USING(projection_rowid) WHERE projection_fts MATCH ?1)",[phrase],|r|r.get(0)).map_err(sql)?;
-            dfs.push(df as f64);
-        }
+        let dfs = self.scoped_phrase_counts(
+            &expression,
+            |phrase, deadline_check| {
+                deadline_check()?;
+                let df:i64=self.transaction.query_row("SELECT COUNT(*) FROM(SELECT DISTINCT p.message_id,p.index_digest FROM projection_fts JOIN source_projections p ON p.projection_rowid=projection_fts.rowid JOIN qualified_projections q USING(projection_rowid) WHERE projection_fts MATCH ?1)",[phrase],|r|r.get(0)).map_err(sql)?;
+                Ok(df as f64)
+            },
+        )?;
         struct Candidate {
             rowid: i64,
             score: f64,
@@ -3304,6 +3317,93 @@ fn charge_graph(remaining: &mut usize, bytes: i64) -> PortResult<()> {
     Ok(())
 }
 
+impl ManagedRead<'_> {
+    /// Split one already-generated safe FTS expression into its phrases and
+    /// score each with caller-supplied document-frequency work.
+    ///
+    /// The unicode61 tokenizer keeps some Rust-alphanumeric characters out of
+    /// tokens (circled letters, for example), so a quoted phrase can contain
+    /// zero tokens. FTS5 drops such a phrase from the implicit AND — verified
+    /// against the bundled engine — while `managed_fts_stats` then reports one
+    /// fewer phrase than this clause list. Counting the empty phrase would make
+    /// every ordinary query look like catalog corruption, so a phrase with no
+    /// tokens is skipped here exactly as FTS5 skips it at match time. The
+    /// emptiness decision uses a real fts5vocab probe, not a Rust `char`
+    /// approximation, so the two engines cannot drift.
+    fn scoped_phrase_counts(
+        &self,
+        expression: &str,
+        mut count: impl FnMut(&str, &dyn Fn() -> PortResult<()>) -> PortResult<f64>,
+    ) -> PortResult<Vec<f64>> {
+        let mut dfs = Vec::new();
+        for phrase in fts_clauses(expression)? {
+            if self.phrase_tokens(phrase) == 0 {
+                continue;
+            }
+            dfs.push(count(phrase, &|| self.check_deadline())?);
+        }
+        Ok(dfs)
+    }
+
+    fn phrase_tokens(&self, phrase: &str) -> usize {
+        let inner = phrase
+            .strip_prefix('"')
+            .map(|value| value.strip_suffix('*').unwrap_or(value))
+            .unwrap_or(phrase)
+            .strip_suffix('"')
+            .unwrap_or(phrase)
+            .replace("\"\"", "\"");
+        TOKEN_PROBE
+            .with(|probe| probe.borrow_mut().tokens(&inner))
+            .unwrap_or(usize::MAX)
+    }
+}
+
+thread_local! {
+    /// One private probe table per reading thread. Managed reads own a live
+    /// transaction, so the probe lives on a separate connection and only ever
+    /// holds synthetic phrase text supplied by this module's own grammar.
+    static TOKEN_PROBE: std::cell::RefCell<TokenProbe> =
+        std::cell::RefCell::new(TokenProbe::default());
+}
+
+#[derive(Default)]
+struct TokenProbe {
+    conn: Option<rusqlite::Connection>,
+}
+
+impl TokenProbe {
+    fn tokens(&mut self, text: &str) -> PortResult<usize> {
+        let conn = match &self.conn {
+            Some(conn) => conn,
+            None => {
+                let conn = rusqlite::Connection::open_in_memory().map_err(|_| corrupt())?;
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE temp.token_probe USING fts5(x, tokenize='unicode61');
+                     CREATE VIRTUAL TABLE temp.token_probe_vocab USING fts5vocab(temp, token_probe, 'instance');",
+                )
+                .map_err(|error| {
+                    PortError::Backend(format!("token probe setup failed: {error}"))
+                })?;
+                self.conn.insert(conn)
+            }
+        };
+        conn.execute("DELETE FROM temp.token_probe", [])
+            .map_err(|_| corrupt())?;
+        conn.execute(
+            "INSERT INTO temp.token_probe(rowid, x) VALUES(1, ?1)",
+            [text],
+        )
+        .map_err(|_| corrupt())?;
+        let tokens: i64 = conn
+            .query_row("SELECT COUNT(*) FROM temp.token_probe_vocab", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| corrupt())?;
+        usize::try_from(tokens).map_err(|_| corrupt())
+    }
+}
+
 // Parse only the already-generated safe FTS grammar, not source/query tokens.
 // Quoted punctuation/path phrases stay intact; escaped quotes and prefix * stay.
 fn fts_clauses(expression: &str) -> PortResult<Vec<&str>> {
@@ -3342,6 +3442,27 @@ fn fts_clauses(expression: &str) -> PortResult<Vec<&str>> {
         clauses.push(&expression[start..at]);
     }
     Ok(clauses)
+}
+
+#[cfg(test)]
+mod token_probe_tests {
+    use super::*;
+
+    #[test]
+    fn phrase_token_probe_matches_fts5_unicode61() {
+        let mut probe = TokenProbe::default();
+        assert_eq!(
+            probe
+                .tokens("hello")
+                .map_err(|error| error.to_string())
+                .unwrap(),
+            1
+        );
+        assert_eq!(probe.tokens("\u{24b6}").unwrap(), 0);
+        assert_eq!(probe.tokens("a\u{24b6}b").unwrap(), 2);
+        assert_eq!(probe.tokens("mcp.json").unwrap(), 2);
+        assert_eq!(probe.tokens("配置备份").unwrap(), 1);
+    }
 }
 
 #[cfg(test)]

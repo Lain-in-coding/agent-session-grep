@@ -491,6 +491,41 @@ fn identical_copies_do_not_change_scoped_score_and_hidden_prefix_cannot_fill_lim
     );
 }
 
+/// Characters that Rust treats as alphanumeric but the unicode61 tokenizer
+/// treats as separators (circled letters, for example) produce a quoted phrase
+/// with zero tokens. FTS5 drops such a phrase from the implicit AND, so the
+/// per-phrase statistics no longer matched the clause count and an ordinary
+/// query was reported as catalog corruption. The empty clause must be ignored
+/// exactly as FTS5 ignores it.
+#[test]
+fn zero_token_query_terms_match_like_fts5_instead_of_reporting_corruption() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema(&conn);
+    let a = observation("a", 1);
+    publish(&conn, &batch(&a, "hello workbench"), &a);
+    let read = open_read(&conn, &[&a]);
+    let baseline = read
+        .query_lexical("hello", &ProjectionQuery::default(), 5)
+        .unwrap();
+    assert_eq!(baseline.hits.len(), 1);
+    for query in ["hello \u{24b6}", "\u{24b6} hello", "hello \u{24b6}\u{24b7}"] {
+        let page = read
+            .query_lexical(query, &ProjectionQuery::default(), 5)
+            .unwrap_or_else(|error| panic!("{query:?}: {error:?}"));
+        assert_eq!(page.hits.len(), 1, "{query:?}");
+        assert_eq!(page.hits[0].score, baseline.hits[0].score, "{query:?}");
+    }
+    // A query made only of separators matches nothing instead of failing.
+    let empty = read
+        .query_lexical("\u{24b6}", &ProjectionQuery::default(), 5)
+        .unwrap();
+    assert!(empty.hits.is_empty());
+    let sessions = read
+        .search_sessions("hello \u{24b6}", &ProjectionQuery::default(), 5)
+        .unwrap_or_else(|error| panic!("session search: {error:?}"));
+    let _ = sessions;
+}
+
 #[test]
 fn typed_metadata_tools_usage_and_native_claims_remain_source_scoped() {
     let conn = Connection::open_in_memory().unwrap();
@@ -589,6 +624,105 @@ fn typed_metadata_tools_usage_and_native_claims_remain_source_scoped() {
             .entities(EntityKind::Resume, &[session], &ProjectionQuery::default())
             .unwrap()
             .is_empty()
+    );
+}
+
+/// A transcript legitimately repeats identical facts: two reads of the same
+/// file in one assistant turn, or two Codex turns whose incremental token
+/// buckets happen to be equal. Both derive the same content-addressed id. The
+/// legacy writer folds such repeats; the managed publisher rejected the whole
+/// source as invalid, so one ordinary repeat blocked every later update.
+#[test]
+fn identical_repeated_tool_and_usage_facts_publish_once() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema(&conn);
+    let a = observation("a", 1);
+    let mut data = batch(&a, "alpha");
+    let session = id(IdKind::Session, "shared");
+    let message = id(IdKind::Message, "shared");
+    let read_file = SourceActivity {
+        message_id: message.clone(),
+        activity: ToolActivity {
+            kind: ToolActivityKind::File,
+            actor: ToolActivityActor::Main,
+            name: "Read".into(),
+            target: Some("synthetic-file".into()),
+            status: ToolActivityStatus::Success,
+        },
+    };
+    data.activities.push(read_file.clone());
+    data.activities.push(read_file);
+    let usage = SourceUsage {
+        session_id: session.clone(),
+        message_id: None,
+        usage: UsageObservation {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: TokenSource::Derived,
+        },
+    };
+    data.usage_events.push(usage.clone());
+    data.usage_events.push(usage);
+    publish(&conn, &data, &a);
+    let read = open_read(&conn, &[&a]);
+    let query = ProjectionQuery::default();
+    assert_eq!(
+        read.entities(EntityKind::Tool, std::slice::from_ref(&message), &query)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        read.entities(EntityKind::Usage, std::slice::from_ref(&session), &query)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn conflicting_facts_under_one_key_still_fail_closed() {
+    let session = id(IdKind::Session, "shared");
+    let claim = |native: &str| SourceResumeClaim {
+        provider_id: "claude-code".into(),
+        session_id: session.as_str().into(),
+        provider_session_id: Some(native.into()),
+        provider_session_id_state: "resolved".into(),
+        original_working_directory: None,
+        original_working_directory_state: "missing".into(),
+        pair_observed: false,
+    };
+    let attempt = |claims: Vec<SourceResumeClaim>| {
+        let conn = Connection::open_in_memory().unwrap();
+        schema(&conn);
+        let a = observation("a", 1);
+        let mut data = batch(&a, "alpha");
+        data.resume_claims = claims;
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = publish_source_in_tx(&conn, &data, &a, 1).map(|_| ());
+        conn.execute_batch("ROLLBACK").unwrap();
+        result
+    };
+    // Control: one claim publishes, so a failure below is the duplicate key.
+    assert!(attempt(vec![claim("synthetic-native-a")]).is_ok());
+    // Resume claims are not content addressed: even an identical repeat is a
+    // second claim for one session, and a different value is a conflict.
+    assert!(
+        attempt(vec![
+            claim("synthetic-native-a"),
+            claim("synthetic-native-a")
+        ])
+        .is_err()
+    );
+    assert!(
+        attempt(vec![
+            claim("synthetic-native-a"),
+            claim("synthetic-native-b")
+        ])
+        .is_err()
     );
 }
 
