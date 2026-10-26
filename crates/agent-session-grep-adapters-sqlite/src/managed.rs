@@ -1257,6 +1257,12 @@ pub struct ManagedRead<'a> {
     transaction: Transaction<'a>,
     snapshot: ReadSnapshot,
     deadline: Instant,
+    /// Query the qualification tables currently hold. `qualify` and
+    /// `qualify_entities` are full scans of every authorized row; a request
+    /// stream that reuses one query (a paged `list`, for example) must not
+    /// repeat that work per call. Interior mutability keeps the ProjectionRead
+    /// trait signatures unchanged.
+    qualified_for: std::cell::RefCell<Option<ProjectionQuery>>,
     /// Captured by the authorized constructor. An explicit test allow-list
     /// alone cannot prove that a barrier's selection revision/root is current.
     policy: Option<control::ReadPolicy>,
@@ -1554,6 +1560,7 @@ impl<'a> ManagedRead<'a> {
                 policy_epoch: scope.policy_epoch,
             },
             deadline,
+            qualified_for: std::cell::RefCell::new(None),
             policy: None,
         })
     }
@@ -2081,6 +2088,9 @@ impl<'a> ManagedRead<'a> {
     }
 
     fn qualify(&self, query: &ProjectionQuery) -> PortResult<()> {
+        if self.qualified_for.borrow().as_ref() == Some(query) {
+            return Ok(());
+        }
         self.check_deadline()?;
         if query
             .filters
@@ -2159,6 +2169,7 @@ impl<'a> ManagedRead<'a> {
             .execute(&clause, rusqlite::params_from_iter(values))
             .map_err(sql)?;
         self.transaction.execute_batch("INSERT INTO qualified_projections SELECT p.projection_rowid FROM source_projections p JOIN allowed_sources a USING(source_id) JOIN source_revision_receipts r ON r.revision_id=p.revision_id AND r.source_id=p.source_id JOIN source_heads h ON h.source_id=p.source_id WHERE r.published=1 AND h.visible_revision_id IS NOT NULL AND h.update_state!='revoked' AND EXISTS(SELECT 1 FROM source_occurrences o JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=p.source_id AND o.message_id=p.message_id)").map_err(sql)?;
+        *self.qualified_for.borrow_mut() = Some(query.clone());
         Ok(())
     }
 
@@ -3198,7 +3209,9 @@ impl ManagedRead<'_> {
         Ok(result)
     }
     fn qualify_entities(&self, query: &ProjectionQuery) -> PortResult<()> {
-        self.qualify(query)?;
+        if self.qualified_for.borrow().as_ref() != Some(query) {
+            self.qualify(query)?;
+        }
         self.transaction.execute_batch("CREATE TEMP TABLE IF NOT EXISTS qualified_entities(entity_projection_rowid INTEGER PRIMARY KEY) WITHOUT ROWID; DELETE FROM qualified_entities;").map_err(sql)?;
         let mut statement=self.transaction.prepare("SELECT e.entity_projection_rowid,e.payload,e.source_id,e.entity_id FROM source_entity_projections e JOIN allowed_sources a USING(source_id) JOIN source_revision_receipts r ON r.revision_id=e.revision_id AND r.source_id=e.source_id JOIN source_heads h ON h.source_id=e.source_id WHERE r.published=1 AND h.visible_revision_id IS NOT NULL AND h.update_state!='revoked'").map_err(sql)?;
         let mut rows = statement.query([]).map_err(sql)?;
@@ -3219,6 +3232,7 @@ impl ManagedRead<'_> {
                     .map_err(sql)?;
             }
         }
+        *self.qualified_for.borrow_mut() = Some(query.clone());
         Ok(())
     }
     fn entity_qualifies(

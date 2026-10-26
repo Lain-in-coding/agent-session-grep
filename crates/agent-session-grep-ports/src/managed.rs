@@ -177,7 +177,7 @@ pub struct SourceProgress {
     pub last_attempt: Option<RevisionRef>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectionQuery {
     pub filters: SearchFilters,
     pub facets: SearchFacets,
