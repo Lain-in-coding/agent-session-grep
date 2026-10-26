@@ -18,14 +18,65 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parent / "out"
 
+# Must match crates/agent-session-grep-application/src/candle_embedding.rs.
+E5_SMALL_MODEL_ID = "intfloat-multilingual-e5-small@614241f6-candle-f32-meanpool-l2-qpass-v1"
+
+
+def percentile(sorted_values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile: smallest value covering `fraction` of samples."""
+    percent = round(fraction * 100)
+    rank = max(1, -(-len(sorted_values) * percent // 100))
+    return sorted_values[rank - 1]
+
+
+def check_semantic_envelope(envelope: dict) -> None:
+    """Refuse to time anything that is not a clean semantic search."""
+    if envelope.get("outcome") != "success":
+        raise RuntimeError(f"probe search failed: {envelope}")
+    if envelope["data"].get("retrieval_mode") != "semantic" or envelope.get("warnings"):
+        raise RuntimeError(
+            "semantic mode did not execute: "
+            f"retrieval_mode={envelope['data'].get('retrieval_mode')} "
+            f"warnings={envelope.get('warnings')}"
+        )
+
 
 def frame(id: int, method: str, params: object) -> dict:
     return {"jsonrpc": "2.0", "id": id, "method": method, "params": params}
 
 
+def run_checked(argv: list[str]) -> None:
+    done = subprocess.run(argv, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({done.returncode}): {' '.join(argv)}\n"
+            f"stdout: {done.stdout}\nstderr: {done.stderr}"
+        )
+
+
+def verified_model_status(binary: str) -> dict:
+    """Refuse to measure until a verified real embedding model is importable."""
+    status = subprocess.run(
+        [binary, "--robot", "model", "status"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    data = json.loads(status.stdout)["data"]
+    if not data.get("verified") or data.get("model_kind") != "real_embedding":
+        raise RuntimeError(
+            f"semantic model bundle is not a verified real model (model status: {data})"
+        )
+    if data.get("detail", {}).get("model_id") != E5_SMALL_MODEL_ID:
+        raise RuntimeError(f"unexpected model id (model status: {data})")
+    return data
+
+
 def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/release/agent-session-grep.exe"
     db = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    scratch = None
+    status_data = verified_model_status(binary)
     queries = [
         "ferroflux invalidate_stale",
         "FerrofluxCache epoch invalidation",
@@ -54,18 +105,11 @@ def main() -> int:
         )
         for i, query in enumerate(queries)
     ]
-    fixture = Path(scratch.name) / "seed.jsonl"
+    scratch_dir = scratch.name if scratch is not None else tempfile.gettempdir()
+    fixture = Path(scratch_dir) / "asg-mcp-latency-seed.jsonl"
     fixture.write_text("\n".join(seed_lines) + "\n", encoding="utf-8")
-    subprocess.run(
-        [binary, "--db", str(db), "--robot", "sync", str(fixture)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [binary, "--db", str(db), "--robot", "index", "embeddings"],
-        check=True,
-        capture_output=True,
-    )
+    run_checked([binary, "--db", str(db), "--robot", "sync", str(fixture)])
+    run_checked([binary, "--db", str(db), "--robot", "index", "embeddings"])
 
     proc = subprocess.Popen(
         [binary, "--db", str(db), "mcp"],
@@ -93,10 +137,8 @@ def main() -> int:
     proc.stdin.flush()
     # Drain initialize response.
     proc.stdout.readline()
-    samples = []
-    for i, query in enumerate(queries):
-        request_id = 2 + i
-        started = time.perf_counter()
+
+    def search_once(request_id: int, query: str) -> dict:
         proc.stdin.write(
             json.dumps(
                 frame(
@@ -114,22 +156,40 @@ def main() -> int:
         while True:
             line = proc.stdout.readline()
             if not line:
-                break
+                # EOF before a matched response means the request failed; it
+                # must not become a latency datapoint.
+                raise RuntimeError(f"no response for request {request_id}")
             parsed = json.loads(line)
             if parsed.get("id") == request_id:
-                break
+                return parsed
+
+    # Prove the semantic path really executes before timing anything: a
+    # lexical_fallback envelope (or any warning) means the reported numbers
+    # would not be semantic latency.
+    probe = search_once(2, queries[0])
+    check_semantic_envelope(probe["result"]["structuredContent"])
+
+    samples = []
+    for i, query in enumerate(queries):
+        request_id = 2 + i
+        started = time.perf_counter()
+        search_once(request_id, query)
         samples.append((time.perf_counter() - started) * 1000.0)
     proc.stdin.close()
     proc.wait(timeout=60)
 
     samples.sort()
-    p50 = samples[len(samples) // 2]
-    p95 = samples[int(len(samples) * 0.95) - 1]
+    p50 = percentile(samples, 0.50)
+    p95 = percentile(samples, 0.95)
     OUT.mkdir(parents=True, exist_ok=True)
     report = {
         "schema": "agent-session-grep.semantic-mcp-latency/v1",
         "entry_point": "mcp",
-        "model": "intfloat-multilingual-e5-small@614241f6-candle-f32-meanpool-l2-qpass-v1",
+        "model": {
+            "model_id": E5_SMALL_MODEL_ID,
+            "model_kind": status_data.get("model_kind"),
+            "verified": status_data.get("verified"),
+        },
         "query_count": len(samples),
         "p50_ms": round(p50, 1),
         "p95_ms": round(p95, 1),

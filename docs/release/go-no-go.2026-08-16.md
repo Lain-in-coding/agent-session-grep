@@ -143,7 +143,9 @@ Claude/Codex certified — currently 0 Beta. **Not release-ready per provider ga
    `model import` / `model status` path, **real E5 inference verification**
    (pinned weights imported, recall benchmark validates with semantic ≥ lexical
    on the frozen corpus), and **amortized MCP latency** (p50 16.6 ms / p95 21.0 ms
-   per query with the encoder resident via `load_cached`) are now landed and
+   per query with the encoder resident via `load_cached`; that harness run's
+   p95 label actually selected p90 — see the 2026-10-26 correction in
+   `docs/operations/SEMANTIC-MODEL-BUNDLE.md`) are now landed and
    recorded in `docs/operations/SEMANTIC-MODEL-BUNDLE.md`. Default builds stay
    bigram-hash / lexical-only and must not be marketed as semantic. Still
    deferred: official weight redistribution packaging, frozen recall/latency

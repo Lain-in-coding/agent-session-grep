@@ -165,6 +165,28 @@ Generated reports land under `scripts/evidence/out/` (gitignored); the frozen
 corpus/manifest under `scripts/evidence/fixtures/semantic/` is committed and
 protected by determinism tests.
 
+## Latency harness correction (2026-10-26)
+
+The p50/p95 figures recorded above were produced by the pre-fix harness, whose
+p95 formula selected the p90 order statistic (index `int(n*0.95)-1`, the 9th
+of 10 samples, instead of nearest-rank rank 10). The harness now computes
+nearest-rank percentiles; turns any EOF/failed sample into an error instead
+of a datapoint; probes a first un-timed `search_sessions` call and refuses to
+continue unless it returns `retrieval_mode: "semantic"` with no warnings; and
+requires `--robot model status` to report `verified: true`,
+`model_kind: real_embedding`, and the pinned model id before it measures
+anything (neither the default bigram-hash build nor an unverified bundle can
+be mislabeled as E5 evidence). The two-argument form now writes its seed
+fixture under the system temp directory without the previous `NameError`.
+The honesty contract is pinned by `scripts/evidence/test_semantic_mcp_latency.py`.
+
+Re-measured on 2026-10-26 with a release `--features semantic-candle` build
+and the same pinned weights (10 synthetic queries, encoder resident after the
+warm probe): p50 40.0–54.9 ms, p95 47.4–88.4 ms per query across four runs.
+The 2026-08-18 figures remain a valid historical record for that build; their
+p95 label was wrong, so the corrected nearest-rank numbers above supersede
+them as current evidence.
+
 ## What is still deferred
 
 - Official weight packaging / redistribution decision (license notice in
