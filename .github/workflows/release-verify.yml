@@ -5,9 +5,15 @@ name: release-verify
 on:
   workflow_dispatch:
   pull_request:
-    types: [opened, synchronize, reopened, edited, ready_for_review]
+    # A description edit must not re-run the 3-OS matrix and four release
+    # builds; code changes still arrive as synchronize events.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
