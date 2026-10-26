@@ -70,7 +70,24 @@ fn redact_value_inner(value: serde_json::Value, count: &mut u64) -> serde_json::
                 } else {
                     redact_value_inner(val, count)
                 };
-                new_map.insert(key, redacted_val);
+                // A secret can also be the key itself (`{"AKIA...": x}`). The
+                // key is a string on the boundary like any value.
+                let key = match agent_session_grep_ports::redact::redact_string(&key) {
+                    Some(redacted) => {
+                        *count += 1;
+                        redacted
+                    }
+                    None => key,
+                };
+                // Distinct secrets collapse to one marker; keep every entry
+                // instead of letting the last key overwrite earlier ones.
+                let mut unique = key.clone();
+                let mut suffix = 2;
+                while new_map.contains_key(&unique) {
+                    unique = format!("{key}#{suffix}");
+                    suffix += 1;
+                }
+                new_map.insert(unique, redacted_val);
             }
             serde_json::Value::Object(new_map)
         }
@@ -195,6 +212,32 @@ pub fn redact_text(s: &str) -> (String, RedactionStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_secret_object_keys_without_overwriting_entries() {
+        // Assemble synthetic AWS-shaped keys at runtime so source scanners
+        // don't mistake test data for a credential.
+        let key_a = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        let key_b = ["AKIA", "IOSFODNN7EXAMPLF"].concat();
+        let mut val = serde_json::Map::new();
+        val.insert(key_a, serde_json::json!("first"));
+        val.insert(key_b, serde_json::json!("second"));
+        let val = serde_json::Value::Object(val);
+        let (redacted, status) = redact_value(val);
+        let object = redacted.as_object().expect("object");
+        assert_eq!(status.redacted_count, 2);
+        assert_eq!(status.status, RedactionState::Applied);
+        assert_eq!(object.len(), 2, "both keyed entries must survive");
+        let mut values: Vec<&str> = object
+            .values()
+            .map(|value| value.as_str().expect("string value"))
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, ["first", "second"]);
+        for key in object.keys() {
+            assert!(key.starts_with("[redacted:aws_access_key]"), "{key}");
+        }
+    }
 
     #[test]
     fn redacts_aws_access_key() {
