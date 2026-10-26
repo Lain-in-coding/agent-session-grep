@@ -441,33 +441,55 @@ fn content_bytes(pack: &HandoffPack) -> u64 {
 }
 
 /// Derive a deterministic pack_id from generation + query + filters + budget.
+///
+/// Every field is length-prefixed and every section is tagged. Joining the
+/// fields with a separator alone fed identical bytes for
+/// `terms=[a, b], providers=[]` and `terms=[a], providers=[b]`, so two
+/// different requests shared one pack id.
 fn derive_pack_id(input: &HandoffInput<'_>) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"handoff-pack/v1\0");
-    hasher.update(format!("gen={}\0", input.catalog_generation).as_bytes());
-    hasher.update(input.retrieval_mode.as_str().as_bytes());
-    hasher.update(b"\0");
+    let mut field = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(b"generation");
+    field(&input.catalog_generation.to_le_bytes());
+    field(b"mode");
+    field(input.retrieval_mode.as_str().as_bytes());
+    field(b"terms");
+    field(&(input.query_terms.len() as u64).to_le_bytes());
     for term in input.query_terms {
-        hasher.update(term.as_bytes());
-        hasher.update(b"\0");
+        field(term.as_bytes());
     }
+    field(b"providers");
+    field(&(input.filters.providers.len() as u64).to_le_bytes());
     for provider in &input.filters.providers {
-        hasher.update(provider.as_bytes());
-        hasher.update(b"\0");
+        field(provider.as_bytes());
     }
-    if let Some(since) = &input.filters.since {
-        hasher.update(since.as_bytes());
-        hasher.update(b"\0");
+    for (tag, value) in [
+        ("since", &input.filters.since),
+        ("until", &input.filters.until),
+    ] {
+        field(tag.as_bytes());
+        match value {
+            Some(timestamp) => {
+                field(b"set");
+                field(timestamp.as_bytes());
+            }
+            None => field(b"unset"),
+        }
     }
-    if let Some(until) = &input.filters.until {
-        hasher.update(until.as_bytes());
-        hasher.update(b"\0");
+    for (tag, value) in [
+        ("tokens", input.max_tokens),
+        ("bytes", input.max_bytes),
+        ("evidence", input.max_evidence as u64),
+    ] {
+        field(tag.as_bytes());
+        field(&value.to_le_bytes());
     }
-    hasher.update(format!("tokens={}\0", input.max_tokens).as_bytes());
-    hasher.update(format!("bytes={}\0", input.max_bytes).as_bytes());
-    hasher.update(format!("evidence={}\0", input.max_evidence).as_bytes());
     let hash = hasher.finalize();
-    format!("pack_v1_{}", &hash.to_hex()[..16])
+    format!("pack_v1_{}", &hash.to_hex()[..32])
 }
 
 /// Format Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` in UTC using the
@@ -773,6 +795,26 @@ mod tests {
         let pack1 = generate_deterministic(input1);
         let pack2 = generate_deterministic(input2);
         assert_ne!(pack1.pack_id, pack2.pack_id);
+    }
+
+    #[test]
+    fn pack_id_framing_keeps_terms_and_providers_apart() {
+        // `terms=[a, b], providers=[]` and `terms=[a], providers=[b]` fed
+        // identical bytes to a separator-only join.
+        let hits = vec![hit("msg_v1_aaa", 1.0, "hello")];
+        let locs = locations(&hits);
+        let two_terms = vec!["a".to_string(), "b".to_string()];
+        let one_term = vec!["a".to_string()];
+        let mut split = default_input(&hits, &locs);
+        split.query_terms = &two_terms;
+        let mut merged = default_input(&hits, &locs);
+        merged.query_terms = &one_term;
+        merged.filters.providers = vec!["b".to_string()];
+        let split_id = generate_deterministic(split).pack_id;
+        let merged_id = generate_deterministic(merged).pack_id;
+        assert_ne!(split_id, merged_id);
+        // One digest length for the generator and the managed path.
+        assert_eq!(split_id.len(), "pack_v1_".len() + 32);
     }
 
     #[test]
