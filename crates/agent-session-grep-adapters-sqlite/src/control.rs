@@ -1382,21 +1382,37 @@ impl SqliteControlStore {
         private_file(path)?;
         #[cfg(unix)]
         let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Native flags for the supported Unix release targets, as in
-            // managed_locks. Do not assume Linux flags on macOS.
-            #[cfg(target_os = "linux")]
-            let flags = 0o400000 | 0o4000 | 0o2000000;
-            #[cfg(target_os = "macos")]
-            let flags = 0x100 | 0x4 | 0x01000000;
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            return Err(io_error(()));
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(flags)
-                .open(path)
-                .map_err(io_error)?
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos"
+            ))]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Per-architecture constants shared with managed_locks: the
+                // hardcoded x86_64 Linux value turned O_NOFOLLOW into
+                // O_LARGEFILE on aarch64.
+                let flags = crate::managed_locks::platform::NOFOLLOW
+                    | crate::managed_locks::platform::NONBLOCK
+                    | crate::managed_locks::platform::CLOEXEC;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(flags)
+                    .open(path)
+                    .map_err(io_error)?
+            }
+            #[cfg(not(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos"
+            )))]
+            {
+                return Err(io_error(()));
+            }
         };
         #[cfg(windows)]
         let file = windows_private::open_private_read(path)?;

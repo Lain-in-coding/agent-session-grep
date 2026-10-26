@@ -1231,8 +1231,13 @@ impl ContextSqlDeadline<'_> {
         let conn = self.connection.borrow();
         conn.progress_handler(0, None::<fn() -> bool>)
             .map_err(storage)?;
+        // The deadline scope installed `busy_handler(|_| false)`; leaving it
+        // in place made every later call fail immediately on transient BUSY
+        // instead of waiting. Reinstate the connection's busy timeout, which
+        // replaces the custom handler.
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MILLIS))
+            .map_err(storage)?;
         self.active = false;
-        // Immediate busy handling remains safe for subsequent bounded calls.
         Ok(())
     }
 }
@@ -1256,6 +1261,10 @@ fn admission(control: &SqliteControlStore, root: RootIdentity) -> PortResult<Rea
     }
     Ok(policy)
 }
+/// Wait budget for transient SQLITE_BUSY on managed connections. Restored after
+/// any deadline-scoped call reinstalls its immediate busy handler.
+const BUSY_TIMEOUT_MILLIS: u64 = 250;
+
 fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1264,7 +1273,7 @@ fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     };
     let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
         .map_err(storage)?;
-    conn.busy_timeout(Duration::from_millis(250))
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MILLIS))
         .map_err(storage)?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
         .map_err(storage)?;

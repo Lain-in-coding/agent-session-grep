@@ -522,7 +522,7 @@ fn classify_lock_result(result: io::Result<bool>) -> PortResult<()> {
 }
 
 #[cfg(windows)]
-mod platform {
+pub(crate) mod platform {
     use super::*;
     use std::{
         fs::OpenOptions,
@@ -773,11 +773,11 @@ mod platform {
     const FLAGS: (i32, i32, i32, i32, i32) = (0x8000, 0x80000, 0x800, 0x4000, 0x40);
     #[cfg(target_os = "macos")]
     const FLAGS: (i32, i32, i32, i32, i32) = (0x100, 0x1000000, 0x4, 0x100000, 0x200);
-    const NOFOLLOW: i32 = FLAGS.0;
-    const CLOEXEC: i32 = FLAGS.1;
-    const NONBLOCK: i32 = FLAGS.2;
-    const DIRECTORY: i32 = FLAGS.3;
-    const CREATE: i32 = FLAGS.4;
+    pub(crate) const NOFOLLOW: i32 = FLAGS.0;
+    pub(crate) const CLOEXEC: i32 = FLAGS.1;
+    pub(crate) const NONBLOCK: i32 = FLAGS.2;
+    pub(crate) const DIRECTORY: i32 = FLAGS.3;
+    pub(crate) const CREATE: i32 = FLAGS.4;
 
     unsafe extern "C" {
         fn openat(directory: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
