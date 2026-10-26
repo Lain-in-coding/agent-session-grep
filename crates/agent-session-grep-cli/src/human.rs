@@ -803,10 +803,24 @@ fn number_text(data: &Value, key: &str) -> String {
     }
 }
 
-/// 单行化预览：控制字符替换为空格，超出 `max` 字符即截断（字符边界安全）。
+/// 单向覆盖/隔离控制（Cf）在终端按字面呈现时会把后续文本重排成相反方向，
+/// 让路径、token 或错误码在视觉上被替换（Trojan Source 的终端变体）。它们
+/// 是 `char::is_control` 看不见的普通 Cf 字符，必须随 Cc 一起折叠成空格。
+fn is_bidi_control(c: char) -> bool {
+    matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// 单行化预览：控制字符（含 Cf 双向控制）替换为空格，超出 `max` 字符即截断
+/// （字符边界安全）。
 fn preview(text: &str, max: usize) -> String {
     text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_bidi_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .take(max)
         .collect()
 }
@@ -840,7 +854,13 @@ fn anchored_preview(text: &str, why_matched: Option<&[Value]>, max: usize) -> St
     let end = (start + max).min(chars.len());
     chars[start..end]
         .iter()
-        .map(|value| if value.is_control() { ' ' } else { *value })
+        .map(|value| {
+            if value.is_control() || is_bidi_control(*value) {
+                ' '
+            } else {
+                *value
+            }
+        })
         .collect()
 }
 
@@ -879,7 +899,7 @@ fn earliest_term_span(chars: &[char], terms: &[&str]) -> Option<(usize, usize)> 
 }
 
 /// 仅单行化、不截断。
-fn sanitize(text: &str) -> String {
+pub(super) fn sanitize(text: &str) -> String {
     preview(text, usize::MAX)
 }
 
@@ -2497,6 +2517,39 @@ mod tests {
     #[test]
     fn resume_table_empty_input_renders_empty_string() {
         assert_eq!(render_session_resume_table(&[]), "");
+    }
+
+    #[test]
+    fn preview_folds_bidi_override_and_isolate_controls_into_spaces() {
+        let lre = "\u{202A}";
+        let rlo = "\u{202E}";
+        let isolate = "\u{2068}";
+        let pop = "\u{2069}";
+        for control in [lre, rlo, isolate, pop] {
+            let out = preview(&format!("path{control}token"), 64);
+            assert_eq!(out, "path token", "{control:?}");
+            // These are Cf formatting characters, not Cc: `char::is_control`
+            // alone does not see them, which is why the fold exists.
+            assert!(!control.chars().next().unwrap().is_control());
+        }
+    }
+
+    #[test]
+    fn anchored_preview_folds_bidi_controls_at_window_edges() {
+        // A hostile document places the override at the window boundary so a
+        // naive crop leaves it standing; the fold must see every window char.
+        let text = format!("{}needle{}", "x".repeat(300), "\u{202E}");
+        let terms = [serde_json::Value::String("needle".into())];
+        let line = anchored_preview(&text, Some(&terms), 40);
+        assert!(!line.contains('\u{202E}'), "{line:?}");
+        assert!(line.contains("needle"), "{line:?}");
+    }
+
+    #[test]
+    fn sanitize_folds_bidi_controls_in_warning_style_values() {
+        let out = sanitize("remaining: \u{202A}C:/tmp\u{202C}");
+        // Cc 和 Cf 一视同仁地折叠成空格，不刻意压紧多出来的那一格。
+        assert_eq!(out, "remaining:  C:/tmp ");
     }
 
     fn resume_row(

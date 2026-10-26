@@ -1003,7 +1003,7 @@ fn emit_result(
     match mode {
         protocol::OutputMode::Human => {
             for warning in warnings {
-                eprintln!("warning: {warning}");
+                eprintln!("{}", human_warning_line(warning));
             }
             for line in human::render_success(command, outcome, &data, page) {
                 protocol::write_stdout_line(&line);
@@ -1043,6 +1043,12 @@ fn emit_result(
             ));
         }
     }
+}
+
+/// Human 模式的 stderr 警告行：与其余 human 输出同一单行化契约——警告文本
+/// 可能内嵌换行或终端双向控制字符，不能原样走 stderr。
+fn human_warning_line(warning: &str) -> String {
+    format!("warning: {}", human::sanitize(warning))
 }
 
 #[derive(serde::Serialize)]
@@ -8093,5 +8099,19 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["placement_id"], "plc_v1_anchor");
         assert_eq!(messages[0]["payload"]["text"], "hi");
+    }
+}
+
+#[cfg(test)]
+mod warning_line_tests {
+    use super::*;
+
+    #[test]
+    fn human_warning_line_folds_newlines_and_bidi_controls() {
+        // 与其余 human 输出同一单行化契约：换行拆行、Cf 双向控制折叠成空格。
+        let line = human_warning_line("retained\nsneaky \u{202E}gnp.exe");
+        assert_eq!(line, "warning: retained sneaky  gnp.exe");
+        assert!(!line.contains('\n'));
+        assert!(!line.contains('\u{202E}'));
     }
 }

@@ -14,8 +14,10 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, mpsc};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_session_grep_adapters_sqlite::SqliteStore;
@@ -68,10 +70,11 @@ impl ServeSession {
 
 /// Run the loopback HTTP server until interrupted.
 ///
-/// Network reads and writes run in a fixed-size worker pool. The Application
-/// ADT stays on the listener thread because `SqliteStore` deliberately owns a
-/// non-`Sync` SQLite connection; parsed requests are routed serially while a
-/// slow or non-reading client can occupy at most one bounded worker slot.
+/// Network reads and writes run in a fixed-size worker pool; routing runs on
+/// one dedicated thread because `SqliteStore` deliberately owns a non-`Sync`
+/// SQLite connection. A slow query therefore parks only that router thread —
+/// accepts keep running while a slow or non-reading client can occupy at most
+/// one bounded worker slot.
 pub fn run(
     session: &ServeSession,
     db: &str,
@@ -154,42 +157,79 @@ fn serve_listener(
         }
         drop(event_tx);
 
-        let mut accepted = 0usize;
+        // The accept loop only touches the listener, the work queue sender and
+        // the completed counter — none of them `!Sync` — so it runs on its own
+        // scoped thread and a slow query routed below can never stall accepts.
+        // After the stop budget is reached it returns and releases the work
+        // queue, letting the workers drain what is already staged and exit.
+        let completed_counter = Arc::new(AtomicUsize::new(0));
+        let accept_thread = {
+            let completed_counter = Arc::clone(&completed_counter);
+            scope.spawn(move || {
+                let mut accepted = 0usize;
+                loop {
+                    if limits.stop_after.is_some_and(|max| accepted >= max) {
+                        return Ok(());
+                    }
+                    loop {
+                        let in_flight =
+                            accepted.saturating_sub(completed_counter.load(Ordering::Relaxed));
+                        if in_flight < WORKER_COUNT + QUEUE_CAPACITY {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    match listener.accept() {
+                        Ok((stream, _peer)) => match work_tx.send(stream) {
+                            Ok(()) => accepted += 1,
+                            Err(_) => return Ok(()),
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+        };
+
+        // Routing runs on the store-owning thread (`SqliteStore` is `!Sync`)
+        // directly in this event loop: one slow query parks it, but the accept
+        // thread above keeps admitting and staging connections. Worker
+        // completion is shared with the accept thread through the atomic
+        // counter above.
         let mut completed = 0usize;
         loop {
-            let accepting = limits.stop_after.is_none_or(|max| accepted < max);
-            let in_flight = accepted.saturating_sub(completed);
-            if accepting && in_flight < WORKER_COUNT + QUEUE_CAPACITY {
-                match listener.accept() {
-                    Ok((stream, _peer)) => match work_tx.try_send(stream) {
-                        Ok(()) => accepted += 1,
-                        Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "HTTP worker pool stopped",
-                            ));
-                        }
-                    },
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error),
-                }
-            }
-
-            match event_rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(event) => handle_worker_event(event, token, db, offline, store, &mut completed),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            while let Ok(event) = event_rx.try_recv() {
-                handle_worker_event(event, token, db, offline, store, &mut completed);
-            }
-
             if limits.stop_after.is_some_and(|max| completed >= max) {
                 break;
             }
+            match event_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(WorkerEvent::Parsed { request, reply }) => match request {
+                    Ok(request) => {
+                        let response = route_response(&request, token, db, offline, store);
+                        let _ = reply.send(response);
+                    }
+                    Err(error) => {
+                        let response = if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) {
+                            fixed_error(408, "request_timeout", "request timed out")
+                        } else {
+                            fixed_error(400, "invalid_request", "malformed HTTP request")
+                        };
+                        let _ = reply.send(response);
+                    }
+                },
+                Ok(WorkerEvent::Completed) => {
+                    completed += 1;
+                    completed_counter.store(completed, Ordering::Relaxed);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
-        drop(work_tx);
+        accept_thread
+            .join()
+            .expect("serve accept thread panicked")?;
         Ok(())
     })
 }
@@ -241,31 +281,26 @@ fn worker_loop(
     }
 }
 
-fn handle_worker_event(
-    event: WorkerEvent,
+/// Route one request on the router thread, surviving a handler panic.
+///
+/// `dispatch` unwinds on internal bugs; with the router on its own thread a
+/// panic would otherwise kill routing for the rest of the server's lifetime
+/// and hang every later request. One fixed 500 per failing request is the
+/// honest failure; the panic payload is never echoed (it may quote transcript
+/// content).
+fn route_response(
+    request: &HttpRequest,
     token: &str,
     db: &str,
     offline: bool,
     store: &SqliteStore,
-    completed: &mut usize,
-) {
-    match event {
-        WorkerEvent::Parsed { request, reply } => {
-            let response = match request {
-                Ok(request) => route_request(&request, token, db, offline, store),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    fixed_error(408, "request_timeout", "request timed out")
-                }
-                Err(_) => fixed_error(400, "invalid_request", "malformed HTTP request"),
-            };
-            let _ = reply.send(response);
-        }
-        WorkerEvent::Completed => *completed += 1,
+) -> HttpResponse {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        route_request(request, token, db, offline, store)
+    }));
+    match result {
+        Ok(response) => response,
+        Err(_) => fixed_error(500, "internal", "request handler failed"),
     }
 }
 
@@ -485,7 +520,9 @@ impl HttpResponse {
             status,
             body: body.to_string(),
             content_type,
-            headers: vec![("X-Content-Type-Options", "nosniff")],
+            // `to_bytes` emits X-Content-Type-Options for every response; a
+            // second value here made text responses send the header twice.
+            headers: Vec::new(),
         }
     }
 
@@ -2016,5 +2053,55 @@ mod tests {
         let session = ServeSession::bind_loopback(0).expect("session");
         assert_eq!(session.token().len(), 32);
         assert_eq!(session.address(), "127.0.0.1:0");
+    }
+
+    /// Slow queries run on the dedicated router thread, so accepts keep
+    /// completing while one route is parked: after the slow request has been
+    /// submitted, a fast GET must still be answered. Before the router thread,
+    /// routing ran on the listener thread and this request would have stalled
+    /// behind the parked route until the client's own timeout.
+    #[test]
+    fn integration_slow_route_does_not_block_accepts() {
+        let (address, token, server) = start_test_server(2, Duration::from_secs(5));
+        let mut parked = TcpStream::connect(address).expect("connect parked client");
+        parked
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("parked read timeout");
+        parked
+            .write_all(get_request(address, &token, "/api/search?q=needle").as_bytes())
+            .expect("submit parked request");
+        parked
+            .shutdown(Shutdown::Write)
+            .expect("finish parked request");
+
+        let fast = raw_http(address, &get_request(address, &token, "/health"));
+        assert!(fast.starts_with("HTTP/1.1 200"), "{fast}");
+
+        // The parked route completes on the router thread once the fast
+        // response is out, so `stop_after` is reached without waiting out the
+        // server's read timeout.
+        let mut parked_response = String::new();
+        parked
+            .read_to_string(&mut parked_response)
+            .expect("read parked response");
+        assert!(
+            parked_response.starts_with("HTTP/1.1 200"),
+            "{parked_response}"
+        );
+        drop(parked);
+        server.join().expect("server join");
+    }
+
+    /// Text responses must emit X-Content-Type-Options exactly once: the
+    /// builder also pushed it, so `to_bytes` sent a duplicate header (Info).
+    #[test]
+    fn text_response_emits_nosniff_exactly_once() {
+        let response = HttpResponse::text(200, "body", "text/html; charset=utf-8");
+        let bytes = String::from_utf8(response.to_bytes()).expect("HTTP bytes");
+        assert_eq!(
+            bytes.matches("X-Content-Type-Options:").count(),
+            1,
+            "{bytes}"
+        );
     }
 }
