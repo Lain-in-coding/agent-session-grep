@@ -359,6 +359,12 @@ four native packages or Beta maturity; no provider is promoted here.
   producing a degenerate pack. The limits match MCP's published handoff floor,
   and CLI, MCP and Web now execute the same handoff implementation rather than
   maintaining three copies of the assembly path.
+- Rebuilding a session's search text and title on commit scanned every member
+  message twice (once for each projection). The first valid user text is now
+  computed once and shared, halving that per-session stage: on a synthetic
+  6,000-message session the stage fell from ~53 ms to ~26 ms. End-to-end
+  append sync stays dominated by the durable commit and alias regeneration, so
+  whole-command timings remain within run-to-run noise.
 - Live OpenCode/Cursor SQLite ingestion reads committed WAL state through
   bounded read-only backups and preserves distinct sessions and resume claims.
   Parser semantic version 2 reparses prior scans. SQL failures abort ingestion;

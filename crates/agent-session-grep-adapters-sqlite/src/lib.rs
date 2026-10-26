@@ -7098,7 +7098,15 @@ impl SqliteStore {
     /// 按格式事实预留的更高优先级来源，provider 未来填充即自动生效。全部
     /// 候选缺失（含会话不存在）→ `None`（不写行）。所有候选统一 trim +
     /// ≤[`SESSION_TITLE_MAX_CHARS`] char 边界截断。
-    fn session_title(conn: &Connection, session_wire: &str) -> PortResult<Option<String>> {
+    ///
+    /// The first valid user text is supplied by the caller. Search-text and
+    /// title projections are rebuilt together and both need the same ordered
+    /// scan of every member message, so the scan runs once per session.
+    fn session_title_with_first_user(
+        conn: &Connection,
+        session_wire: &str,
+        first_user_text: Option<&str>,
+    ) -> PortResult<Option<String>> {
         let payload: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT payload FROM catalog WHERE id = ?1",
@@ -7121,7 +7129,7 @@ impl SqliteStore {
                 }
             }
         }
-        Self::first_user_text_for_session(conn, session_wire, SESSION_TITLE_MAX_CHARS)
+        Ok(first_user_text.map(|text| text.chars().take(SESSION_TITLE_MAX_CHARS).collect()))
     }
 
     /// Conflict-free resolved resume claim for one canonical Session。
@@ -7194,7 +7202,18 @@ impl SqliteStore {
     /// Build one Session's bounded search text from authoritative relational
     /// state. A representative placement is required so a metadata match can be
     /// returned as an existing Message `SearchHit` without fabricating an id.
+    #[cfg(test)]
     fn session_search_text(conn: &Connection, session_wire: &str) -> PortResult<Option<String>> {
+        let first_user_text =
+            Self::first_user_text_for_session(conn, session_wire, SESSION_SEARCH_FIELD_CHARS)?;
+        Self::session_search_text_with_first_user(conn, session_wire, first_user_text)
+    }
+
+    fn session_search_text_with_first_user(
+        conn: &Connection,
+        session_wire: &str,
+        first_user_text: Option<String>,
+    ) -> PortResult<Option<String>> {
         let session_exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM catalog WHERE id = ?1)",
@@ -7205,9 +7224,6 @@ impl SqliteStore {
         if !session_exists {
             return Ok(None);
         }
-
-        let first_user_text =
-            Self::first_user_text_for_session(conn, session_wire, SESSION_SEARCH_FIELD_CHARS)?;
 
         // Claims for one canonical Session must agree exactly. Conflict is
         // privacy-sensitive, so fail closed and index none of their values.
@@ -7262,7 +7278,14 @@ impl SqliteStore {
             [session_wire],
         )
         .map_err(backend)?;
-        if let Some(text) = Self::session_search_text(tx, session_wire)? {
+        // One ordered member scan serves both projections below; the search
+        // field cap (4096) is wider than the title cap (80), so the title is a
+        // prefix of the same text.
+        let first_user_text =
+            Self::first_user_text_for_session(tx, session_wire, SESSION_SEARCH_FIELD_CHARS)?;
+        if let Some(text) =
+            Self::session_search_text_with_first_user(tx, session_wire, first_user_text.clone())?
+        {
             tx.execute(
                 "INSERT INTO session_fts(session_wire, text) VALUES(?1, ?2)",
                 rusqlite::params![session_wire, fts_tokens_cjk(&text)],
@@ -7282,7 +7305,9 @@ impl SqliteStore {
             [session_wire],
         )
         .map_err(backend)?;
-        if let Some(title) = Self::session_title(tx, session_wire)? {
+        if let Some(title) =
+            Self::session_title_with_first_user(tx, session_wire, first_user_text.as_deref())?
+        {
             tx.execute(
                 "INSERT INTO session_titles(session_wire, title) VALUES(?1, ?2)",
                 rusqlite::params![session_wire, title],
@@ -12395,6 +12420,34 @@ mod tests {
 
     thread_local! {
         static TRACED_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static TRACED_SQL: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Record every user-level SQL text executed by `run` on this store.
+    pub(crate) fn traced_sql<R>(store: &SqliteStore, run: impl FnOnce() -> R) -> (R, Vec<String>) {
+        TRACED_SQL.with(|cell| cell.borrow_mut().clear());
+        {
+            let conn = store.conn.borrow();
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_user_statement),
+            );
+        }
+        let result = run();
+        {
+            let conn = store.conn.borrow();
+            conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        }
+        let sql = TRACED_SQL.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        (result, sql)
+    }
+
+    fn record_user_statement(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_stmt, sql) = event
+            && !sql.starts_with("--")
+        {
+            TRACED_SQL.with(|cell| cell.borrow_mut().push(sql.to_string()));
+        }
     }
 
     /// 在该 store 的连接上挂 `SQLITE_TRACE_STMT` 钩子执行 `run`,返回期间执行的
@@ -18690,6 +18743,78 @@ mod tests {
         }
         store.rebuild_index().unwrap();
         assert_eq!(title_of(&store).as_deref(), Some("zeroth request"));
+    }
+
+    /// Search text and title both need the session's first valid user message.
+    /// That ordered scan joins every member payload, so recomputing it for the
+    /// title doubled the per-session cost of every affected commit.
+    #[test]
+    fn session_projection_rebuild_scans_member_messages_once() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = sid(IdKind::Session, b"one-scan");
+        let document = sid(IdKind::Document, b"one-scan");
+        let message = sid(IdKind::Message, b"one-scan-message");
+        let first_text = "a long first request that becomes both search text and title";
+        let payload = serde_json::json!({
+            "role": "user",
+            "text": first_text,
+            "timestamp": "2026-07-28T00:00:00Z",
+        })
+        .to_string()
+        .into_bytes();
+        let batch = SourceBatch {
+            source_path: "one-scan-source.jsonl".into(),
+            entries: vec![
+                (
+                    session.clone(),
+                    serde_json::json!({ "messages": [message.as_str()] })
+                        .to_string()
+                        .into_bytes(),
+                    String::new(),
+                ),
+                typed_document_entry(&document),
+                (message.clone(), payload, String::new()),
+            ],
+            placements: vec![placement(
+                &session,
+                &document,
+                &message,
+                0,
+                false,
+                Some((0, 3)),
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: None,
+            fingerprint: None,
+            provider_id: None,
+            resume_claims: Vec::new(),
+        };
+        let (result, sql) = traced_sql(&store, || {
+            store.commit_source_batches_if_changed(std::slice::from_ref(&batch))
+        });
+        result.unwrap();
+        let member_scans = sql
+            .iter()
+            .filter(|statement| {
+                statement.contains("FROM message_placements")
+                    && statement
+                        .contains("JOIN catalog ON catalog.id = message_placements.message_id")
+                    && statement.contains("ORDER BY asg_instant_sort_key")
+            })
+            .count();
+        assert_eq!(member_scans, 1, "{sql:#?}");
+        let title = store
+            .session_titles(std::slice::from_ref(&session))
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        let expected: String = first_text.chars().take(SESSION_TITLE_MAX_CHARS).collect();
+        assert_eq!(title, expected);
     }
 
     #[test]
