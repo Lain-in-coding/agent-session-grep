@@ -7149,7 +7149,7 @@ impl SqliteStore {
                  WHERE NOT EXISTS (
                      SELECT 1 FROM catalog
                      WHERE catalog.id = session_repo_slugs.session_wire
-                       AND catalog.id LIKE 'ses_v1_%'
+                       AND catalog.id GLOB 'ses_v1_*'
                  )",
                 [],
             )
@@ -7157,7 +7157,12 @@ impl SqliteStore {
         }
         let sessions = {
             let mut stmt = tx
-                .prepare("SELECT id FROM catalog WHERE id LIKE 'ses_v1_%' ORDER BY id")
+                // GLOB rather than LIKE: with the default case-insensitive
+                // LIKE, SQLite cannot use the BINARY index for a prefix
+                // pattern, so every rebuild scanned the whole catalog. GLOB
+                // is case-sensitive and takes the literal-prefix index path;
+                // ids contain no GLOB metacharacters.
+                .prepare("SELECT id FROM catalog WHERE id GLOB 'ses_v1_*' ORDER BY id")
                 .map_err(backend)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -11505,6 +11510,31 @@ mod tests {
         eprintln!(
             "metadata SQL: message exclusions=1100 sql_bytes={} plan={plan:?}",
             sql.len()
+        );
+    }
+
+    #[test]
+    fn session_prefix_glob_uses_the_catalog_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.borrow();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM catalog WHERE id GLOB 'ses_v1_*' ORDER BY id",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("USING COVERING INDEX") || line.contains("USING INDEX")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN catalog")),
+            "{plan:?}"
         );
     }
 
