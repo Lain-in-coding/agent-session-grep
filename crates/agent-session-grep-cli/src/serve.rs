@@ -742,12 +742,11 @@ pub fn route_request(
     // The UI page itself is static HTML with no secrets and no data; it may be
     // fetched without a token so the fragment-based flow can boot at all — a
     // fragment is never sent to the server, so the page-load request carries
-    // no credential by design (the query-string form keeps its historical
-    // bootstrap path too). Every data route below still requires the bearer.
+    // no credential by design. The query string is never a credential: it
+    // reaches access logs and `Referer` headers, which is exactly why the
+    // printed URL uses a fragment. Every data route below requires the bearer.
     let is_ui_page = req.method == "GET" && path_only(req.path.as_str()) == "/";
-    let bootstrap_token =
-        path_only(req.path.as_str()) == "/" && req.query_param("token").as_deref() == Some(token);
-    if !is_ui_page && !req.check_token(token) && !bootstrap_token {
+    if !is_ui_page && !req.check_token(token) {
         return fixed_error(401, "unauthorized", "valid bearer token required");
     }
 
@@ -1313,12 +1312,16 @@ mod tests {
             403
         );
 
-        let bootstrap = request(
+        // A query string is never a credential: the page is served for
+        // `/?token=…` because it is the static UI route, but the token there
+        // is inert (the UI reads only the fragment), and
+        // `/api/status?token=…` stays unauthorized like any other data route.
+        let query_token_page = request(
             "GET",
             &format!("/?token={TEST_TOKEN}"),
             vec![("Host".into(), "127.0.0.1:8080".into())],
         );
-        let response = route_request(&bootstrap, TEST_TOKEN, "test.db", false, &store);
+        let response = route_request(&query_token_page, TEST_TOKEN, "test.db", false, &store);
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data-shell=\"asg-web\""));
 

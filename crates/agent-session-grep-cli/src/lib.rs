@@ -832,7 +832,7 @@ fn run(
             .as_deref()
             .map(|v| {
                 v.parse::<u16>()
-                    .map_err(|_| CliError::usage("--port 需要 0-65535 的整数"))
+                    .map_err(|_| CliError::usage("--port requires an integer from 0 to 65535"))
             })
             .transpose()?
             .unwrap_or(0);
@@ -906,7 +906,7 @@ fn hook_data(db: &str, rest: &[String], offline: bool) -> Result<serde_json::Val
         .as_deref()
         .map(|v| {
             v.parse::<u64>()
-                .map_err(|_| CliError::usage("--max-tokens 需要非负整数"))
+                .map_err(|_| CliError::usage("--max-tokens requires a non-negative integer"))
         })
         .transpose()?
         .unwrap_or(2000);
@@ -918,7 +918,7 @@ fn hook_data(db: &str, rest: &[String], offline: bool) -> Result<serde_json::Val
             .as_deref()
             .map(|v| {
                 v.parse::<u32>()
-                    .map_err(|_| CliError::usage("--decay-days 需要非负整数"))
+                    .map_err(|_| CliError::usage("--decay-days requires a non-negative integer"))
             })
             .transpose()?
             .unwrap_or(0),

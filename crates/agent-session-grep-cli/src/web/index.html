@@ -509,7 +509,7 @@ function applyTheme(mode) {
   applyTheme(saved || (prefersDark ? 'dark' : 'light'));
 }
 
-/* ─── Token: fragment → query fallback → remembered ────────────────────── */
+/* ─── Token: URL fragment → remembered ─────────────────────────────────── */
 const TOKEN_KEY = 'asg-web-token';
 /* Read the token out of the address bar and strip it from the visible URL.
    This must stay callable after load: a URL that differs only in its fragment
@@ -520,7 +520,7 @@ const TOKEN_KEY = 'asg-web-token';
 function readUrlToken() {
   const url = new URL(window.location.href);
   const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''));
-  const found = hashParams.get('token') || url.searchParams.get('token') || '';
+  const found = hashParams.get('token') || '';
   if (found) window.history.replaceState(null, '', url.pathname);
   return found;
 }
