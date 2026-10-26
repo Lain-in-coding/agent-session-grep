@@ -7,8 +7,9 @@ use agent_session_grep_adapters_sqlite::{
 use agent_session_grep_ports::{
     PortError,
     control::{
-        BackgroundControl, CanonicalLocator, ControlStore, DesiredUpdates, LatestBarrier,
-        MaintenanceFence, MaintenancePhase, MaintenanceState, PurgeState, RequestIntersection,
+        BackgroundControl, CanonicalLocator, ControlId, ControlStore, DesiredUpdates,
+        LatestBarrier, MaintenanceFence, MaintenancePhase, MaintenanceState, PurgeState,
+        RequestIntersection, UpdateState,
     },
     managed::{ProjectionQuery, ProjectionRead},
 };
@@ -573,6 +574,64 @@ fn real_child_imports_both_providers_and_preserves_original_bytes() {
         assert_eq!(sources.len(), 1);
         assert!(sources[0].latest_receipt.as_ref().unwrap().published);
     }
+}
+
+/// A held background lock alone is not liveness: update and uninstall drain
+/// intentionally keep the lock after the worker exits. Offline worker state
+/// must report running=false even while the lock is still held.
+#[test]
+fn held_lock_with_offline_worker_record_reports_not_running() {
+    let mut f = Fixture::new("claude");
+    let path = f.history.join("offline.jsonl");
+    fs::write(&path, claude("offline-case", "offlineholdneedle")).unwrap();
+    f.spawn();
+    f.wait(|f| {
+        f.control()
+            .background_status()
+            .unwrap()
+            .worker
+            .heartbeat_at_ms
+            .is_some()
+    });
+    f.desired(DesiredUpdates::Stopped);
+    f.wait(|f| f.control().background_status().unwrap().worker.state == UpdateState::Offline);
+    assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_some());
+    f.child = None;
+    let root = f.db.parent().unwrap();
+    let drain = ExclusiveGuard::try_acquire(root, LockKind::Background).unwrap();
+    let control = f.control();
+    assert_eq!(
+        control.background_status().unwrap().worker.state,
+        UpdateState::Offline
+    );
+    let status = successful(run(&f.db, &["background", "status"]));
+    assert_eq!(status["running"], false);
+    assert_eq!(status["effective_state"], "offline");
+    drop(drain);
+}
+
+/// A lock held by a live registered worker with a fresh heartbeat is running.
+#[test]
+fn held_lock_with_live_worker_and_fresh_heartbeat_reports_running() {
+    let mut f = Fixture::new("claude");
+    let path = f.history.join("live.jsonl");
+    fs::write(&path, claude("live-case", "liveheartbeatneedle")).unwrap();
+    f.spawn();
+    f.wait(|f| {
+        f.control()
+            .background_status()
+            .unwrap()
+            .worker
+            .heartbeat_at_ms
+            .is_some()
+    });
+    let status = successful(run(&f.db, &["background", "status"]));
+    assert_eq!(status["running"], true);
+    assert_eq!(status["desired_updates"], "running");
+    assert!(matches!(
+        status["effective_state"].as_str(),
+        Some("running") | Some("idle") | Some("busy") | Some("deferred")
+    ));
 }
 
 #[test]
@@ -1501,7 +1560,7 @@ fn completed_codex_rollout_with_known_environment_metadata_publishes_and_keeps_e
 use agent_session_grep_adapters_sqlite::managed::ManagedRead;
 use agent_session_grep_ports::{
     PortResult,
-    control::{ControlId, CycleState, ObservationCycle},
+    control::{CycleState, ObservationCycle},
     managed::{EntityData, EntityKind, LexicalHit, ResumeValue},
     source_context::{DependencyResolution, UnresolvedDependency},
 };

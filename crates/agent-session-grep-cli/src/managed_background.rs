@@ -41,6 +41,10 @@ const CHILD: &str = "__managed-background";
 const CADENCE: Duration = Duration::from_secs(1);
 const CONFIRMATION_MS: i64 = 5_000;
 const CONTROL_BUDGET: Duration = Duration::from_millis(250);
+// The worker heartbeats once per cadence (one second). A held lock corroborates
+// a live worker only within a bounded multiple of that cadence, so a lock left
+// by an exited worker during update/uninstall drain cannot read as running.
+const LIVE_WORKER_WINDOW_MS: i64 = 30_000;
 const SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(30);
 const MAX_DISCOVERY_PATHS: usize = 65_536;
 
@@ -381,14 +385,18 @@ fn quote_windows(argument: &std::ffi::OsStr, line: &mut Vec<u16>) -> PortResult<
     Ok(())
 }
 
-/// Content-free liveness. The control heartbeat alone never establishes liveness
-/// or freshness. No catalog is opened, and no worker is started by status.
+/// Content-free liveness. The control heartbeat alone never establishes
+/// liveness or freshness. No catalog is opened, and no worker is started by
+/// status. A held background lock is necessary but not sufficient: update and
+/// uninstall drain intentionally keep the lock after the worker exits, so a
+/// dead worker record must never report running. The lock only counts when
+/// the registered worker state is not Offline and its heartbeat is fresh.
 pub(crate) fn status(db: &Path) -> Result<StatusReport, CliError> {
     let private = root(db).map_err(cli)?;
     let control = SqliteControlStore::open_current_read_only(private).map_err(cli)?;
     let current = control.status().map_err(cli)?;
     let worker = control.background_status().map_err(cli)?.worker;
-    let running = if !private
+    let lock_busy = if !private
         .join("background.lock")
         .try_exists()
         .map_err(|_| cli(unavailable()))?
@@ -404,6 +412,11 @@ pub(crate) fn status(db: &Path) -> Result<StatusReport, CliError> {
             Err(error) => return Err(cli(error)),
         }
     };
+    let running = lock_busy
+        && worker.state != UpdateState::Offline
+        && worker
+            .heartbeat_at_ms
+            .is_some_and(|at| app_clock_ms() - at <= LIVE_WORKER_WINDOW_MS);
     Ok(StatusReport {
         running,
         desired_updates: match current.desired_updates {
