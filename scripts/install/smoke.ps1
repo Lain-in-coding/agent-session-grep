@@ -6,6 +6,8 @@
 #
 # The fixture is synthetic and inlined below. No real transcript is ever read.
 
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$Binary,

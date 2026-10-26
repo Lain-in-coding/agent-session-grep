@@ -3,6 +3,8 @@
 # uninstall twice -> reinstall -> smoke -> final uninstall, all against a
 # throwaway prefix.
 
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$Prefix,

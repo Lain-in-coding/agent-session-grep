@@ -681,7 +681,9 @@ Imported older CI records retain their original scope in
    exit non-zero.
 3. `cargo build --locked --release -p agent-session-grep-cli`.
 4. Compute the SHA-256 of the built binary, create the destination directory
-   if needed, and atomically replace the canonical command.
+   if needed, and replace the canonical command through a same-directory
+   staged copy created with exclusive-create semantics, so a pre-planted
+   entry at the random staging name fails closed.
 5. Install `asg.exe` as a second executable copy on Windows. On Unix, install
    `asg` as a relative symlink to `agent-session-grep`, with a marked wrapper
    fallback when symlinks are unavailable. An unrelated existing alias is never
@@ -694,6 +696,16 @@ Imported older CI records retain their original scope in
 Any failing step exits non-zero with a diagnostic. The script does not modify
 `PATH`, write to the registry, edit shell profiles, request elevation, or
 download anything beyond what `cargo build` itself fetches.
+
+On Windows the two command files are replaced as one recoverable pair. Before
+either file changes, the installer probes both destinations for an exclusive
+write handle (a running command holds its image open, so it fails early with a
+message naming the file instead of failing halfway) and records a backup of
+each existing file in `.asg-install-journal.json` next to the commands. If a
+replacement fails, both destinations are restored and the journal removed. If
+the process dies between the two replacements, the next run restores the
+recorded pair before installing, so a half-upgraded canonical/alias pair never
+persists.
 
 ## Default install location
 
@@ -803,6 +815,12 @@ over an existing install replaced both managed files in place and the version
 output followed the new artifact. There is still no second released version to
 upgrade across, so this proves the replacement mechanics, not compatibility
 between two real releases.
+
+A re-run over a pair left half-replaced by an interrupted earlier run recovers
+first: the journal written before the swap names a backup of both files, the
+installer restores them, removes the journal, and then performs the normal
+install. The local gate (`scripts/install/gate_smoke.ps1`) exercises install,
+in-place upgrade, repeated uninstall, and reinstall against a throwaway prefix.
 
 An upgraded binary may need to migrate an existing catalog. The current store
 schema is v22: v18 added installation/relocation records, v19 added journal

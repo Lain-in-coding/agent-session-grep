@@ -3,6 +3,8 @@
 # agent-session-grep[.exe] and its managed asg[.exe] copy; it never recurses
 # into a shared bin directory or touches a data root. Missing files are success.
 
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$Prefix

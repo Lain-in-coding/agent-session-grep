@@ -5,6 +5,11 @@
 # The artifact is unsigned and unnotarized; this script deliberately does NOT
 # touch PATH, the registry, or shell profiles.
 
+# Requires PowerShell 7+: the script uses $IsWindows and $PSNativeCommandUse...
+# Adding the requirement turns a PowerShell 5.1 strict-mode crash into a clear
+# version error.
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [string]$Prefix,
@@ -94,6 +99,63 @@ if (-not (Test-Path -LiteralPath $artifact)) {
 $sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
 $target = Join-Path $Prefix $binaryName
 $aliasTarget = Join-Path $Prefix $aliasName
+$journalPath = Join-Path $Prefix '.asg-install-journal.json'
+
+# Finish or undo an interrupted earlier install first. A crash between the two
+# file replacements leaves a half-upgraded pair that the alias guard below
+# would otherwise refuse forever. The journal records a backup of both
+# destinations before anything is replaced, so recovery always restores the
+# previous consistent pair and then lets a normal install run.
+if ($DryRun -and (Test-Path -LiteralPath $journalPath)) {
+    Write-Host "install: dry run: an interrupted install is recorded in $journalPath and would be restored first"
+} elseif (-not $DryRun -and (Test-Path -LiteralPath $journalPath)) {
+    $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+    if ($journal.schema -ne 'asg-source-install-journal/v1') {
+        Fail "$journalPath is not an install journal created by this script; move it aside and re-run"
+    }
+    Write-Host "install: recovering an interrupted install recorded in $journalPath"
+    try {
+        foreach ($entry in $journal.entries) {
+            if ($entry.existed) {
+                if (-not $entry.backup -or -not (Test-Path -LiteralPath $entry.backup)) {
+                    Fail "recovery backup for $($entry.destination) is missing; restore that file manually or re-run against an empty -Prefix"
+                }
+                Copy-Item -LiteralPath $entry.backup -Destination $entry.destination -Force
+            } elseif (Test-Path -LiteralPath $entry.destination) {
+                Remove-Item -LiteralPath $entry.destination -Force
+            }
+        }
+    } catch {
+        Fail "cannot restore the interrupted install; close any program using these commands and re-run: $($_.Exception.Message)"
+    }
+    foreach ($entry in $journal.entries) {
+        if ($entry.backup -and (Test-Path -LiteralPath $entry.backup)) {
+            Remove-Item -LiteralPath $entry.backup -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath $journalPath -Force
+    Write-Host 'install: previous install restored; continuing with this install'
+}
+
+# Refuse to touch a locked pair before anything changes: the alias guard below
+# hashes both files and a running command holds its image open, so probing for
+# an exclusive write handle first reports the lock as an install error instead
+# of a raw I/O failure mid-script.
+if (-not $DryRun) {
+    foreach ($destination in @($target, $aliasTarget)) {
+        if (-not (Test-Path -LiteralPath $destination)) { continue }
+        try {
+            $probe = [System.IO.File]::Open(
+                $destination,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            $probe.Dispose()
+        } catch {
+            Fail "$destination is in use; stop the programs running it (including any MCP host) and re-run: $($_.Exception.Message)"
+        }
+    }
+}
 
 # A custom prefix can be a shared bin directory. Refuse to replace an unrelated
 # asg.exe; an alias previously installed by this script is byte-identical to the
@@ -123,18 +185,85 @@ if (-not (Test-Path -LiteralPath $Prefix)) {
     New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
 }
 
-# Atomically replace each executable through a same-directory temporary file.
-# Windows receives a physical alias copy; no symlink privilege is required.
-foreach ($destination in @($target, $aliasTarget)) {
-    $tempTarget = Join-Path $Prefix ".$([System.IO.Path]::GetFileName($destination)).tmp-$(Get-Random)"
-    try {
-        Copy-Item -LiteralPath $artifact -Destination $tempTarget -Force
-        Move-Item -LiteralPath $tempTarget -Destination $destination -Force
-    } finally {
-        if (Test-Path -LiteralPath $tempTarget) {
-            Remove-Item -LiteralPath $tempTarget -Force -ErrorAction SilentlyContinue
+# Replace both executables as one recoverable pair. Windows receives a physical
+# alias copy; no symlink privilege is required.
+#
+# The staged file is created with FileMode::CreateNew so a pre-planted entry
+# (including a symlink) at the random temp name fails closed instead of being
+# written through. Both destinations are locked-probed and backed up before
+# either is replaced; a failure or a crash mid-swap restores the previous
+# pair rather than leaving one command upgraded and the other stale.
+$destinations = @($target, $aliasTarget)
+$staged = @()
+$entries = @()
+$failure = $null
+try {
+    foreach ($destination in $destinations) {
+        $temp = Join-Path $Prefix ([System.IO.Path]::GetRandomFileName())
+        $source = [System.IO.File]::OpenRead($artifact)
+        try {
+            $stream = [System.IO.File]::Open(
+                $temp,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            try { $source.CopyTo($stream) } finally { $stream.Dispose() }
+        } finally {
+            $source.Dispose()
+        }
+        $stagedHash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedHash -ne $sha256) {
+            throw "staged copy of $destination does not match the artifact sha256"
+        }
+        $staged += [pscustomobject]@{ Destination = $destination; Temp = $temp }
+    }
+
+    foreach ($destination in $destinations) {
+        if (Test-Path -LiteralPath $destination) {
+            $backup = Join-Path $Prefix ([System.IO.Path]::GetRandomFileName())
+            Copy-Item -LiteralPath $destination -Destination $backup -Force
+            $entries += [pscustomobject]@{ destination = $destination; existed = $true; backup = $backup }
+        } else {
+            $entries += [pscustomobject]@{ destination = $destination; existed = $false; backup = $null }
         }
     }
+    $journal = [pscustomobject]@{
+        schema          = 'asg-source-install-journal/v1'
+        artifact_sha256 = $sha256
+        entries         = $entries
+    }
+    Set-Content -LiteralPath $journalPath -Value ($journal | ConvertTo-Json -Depth 4) -Encoding utf8
+
+    foreach ($item in $staged) {
+        Move-Item -LiteralPath $item.Temp -Destination $item.Destination -Force
+    }
+    Remove-Item -LiteralPath $journalPath -Force
+} catch {
+    $failure = $_
+    if (Test-Path -LiteralPath $journalPath) {
+        foreach ($entry in $entries) {
+            if ($entry.existed) {
+                Copy-Item -LiteralPath $entry.backup -Destination $entry.destination -Force
+            } elseif (Test-Path -LiteralPath $entry.destination) {
+                Remove-Item -LiteralPath $entry.destination -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+    }
+} finally {
+    foreach ($item in $staged) {
+        if (Test-Path -LiteralPath $item.Temp) {
+            Remove-Item -LiteralPath $item.Temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($entry in $entries) {
+        if ($entry.backup -and (Test-Path -LiteralPath $entry.backup)) {
+            Remove-Item -LiteralPath $entry.backup -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+if ($failure) {
+    Fail "install failed; the previous install was left in place: $($failure.Exception.Message)"
 }
 
 $versionLine = & $target --version
