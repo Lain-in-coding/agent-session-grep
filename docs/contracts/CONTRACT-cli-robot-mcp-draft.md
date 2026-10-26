@@ -170,7 +170,11 @@ only after no old-policy write can follow that acknowledgement; stalled holders
 produce `scope_revoking`, not a forged success. OS lock ownership cannot be
 stolen by a timestamp. Physical purge runs separately and reports pending or
 blocked cleanup honestly. Already delivered host/user copies are outside ASG
-ownership.
+ownership. Physical cleanup is whole-file work — FTS `optimize`, integrity
+checks and `VACUUM` cannot be split — so its slice is sized from the catalog
+instead of the 5 s admission slice and doubles after a miss; while it runs it
+holds the catalog, writer and emission locks, and ordinary reads receive a
+bounded busy response until the slice ends.
 
 Managed continuations retain a bounded result set: 512 canonical candidates,
 4 MiB per set, 64 sets/64 MiB total, and a 15-minute TTL. Generation is recorded

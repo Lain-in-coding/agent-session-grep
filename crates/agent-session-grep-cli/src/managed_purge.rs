@@ -27,6 +27,38 @@ const CHILD: &str = "__managed-purge";
 const SLICE_BUDGET: Duration = Duration::from_secs(5);
 const CONTROL_BUDGET: Duration = Duration::from_millis(250);
 
+/// Physical cleanup after a catalog purge commits is whole-file work: FTS
+/// `optimize`, four `integrity-check` passes and `VACUUM` cannot be split, and
+/// they scale with the catalog. On a 1.9 GiB catalog they need ~45 s on a fast
+/// NVMe host, so a fixed 5 s slice was interrupted at the deadline, rolled
+/// back, and retried forever while holding the catalog, writer and emission
+/// locks. Once the catalog stage reports pending, the next slice is sized from
+/// the catalog bytes with a conservative throughput floor and doubles on each
+/// further miss up to a hard cap.
+const CATALOG_SLICE_FLOOR_MIB_PER_SECOND: u64 = 10;
+const CATALOG_SLICE_OVERHEAD: Duration = Duration::from_secs(10);
+const CATALOG_SLICE_MAX: Duration = Duration::from_secs(30 * 60);
+
+fn next_catalog_slice(previous: Duration, bytes: u64) -> Duration {
+    let mib = bytes.saturating_add((1 << 20) - 1) >> 20;
+    let estimated = CATALOG_SLICE_OVERHEAD.saturating_add(Duration::from_secs(
+        mib / CATALOG_SLICE_FLOOR_MIB_PER_SECOND.max(1),
+    ));
+    previous
+        .saturating_mul(2)
+        .max(estimated)
+        .max(SLICE_BUDGET)
+        .min(CATALOG_SLICE_MAX)
+}
+
+fn catalog_bytes(catalog: &Path) -> u64 {
+    let mut total = fs::metadata(catalog).map_or(0, |m| m.len());
+    let mut wal = catalog.as_os_str().to_os_string();
+    wal.push("-wal");
+    total = total.saturating_add(fs::metadata(PathBuf::from(wal)).map_or(0, |m| m.len()));
+    total
+}
+
 fn check_control_deadline(deadline: Instant) -> PortResult<()> {
     if Instant::now() >= deadline {
         Err(PortError::WriterBusy(
@@ -225,17 +257,22 @@ fn run_child(catalog: &Path) -> PortResult<()> {
     let owner = control_before(&control, startup_end, || {
         control.bind_purge_owner(&guard, nonce.clone())
     })?;
+    let mut slice = SLICE_BUDGET;
     loop {
-        let end = SqliteControlStore::effective_runtime_deadline(Instant::now() + SLICE_BUDGET);
+        let end = SqliteControlStore::effective_runtime_deadline(Instant::now() + slice);
         check_control_deadline(end)?;
         let report = run_slice(&control, catalog, &owner, end);
         let pause = match report {
             Ok(None) => return Ok(()),
             Ok(Some(report)) if report.complete() => return Ok(()),
             Ok(Some(report)) if matches!(report.catalog, PurgeStage::Pending(_)) => {
+                slice = next_catalog_slice(slice, catalog_bytes(catalog));
                 Duration::from_secs(2)
             }
-            Ok(_) => Duration::from_secs(10),
+            Ok(_) => {
+                slice = SLICE_BUDGET;
+                Duration::from_secs(10)
+            }
             Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {
                 Duration::from_secs(2)
             }
@@ -1027,6 +1064,23 @@ mod tests {
         assert_eq!(job.job.state, PurgeState::Pending);
         assert_eq!(job.job.attempts.get(), 0);
         fixture.assert_original();
+    }
+
+    #[test]
+    fn catalog_slice_grows_for_whole_file_cleanup_and_is_capped() {
+        // A tiny catalog still gets at least a doubled slice after a miss.
+        assert_eq!(next_catalog_slice(SLICE_BUDGET, 0), Duration::from_secs(10));
+        // 1.9 GiB of catalog needs ~190 s at the conservative 10 MiB/s floor,
+        // which must dominate the 5 s base slice.
+        assert_eq!(
+            next_catalog_slice(SLICE_BUDGET, 1907 * (1 << 20)),
+            Duration::from_secs(200)
+        );
+        // Repeated misses never exceed the cap.
+        assert_eq!(
+            next_catalog_slice(CATALOG_SLICE_MAX, u64::MAX),
+            CATALOG_SLICE_MAX
+        );
     }
 
     #[test]
