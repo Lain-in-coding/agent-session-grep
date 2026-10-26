@@ -6094,11 +6094,34 @@ impl SqliteStore {
 
         let mut claimers_by_entity = BTreeMap::<String, BTreeSet<String>>::new();
         let mut session_document_claims = BTreeMap::<String, BTreeSet<String>>::new();
+        // Ownership claims used to scan both membership tables in full and
+        // filter in Rust, which cost O(catalog) per commit (the placement
+        // join alone measured ~900 ms on 100k rows). Put the candidates in a
+        // temp table and let SQLite drive one covering scan plus indexed
+        // lookups instead.
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS alias_candidates(
+                 entity_id TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             DELETE FROM alias_candidates;",
+        )
+        .map_err(backend)?;
+        let candidates: Vec<&str> = candidate_entities.iter().map(String::as_str).collect();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO alias_candidates(entity_id) VALUES(?1)")
+                .map_err(backend)?;
+            for candidate in &candidates {
+                insert.execute([candidate]).map_err(backend)?;
+            }
+        }
         {
             let mut stmt = tx
                 .prepare(
-                    "SELECT source_path, message_id, document_id
-                     FROM source_membership",
+                    "SELECT membership.source_path, membership.message_id, membership.document_id
+                     FROM source_membership AS membership
+                     JOIN alias_candidates AS candidates
+                       ON candidates.entity_id = membership.message_id",
                 )
                 .map_err(backend)?;
             let rows = stmt
@@ -6132,11 +6155,37 @@ impl SqliteStore {
         {
             let mut stmt = tx
                 .prepare(
+                    // Each arm is an indexed lookup on message_placements
+                    // (message_id / session_id / document_id) joined to the
+                    // placement claim by its primary key. UNION ALL keeps the
+                    // plan linear; duplicate claims are absorbed by the sets
+                    // below.
+                    // CROSS JOIN pins the order so the small candidate set
+                    // drives indexed placement lookups; without it SQLite
+                    // scanned the claims table once per arm.
                     "SELECT claims.source_path, placements.session_id,
                             placements.document_id, placements.message_id
-                     FROM source_placement_membership AS claims
-                     JOIN message_placements AS placements
-                       ON placements.placement_id = claims.placement_id",
+                     FROM alias_candidates AS candidates
+                     CROSS JOIN message_placements AS placements
+                     JOIN source_placement_membership AS claims
+                       ON claims.placement_id = placements.placement_id
+                     WHERE candidates.entity_id = placements.message_id
+                     UNION ALL
+                     SELECT claims.source_path, placements.session_id,
+                            placements.document_id, placements.message_id
+                     FROM alias_candidates AS candidates
+                     CROSS JOIN message_placements AS placements
+                     JOIN source_placement_membership AS claims
+                       ON claims.placement_id = placements.placement_id
+                     WHERE candidates.entity_id = placements.session_id
+                     UNION ALL
+                     SELECT claims.source_path, placements.session_id,
+                            placements.document_id, placements.message_id
+                     FROM alias_candidates AS candidates
+                     CROSS JOIN message_placements AS placements
+                     JOIN source_placement_membership AS claims
+                       ON claims.placement_id = placements.placement_id
+                     WHERE candidates.entity_id = placements.document_id",
                 )
                 .map_err(backend)?;
             let rows = stmt
@@ -7828,6 +7877,8 @@ impl SqliteStore {
             .map(|(id, payload, _)| (id.as_str(), payload.as_slice()))
             .collect();
         Self::regenerate_compatibility_aliases_in_tx(&tx, &batch_sources, &in_memory_payloads)?;
+        trace::add(&mut trace_stages, "alias_regeneration", trace_sessions);
+        let trace_sessions = trace::begin();
         let resolver: &dyn RepoSlugResolver = &**self.repo_slug_resolver.borrow();
         for session_wire in affected_sessions {
             Self::rebuild_session_search_row_in_tx(
