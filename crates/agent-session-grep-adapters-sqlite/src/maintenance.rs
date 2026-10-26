@@ -351,6 +351,10 @@ impl MaintenanceCatalog for SqliteMaintenanceCatalog {
             conn.busy_timeout(Duration::ZERO).map_err(sql_failure)?;
             let tx = conn.unchecked_transaction().map_err(sql_failure)?;
             schema(&tx)?;
+            // A managed catalog is never a legacy maintenance target: its
+            // lease, control and handle guards live outside this path, and a
+            // missing control.db must not turn VACUUM into an unguarded write.
+            SqliteStore::validate_legacy_admission(&tx, None).map_err(port_failure)?;
             let selection = selection_from(
                 SqliteStore::preview_journal_compaction_with_id(&tx, PREVIEW_COMPACTION_ID.into())
                     .map_err(port_failure)?,
@@ -394,6 +398,7 @@ impl MaintenanceCatalog for SqliteMaintenanceCatalog {
             .map_err(sql_failure)?;
         conn.busy_timeout(Duration::ZERO).map_err(sql_failure)?;
         schema(&conn)?;
+        SqliteStore::validate_legacy_admission(&conn, None).map_err(port_failure)?;
         // No recovery, migration, journal-mode change or reprojection here.
         target_matches(&job.target)?;
         Ok(Box::new(SqliteMaintenanceSession {

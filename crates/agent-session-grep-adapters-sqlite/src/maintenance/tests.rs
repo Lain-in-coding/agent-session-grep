@@ -176,6 +176,25 @@ fn soak_physically_reclaims_and_preserves_schema_generation_fts_identity() {
 }
 
 #[test]
+fn managed_catalog_is_refused_as_a_legacy_maintenance_target() {
+    let fixture = Fixture::new(1);
+    let job = fixture.job();
+    fixture
+        .connection()
+        .pragma_update(None, "application_id", crate::managed_store::APPLICATION_ID)
+        .unwrap();
+    // Preview must not plan compaction for a managed catalog, and acquire must
+    // not open it read-write even with a token minted before the switch.
+    assert!(
+        fixture
+            .adapter
+            .preview(fixture.path.to_str().unwrap())
+            .is_err()
+    );
+    assert!(fixture.adapter.acquire(&job).is_err());
+}
+
+#[test]
 fn preview_is_read_only_stable_and_missing_or_old_catalog_is_not_created_or_migrated() {
     let fixture = Fixture::new(1);
     let first = fixture.job();
