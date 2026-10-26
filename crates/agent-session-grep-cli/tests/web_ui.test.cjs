@@ -218,6 +218,29 @@ test('a byte budget below the server floor is rejected before any request', asyn
   assert.match(p.nodes.get('results').textContent, /floor/);
 });
 
+test('handoff forwards the visible repo, provider and time scope', async () => {
+  const p = await page();
+  p.nodes.get('query').value = 'needle';
+  p.nodes.get('provider').value = 'opencode';
+  p.nodes.get('repo').value = 'owner/repo';
+  p.nodes.get('since').value = '2026-01-01T00:00:00Z';
+  p.nodes.get('until').value = '2027-01-01T00:00:00Z';
+  p.nodes.get('mode').value = 'hybrid';
+  p.nodes.get('limit').value = '3';
+  const searchTask = p.ui.doSearch();
+  p.request('/api/search?').resolve(searchBody('handoff-source'));
+  await searchTask;
+
+  const handoffTask = p.ui.previewHandoff();
+  const request = p.request('/api/handoff?');
+  assert.deepEqual(Object.fromEntries(new URL(request.url, 'http://localhost').searchParams), {
+    q: 'needle', provider: 'opencode', repo: 'owner/repo',
+    since: '2026-01-01T00:00:00Z', until: '2027-01-01T00:00:00Z',
+  });
+  request.resolve({ data: { schema_version: '1.0' } });
+  await handoffTask;
+});
+
 test('cursor guard also rejects programmatic input changes and duplicate page loads', async () => {
   const p = await page();
   await search(p, 'first', 'page-two');
