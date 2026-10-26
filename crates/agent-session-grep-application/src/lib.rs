@@ -735,6 +735,11 @@ impl CanonicalEventSink for StagingSink {
     }
 }
 
+/// Upper bound on the query text the search path will index against. Managed
+/// requests cap at 256 characters; the legacy path keeps a wider but still
+/// bounded window so a pasted document cannot expand into a huge FTS query.
+pub const MAX_SEARCH_QUERY_CHARS: usize = 1024;
+
 /// Validate search input without accessing a backend. Entrypoints reuse this
 /// before opening a catalog; Application remains authoritative for all callers.
 pub fn validate_search_request(
@@ -748,6 +753,15 @@ pub fn validate_search_request(
     }
     if query.chars().any(char::is_control) {
         return Err(DomainError::InvalidRequest("query contains control characters".into()).into());
+    }
+    // Bound the FTS expression a query can produce. Han text expands to
+    // roughly two tokens per character, so an unbounded paste becomes tens of
+    // thousands of ANDed phrases with no progress deadline on this path.
+    if query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+        return Err(DomainError::InvalidRequest(format!(
+            "query must be at most {MAX_SEARCH_QUERY_CHARS} characters"
+        ))
+        .into());
     }
     if query.trim().is_empty() {
         return Err(DomainError::InvalidRequest("query must not be empty".into()).into());
@@ -3015,6 +3029,40 @@ mod tests {
             r.unwrap_err(),
             AppError::Domain(DomainError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn search_rejects_a_query_over_the_character_bound() {
+        let r = app().handle(AppRequest::Search {
+            query: "汉".repeat(MAX_SEARCH_QUERY_CHARS + 1),
+            filters: SearchFilters::default(),
+            facets: SearchFacets::default(),
+            limit: 5,
+            cursor: None,
+            budget: ResponseBudget::default(),
+            include_system: false,
+            group_by_session: false,
+            mode: RetrievalMode::Lexical,
+            query_embedding: None,
+        });
+        assert!(matches!(
+            r.unwrap_err(),
+            AppError::Domain(DomainError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn search_query_bound_is_inclusive() {
+        let query = "汉".repeat(MAX_SEARCH_QUERY_CHARS);
+        assert!(
+            validate_search_request(
+                &query,
+                &SearchFilters::default(),
+                5,
+                &ResponseBudget::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

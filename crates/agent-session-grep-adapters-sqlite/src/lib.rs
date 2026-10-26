@@ -10511,9 +10511,17 @@ where
 /// 参考 hstry `sanitize_fts_query`（MIT，hstry/crates/hstry-core/src/db.rs:3177）
 /// 的逐 token 引号化 + 引号外前缀 `*` 模式；本项目保留 CJK n-gram 前置变换
 /// （ADR-0007）与全标点词跳过。
+/// Hard ceiling on quoted phrases in one FTS expression. The Application layer
+/// caps query text so this is unreachable through normal entrypoints; it keeps
+/// a direct port caller from building an unbounded AND chain.
+const MAX_FTS_PHRASES: usize = 4096;
+
 fn safe_fts_query(query: &str) -> String {
     let mut words: Vec<String> = Vec::new();
     for raw in query.split_whitespace() {
+        if words.len() >= MAX_FTS_PHRASES {
+            break;
+        }
         let is_prefix = raw.ends_with('*');
         let stem = raw.trim_end_matches('*').replace('"', "\"\"");
         if stem.is_empty() {
@@ -11729,6 +11737,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn safe_fts_query_bounds_the_phrase_count() {
+        let query = "term ".repeat(MAX_FTS_PHRASES + 50);
+        let rendered = safe_fts_query(&query);
+        assert_eq!(rendered.matches('"').count() / 2, MAX_FTS_PHRASES);
     }
 
     #[test]

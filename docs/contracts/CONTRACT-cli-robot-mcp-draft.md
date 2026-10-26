@@ -86,6 +86,8 @@ tools: search_sessions / get_session_context / get_session_resume / get_message 
 
 `SearchRequest.query` 使用 plain-text 关键词：按空白切分的字面片段、隐式 AND。`AND`/`OR`/`NOT`、`NEAR(...)` 和用户输入的引号不启用高级 FTS 查询语言。当前 `safe_fts_query` 将片段引号化，但保留尾随 `*` 的前缀匹配，例如 `work*`；路径和标点仍经 FTS5 分词器处理。索引与查询先应用同一 CJK transform，再进行字面量化。CLI/MCP/Port 共用此边界，不另造分词规则。
 
+查询文本上限 1024 个 Unicode 字符（`invalid_request`，exit 2）；handoff 的 256 字符上限不变。上限如此设定是因为 CJK transform 会把每个 Han 字符展开成约两个短语，超长粘贴会生成成千上万个 AND 短语。适配器另有 4096 短语的硬上限，作为直接 Port 调用方的防御边界。
+
 - 命中的 `text` 是 Application 装配的显示摘要（ADR-0008），不是索引原文：有可证明的字面命中时取该命中的原文连续窗口（≤ `max_snippet_chars` 字符，以最早命中为中心按 2 右 : 1 左 扩展，锚点自身超限时取锚点起始切片）；无字面证据（无匹配、语义-only）时回退正文前缀。不插入省略号/高亮等合成字符，大小写不敏感匹配按小写展开回映到原字符边界；窗口字节经既有命中级估算计入 `max_response_bytes`，排名/游标/`why_matched`/建议命令不受影响。human 模式的片段行在此摘要上按同一字面词元重新居中（≤120 字符，命中左侧约 40 字符上下文）；无词元/未命中/正文更短时保持原前缀预览。
 
 ## 10. Web 搜索参数与向量重建
