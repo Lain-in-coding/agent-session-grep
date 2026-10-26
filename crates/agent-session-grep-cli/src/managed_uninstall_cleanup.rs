@@ -1253,21 +1253,7 @@ fn launch_tail(
 }
 #[cfg(windows)]
 fn system_powershell() -> Result<PathBuf, Reason> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
-    }
-    let mut buffer = vec![0u16; 32768];
-    let size = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if size == 0 || size >= buffer.len() {
-        return Err(Reason::OwnedAfterExitHelperRequired);
-    }
-    let path = PathBuf::from(OsString::from_wide(&buffer[..size]))
-        .join("WindowsPowerShell/v1.0/powershell.exe");
-    package_installation::ordinary(&path).map_err(|_| Reason::OwnedAfterExitHelperRequired)?;
-    Ok(path)
+    package_installation::system_powershell().map_err(|_| Reason::OwnedAfterExitHelperRequired)
 }
 
 /// A finite inventory check is not removal authority. Only ancestors of bound

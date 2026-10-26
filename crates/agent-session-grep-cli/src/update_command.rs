@@ -139,7 +139,7 @@ fn check(
         return Err(package_installation::invalid_install("helper digest"));
     }
     #[cfg(windows)]
-    let program = PathBuf::from("powershell.exe");
+    let program = package_installation::system_powershell()?;
     #[cfg(unix)]
     let program = PathBuf::from("/bin/sh");
     let mut transport = HelperTransport::from_installed_script(program, &helper.path);

@@ -189,6 +189,31 @@ pub(crate) fn ordinary(path: &Path) -> Result<(), CliError> {
     }
     Ok(())
 }
+
+/// Absolute path to the in-box Windows PowerShell executable.
+///
+/// A bare `powershell.exe` would let CreateProcess search the current
+/// directory first, so a check run from an attacker-writable directory could
+/// execute a planted binary with the caller's privileges. The system
+/// directory is resolved through the API instead of `%Path%`.
+#[cfg(windows)]
+pub(crate) fn system_powershell() -> Result<PathBuf, CliError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut buffer = vec![0u16; 32768];
+    let size = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if size == 0 || size >= buffer.len() {
+        return Err(invalid_install("system-directory"));
+    }
+    let path = PathBuf::from(OsString::from_wide(&buffer[..size]))
+        .join("WindowsPowerShell/v1.0/powershell.exe");
+    ordinary(&path)?;
+    Ok(path)
+}
 pub(crate) fn pinned(path: &Path) -> Result<File, CliError> {
     ordinary(path)?;
     let mut options = OpenOptions::new();
