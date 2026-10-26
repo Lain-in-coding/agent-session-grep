@@ -1026,8 +1026,9 @@ raise SystemExit(not result.wasSuccessful())
 
 
 class ZeroEgressControlTests(unittest.TestCase):
-    crates = ("reqwest", "hyper", "ureq", "isahc", "surf", "attohttpc", "tiny_http",
-              "rouille", "warp", "axum", "tokio", "async-std")
+    crates = ("reqwest", "hyper", "ureq", "isahc", "surf", "attohttpc", "curl",
+              "quinn", "quiche", "tiny_http", "rouille", "warp", "axum", "tokio",
+              "async-std")
     socket_argv = ["grep", "-rlEZ", "TcpListener|TcpStream|TcpSocket|UdpSocket|std::net",
                    "crates", "--include=*.rs"]
 

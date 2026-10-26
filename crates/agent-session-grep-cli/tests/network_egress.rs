@@ -14,6 +14,9 @@ const FORBIDDEN_HTTP_CLIENT_CRATES: &[&str] = &[
     "isahc",
     "surf",
     "attohttpc",
+    "curl",
+    "quinn",
+    "quiche",
     "tiny_http",
     "rouille",
     "warp",
@@ -48,6 +51,39 @@ fn default_build_has_no_http_client_dependency() {
             !lock.contains(&needle),
             "default build must not depend on HTTP client crate `{crate_name}` \
              (zero-telemetry audit, design D5)"
+        );
+    }
+}
+
+/// `deny.toml` is the authority for banned network crates. This list once
+/// held 12 names while the policy banned 15 (curl, quinn and quiche were
+/// missing), so this test reads the policy itself: every banned crate must
+/// be absent from the lock file and named in the test's own list.
+#[test]
+fn egress_audit_list_matches_the_cargo_deny_policy() {
+    let root = workspace_root();
+    let policy = std::fs::read_to_string(root.join("deny.toml"))
+        .expect("workspace deny.toml must exist and be readable");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+        .expect("workspace Cargo.lock must exist and be readable");
+    let banned: Vec<&str> = policy
+        .lines()
+        .filter(|line| line.contains("reason = \"zero-egress"))
+        .filter_map(|line| line.split("name = \"").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(
+        banned.len() >= 15,
+        "deny.toml must keep its zero-egress bans parseable: {banned:?}"
+    );
+    for crate_name in banned {
+        assert!(
+            FORBIDDEN_HTTP_CLIENT_CRATES.contains(&crate_name),
+            "deny.toml bans `{crate_name}` but the egress audit list does not"
+        );
+        assert!(
+            !lock.contains(&format!("name = \"{crate_name}\"")),
+            "default build must not depend on banned network crate `{crate_name}`"
         );
     }
 }

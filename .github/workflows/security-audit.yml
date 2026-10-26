@@ -110,7 +110,9 @@ jobs:
           cargo install --locked --version 0.22.2 cargo-audit
 
       - name: Verify committed lockfile
-        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+        # `--no-deps` skips dependency resolution, which made `--locked` a
+        # no-op. Resolve the full graph so a stale Cargo.lock fails here.
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Check dependency policy
         run: cargo deny check
@@ -130,8 +132,10 @@ jobs:
               return result
 
           def audit_zero_egress():
-              for crate in ("reqwest", "hyper", "ureq", "isahc", "surf", "attohttpc", "tiny_http",
-                            "rouille", "warp", "axum", "tokio", "async-std"):
+              # Same 15 names as deny.toml; network_egress.rs pins the parity.
+              for crate in ("reqwest", "hyper", "ureq", "isahc", "surf", "attohttpc", "curl",
+                            "quinn", "quiche", "tiny_http", "rouille", "warp", "axum", "tokio",
+                            "async-std"):
                   if grep_result(["-q", f'^name = "{crate}"', "Cargo.lock"]).returncode == 0:
                       raise ValueError("zero-egress audit found a forbidden HTTP client dependency")
               result = grep_result(["-rlEZ", "TcpListener|TcpStream|TcpSocket|UdpSocket|std::net",
