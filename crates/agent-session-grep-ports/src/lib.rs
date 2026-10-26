@@ -382,6 +382,12 @@ pub struct SearchHit {
     /// robot/json/jsonl 序列化器输出为命中对象的 `text` 字段；人类渲染器打印
     /// 同一摘要的片段行（human 预览会再按 `why_matched` 词元居中，见 CLI
     /// `render_search`）。
+    ///
+    /// 已知边界：窗口边缘可能落在一个连续非空白 run 内部。跨边界脱敏
+    /// （ADR-0009）只对完整高置信 secret 形态命中，被窗口截断的片段不再
+    /// 匹配形态而可能原样输出——这是实验 A 窗口语义的诚实披露，不是
+    /// 静默丢弃；需要完全消除时必须改为全文本级脱敏（会同时影响按
+    /// ADR-0004 保持未脱敏的人类输出），属独立设计决定。
     pub text: Option<String>,
     /// 确定性字面量命中证据（search-match-guidance）：由 Application 用与索引侧
     /// 同一 CJK/plain-text 词元分析对用户**字面查询**派生，逐词断言在命中完整正文
