@@ -876,6 +876,27 @@ mod identity_tests {
     }
 
     #[test]
+    fn torn_prefix_receipt_is_repaired_by_explicit_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let path = catalog(&base.join("data"), "torn-binding-installation");
+        let identity = SetupIdentity::capture(&path).unwrap();
+        let install = install(&base.join("pkg"));
+        let binding = path.parent().unwrap().join("installation-prefix.json");
+        // A crash during the first write leaves a prefix of the JSON bytes.
+        fs::write(&binding, b"{\"schema\":\"asg.installation-prefix/v1\"").unwrap();
+        record_installation_binding(
+            &install,
+            &path,
+            &identity,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("explicit setup must repair a torn binding");
+        let value: Value = serde_json::from_slice(&fs::read(&binding).unwrap()).unwrap();
+        assert_eq!(value["installation_id"], "torn-binding-installation");
+    }
+
+    #[test]
     fn setup_binding_original_end_never_adopts_replacement_physical_root() {
         for same_installation in [false, true] {
             let temp = tempfile::tempdir().unwrap();

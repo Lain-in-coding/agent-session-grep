@@ -914,13 +914,27 @@ impl SqliteControlStore {
         let path = self.private_root.join(PREFIX_BINDING_FILE);
         match fs::symlink_metadata(&path) {
             Ok(_) => {
-                self.verify_installation_prefix(identity, &status.policy.installation_id)?;
-                if Instant::now() >= deadline {
-                    return Err(PortError::WriterBusy(
-                        "installation binding deadline reached".into(),
-                    ));
+                match self.verify_installation_prefix(identity, &status.policy.installation_id) {
+                    Ok(()) => {
+                        if Instant::now() >= deadline {
+                            return Err(PortError::WriterBusy(
+                                "installation binding deadline reached".into(),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    // An unparsable, oversized or unreadable-as-private file
+                    // records no association at all: a crash during the first
+                    // write leaves a torn file that used to block setup
+                    // forever. Explicit setup may record the first override of
+                    // that torn file. A parsable binding that names another
+                    // prefix or installation stays invalid and is never
+                    // rebound.
+                    Err(PortError::SchemaIncompatible(_)) => {
+                        fs::remove_file(&path).map_err(io_error)?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(error)),
