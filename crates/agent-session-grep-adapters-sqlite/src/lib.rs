@@ -5413,8 +5413,32 @@ impl SqliteStore {
         scanned: &BTreeSet<String>,
     ) -> PortResult<()> {
         let conn = self.conn.borrow();
+        // `source_membership` has no message_id index, so both an unscoped
+        // fetch and chunked IN lists degrade to a full table scan (the latter
+        // once per chunk). One covering scan joined to the small candidate set
+        // keeps this O(membership) once and only materializes matching rows.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS claim_candidates(
+                 entity_id TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             DELETE FROM claim_candidates;",
+        )
+        .map_err(backend)?;
+        {
+            let mut insert = conn
+                .prepare("INSERT INTO claim_candidates(entity_id) VALUES(?1)")
+                .map_err(backend)?;
+            for candidate in candidates {
+                insert.execute([candidate]).map_err(backend)?;
+            }
+        }
         let mut stmt = conn
-            .prepare("SELECT source_path, message_id, document_id FROM source_membership")
+            .prepare(
+                "SELECT membership.source_path, membership.message_id, membership.document_id
+                 FROM source_membership AS membership
+                 JOIN claim_candidates AS candidates
+                   ON candidates.entity_id = membership.message_id",
+            )
             .map_err(backend)?;
         let rows = stmt
             .query_map([], |row| {
@@ -5427,7 +5451,7 @@ impl SqliteStore {
             .map_err(backend)?;
         for row in rows {
             let (source_path, entity_id, document_id) = row.map_err(backend)?;
-            if scanned.contains(&source_path) || !candidates.contains(&entity_id) {
+            if scanned.contains(&source_path) {
                 continue;
             }
             state
@@ -14469,6 +14493,7 @@ mod tests {
             let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
             flat.ends_with("FROM message_placements ORDER BY placement_id")
                 || flat.ends_with("FROM message_edges ORDER BY child_placement_id")
+                || flat == "SELECT source_path, message_id, document_id FROM source_membership"
         });
         assert!(
             unscoped.is_none(),
