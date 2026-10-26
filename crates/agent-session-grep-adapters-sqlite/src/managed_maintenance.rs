@@ -1395,7 +1395,15 @@ pub fn inspect_restore_inventory(
     })
 }
 
-const MAX_RESTORE_JOURNAL: u64 = 256 * 1024;
+/// Upper bound for one restore ownership journal.
+///
+/// The intent event embeds the full source id list of the catalog it is
+/// restoring. It is the only surviving copy once the backup record has been
+/// purged by policy, so the bound must scale with the catalog rather than with
+/// a fixed event count: 256 KiB held roughly 6k ids and made restore fail
+/// closed forever on larger installations. The journal is a private local
+/// file written only during an explicit restore.
+const MAX_RESTORE_JOURNAL: u64 = 64 * 1024 * 1024;
 
 fn restore_journal_path(control: &SqliteControlStore, intent: &RestoreIntent) -> PathBuf {
     let key = blake3::hash(
@@ -1462,18 +1470,36 @@ fn append_restore_event(
     }
     #[cfg(unix)]
     let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        #[cfg(target_os = "linux")]
-        let flags = 0o400000 | 0o4000 | 0o2000000;
-        #[cfg(target_os = "macos")]
-        let flags = 0x100 | 0x4 | 0x01000000;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err(storage());
-        fs::OpenOptions::new()
-            .append(true)
-            .custom_flags(flags)
-            .open(path)
-            .map_err(|_| storage())?
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos"
+        ))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Per-architecture constants shared with managed_locks: the
+            // x86_64 Linux value is O_LARGEFILE on aarch64.
+            let flags = crate::managed_locks::platform::NOFOLLOW
+                | crate::managed_locks::platform::NONBLOCK
+                | crate::managed_locks::platform::CLOEXEC;
+            fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(flags)
+                .open(path)
+                .map_err(|_| storage())?
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos"
+        )))]
+        {
+            return Err(storage());
+        }
     };
     #[cfg(windows)]
     let mut file = {
