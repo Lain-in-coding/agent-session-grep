@@ -1,4 +1,6 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-pc-windows-msvc"]
+# No `targets` key: pinning a Windows MSVC target here made every Linux and
+# macOS host download a foreign standard library. Release builds run on native
+# runners, whose host target rustup installs by default.
