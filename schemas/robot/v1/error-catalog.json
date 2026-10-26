@@ -92,6 +92,16 @@
       "operator_action": "Wait for the current writer to finish and retry."
     },
     {
+      "code": "deadline_exceeded",
+      "layer": "application",
+      "retryable": false,
+      "partial_allowed": false,
+      "cli_exit_code": 6,
+      "robot_ok": false,
+      "redaction": "none",
+      "operator_action": "The request exceeded its time budget. Narrow the query or budgets, or retry later."
+    },
+    {
       "code": "schema_incompatible",
       "layer": "protocol",
       "retryable": false,

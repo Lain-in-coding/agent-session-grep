@@ -40,6 +40,7 @@ fn port(error: PortError) -> CliError {
         PortError::InvalidRequest(_) => CanonicalCode::InvalidRequest,
         PortError::NotFound(_) => CanonicalCode::NotFound,
         PortError::WriterBusy(_) => CanonicalCode::WriterBusy,
+        PortError::DeadlineExceeded(_) => CanonicalCode::DeadlineExceeded,
         PortError::GenerationMismatch(_) => CanonicalCode::GenerationMismatch,
         PortError::SchemaIncompatible(_) => CanonicalCode::SchemaIncompatible,
         PortError::SnapshotChanged(_) => CanonicalCode::SourceChanged,

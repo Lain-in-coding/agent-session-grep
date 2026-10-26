@@ -1102,6 +1102,7 @@ fn protocol_error(error: crate::protocol::ProtocolError) -> HttpResponse {
         crate::protocol::CanonicalCode::GenerationMismatch => "catalog generation changed",
         crate::protocol::CanonicalCode::SchemaIncompatible => "catalog schema is incompatible",
         crate::protocol::CanonicalCode::WriterBusy => "catalog writer is busy",
+        crate::protocol::CanonicalCode::DeadlineExceeded => "request deadline exceeded",
         crate::protocol::CanonicalCode::SourceChanged => "source changed during operation",
         crate::protocol::CanonicalCode::SourceIo => "source I/O failed",
         crate::protocol::CanonicalCode::SnapshotFailed => "source snapshot failed",

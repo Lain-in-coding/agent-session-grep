@@ -56,6 +56,7 @@
             "catalog_error",
             "provider_error",
             "writer_busy",
+            "deadline_exceeded",
             "schema_incompatible",
             "cursor_invalid",
             "cursor_expired",

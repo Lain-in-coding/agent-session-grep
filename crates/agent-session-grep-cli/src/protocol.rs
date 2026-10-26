@@ -66,6 +66,8 @@ pub enum CanonicalCode {
     CapabilityNotSupported,
     /// writer lease 未取得（`writer_busy`）→ exit 6，可重试。
     WriterBusy,
+    /// 请求超过处理时限（`deadline_exceeded`）→ exit 6，不自动重试。
+    DeadlineExceeded,
     /// JSON/协议版本不兼容 → exit 9。
     SchemaIncompatible,
     /// Cursor 令牌无法解析/校验失败（`cursor_invalid`）→ exit 2。
@@ -93,6 +95,7 @@ impl CanonicalCode {
             CanonicalCode::ProviderError => "provider_error",
             CanonicalCode::CapabilityNotSupported => "capability_not_supported",
             CanonicalCode::WriterBusy => "writer_busy",
+            CanonicalCode::DeadlineExceeded => "deadline_exceeded",
             CanonicalCode::SchemaIncompatible => "schema_incompatible",
             CanonicalCode::CursorInvalid => "cursor_invalid",
             CanonicalCode::CursorExpired => "cursor_expired",
@@ -112,7 +115,9 @@ impl CanonicalCode {
             CanonicalCode::SourceIo
             | CanonicalCode::SourceChanged
             | CanonicalCode::SnapshotFailed => 5,
-            CanonicalCode::CatalogError | CanonicalCode::WriterBusy => 6,
+            CanonicalCode::CatalogError
+            | CanonicalCode::WriterBusy
+            | CanonicalCode::DeadlineExceeded => 6,
             CanonicalCode::ProviderError | CanonicalCode::CapabilityNotSupported => 7,
             CanonicalCode::SchemaIncompatible | CanonicalCode::GenerationMismatch => 9,
             CanonicalCode::UpdateRecoveryRequired => 10,
@@ -153,6 +158,9 @@ impl CanonicalCode {
             }
             CanonicalCode::WriterBusy => {
                 "另一个进程正在写入数据库，等待其结束（或结束残留的 agent-session-grep 进程）后重试"
+            }
+            CanonicalCode::DeadlineExceeded => {
+                "本次请求超过了处理时限：缩小查询范围、降低 limit/预算，或稍后重试"
             }
             CanonicalCode::UpdateRecoveryRequired => {
                 "运行 update status 核对持久状态，再对同一安装与 catalog 运行 update recover"
@@ -270,6 +278,7 @@ fn port_error_code(error: &PortError) -> CanonicalCode {
         PortError::NotFound(_) => CanonicalCode::NotFound,
         PortError::SnapshotChanged(_) => CanonicalCode::SourceChanged,
         PortError::WriterBusy(_) => CanonicalCode::WriterBusy,
+        PortError::DeadlineExceeded(_) => CanonicalCode::DeadlineExceeded,
         PortError::InvalidRequest(_) => CanonicalCode::InvalidRequest,
         PortError::GenerationMismatch(_) => CanonicalCode::GenerationMismatch,
     }
@@ -289,6 +298,7 @@ impl ProtocolError {
             CanonicalCode::NotFound => "registered installation was not found",
             CanonicalCode::SourceChanged => "source changed; create a fresh relocation preview",
             CanonicalCode::WriterBusy => "another writer holds the catalog lease",
+            CanonicalCode::DeadlineExceeded => "the operation exceeded its deadline",
             CanonicalCode::InvalidRequest => {
                 "relocation request is invalid; check the mapping and obtain a fresh preview"
             }
@@ -642,6 +652,7 @@ mod tests {
             CanonicalCode::ProviderError,
             CanonicalCode::CapabilityNotSupported,
             CanonicalCode::WriterBusy,
+            CanonicalCode::DeadlineExceeded,
             CanonicalCode::SchemaIncompatible,
             CanonicalCode::CursorInvalid,
             CanonicalCode::CursorExpired,
@@ -696,6 +707,15 @@ mod tests {
         let e: ProtocolError = PortError::WriterBusy("held".into()).into();
         assert_eq!(e.code, CanonicalCode::WriterBusy);
         assert!(e.code.retryable());
+    }
+
+    #[test]
+    fn deadline_maps_to_its_own_code_without_retry() {
+        let e: ProtocolError = PortError::DeadlineExceeded("budget".into()).into();
+        assert_eq!(e.code, CanonicalCode::DeadlineExceeded);
+        assert_eq!(e.code.as_str(), "deadline_exceeded");
+        assert_eq!(e.code.exit_code(), 6);
+        assert!(!e.code.retryable());
     }
 
     #[test]
@@ -1061,6 +1081,7 @@ mod tests {
             CanonicalCode::ProviderError,
             CanonicalCode::CapabilityNotSupported,
             CanonicalCode::WriterBusy,
+            CanonicalCode::DeadlineExceeded,
             CanonicalCode::SchemaIncompatible,
             CanonicalCode::CursorInvalid,
             CanonicalCode::CursorExpired,
@@ -1098,7 +1119,7 @@ mod tests {
         let codes = schema["$defs"]["errorBody"]["properties"]["code"]["enum"]
             .as_array()
             .expect("schema must enumerate canonical error codes");
-        assert_eq!(codes.len(), 14);
+        assert_eq!(codes.len(), 15);
         let search_condition = &schema["$defs"]["success"]["allOf"][0];
         assert_eq!(
             search_condition["if"]["properties"]["command"]["const"],

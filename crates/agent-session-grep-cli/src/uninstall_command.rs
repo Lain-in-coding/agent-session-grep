@@ -414,6 +414,7 @@ fn port(value: PortError) -> CliError {
         PortError::InvalidRequest(_) => CanonicalCode::CapabilityNotSupported,
         PortError::NotFound(_) => CanonicalCode::NotFound,
         PortError::WriterBusy(_) => CanonicalCode::WriterBusy,
+        PortError::DeadlineExceeded(_) => CanonicalCode::DeadlineExceeded,
         PortError::SchemaIncompatible(_) => CanonicalCode::SchemaIncompatible,
         PortError::GenerationMismatch(_) => CanonicalCode::GenerationMismatch,
         PortError::SnapshotChanged(_) => CanonicalCode::SourceChanged,

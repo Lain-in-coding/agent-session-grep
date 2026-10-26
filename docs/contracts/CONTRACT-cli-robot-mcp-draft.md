@@ -43,11 +43,11 @@ SessionId/MessageId/BranchId/CursorToken 为带类型和协议版本的 opaque �
 ## 5. Error Catalog Matrix（统一映射）
 
 字段: canonical_code | layer | retryable | partial_allowed | CLI_exit | robot_ok | MCP_code | redaction | operator_action
-全部 15 码: invalid_request | not_found | source_io | source_changed | snapshot_failed |
-        catalog_error | provider_error | capability_not_supported | writer_busy |
+全部 16 码: invalid_request | not_found | source_io | source_changed | snapshot_failed |
+        catalog_error | provider_error | capability_not_supported | writer_busy | deadline_exceeded |
         schema_incompatible | cursor_invalid | cursor_expired | generation_mismatch |
         update_recovery_required | internal
-Exit Code(权威为 `schemas/robot/v1/error-catalog.json` 的 15 码，实现镜像为 `protocol::CanonicalCode::exit_code`): 0 成功 / 2 校验(invalid_request, cursor_invalid, cursor_expired) / 4 不存在(not_found) / 5 IO(source_io, source_changed, snapshot_failed) / 6 Catalog(catalog_error, writer_busy) / 7 Provider(provider_error, capability_not_supported) / 9 协议(schema_incompatible, generation_mismatch) / 10 部分成功(update_recovery_required) / 70 内部(internal)。无 3(配置)与 8(安全)退出码。retryable 仅 writer_busy 与 source_changed 两码。
+Exit Code(权威为 `schemas/robot/v1/error-catalog.json` 的 16 码，实现镜像为 `protocol::CanonicalCode::exit_code`): 0 成功 / 2 校验(invalid_request, cursor_invalid, cursor_expired) / 4 不存在(not_found) / 5 IO(source_io, source_changed, snapshot_failed) / 6 Catalog(catalog_error, writer_busy, deadline_exceeded) / 7 Provider(provider_error, capability_not_supported) / 9 协议(schema_incompatible, generation_mismatch) / 10 部分成功(update_recovery_required) / 70 内部(internal)。无 3(配置)与 8(安全)退出码。retryable 仅 writer_busy 与 source_changed 两码。
 - `get`/`show` 对缺失实体统一 exit 4 + `not_found` envelope，不返回 exit 0 + `payload:null`（ADR-0005，已实现）。
 
 ## 6. Output Truth Table（stdout/stderr 契约）

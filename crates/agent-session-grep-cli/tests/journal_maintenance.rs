@@ -187,6 +187,7 @@ fn observation_error_code(error: &PortError) -> &'static str {
         PortError::NotFound(_) => "not_found",
         PortError::SnapshotChanged(_) => "snapshot_changed",
         PortError::WriterBusy(_) => "writer_busy",
+        PortError::DeadlineExceeded(_) => "deadline_exceeded",
     }
 }
 

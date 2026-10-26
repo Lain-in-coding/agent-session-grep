@@ -54,6 +54,10 @@ pub enum PortError {
     /// data-root writer lease 已被占用，未能取得（对应 error catalog `writer_busy`）。
     #[error("writer lease held: {0}")]
     WriterBusy(String),
+
+    /// 请求超过自身处理时限（不涉及写者争用；对应 catalog `deadline_exceeded`）。
+    #[error("request deadline exceeded: {0}")]
+    DeadlineExceeded(String),
 }
 
 pub type PortResult<T> = Result<T, PortError>;
@@ -1004,6 +1008,7 @@ fn port_error_kind(error: &PortError) -> &'static str {
         PortError::NotFound(_) => "not_found",
         PortError::SnapshotChanged(_) => "snapshot_changed",
         PortError::WriterBusy(_) => "writer_busy",
+        PortError::DeadlineExceeded(_) => "deadline_exceeded",
         PortError::InvalidRequest(_) => "invalid_request",
         PortError::GenerationMismatch(_) => "generation_mismatch",
     }

@@ -361,6 +361,9 @@ impl Fixture {
                     panic!("managed source query schema failure")
                 }
                 Err(PortError::Backend(_)) => panic!("managed source query backend failure"),
+                Err(PortError::DeadlineExceeded(_)) => {
+                    panic!("managed source query deadline exceeded")
+                }
             }
         }
     }

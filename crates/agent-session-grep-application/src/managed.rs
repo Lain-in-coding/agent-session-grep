@@ -355,7 +355,7 @@ fn bytes(value: &impl serde::Serialize) -> Result<Vec<u8>, AppError> {
 }
 fn handoff_deadline(expired: &dyn Fn() -> bool) -> Result<(), AppError> {
     if expired() {
-        Err(PortError::WriterBusy("managed request deadline exceeded".into()).into())
+        Err(PortError::DeadlineExceeded("managed request deadline exceeded".into()).into())
     } else {
         Ok(())
     }
@@ -413,7 +413,7 @@ impl<'a, R: ProjectionRead + ?Sized> ManagedApp<'a, R> {
     }
     fn check_deadline(&self) -> Result<(), AppError> {
         if (self.context.deadline_expired)() {
-            Err(PortError::WriterBusy("managed request deadline exceeded".into()).into())
+            Err(PortError::DeadlineExceeded("managed request deadline exceeded".into()).into())
         } else {
             Ok(())
         }
@@ -2835,7 +2835,9 @@ fn fit_message_payload(
     let mut best = None;
     while low < high {
         if expired() {
-            return Err(PortError::WriterBusy("managed request deadline exceeded".into()).into());
+            return Err(
+                PortError::DeadlineExceeded("managed request deadline exceeded".into()).into(),
+            );
         }
         let mid = low + (high - low) / 2;
         let mut end = mid;

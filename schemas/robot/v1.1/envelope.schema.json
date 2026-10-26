@@ -174,6 +174,7 @@
             "provider_error",
             "capability_not_supported",
             "writer_busy",
+            "deadline_exceeded",
             "schema_incompatible",
             "cursor_invalid",
             "cursor_expired",
