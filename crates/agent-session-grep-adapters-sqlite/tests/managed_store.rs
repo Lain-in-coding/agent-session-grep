@@ -151,6 +151,52 @@ impl Fixture {
 }
 
 #[test]
+fn crash_before_activation_resumes_a_pristine_managed_catalog() {
+    let f = Fixture::new();
+    drop(ManagedStore::create(&f.catalog, &f.control, id("inc-one"), 1).unwrap());
+    // Simulate a crash between schema initialization and activation: the
+    // managed application id stays, but no identity was committed.
+    let conn = Connection::open(&f.catalog).unwrap();
+    conn.execute_batch(
+        "DELETE FROM catalog_meta;
+         UPDATE store_metadata SET managed_mode=0, projection_contract_version=0;",
+    )
+    .unwrap();
+    drop(conn);
+    drop(ManagedStore::create(&f.catalog, &f.control, id("inc-two"), 2).unwrap());
+    let reopened = ManagedStore::open(&f.catalog, &f.control).unwrap();
+    assert_eq!(
+        *reopened.incarnation(),
+        id("inc-two"),
+        "resumed creation must commit the new incarnation"
+    );
+}
+
+#[test]
+fn repeated_create_is_idempotent_for_the_same_incarnation_only() {
+    let f = Fixture::new();
+    drop(ManagedStore::create(&f.catalog, &f.control, id("inc-same"), 1).unwrap());
+    drop(
+        ManagedStore::create(&f.catalog, &f.control, id("inc-same"), 1)
+            .expect("identical create retry adopts the activated catalog"),
+    );
+    assert!(matches!(
+        ManagedStore::create(&f.catalog, &f.control, id("inc-other"), 2),
+        Err(PortError::GenerationMismatch(_))
+    ));
+}
+
+#[test]
+fn create_refuses_an_existing_catalog_without_its_creation_intent() {
+    let f = Fixture::new();
+    drop(ManagedStore::create(&f.catalog, &f.control, id("inc-marker"), 1).unwrap());
+    let mut marker = f.catalog.as_os_str().to_os_string();
+    marker.push(".asg-managed-create");
+    std::fs::remove_file(std::path::PathBuf::from(marker)).unwrap();
+    assert!(ManagedStore::create(&f.catalog, &f.control, id("inc-marker"), 1).is_err());
+}
+
+#[test]
 fn managed_publication_outbox_and_receipt_are_atomic_and_legacy_is_hidden() {
     let f = Fixture::new();
     let store = f.create();

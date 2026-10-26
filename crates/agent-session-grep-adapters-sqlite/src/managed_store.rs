@@ -111,6 +111,86 @@ fn reserve_creation(path: &Path, control: &SqliteControlStore) -> PortResult<()>
         .map_err(|_| incompatible())?;
     Ok(())
 }
+
+/// What an existing path may be while `create` runs again.
+enum ExistingCreation {
+    /// Reserved by this installation but no catalog was activated yet. The
+    /// schema may be absent or partially migrated; only an empty, unmanaged
+    /// store qualifies, so a damaged established catalog is never rebuilt.
+    Pristine,
+    /// Activation already committed; an identical retry adopts it.
+    Initialized(ControlId),
+}
+
+fn inspect_existing_creation(
+    path: &Path,
+    control: &SqliteControlStore,
+    installation: &ControlId,
+) -> PortResult<ExistingCreation> {
+    // Only a path reserved by this installer's creation intent may resume.
+    if std::fs::symlink_metadata(creation_intent_path(path)).is_err() {
+        return Err(invalid());
+    }
+    control.validate_catalog_file(path)?;
+    let conn = connect(path, false)?;
+    let application: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(storage)?;
+    if application != APPLICATION_ID {
+        return Err(incompatible());
+    }
+    if let Ok(incarnation) = identity(&conn, installation) {
+        return Ok(ExistingCreation::Initialized(incarnation));
+    }
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(storage)?;
+    if version > SCHEMA_VERSION {
+        return Err(incompatible());
+    }
+    let rows = |table: &str| -> PortResult<i64> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if !exists {
+            return Ok(0);
+        }
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(storage)
+    };
+    if rows("catalog_meta")? != 0 || rows("catalog")? != 0 || rows("index_batches")? != 0 {
+        return Err(incompatible());
+    }
+    // `store_metadata.managed_mode` is set only by activation.
+    let has_managed_mode: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('store_metadata') WHERE name='managed_mode'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if has_managed_mode {
+        let managed_mode: i64 = conn
+            .query_row(
+                "SELECT managed_mode FROM store_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if managed_mode != 0 {
+            return Err(incompatible());
+        }
+    }
+    Ok(ExistingCreation::Pristine)
+}
 fn incompatible() -> PortError {
     PortError::SchemaIncompatible("managed catalog identity is unavailable or incompatible".into())
 }
@@ -254,14 +334,49 @@ impl ManagedStore {
         let root = handles.root_identity();
         let policy = admission(control, root)?;
         let lease = WriterLease::try_acquire(root_path)?;
-        reserve_creation(path, control)?;
-        control.create_private_catalog_file(path)?;
+        let resume = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reserve_creation(path, control)?;
+                control.create_private_catalog_file(path)?;
+                None
+            }
+            Ok(_) => Some(inspect_existing_creation(
+                path,
+                control,
+                &policy.installation_id,
+            )?),
+            Err(_) => return Err(incompatible()),
+        };
         let conn = connect(path, true)?;
+        let fresh = resume.is_none();
+        if let Some(existing) = resume {
+            match existing {
+                ExistingCreation::Initialized(existing_incarnation) => {
+                    // The previous attempt committed activation but never
+                    // returned (crash or ack loss). An identical retry adopts
+                    // that catalog; a different incarnation is a mismatch.
+                    if existing_incarnation != incarnation {
+                        return Err(changed());
+                    }
+                    control.validate_catalog_file(path)?;
+                    return Ok(Self::from_parts(
+                        conn,
+                        Some(lease),
+                        handles,
+                        policy.installation_id,
+                        incarnation,
+                    ));
+                }
+                ExistingCreation::Pristine => {}
+            }
+        }
         // Reserve this file for the policy-enforcing facade before any schema
         // work. A crash after initialization but before activation must not let
         // a legacy writer adopt the partly initialized managed catalog.
-        conn.pragma_update(None, "application_id", APPLICATION_ID)
-            .map_err(storage)?;
+        if fresh {
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .map_err(storage)?;
+        }
         SqliteStore::init(&conn)?;
         let tx = conn.unchecked_transaction().map_err(storage)?;
         managed::initialize_catalog_in_tx(
