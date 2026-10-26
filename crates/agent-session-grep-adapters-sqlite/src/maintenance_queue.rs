@@ -13,6 +13,34 @@ use std::{
 
 const QUEUE_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x41534d31;
+/// Terminal jobs kept for `list` after newer ones arrive. The table used to
+/// grow forever, and every listing deserialized the whole history; the durable
+/// compaction audit lives in `journal_compactions`, not here.
+const RETAINED_TERMINAL_JOBS: i64 = 128;
+
+fn prune_terminal_jobs(conn: &Connection) -> PortResult<()> {
+    let ids: Vec<String> = {
+        let mut statement = conn
+            .prepare("SELECT id FROM jobs ORDER BY rowid DESC LIMIT -1 OFFSET ?1")
+            .map_err(sql_error)?;
+        statement
+            .query_map([RETAINED_TERMINAL_JOBS], |row| row.get(0))
+            .map_err(sql_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sql_error)?
+    };
+    for id in ids {
+        let job = load(conn, &id)?;
+        if matches!(
+            job.state,
+            MaintenanceState::Completed | MaintenanceState::Failed | MaintenanceState::Cancelled
+        ) {
+            conn.execute("DELETE FROM jobs WHERE id=?1", [&id])
+                .map_err(sql_error)?;
+        }
+    }
+    Ok(())
+}
 fn backend<E>(_: E) -> PortError {
     PortError::Backend("maintenance queue operation failed".into())
 }
@@ -170,6 +198,7 @@ impl MaintenanceQueue for SqliteMaintenanceQueue {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         tx.execute("INSERT INTO jobs(id,token,target,record,revision,cancel_requested) VALUES(?1,?2,?3,?4,0,0) ON CONFLICT(token) DO NOTHING", params![job.id,job.token,job.target.canonical_path,record]).map_err(sql_error)?;
+        prune_terminal_jobs(&tx)?;
         let id: String = tx
             .query_row("SELECT id FROM jobs WHERE token=?1", [&job.token], |r| {
                 r.get(0)

@@ -45,6 +45,34 @@ fn job(id: &str) -> MaintenanceJob {
     }
 }
 #[test]
+fn terminal_jobs_are_pruned_but_runnable_jobs_never_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
+    let mut running = job("running");
+    running.state = MaintenanceState::Running;
+    queue.enqueue(&running).unwrap();
+    for index in 0..200 {
+        let mut terminal = job(&format!("done-{index:03}"));
+        terminal.state = MaintenanceState::Completed;
+        queue.enqueue(&terminal).unwrap();
+    }
+    let jobs = queue.list(None).unwrap();
+    assert!(
+        jobs.len() <= 129,
+        "terminal history must stay bounded, saw {}",
+        jobs.len()
+    );
+    assert!(
+        jobs.iter().any(|job| job.id == "running"),
+        "an old runnable job must never be pruned"
+    );
+    assert!(
+        jobs.iter().any(|job| job.id == "done-199"),
+        "the newest terminal job must be retained"
+    );
+}
+
+#[test]
 fn missing_queue_reads_do_not_create_anything() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("absent");
