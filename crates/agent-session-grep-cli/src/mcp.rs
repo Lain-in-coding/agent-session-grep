@@ -12,18 +12,15 @@
 //!   成功 JSON-RPC response，result 携 `isError: true` + canonical error 结构。
 
 use crate::protocol::{self, CanonicalCode, Outcome, ProtocolError};
-use crate::{CliError, canonical_search_provider, provider_registry, render, resume_app_with_repo};
+use crate::{CliError, canonical_search_provider, provider_registry, render};
 use agent_session_grep_adapters_sqlite::SqliteStore;
 use agent_session_grep_application::{
-    AppRequest, AppResponse, ContextLevel, ResponseBudget,
-    handoff_pack::{HandoffInput, resolve_source_locations},
-    parse_search_instant,
+    AppRequest, ContextLevel, ResponseBudget, parse_search_instant,
 };
 use agent_session_grep_domain::{ContextPolicy, IdKind, StableId};
 use agent_session_grep_ports::{
     RetrievalMode, SearchFacets, SearchFilters, SidechainFacet,
     capability::{ProviderCapabilityMatrix, ProviderMaturity},
-    handoff::HandoffFilters,
 };
 use serde_json::{Map, Value, json};
 use std::io::BufRead;
@@ -821,96 +818,19 @@ impl McpServer<'_> {
             );
         }
         let store = self.legacy_store()?;
-        let search_limit = limit.unwrap_or(50);
-        let app = resume_app_with_repo(store, crate::current_repo_slug());
-        // 检索作为装配源：宽松 fetch-all 预算 + 全文级 snippet；pack 预算由
-        // 包构建器单一执行（与 CLI handoff 同一约定）。
-        let response = app.handle(AppRequest::Search {
-            query: query.clone(),
-            filters: filters.clone(),
-            facets: SearchFacets::default(),
-            limit: search_limit,
-            cursor: None,
-            budget: ResponseBudget {
-                max_items: search_limit,
-                max_response_bytes: 64 * 1024 * 1024,
-                max_snippet_chars: 65536,
-                max_messages: search_limit,
-                max_evidence_spans: 512,
-            },
-            include_system: false,
-            group_by_session: false,
-            mode: RetrievalMode::Lexical,
-            query_embedding: None,
-        });
-        let (hits, generation) = match response {
-            Ok(AppResponse::Search {
-                hits, generation, ..
-            }) => (hits, generation),
-            Ok(_) => {
-                return Err(ToolError::Params(
-                    "handoff: unexpected search response".into(),
-                ));
-            }
-            Err(error) => return Err(ToolError::Business(error.into())),
-        };
-        let source_locations = resolve_source_locations(store, &hits).map_err(business)?;
-        let hit_ids: Vec<_> = hits.iter().map(|h| h.id.clone()).collect();
-        let tool_activities = store
-            .tool_activities_for_messages(&hit_ids)
-            .map_err(business)?;
-        let message_facts: Vec<_> = store
-            .message_facts_for(&hit_ids)
-            .map_err(business)?
-            .into_iter()
-            .map(|(message_id, role, is_sidechain)| {
-                agent_session_grep_application::handoff_pack::MessageFact {
-                    message_id,
-                    role,
-                    is_sidechain,
-                }
-            })
-            .collect();
-        let pack =
-            agent_session_grep_application::handoff_pack::generate_deterministic(HandoffInput {
-                query_terms: std::slice::from_ref(&query),
-                retrieval_mode: RetrievalMode::Lexical,
-                filters: HandoffFilters {
-                    providers: filters
-                        .providers
-                        .iter()
-                        .map(|p| p.as_str().to_string())
-                        .collect(),
-                    since: filters
-                        .since
-                        .map(|s| format!("{}.{:09}Z", s.unix_seconds, s.nanosecond)),
-                    until: filters
-                        .until
-                        .map(|s| format!("{}.{:09}Z", s.unix_seconds, s.nanosecond)),
-                },
-                hits: &hits,
-                source_locations: &source_locations,
-                tool_activities: &tool_activities,
-                message_facts: &message_facts,
-                catalog_generation: generation,
-                max_tokens: max_tokens as u64,
-                max_bytes: max_bytes as u64,
+        let (outcome, data, page, warnings) = crate::read_commands::handoff(
+            store,
+            crate::read_commands::HandoffCommand {
+                query,
+                filters,
+                search_limit: limit.unwrap_or(crate::read_commands::DEFAULT_HANDOFF_SEARCH_LIMIT),
                 max_evidence,
-                target: None,
-            });
-        let outcome = if pack.truncation.truncated {
-            Outcome::Partial
-        } else {
-            Outcome::Success
-        };
-        let data = serde_json::to_value(&pack)
-            .map_err(|e| ToolError::Params(format!("handoff: serialization error: {e}")))?;
-        Ok(success_payload(
-            outcome,
-            data,
-            &protocol::Page::default(),
-            &[],
-        ))
+                max_tokens,
+                max_bytes,
+            },
+        )
+        .map_err(|error| ToolError::Business(error.0))?;
+        Ok(success_payload(outcome, data, &page, &warnings))
     }
 
     /// doctor 不经 App：直接读 store 只读事实。data 由 [`crate::doctor_store_data`]

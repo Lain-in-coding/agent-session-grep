@@ -310,7 +310,7 @@ pre.preview { margin: 0 16px 20px; max-height: 40vh; overflow: auto; padding: 12
         <details class="search-filters">
           <summary data-i18n="filters"></summary>
           <div class="filter-grid">
-            <label class="filter-field"><span data-i18n="maxBytes"></span><input id="maxBytes" type="number" min="1" step="1" inputmode="numeric"></label>
+            <label class="filter-field"><span data-i18n="maxBytes"></span><input id="maxBytes" type="number" min="4096" step="1" inputmode="numeric" placeholder="4096"></label>
             <label class="filter-field"><span data-i18n="repo"></span><input id="repo" type="text" autocomplete="off"></label>
             <label class="filter-field"><span data-i18n="since"></span><input id="since" type="text" autocomplete="off" placeholder="2026-01-01T00:00:00Z"></label>
             <label class="filter-field"><span data-i18n="until"></span><input id="until" type="text" autocomplete="off" placeholder="2026-01-01T00:00:00Z"></label>
@@ -971,7 +971,15 @@ async function previewResume() {
 
 async function previewHandoff() {
   if (!lastQuery) return;
-  await loadPreview('/api/handoff?q=' + encodeURIComponent(lastQuery));
+  // A handoff must describe the same slice the user is looking at. Search-only
+  // filters (mode, paging, sidechain, tool facets, system noise) have no
+  // handoff parameter and are intentionally not invented here.
+  const params = new URLSearchParams({ q: lastQuery });
+  for (const id of ['provider', 'repo', 'since', 'until']) {
+    const value = document.getElementById(id).value.trim();
+    if (value) params.set(id, value);
+  }
+  await loadPreview('/api/handoff?' + params);
 }
 
 /* ─── Wiring ────────────────────────────────────────────────────────────── */

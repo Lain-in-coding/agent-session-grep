@@ -93,8 +93,10 @@ tools: search_sessions / get_session_context / get_session_resume / get_message 
 ## 10. Web 搜索参数与向量重建
 
 - `GET /api/search` 与 `/api/projection/search` 支持 `q`、`mode`、`limit`、`max_bytes`、`cursor`、可重复的 `provider`、`since`、`until`、`repo`、`include_system`、`group_by_session`、`sidechain`、`tool_kind`、`tool_name`。`limit` 同时设置页大小和 `max_items`；没有独立的第二个 item 预算。`sidechain` 接受 `include|main_only|subagent_only`，布尔值只接受 `true|false`。
-- 每个 `provider` 都进入 OR 集合，标量参数重复、未知参数、空参数及非法百分号编码返回 `invalid_request`；不静默丢弃过滤条件。Web 时间参数沿用 CLI 的绝对或相对时间语法；MCP 保持只接受绝对时间。
+- Web 请求在 HTTP 边界直接构造类型化命令，不在查询值与 CLI argv 之间往返。参数值按字面量进入对应字段，因此 `q=--repo` 检索文本 `--repo`，不会触发或改变 `repo` 过滤；MCP 对同名查询值采用同一字面量语义。
+- 所有 Web 数据路由都拒绝未知参数、重复标量、空参数、控制字符及非法百分号编码（`invalid_request`），不静默丢弃过滤条件。`/api/search` 和 `/api/handoff` 的 `provider` 可重复，每个值进入 OR 集合。`/api/context` 支持 `policy`、`level`、`max_messages`、`max_bytes`；`/api/handoff` 支持 `q`、可重复 `provider`、`repo`、`since`、`until`、`max_evidence`、`max_tokens`、`max_bytes`。Web 时间参数沿用 CLI 的绝对或相对时间语法；MCP 保持只接受绝对时间。
 - `/api/status` 的 `data.web_capabilities` 公布实际搜索参数、重复参数、provider 取值和检索模式，并明确 `mutation_and_execution=false`。Web 仍为只读预览入口。
+- `GET /api/resume` 只构造命令描述和证据字段，绝不执行 provider、绝不写磁盘。首次预览标记只由可执行的 CLI `resume`/`resume --yes` 路径管理，查看 Web 预览不能让后续 `resume --yes` 跳过强制预览。
 - `index embeddings` 以 128 行 keyset 批次扫描权威 catalog，只为含正文的 Message 编码；adapter 批次上限为 512。模型向量必须符合声明维度且全部有限。旧向量替换与 generation 推进在同一事务内完成，编码/写入失败回滚全部替换，原有向量与 generation 保持不变。
 
 ## 11. SQLite 源与只读目录

@@ -196,6 +196,28 @@ test('each search input invalidates its cursor and both change events retain fee
   }
 });
 
+// The server rejects a response budget below 4096 bytes. The control must
+// declare the same floor so an out-of-range value is caught locally with the
+// numeric-filter message instead of a round trip ending in a generic 400.
+test('a byte budget below the server floor is rejected before any request', async () => {
+  const p = await page();
+  p.nodes.get('query').value = 'needle';
+  p.nodes.get('maxBytes').value = '100';
+  const count = p.pending.length;
+  const rejected = p.ui.doSearch();
+  assert.equal(p.pending.length, count);
+  assert.match(p.nodes.get('searchFeedback').textContent, /numeric filters/);
+  if (p.pending.length > count) {
+    p.pending.at(-1).resolve(searchBody('unexpected'));
+    await rejected;
+  }
+  p.nodes.get('maxBytes').value = '4096';
+  const task = p.ui.doSearch();
+  p.request('/api/search?').resolve(searchBody('floor'));
+  await task;
+  assert.match(p.nodes.get('results').textContent, /floor/);
+});
+
 test('cursor guard also rejects programmatic input changes and duplicate page loads', async () => {
   const p = await page();
   await search(p, 'first', 'page-two');

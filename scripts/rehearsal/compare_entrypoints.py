@@ -328,8 +328,8 @@ def _serve_url(binary: str, db: str) -> Tuple[subprocess.Popen[str], str]:
                 break
             continue
         # Current serve prints one ready line: `asg serve: open http://<addr>/#token=<token>`.
-        # The token lives in the URL fragment (never sent to the server); the
-        # query form is still accepted for hand-typed URLs.
+        # The token lives in the URL fragment (never sent to the server). The
+        # query form below exists only to carry it inside this local harness.
         if line.startswith("asg serve: open http://") and address is None:
             ready = line.removeprefix("asg serve: open ")
             parsed = urllib.parse.urlsplit(ready)

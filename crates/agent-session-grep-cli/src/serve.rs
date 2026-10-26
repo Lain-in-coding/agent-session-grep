@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_session_grep_adapters_sqlite::SqliteStore;
+use agent_session_grep_application::{ContextLevel, ResponseBudget};
+use agent_session_grep_domain::ContextPolicy;
+use agent_session_grep_ports::{SearchFacets, SearchFilters, SearchProvider, SidechainFacet};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -77,8 +80,6 @@ impl ServeSession {
 /// one bounded worker slot.
 pub fn run(
     session: &ServeSession,
-    db: &str,
-    offline: bool,
     store: &SqliteStore,
 ) -> Result<crate::protocol::Outcome, crate::CliError> {
     let listener = TcpListener::bind(session.address())
@@ -99,15 +100,8 @@ pub fn run(
         session.token()
     );
     eprintln!("asg serve: loopback-only; LAN mode is capability_not_supported");
-    serve_listener(
-        listener,
-        session.token(),
-        db,
-        offline,
-        store,
-        ServerLimits::production(),
-    )
-    .map_err(|e| crate::CliError::usage(format!("serve: listener failed: {e}")))?;
+    serve_listener(listener, session.token(), store, ServerLimits::production())
+        .map_err(|e| crate::CliError::usage(format!("serve: listener failed: {e}")))?;
     Ok(crate::protocol::Outcome::Success)
 }
 
@@ -139,8 +133,6 @@ enum WorkerEvent {
 fn serve_listener(
     listener: TcpListener,
     token: &str,
-    db: &str,
-    offline: bool,
     store: &SqliteStore,
     limits: ServerLimits,
 ) -> std::io::Result<()> {
@@ -204,7 +196,7 @@ fn serve_listener(
             match event_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(WorkerEvent::Parsed { request, reply }) => match request {
                     Ok(request) => {
-                        let response = route_response(&request, token, db, offline, store);
+                        let response = route_response(&request, token, store);
                         let _ = reply.send(response);
                     }
                     Err(error) => {
@@ -288,16 +280,8 @@ fn worker_loop(
 /// and hang every later request. One fixed 500 per failing request is the
 /// honest failure; the panic payload is never echoed (it may quote transcript
 /// content).
-fn route_response(
-    request: &HttpRequest,
-    token: &str,
-    db: &str,
-    offline: bool,
-    store: &SqliteStore,
-) -> HttpResponse {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        route_request(request, token, db, offline, store)
-    }));
+fn route_response(request: &HttpRequest, token: &str, store: &SqliteStore) -> HttpResponse {
+    let result = catch_unwind(AssertUnwindSafe(|| route_request(request, token, store)));
     match result {
         Ok(response) => response,
         Err(_) => fixed_error(500, "internal", "request handler failed"),
@@ -389,28 +373,23 @@ impl HttpRequest {
             .any(|(name, _)| is_forwarding_header(name))
     }
 
-    /// Extract a query-string parameter from the request path (percent-
-    /// decoding is minimal: '+' as space; other escapes passed through).
-    pub fn query_param(&self, name: &str) -> Option<String> {
-        let (_, query) = self.path.split_once('?')?;
-        for pair in query.split('&') {
-            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            if percent_decode(raw_key).as_deref() == Some(name) {
-                return percent_decode(raw_value);
-            }
-        }
-        None
-    }
-
     fn query_pairs(&self) -> Result<Vec<(String, String)>, HttpResponse> {
         let Some((_, query)) = self.path.split_once('?') else {
             return Ok(Vec::new());
         };
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
         query
             .split('&')
-            .filter(|pair| !pair.is_empty())
             .map(|pair| {
-                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let Some((key, value)) = pair.split_once('=') else {
+                    return Err(fixed_error(
+                        400,
+                        "invalid_request",
+                        "invalid query parameter encoding",
+                    ));
+                };
                 match (percent_decode(key), percent_decode(value)) {
                     (Some(key), Some(value)) => Ok((key, value)),
                     _ => Err(fixed_error(
@@ -443,7 +422,12 @@ fn percent_decode(value: &str) -> Option<String> {
         }
         index += 1;
     }
-    String::from_utf8(output).ok()
+    let value = String::from_utf8(output).ok()?;
+    // A raw control byte is rejected above, but `%0A` would otherwise decode
+    // into one. No request parameter has a legitimate control-character use,
+    // and accepting some here while the search validator rejects others made
+    // the failure depend on the parameter name.
+    (!value.chars().any(char::is_control)).then_some(value)
 }
 
 fn loopback_host(host: Option<&str>) -> bool {
@@ -717,13 +701,7 @@ fn path_only(path: &str) -> &str {
 ///
 /// All JSON responses pass through the cross-boundary redactor (ADR-0009):
 /// Web 是跨边界输出,secret 模式一律脱敏(与 Robot/MCP/Handoff 同规则)。
-pub fn route_request(
-    req: &HttpRequest,
-    token: &str,
-    db: &str,
-    offline: bool,
-    store: &SqliteStore,
-) -> HttpResponse {
+pub fn route_request(req: &HttpRequest, token: &str, store: &SqliteStore) -> HttpResponse {
     // The order deliberately reveals no token validity to a non-loopback Host
     // or Origin. Every rejection has a fixed, path-free, secret-free body.
     if !req.check_host_loopback() {
@@ -771,10 +749,6 @@ pub fn route_request(
         return fixed_error(400, "invalid_request", "GET requests only");
     }
 
-    let mut args = match request_args(req) {
-        Ok(args) => args,
-        Err(response) => return response,
-    };
     let path = path_only(req.path.as_str());
     if path == "/" {
         let mut response = HttpResponse::text(200, WEB_UI_HTML, "text/html; charset=utf-8");
@@ -784,89 +758,166 @@ pub fn route_request(
         ));
         return response;
     }
-    if path == "/health" {
-        args = vec!["status".to_string()];
-    }
-    if path == "/api/providers" {
-        // 与其它 Web 路由共用同一 envelope（command/outcome/data/page/warnings），
-        // 客户端无需为单一路由特判响应形状（audit P1-6）。
-        return redacted_json(
-            200,
-            serde_json::json!({
-                "command": "providers",
-                "outcome": "success",
-                "data": crate::provider_matrix_data(),
-                "page": { "next_cursor": null, "has_more": false },
-                "warnings": [],
-            }),
-        );
-    }
-    if let Some(id) = path.strip_prefix("/api/show/") {
-        if let Err(response) = check_argv_value("id", id) {
-            return response;
+    match path {
+        "/health" | "/api/status" => match WebParams::parse(req, &[], &[]) {
+            Ok(_) => execute(
+                "status",
+                crate::read_commands::status(store).map(with_web_capabilities),
+            ),
+            Err(response) => response,
+        },
+        "/api/providers" => match WebParams::parse(req, &[], &[]) {
+            Ok(_) => redacted_json(
+                200,
+                serde_json::json!({
+                    "command": "providers",
+                    "outcome": "success",
+                    "data": crate::provider_matrix_data(),
+                    "page": { "next_cursor": null, "has_more": false },
+                    "warnings": [],
+                }),
+            ),
+            Err(response) => response,
+        },
+        "/api/search" | "/api/projection/search" => web_search(req, store),
+        "/api/context" => web_context(req, store),
+        "/api/handoff" => web_handoff(req, store),
+        "/api/show" => web_show(req, store, None),
+        "/api/resume" => web_resume(req, store, None),
+        _ => {
+            if let Some(id) = path.strip_prefix("/api/show/") {
+                web_show(req, store, Some(id))
+            } else if let Some(session_id) = path.strip_prefix("/api/resume/") {
+                web_resume(req, store, Some(session_id))
+            } else {
+                fixed_error(404, "not_found", "HTTP route not found")
+            }
         }
-        args = vec!["show".to_string(), id.to_string()];
-    } else if path == "/api/show" {
-        let Some(id) = req.query_param("id").filter(|value| !value.is_empty()) else {
-            return fixed_error(400, "invalid_request", "missing id parameter");
-        };
-        if let Err(response) = check_argv_value("id", &id) {
-            return response;
-        }
-        args = vec!["show".to_string(), id];
     }
-    if let Some(session_id) = path.strip_prefix("/api/resume/") {
-        if let Err(response) = check_argv_value("session", session_id) {
-            return response;
+}
+
+const WEB_SEARCH_PARAMETERS: &[&str] = &[
+    "q",
+    "mode",
+    "limit",
+    "max_bytes",
+    "cursor",
+    "provider",
+    "since",
+    "until",
+    "repo",
+    "include_system",
+    "group_by_session",
+    "sidechain",
+    "tool_kind",
+    "tool_name",
+];
+
+const WEB_CONTEXT_PARAMETERS: &[&str] =
+    &["session", "policy", "level", "max_messages", "max_bytes"];
+const WEB_HANDOFF_PARAMETERS: &[&str] = &[
+    "q",
+    "provider",
+    "repo",
+    "since",
+    "until",
+    "max_evidence",
+    "max_tokens",
+    "max_bytes",
+];
+
+/// Decode and validate one route's query string exactly once. Every data route
+/// declares its parameter vocabulary; an unknown, repeated scalar, empty or
+/// malformed value is rejected instead of being silently ignored. The page
+/// route (`/`) is deliberately not passed through here: its query string is
+/// inert and the fragment-based bootstrap must keep working.
+struct WebParams {
+    pairs: Vec<(String, String)>,
+}
+
+impl WebParams {
+    fn parse(
+        req: &HttpRequest,
+        allowed: &[&str],
+        repeatable: &[&str],
+    ) -> Result<Self, HttpResponse> {
+        let pairs = req.query_pairs()?;
+        let mut seen = std::collections::BTreeMap::<&str, &str>::new();
+        for (name, value) in &pairs {
+            if !allowed.contains(&name.as_str()) {
+                return Err(fixed_error(
+                    400,
+                    "invalid_request",
+                    "unknown query parameter",
+                ));
+            }
+            if !repeatable.contains(&name.as_str()) && seen.insert(name, value).is_some() {
+                return Err(fixed_error(
+                    400,
+                    "invalid_request",
+                    &format!("repeated query parameter: {name}"),
+                ));
+            }
+            if value.trim().is_empty() {
+                return Err(fixed_error(
+                    400,
+                    "invalid_request",
+                    &format!("empty query parameter: {name}"),
+                ));
+            }
         }
-        args = vec!["resume".to_string(), session_id.to_string()];
-    } else if path == "/api/resume" {
-        let Some(session_id) = req.query_param("session").filter(|value| !value.is_empty()) else {
-            return fixed_error(400, "invalid_request", "missing session parameter");
-        };
-        if let Err(response) = check_argv_value("session", &session_id) {
-            return response;
-        }
-        args = vec!["resume".to_string(), session_id];
-    }
-    if !matches!(
-        path,
-        "/health"
-            | "/api/status"
-            | "/api/search"
-            | "/api/projection/search"
-            | "/api/context"
-            | "/api/handoff"
-            | "/api/providers"
-            | "/api/show"
-            | "/api/resume"
-    ) && !path.starts_with("/api/show/")
-        && !path.starts_with("/api/resume/")
-    {
-        return fixed_error(404, "not_found", "HTTP route not found");
+        Ok(Self { pairs })
     }
 
-    match crate::dispatch(
-        store,
-        db,
-        &args,
-        crate::protocol::OutputMode::Json,
-        None,
-        offline,
-    ) {
-        Ok((command, outcome, mut data, page, warnings)) => {
-            if command == "status"
-                && let Some(data) = data.as_object_mut()
-            {
-                data.insert("web_capabilities".into(), serde_json::json!({
-                    "search_parameters": WEB_SEARCH_PARAMETERS,
-                    "repeated_parameters": ["provider"],
-                    "provider_values": agent_session_grep_ports::capability::search_provider_filter_values(),
-                    "retrieval_modes": ["lexical", "semantic", "hybrid"],
-                    "limit_sets_max_items": true,
-                    "mutation_and_execution": false,
-                }));
-            }
+    fn get(&self, name: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn required(&self, name: &str) -> Result<&str, HttpResponse> {
+        self.get(name).ok_or_else(|| {
+            fixed_error(400, "invalid_request", &format!("missing {name} parameter"))
+        })
+    }
+
+    fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.pairs
+            .iter()
+            .filter(move |(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn opt_usize(&self, name: &str) -> Result<Option<usize>, HttpResponse> {
+        self.get(name)
+            .map(|value| {
+                value.parse::<usize>().map_err(|_| {
+                    fixed_error(400, "invalid_request", &format!("invalid {name} parameter"))
+                })
+            })
+            .transpose()
+    }
+
+    fn opt_bool(&self, name: &str) -> Result<bool, HttpResponse> {
+        match self.get(name) {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(_) => Err(fixed_error(
+                400,
+                "invalid_request",
+                &format!("invalid {name} parameter"),
+            )),
+        }
+    }
+}
+
+fn execute(
+    command: &'static str,
+    result: Result<crate::read_commands::Rendered, crate::CliError>,
+) -> HttpResponse {
+    match result {
+        Ok((outcome, data, page, warnings)) => {
             let outcome = match outcome {
                 crate::protocol::Outcome::Success => "success",
                 crate::protocol::Outcome::Partial => "partial",
@@ -889,184 +940,322 @@ pub fn route_request(
     }
 }
 
-const WEB_SEARCH_PARAMETERS: &[&str] = &[
-    "q",
-    "mode",
-    "limit",
-    "max_bytes",
-    "cursor",
-    "provider",
-    "since",
-    "until",
-    "repo",
-    "include_system",
-    "group_by_session",
-    "sidechain",
-    "tool_kind",
-    "tool_name",
-];
+/// Attach the Web capability block to the rendered status projection before
+/// the envelope is built, so the response is assembled and redacted once.
+fn with_web_capabilities(
+    (outcome, mut data, page, warnings): crate::read_commands::Rendered,
+) -> crate::read_commands::Rendered {
+    if let Some(data) = data.as_object_mut() {
+        data.insert(
+            "web_capabilities".into(),
+            serde_json::json!({
+                "search_parameters": WEB_SEARCH_PARAMETERS,
+                "repeated_parameters": ["provider"],
+                "provider_values": agent_session_grep_ports::capability::search_provider_filter_values(),
+                "retrieval_modes": ["lexical", "semantic", "hybrid"],
+                "limit_sets_max_items": true,
+                "mutation_and_execution": false,
+            }),
+        );
+    }
+    (outcome, data, page, warnings)
+}
 
-fn request_args(req: &HttpRequest) -> Result<Vec<String>, HttpResponse> {
-    let path = path_only(req.path.as_str());
-    let value = |name: &str| -> Result<Option<String>, HttpResponse> {
-        let Some(value) = req.query_param(name).filter(|value| !value.is_empty()) else {
-            return Ok(None);
-        };
-        check_argv_value(name, &value)?;
-        Ok(Some(value))
-    };
-    match path {
-        "/" | "/health" | "/api/providers" => Ok(Vec::new()),
-        "/api/status" => Ok(vec!["status".to_string()]),
-        "/api/search" | "/api/projection/search" => {
-            let parameters = req.query_pairs()?;
-            let mut seen = std::collections::BTreeSet::new();
-            for (name, parameter) in &parameters {
-                if !WEB_SEARCH_PARAMETERS.contains(&name.as_str())
-                    || (name != "provider" && !seen.insert(name.as_str()))
-                    || parameter.trim().is_empty()
-                {
-                    return Err(fixed_error(
-                        400,
-                        "invalid_request",
-                        "unknown, duplicate or empty search parameter",
-                    ));
-                }
-                check_argv_value(name, parameter)?;
-            }
-            let Some(query) = value("q")? else {
-                return Err(fixed_error(400, "invalid_request", "missing q parameter"));
-            };
-            let mut args = vec!["search".to_string(), query];
-            append_value_flag(&mut args, "--mode", value("mode")?);
-            append_value_flag(&mut args, "--max-items", value("limit")?);
-            append_value_flag(&mut args, "--max-bytes", value("max_bytes")?);
-            append_value_flag(&mut args, "--cursor", value("cursor")?);
-            for (_, provider) in parameters.iter().filter(|(name, _)| name == "provider") {
-                append_value_flag(&mut args, "--provider", Some(provider.clone()));
-            }
-            append_value_flag(&mut args, "--since", value("since")?);
-            append_value_flag(&mut args, "--until", value("until")?);
-            // repo（schema v16）：与 CLI `--repo` / MCP `repo` 同一维度，Web 面
-            // 不得少一个过滤轴（五入口一致性）。空取值被 `value` 过滤掉 = 无过滤。
-            append_value_flag(&mut args, "--repo", value("repo")?);
-            append_value_flag(&mut args, "--tool-kind", value("tool_kind")?);
-            append_value_flag(&mut args, "--tool-name", value("tool_name")?);
-            match value("sidechain")?.as_deref() {
-                None | Some("include") => {}
-                Some("main_only") => args.push("--main-only".into()),
-                Some("subagent_only") => args.push("--subagent-only".into()),
-                Some(_) => {
-                    return Err(fixed_error(
-                        400,
-                        "invalid_request",
-                        "invalid sidechain parameter",
-                    ));
-                }
-            }
-            for (name, flag) in [
-                ("include_system", "--include-system"),
-                ("group_by_session", "--group-by-session"),
-            ] {
-                match value(name)?.as_deref() {
-                    Some("true") => args.push(flag.into()),
-                    None | Some("false") => {}
-                    Some(_) => {
-                        return Err(fixed_error(
-                            400,
-                            "invalid_request",
-                            "search boolean must be true or false",
-                        ));
-                    }
-                }
-            }
-            Ok(args)
-        }
-        "/api/context" => {
-            let Some(session) = value("session")? else {
+fn search_command(req: &HttpRequest) -> Result<crate::read_commands::SearchCommand, HttpResponse> {
+    let params = WebParams::parse(req, WEB_SEARCH_PARAMETERS, &["provider"])?;
+    let query = params.required("q")?.trim();
+    let mode = match params.get("mode") {
+        None => agent_session_grep_ports::RetrievalMode::Lexical,
+        Some(value) => match crate::read_commands::retrieval_mode(value) {
+            Some(mode) => mode,
+            None => {
                 return Err(fixed_error(
                     400,
                     "invalid_request",
-                    "missing session parameter",
+                    "invalid mode parameter",
                 ));
-            };
-            let mut args = vec!["context".to_string(), session];
-            append_value_flag(&mut args, "--policy", value("policy")?);
-            append_value_flag(&mut args, "--level", value("level")?);
-            append_value_flag(&mut args, "--max-messages", value("max_messages")?);
-            Ok(args)
-        }
-        "/api/handoff" => {
-            let Some(query) = value("q")? else {
-                return Err(fixed_error(400, "invalid_request", "missing q parameter"));
-            };
-            let mut args = vec!["handoff".to_string(), query];
-            append_value_flag(&mut args, "--provider", value("provider")?);
-            append_value_flag(&mut args, "--since", value("since")?);
-            append_value_flag(&mut args, "--until", value("until")?);
-            append_value_flag(&mut args, "--max-evidence", value("max_evidence")?);
-            Ok(args)
-        }
-        _ => Ok(Vec::new()),
+            }
+        },
+    };
+    let sidechain = match params.get("sidechain") {
+        None => SidechainFacet::Include,
+        Some(value) => match crate::read_commands::sidechain_facet(value) {
+            Some(facet) => facet,
+            None => {
+                return Err(fixed_error(
+                    400,
+                    "invalid_request",
+                    "invalid sidechain parameter",
+                ));
+            }
+        },
+    };
+    let include_system = params.opt_bool("include_system")?;
+    let group_by_session = params.opt_bool("group_by_session")?;
+    let max_items = params.opt_usize("limit")?;
+    let max_bytes = params.opt_usize("max_bytes")?;
+    let mut filters = SearchFilters::default();
+    // Only the clock used to resolve compact relative durations is captured.
+    let now_ms = crate::app_clock_ms();
+    for value in params.values("provider") {
+        let Some(provider) = SearchProvider::parse(value) else {
+            return Err(fixed_error(
+                400,
+                "invalid_request",
+                &format!(
+                    "invalid provider parameter; expected {}",
+                    crate::provider_value_hint()
+                ),
+            ));
+        };
+        filters.providers.push(provider);
     }
-}
-
-/// Flag tokens this surface itself puts into the argv it hands `dispatch`.
-/// [`crate::is_known_flag_name`] covers the prefix-position vocabulary but not
-/// the per-subcommand flags marshalled here, so the two lists together are the
-/// full set of tokens the parser can compare a value against.
-const SERVE_ARGV_FLAGS: &[&str] = &[
-    "--mode",
-    "--max-items",
-    "--max-bytes",
-    "--tool-kind",
-    "--tool-name",
-    "--main-only",
-    "--subagent-only",
-    "--include-sidechain",
-    "--cursor",
-    "--provider",
-    "--since",
-    "--until",
-    "--repo",
-    "--include-system",
-    "--group-by-session",
-    "--policy",
-    "--level",
-    "--max-messages",
-    "--max-evidence",
-];
-
-/// Every request value that reaches [`crate::dispatch`] travels as an argv
-/// token, and the parser matches flag names by whole-token equality wherever
-/// they sit. A value that *equals* a flag name therefore changed what actually
-/// ran: `?q=--repo&repo=needle` searched `needle` filtered by repo `--repo` and
-/// answered 200 for a query nobody asked, while `?q=--include-system` was eaten
-/// as a boolean flag and answered a 400 claiming `q` was missing. Same doctrine
-/// as the `--db <path>` flag-shaped-value guard (R8.1/R8.2): ambiguity is an
-/// explicit usage error, never a silent reinterpretation.
-///
-/// The test is equality against the flag vocabulary, not a `-` prefix, because
-/// equality is exactly what the parser does. `q` is a free-text search term and
-/// coding transcripts are full of flag-*shaped* strings (`--no-verify`, `-Wall`,
-/// `-D warnings`); rejecting those would drop real coverage without closing any
-/// ambiguity, since the parser never compares against them.
-fn check_argv_value(name: &str, value: &str) -> Result<(), HttpResponse> {
-    if crate::is_known_flag_name(value) || SERVE_ARGV_FLAGS.contains(&value) {
-        // 只回显参数名（调用点全是字面量），绝不回显取值——它可能是检索词。
+    filters.since = parse_time_param(&params, "since", now_ms)?;
+    filters.until = parse_time_param(&params, "until", now_ms)?;
+    filters.repo = params.get("repo").map(str::to_string);
+    let tool_kind = params.get("tool_kind").map(str::to_string);
+    if let Some(kind) = tool_kind.as_deref()
+        && !crate::read_commands::valid_tool_kind(kind)
+    {
         return Err(fixed_error(
             400,
             "invalid_request",
-            &format!("parameter {name} must not be a CLI flag name"),
+            "invalid tool_kind parameter",
         ));
     }
-    Ok(())
+    let facets = SearchFacets {
+        sidechain,
+        tool_kind,
+        tool_name: params.get("tool_name").map(str::to_string),
+    };
+    let mut budget = ResponseBudget::default();
+    if let Some(value) = max_items {
+        budget.max_items = value;
+    }
+    if let Some(value) = max_bytes {
+        budget.max_response_bytes = value;
+    }
+    Ok(crate::read_commands::SearchCommand {
+        query: query.to_string(),
+        filters,
+        facets,
+        limit: max_items.unwrap_or(crate::read_commands::DEFAULT_SEARCH_LIMIT),
+        cursor: params.get("cursor").map(str::to_string),
+        budget,
+        include_system,
+        group_by_session,
+        mode,
+        attach_session_rows: false,
+    })
 }
 
-fn append_value_flag(args: &mut Vec<String>, flag: &str, value: Option<String>) {
-    if let Some(value) = value {
-        args.push(flag.to_string());
-        args.push(value);
+fn web_search(req: &HttpRequest, store: &SqliteStore) -> HttpResponse {
+    let command = match search_command(req) {
+        Ok(command) => command,
+        Err(response) => return response,
+    };
+    execute("search", crate::read_commands::search(store, command))
+}
+
+fn parse_time_param(
+    params: &WebParams,
+    name: &str,
+    now_ms: i64,
+) -> Result<Option<agent_session_grep_ports::SearchInstant>, HttpResponse> {
+    let Some(value) = params.get(name) else {
+        return Ok(None);
+    };
+    agent_session_grep_application::parse_search_instant(value)
+        .or_else(|| agent_session_grep_application::parse_relative_search_instant(value, now_ms))
+        .map(Some)
+        .ok_or_else(|| fixed_error(400, "invalid_request", &format!("invalid {name} parameter")))
+}
+
+fn web_context(req: &HttpRequest, store: &SqliteStore) -> HttpResponse {
+    let params = match WebParams::parse(req, WEB_CONTEXT_PARAMETERS, &[]) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let session = match params.required("session") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let policy = match params.get("policy") {
+        None => ContextPolicy::Mainline,
+        Some(value) => match crate::read_commands::context_policy(value) {
+            Some(policy) => policy,
+            None => {
+                return fixed_error(400, "invalid_request", "invalid policy parameter");
+            }
+        },
+    };
+    let level = match params.get("level") {
+        None => ContextLevel::Raw,
+        Some(value) => match crate::read_commands::context_level(value) {
+            Some(level) => level,
+            None => {
+                return fixed_error(400, "invalid_request", "invalid level parameter");
+            }
+        },
+    };
+    let max_messages = match params.opt_usize("max_messages") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let max_bytes = match params.opt_usize("max_bytes") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Some(session_id) = agent_session_grep_domain::StableId::from_wire(session)
+        .filter(|id| id.kind() == agent_session_grep_domain::IdKind::Session)
+    else {
+        return fixed_error(400, "invalid_request", "invalid session parameter");
+    };
+    let mut budget = ResponseBudget::default();
+    if let Some(value) = max_messages {
+        budget.max_messages = value;
+    }
+    if let Some(value) = max_bytes {
+        budget.max_response_bytes = value;
+    }
+    execute(
+        "context",
+        crate::read_commands::context(
+            store,
+            crate::read_commands::ContextCommand {
+                session_id,
+                policy,
+                level,
+                budget,
+            },
+        ),
+    )
+}
+
+fn web_handoff(req: &HttpRequest, store: &SqliteStore) -> HttpResponse {
+    let params = match WebParams::parse(req, WEB_HANDOFF_PARAMETERS, &["provider"]) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let query = match params.required("q") {
+        Ok(query) => query.trim(),
+        Err(response) => return response,
+    };
+    let now_ms = crate::app_clock_ms();
+    let mut filters = SearchFilters::default();
+    for value in params.values("provider") {
+        let Some(provider) = SearchProvider::parse(value) else {
+            return fixed_error(
+                400,
+                "invalid_request",
+                &format!(
+                    "invalid provider parameter; expected {}",
+                    crate::provider_value_hint()
+                ),
+            );
+        };
+        filters.providers.push(provider);
+    }
+    filters.since = match parse_time_param(&params, "since", now_ms) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    filters.until = match parse_time_param(&params, "until", now_ms) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    filters.repo = params.get("repo").map(str::to_string);
+    let max_evidence = match params.opt_usize("max_evidence") {
+        Ok(value) => value.unwrap_or(crate::read_commands::DEFAULT_HANDOFF_EVIDENCE),
+        Err(response) => return response,
+    };
+    let max_tokens = match params.opt_usize("max_tokens") {
+        Ok(value) => value.unwrap_or(crate::read_commands::DEFAULT_HANDOFF_TOKENS),
+        Err(response) => return response,
+    };
+    let max_bytes = match params.opt_usize("max_bytes") {
+        Ok(value) => value.unwrap_or(crate::read_commands::DEFAULT_HANDOFF_BYTES),
+        Err(response) => return response,
+    };
+    execute(
+        "handoff",
+        crate::read_commands::handoff(
+            store,
+            crate::read_commands::HandoffCommand {
+                query: query.to_string(),
+                filters,
+                search_limit: crate::read_commands::DEFAULT_HANDOFF_SEARCH_LIMIT,
+                max_evidence,
+                max_tokens,
+                max_bytes,
+            },
+        ),
+    )
+}
+
+fn web_show(req: &HttpRequest, store: &SqliteStore, path_id: Option<&str>) -> HttpResponse {
+    let id = match path_id {
+        Some(id) => {
+            if let Err(response) = WebParams::parse(req, &[], &[]) {
+                return response;
+            }
+            id.to_string()
+        }
+        None => {
+            let params = match WebParams::parse(req, &["id"], &[]) {
+                Ok(params) => params,
+                Err(response) => return response,
+            };
+            let Ok(id) = params.required("id") else {
+                return fixed_error(400, "invalid_request", "missing id parameter");
+            };
+            id.to_string()
+        }
+    };
+    let Some(id) = agent_session_grep_domain::StableId::from_wire(&id) else {
+        return fixed_error(400, "invalid_request", "invalid id parameter");
+    };
+    execute("show", crate::read_commands::show(store, id))
+}
+
+fn web_resume(req: &HttpRequest, store: &SqliteStore, path_session: Option<&str>) -> HttpResponse {
+    let session = match path_session {
+        Some(session) => {
+            if let Err(response) = WebParams::parse(req, &[], &[]) {
+                return response;
+            }
+            session.to_string()
+        }
+        None => {
+            let params = match WebParams::parse(req, &["session"], &[]) {
+                Ok(params) => params,
+                Err(response) => return response,
+            };
+            let Ok(session) = params.required("session") else {
+                return fixed_error(400, "invalid_request", "missing session parameter");
+            };
+            session.to_string()
+        }
+    };
+    let Some(session_id) = agent_session_grep_domain::StableId::from_wire(&session)
+        .filter(|id| id.kind() == agent_session_grep_domain::IdKind::Session)
+    else {
+        return fixed_error(400, "invalid_request", "invalid session parameter");
+    };
+    // GET is a pure preview: no first-run acknowledgement marker and no
+    // execution. `resume --yes` is a CLI-only capability.
+    match crate::read_commands::resume_preview(store, session_id) {
+        Ok((data, _preview)) => redacted_json(
+            200,
+            serde_json::json!({
+                "command": "resume",
+                "outcome": "success",
+                "data": data,
+                "page": { "next_cursor": null, "has_more": false },
+                "warnings": [],
+            }),
+        ),
+        Err(error) => protocol_error(error.0),
     }
 }
 
@@ -1176,8 +1365,6 @@ mod tests {
             serve_listener(
                 listener,
                 &server_token,
-                "test.db",
-                false,
                 &store,
                 ServerLimits {
                     read_timeout,
@@ -1271,7 +1458,7 @@ mod tests {
             .headers
             .push(("Origin".into(), "http://evil.test".into()));
         assert!(!duplicated.check_origin_loopback());
-        let response = route_request(&duplicated, TEST_TOKEN, "test.db", false, &store);
+        let response = route_request(&duplicated, TEST_TOKEN, &store);
         assert_eq!(response.status, 403, "{}", response.body);
         assert!(
             response.body.contains("forbidden_origin"),
@@ -1285,6 +1472,9 @@ mod tests {
         assert_eq!(percent_decode("hello+world"), Some("hello world".into()));
         assert_eq!(percent_decode("%E9%85%8D%E7%BD%AE"), Some("配置".into()));
         assert_eq!(percent_decode("%zz"), None);
+        assert_eq!(percent_decode("%0A"), None);
+        assert_eq!(percent_decode("%"), None);
+        assert_eq!(percent_decode("%A"), None);
     }
 
     #[test]
@@ -1295,10 +1485,7 @@ mod tests {
             "/api/status",
             vec![("Host".into(), "127.0.0.1:8080".into())],
         );
-        assert_eq!(
-            route_request(&no_token, TEST_TOKEN, "test.db", false, &store).status,
-            401
-        );
+        assert_eq!(route_request(&no_token, TEST_TOKEN, &store).status, 401);
 
         let bad_host = request(
             "GET",
@@ -1308,10 +1495,7 @@ mod tests {
                 ("Host".into(), "example.test".into()),
             ],
         );
-        assert_eq!(
-            route_request(&bad_host, TEST_TOKEN, "test.db", false, &store).status,
-            403
-        );
+        assert_eq!(route_request(&bad_host, TEST_TOKEN, &store).status, 403);
 
         // A query string is never a credential: the page is served for
         // `/?token=…` because it is the static UI route, but the token there
@@ -1322,7 +1506,7 @@ mod tests {
             &format!("/?token={TEST_TOKEN}"),
             vec![("Host".into(), "127.0.0.1:8080".into())],
         );
-        let response = route_request(&query_token_page, TEST_TOKEN, "test.db", false, &store);
+        let response = route_request(&query_token_page, TEST_TOKEN, &store);
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data-shell=\"asg-web\""));
 
@@ -1332,7 +1516,7 @@ mod tests {
             vec![("Host".into(), "127.0.0.1:8080".into())],
         );
         assert_eq!(
-            route_request(&api_query_token, TEST_TOKEN, "test.db", false, &store).status,
+            route_request(&api_query_token, TEST_TOKEN, &store).status,
             401
         );
 
@@ -1342,7 +1526,7 @@ mod tests {
         // `location.hash` and puts it in the Authorization header itself);
         // data routes must not.
         let bare_page = request("GET", "/", vec![("Host".into(), "127.0.0.1:8080".into())]);
-        let response = route_request(&bare_page, TEST_TOKEN, "test.db", false, &store);
+        let response = route_request(&bare_page, TEST_TOKEN, &store);
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data-shell=\"asg-web\""));
     }
@@ -1357,13 +1541,7 @@ mod tests {
             "/api/search?q=needle&repo=github.com/synthetic-owner/synthetic-repo",
             "/api/handoff?q=needle",
         ] {
-            let response = route_request(
-                &authorized("GET", path),
-                TEST_TOKEN,
-                "test.db",
-                false,
-                &store,
-            );
+            let response = route_request(&authorized("GET", path), TEST_TOKEN, &store);
             assert_eq!(response.status, 200, "{path}: {}", response.body);
             let body: serde_json::Value = serde_json::from_str(&response.body).expect("JSON");
             assert!(body.get("data").is_some());
@@ -1373,8 +1551,6 @@ mod tests {
         let invalid = route_request(
             &authorized("GET", "/api/show?id=C%3A%2FUsers%2Falice%2Fsecret.jsonl"),
             TEST_TOKEN,
-            "test.db",
-            false,
             &store,
         );
         assert_eq!(invalid.status, 400);
@@ -1382,36 +1558,119 @@ mod tests {
         assert!(!invalid.body.contains("secret.jsonl"));
     }
 
-    /// Request values travel to `dispatch` as argv tokens, and the parser
-    /// matches flag names by whole-token equality wherever they sit. Before the
-    /// guard, `?q=--repo&repo=needle` really searched `needle` filtered by repo
-    /// `--repo` and answered **200 for a query nobody asked**, while
-    /// `?q=--include-system` was eaten as a boolean flag and answered a 400
-    /// claiming the caller had omitted `q`. Both must be one explicit
-    /// `invalid_request` naming the parameter.
+    /// Once a request is typed, a value equal to a CLI flag cannot influence
+    /// parsing. The old argv bridge rejected `q=--repo`; now it is search text
+    /// and `repo` remains an independent filter, the same way MCP treats it.
     #[test]
-    fn flag_shaped_request_values_are_rejected_instead_of_reparsed() {
-        let store = SqliteStore::open_in_memory().expect("store");
+    fn flag_named_values_are_literal_data_not_reparsed_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let source = dir.path().join("flag-value.jsonl");
+        std::fs::write(
+            &source,
+            r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"literal --repo evidence"},"_meta":{"promptIndex":0}}}"#,
+        )
+        .unwrap();
+        crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+
+        let response = route_request(
+            &authorized("GET", "/api/search?q=--repo"),
+            TEST_TOKEN,
+            &store,
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["data"]["hits"].as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(body["data"]["hits"][0]["text"], "literal --repo evidence");
+
         for path in [
-            "/api/search?q=--repo&repo=needle",
-            "/api/search?q=--include-system",
             "/api/search?q=needle&mode=-x",
-            "/api/search?q=needle&repo=--repo",
             "/api/projection/search?q=--cursor&cursor=needle",
-            "/api/handoff?q=--provider&provider=codex",
-            "/api/context?session=--policy&policy=recent",
             "/api/show?id=--yes",
             "/api/show/--yes",
             "/api/resume?session=--yes",
             "/api/resume/--yes",
         ] {
-            let response = route_request(
-                &authorized("GET", path),
-                TEST_TOKEN,
-                "test.db",
-                false,
-                &store,
-            );
+            let response = route_request(&authorized("GET", path), TEST_TOKEN, &store);
+            assert_eq!(response.status, 400, "{path}: {}", response.body);
+        }
+    }
+
+    #[test]
+    fn web_and_cli_search_build_the_same_typed_request() {
+        let request = authorized(
+            "GET",
+            "/api/search?q=needle&mode=hybrid&limit=5&max_bytes=4096&provider=claude&provider=grok-build&sidechain=subagent_only&tool_kind=command&tool_name=Bash&repo=github.com/synthetic-owner/synthetic-repo&include_system=true&group_by_session=true",
+        );
+        let web = search_command(&request).unwrap_or_else(|response| panic!("{}", response.body));
+        let argv = [
+            "search",
+            "needle",
+            "--mode",
+            "hybrid",
+            "--max-items",
+            "5",
+            "--max-bytes",
+            "4096",
+            "--provider",
+            "claude",
+            "--provider",
+            "grok-build",
+            "--subagent-only",
+            "--tool-kind",
+            "command",
+            "--tool-name",
+            "Bash",
+            "--repo",
+            "github.com/synthetic-owner/synthetic-repo",
+            "--include-system",
+            "--group-by-session",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let cli = crate::search_command_from_args(&argv, crate::protocol::OutputMode::Json)
+            .expect("CLI search command");
+        assert_eq!(web.query, cli.query);
+        assert_eq!(web.filters, cli.filters);
+        assert_eq!(web.facets, cli.facets);
+        assert_eq!(web.limit, cli.limit);
+        assert_eq!(web.cursor, cli.cursor);
+        assert_eq!(web.budget, cli.budget);
+        assert_eq!(web.include_system, cli.include_system);
+        assert_eq!(web.group_by_session, cli.group_by_session);
+        assert_eq!(web.mode, cli.mode);
+    }
+
+    #[test]
+    fn every_data_route_rejects_unknown_duplicate_empty_or_invalid_parameters() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        for path in [
+            "/health?unexpected=true",
+            "/api/status?unexpected=true",
+            "/api/providers?unexpected=true",
+            "/api/search?q=x&unexpected=true",
+            "/api/context?session=x&unexpected=true",
+            "/api/handoff?q=x&unexpected=true",
+            "/api/show?id=x&unexpected=true",
+            "/api/resume?session=x&unexpected=true",
+            "/api/search?q=x&mode=lexical&mode=semantic",
+            "/api/context?session=x&session=y",
+            "/api/handoff?q=x&q=y",
+            "/api/show?id=x&id=y",
+            "/api/resume?session=x&session=y",
+            "/api/search?q=x&max_bytes=",
+            "/api/context?session=x&policy=",
+            "/api/handoff?q=",
+            "/api/show?id=",
+            "/api/resume?session=",
+            "/api/search?q=x&tool_name=%0A",
+            "/api/search?q=x&&mode=lexical",
+            "/api/search?q=x&mode",
+            "/api/search?q=x&provider=",
+            "/api/status?a&",
+        ] {
+            let response = route_request(&authorized("GET", path), TEST_TOKEN, &store);
             assert_eq!(response.status, 400, "{path}: {}", response.body);
             assert!(
                 response.body.contains("invalid_request"),
@@ -1420,128 +1679,123 @@ mod tests {
             );
         }
 
-        // 取值本身绝不回显（可能是用户的检索词），只说参数名。
-        let named = route_request(
-            &authorized("GET", "/api/search?q=--repo&repo=needle"),
+        // An empty query string is equivalent to no query string.
+        assert_eq!(
+            route_request(&authorized("GET", "/api/status?"), TEST_TOKEN, &store,).status,
+            200
+        );
+    }
+
+    #[test]
+    fn handoff_applies_repeated_provider_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let source = dir.path().join("handoff-providers.jsonl");
+        std::fs::write(
+            &source,
+            r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"provider union needle"},"_meta":{"promptIndex":0}}}"#,
+        )
+        .unwrap();
+        crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+        let response = route_request(
+            &authorized(
+                "GET",
+                "/api/handoff?q=needle&provider=claude&provider=grok-build",
+            ),
             TEST_TOKEN,
-            "test.db",
-            false,
             &store,
         );
-        assert!(!named.body.contains("needle"), "{}", named.body);
-        assert!(named.body.contains("parameter q"), "{}", named.body);
-    }
-
-    /// The guard tests equality against the flag vocabulary, not a `-` prefix:
-    /// `q` is a free-text search term and coding transcripts are full of
-    /// flag-shaped strings the parser never compares against. Rejecting those
-    /// would make `--no-verify` or `-D warnings` unsearchable from the Web UI
-    /// while closing no ambiguity at all.
-    #[test]
-    fn search_terms_that_merely_look_like_flags_stay_searchable() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        for query in ["--no-verify", "-Wall", "-D%20warnings", "-1", "--repo%3Dx"] {
-            let response = route_request(
-                &authorized("GET", &format!("/api/search?q={query}")),
-                TEST_TOKEN,
-                "test.db",
-                false,
-                &store,
-            );
-            assert_eq!(response.status, 200, "q={query}: {}", response.body);
-        }
-    }
-
-    /// Structural half of the guard: every flag name this surface marshals into
-    /// argv must be one the guard refuses as a value. Adding a value-taking flag
-    /// to `request_args` without registering it turns the next query that
-    /// happens to equal that flag name back into a silently rewritten request,
-    /// so the omission has to fail here instead.
-    #[test]
-    fn every_flag_serve_marshals_is_refused_as_a_value() {
-        let populated = [
-            "/api/search?q=needle&mode=lexical&limit=5&cursor=c&provider=codex\
-             &since=1d&until=1h&repo=r&include_system=true&group_by_session=true",
-            "/api/context?session=s&policy=recent&level=full&max_messages=5",
-            "/api/handoff?q=needle&provider=codex&since=1d&until=1h&max_evidence=3",
-        ];
-        let mut seen = 0usize;
-        for path in populated {
-            let Ok(args) = request_args(&authorized("GET", path)) else {
-                panic!("{path}: a fully populated request must be accepted");
-            };
-            for flag in args.iter().filter(|arg| arg.starts_with("--")) {
-                assert!(
-                    check_argv_value("q", flag).is_err(),
-                    "{path}: serve emits {flag} but the guard accepts it as a value"
-                );
-                seen += 1;
-            }
-        }
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
         assert_eq!(
-            seen, 16,
-            "the populated routes emit a known number of flags; update this with them"
+            body["data"]["query"]["filters"]["providers"],
+            serde_json::json!(["claude-code", "grok-build"]),
+            "{body}"
         );
+        assert!(
+            body["data"]["evidence"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+            "{body}"
+        );
+
+        // Repo is a Web parity parameter: a non-matching scope must exclude
+        // evidence in handoff exactly as it does in search.
+        let scoped = route_request(
+            &authorized("GET", "/api/handoff?q=needle&repo=synthetic/repo"),
+            TEST_TOKEN,
+            &store,
+        );
+        assert_eq!(scoped.status, 200, "{}", scoped.body);
+        let body: serde_json::Value = serde_json::from_str(&scoped.body).unwrap();
+        assert_eq!(body["data"]["matched_sessions"], serde_json::json!([]));
+        assert_eq!(body["data"]["evidence"], serde_json::json!([]));
     }
 
     #[test]
-    fn search_routes_forward_the_repo_filter_like_the_cli_flag() {
-        // 五入口一致性：Web 的检索路由必须携带与 CLI `--repo`/MCP `repo` 同一
-        // 过滤轴。缺省 = 不过滤；空取值与 CLI/MCP 一样明确报错。
-        for path in ["/api/search", "/api/projection/search"] {
-            let Ok(with_repo) = request_args(&authorized(
-                "GET",
-                &format!("{path}?q=needle&repo=github.com/synthetic-owner/synthetic-repo"),
-            )) else {
-                panic!("{path}: repo 取值必须映射为 --repo 而不是请求错误");
-            };
-            assert!(
-                with_repo.windows(2).any(|pair| pair[0] == "--repo"
-                    && pair[1] == "github.com/synthetic-owner/synthetic-repo"),
-                "{path}: {with_repo:?}"
-            );
-            let Ok(args) = request_args(&authorized("GET", &format!("{path}?q=needle"))) else {
-                panic!("{path}: 缺省 repo 必须是合法请求");
-            };
-            assert!(!args.iter().any(|arg| arg == "--repo"), "{path}: {args:?}");
-            assert!(request_args(&authorized("GET", &format!("{path}?q=needle&repo="))).is_err());
-        }
-    }
+    fn resume_preview_is_read_only_and_never_acknowledges_the_first_run_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.db");
+        let store = SqliteStore::open_for_write(db.to_str().unwrap()).expect("store");
+        let source = dir.path().join("resume.jsonl");
+        let marker = dir
+            .path()
+            .join(agent_session_grep_application::resume::RESUME_PREVIEW_ACK_FILE);
+        std::fs::write(
+            &source,
+            r#"{"type":"user","uuid":"c0000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"ccdd1234-5678-4abc-8def-001122334455","cwd":null,"timestamp":"2026-07-26T01:00:00.000Z","message":{"role":"user","content":"resume preview"}}"#,
+        )
+        .unwrap();
+        crate::ingest_file(&store, source.to_str().unwrap()).unwrap();
+        let (_, data, _, _) = crate::read_commands::search(
+            &store,
+            crate::read_commands::SearchCommand {
+                query: "resume preview".into(),
+                filters: SearchFilters::default(),
+                facets: SearchFacets::default(),
+                limit: 1,
+                cursor: None,
+                budget: ResponseBudget::default(),
+                include_system: true,
+                group_by_session: false,
+                mode: agent_session_grep_ports::RetrievalMode::Lexical,
+                attach_session_rows: false,
+            },
+        )
+        .unwrap();
+        let session_wire = data["hits"][0]["session_id"]
+            .as_str()
+            .expect("fixture session")
+            .to_string();
 
-    #[test]
-    fn search_forwards_budget_facets_and_every_provider_value() {
-        let request = authorized(
-            "GET",
-            "/api/search?q=needle&max_bytes=4096&provider=claude&provider=grok-build&sidechain=subagent_only&tool_kind=command&tool_name=Bash",
+        assert!(!marker.exists());
+        let first = route_request(
+            &authorized("GET", &format!("/api/resume?session={session_wire}")),
+            TEST_TOKEN,
+            &store,
         );
-        let args = request_args(&request).unwrap_or_else(|response| panic!("{}", response.body));
-        for expected in [
-            ["--max-bytes", "4096"],
-            ["--provider", "claude"],
-            ["--provider", "grok-build"],
-            ["--tool-kind", "command"],
-            ["--tool-name", "Bash"],
-        ] {
-            assert!(
-                args.windows(2)
-                    .any(|pair| pair[0] == expected[0] && pair[1] == expected[1]),
-                "{args:?}"
-            );
-        }
-        assert!(args.iter().any(|arg| arg == "--subagent-only"));
-        for query in [
-            "q=x&max_bytes=",
-            "q=x&mode=lexical&mode=semantic",
-            "q=x&tool_name=%FF",
-            "q=x&sidechain=other",
-            "q=x&include_system=1",
-            "q=x&unexpected=true",
-        ] {
-            assert!(
-                request_args(&authorized("GET", &format!("/api/search?{query}"))).is_err(),
-                "{query}"
-            );
-        }
+        assert_eq!(first.status, 200, "{}", first.body);
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["data"]["available"], true, "{body}");
+        assert_eq!(body["data"]["executed"], false, "{body}");
+        assert!(
+            body["data"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--resume")),
+            "{body}"
+        );
+        assert!(
+            !marker.exists(),
+            "a Web GET must not acknowledge the CLI execution gate"
+        );
+
+        let second = route_request(
+            &authorized("GET", &format!("/api/resume?session={session_wire}")),
+            TEST_TOKEN,
+            &store,
+        );
+        assert_eq!(second.status, 200, "{}", second.body);
+        assert!(!marker.exists(), "repeated previews stay side-effect free");
     }
 
     #[test]
@@ -1561,8 +1815,6 @@ mod tests {
                     ),
                 ),
                 TEST_TOKEN,
-                "test.db",
-                true,
                 &store,
             );
             assert_eq!(response.status, 200, "{}", response.body);
@@ -1571,13 +1823,7 @@ mod tests {
             assert_eq!(body["data"]["hits"].as_array().unwrap().len(), 1, "{body}");
             assert_eq!(body["data"]["hits"][0]["text"], "needle web");
         }
-        let status = route_request(
-            &authorized("GET", "/api/status"),
-            TEST_TOKEN,
-            "test.db",
-            true,
-            &store,
-        );
+        let status = route_request(&authorized("GET", "/api/status"), TEST_TOKEN, &store);
         let body: serde_json::Value = serde_json::from_str(&status.body).unwrap();
         assert_eq!(
             body["data"]["web_capabilities"]["search_parameters"],
@@ -1594,7 +1840,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().expect("store");
         let missing_origin = authorized("POST", "/api/resume");
         assert_eq!(
-            route_request(&missing_origin, TEST_TOKEN, "test.db", false, &store).status,
+            route_request(&missing_origin, TEST_TOKEN, &store).status,
             403
         );
 
@@ -1602,14 +1848,11 @@ mod tests {
         valid_guard
             .headers
             .push(("Origin".into(), "http://127.0.0.1:8080".into()));
-        assert_eq!(
-            route_request(&valid_guard, TEST_TOKEN, "test.db", false, &store).status,
-            403
-        );
+        assert_eq!(route_request(&valid_guard, TEST_TOKEN, &store).status, 403);
         valid_guard
             .headers
             .push(("X-CSRF-Token".into(), TEST_TOKEN.into()));
-        let response = route_request(&valid_guard, TEST_TOKEN, "test.db", false, &store);
+        let response = route_request(&valid_guard, TEST_TOKEN, &store);
         assert_eq!(response.status, 501);
         assert!(response.body.contains("capability_not_supported"));
     }
@@ -1996,13 +2239,7 @@ mod tests {
         );
 
         let store = SqliteStore::open_in_memory().expect("store");
-        let page = route_request(
-            &authorized("GET", "/"),
-            TEST_TOKEN,
-            "test.db",
-            false,
-            &store,
-        );
+        let page = route_request(&authorized("GET", "/"), TEST_TOKEN, &store);
         let csp = page
             .headers
             .iter()
@@ -2037,6 +2274,22 @@ mod tests {
             show_gate.contains("removeItem(TOKEN_KEY)"),
             "a rejected token must be dropped from storage: {show_gate}"
         );
+    }
+
+    #[test]
+    fn embedded_ui_bytes_input_matches_the_server_budget_floor() {
+        let ui = WEB_UI_HTML;
+        let tag_start = ui.find("<input id=\"maxBytes\"").expect("maxBytes input");
+        let tag_end = ui[tag_start..]
+            .find('>')
+            .map(|end| tag_start + end)
+            .unwrap();
+        let tag = &ui[tag_start..=tag_end];
+        let minimum = format!(
+            "min=\"{}\"",
+            agent_session_grep_application::budget::MIN_RESPONSE_BYTES
+        );
+        assert!(tag.contains(&minimum), "{tag}");
     }
 
     /// `.ctl-row label` sets `flex: none` and beats `.ctl-row > *` on

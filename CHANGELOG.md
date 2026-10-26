@@ -343,6 +343,22 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- The loopback Web API now constructs typed commands and executes them through
+  the same read path as the CLI. It no longer turns query values back into
+  synthetic argv, so a value equal to a CLI flag name (`q=--repo`) is searched
+  literally instead of rejected or reinterpreted. Every data route rejects
+  unknown, repeated and empty parameters; `/api/handoff` applies all repeated
+  `provider` values and accepts repo/time filters plus the same token/byte
+  budgets as the CLI. The embedded client forwards its visible provider,
+  repo and time scope when it opens a handoff preview.
+  `GET /api/resume` is a pure preview and never writes the CLI's first-run
+  acknowledgement marker.
+- Legacy `handoff` validates evidence, token and byte budgets before searching.
+  Its three remaining Chinese parse errors are now English, and zero evidence
+  or token limits and sub-envelope byte limits are rejected instead of
+  producing a degenerate pack. The limits match MCP's published handoff floor,
+  and CLI, MCP and Web now execute the same handoff implementation rather than
+  maintaining three copies of the assembly path.
 - Live OpenCode/Cursor SQLite ingestion reads committed WAL state through
   bounded read-only backups and preserves distinct sessions and resume claims.
   Parser semantic version 2 reparses prior scans. SQL failures abort ingestion;
