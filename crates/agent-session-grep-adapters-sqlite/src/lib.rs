@@ -4977,8 +4977,12 @@ impl SqliteStore {
                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let mut stmt = conn
                     .prepare(&format!(
-                        "SELECT fi.wire_id, f.text FROM fts f
-                         JOIN fts_ids fi ON fi.id_json = f.id
+                        // `fts.id` is an UNINDEXED content column: joining on it
+                        // scans the whole FTS table once per chunk, so every
+                        // unchanged-source check re-read all indexed text.
+                        // `fts_rowid` addresses the row in O(1).
+                        "SELECT fi.wire_id, f.text FROM fts_ids fi
+                         JOIN fts f ON f.rowid = fi.fts_rowid
                          WHERE fi.wire_id IN ({placeholders})"
                     ))
                     .map_err(backend)?;
