@@ -667,6 +667,61 @@ fn malformed_enum_or_cross_source_content_reference_is_not_cleaned_away() {
 }
 
 #[test]
+fn null_obsolete_revision_refuses_gc_before_any_deletion() {
+    let mut f = Fixture::new();
+    for cycle in 1..=6 {
+        f.publish(
+            "source-one",
+            &format!("revision-{cycle}"),
+            cycle,
+            "boot-old",
+            "original proof",
+        );
+    }
+    f.discovery(1, "boot-old", Some(("source-one", "revision-1")));
+    f.discovery(6, "boot-old", Some(("source-one", "revision-6")));
+    // An ordinary rowid table's TEXT PRIMARY KEY can contain NULL. Keep every
+    // SQL guard enabled and damage an obsolete, unreferenced middle receipt.
+    f.conn
+        .execute(
+            "DELETE FROM receipt_selection_claims WHERE revision_id='revision-2'",
+            [],
+        )
+        .unwrap();
+    f.conn
+        .execute(
+            "UPDATE source_revision_receipts SET revision_id=NULL WHERE revision_id='revision-2'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(f.scalar("SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    let before = (
+        f.scalar("SELECT COUNT(*) FROM source_revision_receipts"),
+        f.scalar("SELECT COUNT(*) FROM receipt_selection_claims"),
+        f.scalar("SELECT COUNT(*) FROM discovery_receipts"),
+        f.evidence_rows(),
+    );
+    let limits = HistoryLimits {
+        batch_rows: 1,
+        ..HistoryLimits::default()
+    };
+    assert!(matches!(
+        f.prunes(&f.dependencies(), &[], limits),
+        Err(PortError::SchemaIncompatible(_))
+    ));
+    assert_eq!(
+        (
+            f.scalar("SELECT COUNT(*) FROM source_revision_receipts"),
+            f.scalar("SELECT COUNT(*) FROM receipt_selection_claims"),
+            f.scalar("SELECT COUNT(*) FROM discovery_receipts"),
+            f.evidence_rows(),
+        ),
+        before,
+        "even an outer commit must preserve all rows when an ID is invalid"
+    );
+}
+
+#[test]
 fn corrupt_discovery_digest_or_receipt_claim_prevents_partial_gc() {
     for corrupt_claim in [false, true] {
         let mut f = Fixture::new();

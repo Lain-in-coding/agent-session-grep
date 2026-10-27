@@ -381,7 +381,10 @@ fn verify_retired_contexts(conn: &Connection, deadline: Instant) -> PortResult<(
 /// are not retention roots, but their dependency rows still hold a real FK.
 /// Filtering before LIMIT lets each bounded batch retire unreferenced owners
 /// first instead of repeatedly selecting a referenced metadata receipt.
-const DELETABLE_RECEIPT: &str = "NOT EXISTS(SELECT 1 FROM source_revision_receipts child WHERE child.content_revision_id=r.revision_id AND child.revision_id!=r.revision_id) AND NOT EXISTS(SELECT 1 FROM source_dependencies d WHERE d.metadata_revision_id=r.revision_id)";
+/// Materialize the non-self content references once per statement rather
+/// than rescanning all receipts per candidate. Excluding NULL is required:
+/// partial attempts have no content revision and must not poison NOT IN.
+const DELETABLE_RECEIPT: &str = "r.revision_id NOT IN(SELECT child.content_revision_id FROM source_revision_receipts child WHERE child.content_revision_id IS NOT NULL AND child.content_revision_id!=child.revision_id) AND NOT EXISTS(SELECT 1 FROM source_dependencies d WHERE d.metadata_revision_id=r.revision_id)";
 
 fn select_delete_receipts(conn: &Connection, limit: usize) -> PortResult<()> {
     conn.execute(
@@ -451,6 +454,14 @@ fn verify_structure(conn: &Connection, snapshot: &ReadSnapshot) -> PortResult<()
     drop(statement);
     // Set-oriented checks prevent deleting a malformed obsolete row to hide
     // corruption. Original payloads are not read or reinterpreted during GC.
+    // A rowid table's TEXT PRIMARY KEY can contain NULL. Reject it explicitly
+    // before NOT IN or three-valued range checks can hide the invalid row.
+    if exists(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM source_revision_receipts WHERE revision_id IS NULL)",
+    )? {
+        return Err(corrupt());
+    }
     let invalid_receipt = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN source_bindings b ON b.source_id=r.source_id LEFT JOIN source_revision_receipts c ON c.revision_id=r.content_revision_id WHERE b.source_id IS NULL OR length(r.revision_id) NOT BETWEEN 1 AND 128 OR r.revision_id GLOB '*[^A-Za-z0-9_-]*' OR length(r.source_id) NOT BETWEEN 1 AND 128 OR r.source_id GLOB '*[^A-Za-z0-9_-]*' OR r.revision_seq<1 OR r.parser_version NOT BETWEEN 1 AND 4294967295 OR r.cycle_seq<1 OR length(r.worker_boot_id) NOT BETWEEN 1 AND 128 OR r.worker_boot_id GLOB '*[^A-Za-z0-9_-]*' OR length(r.catalog_incarnation) NOT BETWEEN 1 AND 128 OR r.catalog_incarnation GLOB '*[^A-Za-z0-9_-]*' OR r.policy_epoch<0 OR r.policy_epoch>?1 OR r.started_control_seq<1 OR r.observed_at_ms<0 OR r.committed_generation<0 OR r.committed_generation>?2 OR r.committed_at_ms<0 OR length(r.revision_digest) NOT BETWEEN 1 AND 256 OR r.published NOT IN(0,1) OR (r.published=1 AND (r.completeness NOT IN('complete','append') OR r.committed_generation IS NULL OR r.committed_at_ms IS NULL OR r.content_revision_id IS NULL OR r.content_set_digest IS NULL OR r.reason IS NOT NULL)) OR (r.published=0 AND (r.completeness!='partial' OR r.committed_generation IS NOT NULL OR r.committed_at_ms IS NOT NULL OR r.content_set_digest IS NOT NULL OR r.reason IS NULL OR r.reason NOT IN('incomplete','unstable','rewrite_pending','deletion_pending'))) OR (r.content_set_digest IS NOT NULL AND (length(r.content_set_digest)!=64 OR r.content_set_digest GLOB '*[^0-9a-f]*')) OR (r.content_revision_id IS NOT NULL AND (c.revision_id IS NULL OR c.source_id!=r.source_id OR c.published!=1 OR c.content_revision_id IS NULL OR c.content_revision_id!=c.revision_id OR (c.revision_id!=r.revision_id AND c.revision_seq>=r.revision_seq) OR (r.published=1 AND (c.content_set_digest!=r.content_set_digest OR c.committed_generation>r.committed_generation)))))",
         params![snapshot.policy_epoch,snapshot.generation], |row| row.get::<_, bool>(0),
@@ -641,4 +652,224 @@ fn retained_tokens(
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CORRELATED_RECEIPT: &str = "NOT EXISTS(SELECT 1 FROM source_revision_receipts child WHERE child.content_revision_id=r.revision_id AND child.revision_id!=r.revision_id) AND NOT EXISTS(SELECT 1 FROM source_dependencies d WHERE d.metadata_revision_id=r.revision_id)";
+
+    // Use the real managed schema and bundled SQLite. These direct SQL rows
+    // exercise candidate-query semantics, not publication proof validation;
+    // the production-path history/context suites cover that boundary.
+    fn receipt_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")
+            .unwrap();
+        crate::managed::create_schema(&conn).unwrap();
+        conn.execute_batch(TEMP_SCHEMA).unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+        conn
+    }
+
+    fn insert_receipt(
+        conn: &Connection,
+        source: &str,
+        seq: usize,
+        content: Option<&str>,
+    ) -> String {
+        conn.execute(
+            "INSERT OR IGNORE INTO source_bindings VALUES(?1,?2,'workbuddy',NULL,'synthetic-root',0)",
+            params![source, format!("/synthetic-history/{source}")],
+        )
+        .unwrap();
+        let revision = format!("revision-{source}-{seq:06}");
+        let published = content.is_some();
+        conn.execute(
+            "INSERT INTO source_revision_receipts VALUES(?1,?2,?3,'synthetic-digest',1,?4,?5,1,'boot','incarnation',1,1,?6,?7,?8,0,?8,?9)",
+            params![
+                revision,
+                source,
+                seq as i64,
+                if published { "complete" } else { "partial" },
+                published,
+                content,
+                published.then(|| "0".repeat(64)),
+                published.then_some(0),
+                (!published).then_some("incomplete"),
+            ],
+        )
+        .unwrap();
+        revision
+    }
+
+    fn insert_dependency(conn: &Connection, owner: &str, metadata: &str) {
+        conn.execute(
+            "INSERT INTO source_publication_contexts SELECT revision_id,source_id,?2,?3,1,NULL FROM source_revision_receipts WHERE revision_id=?1",
+            params![owner, b"[]", "0".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_dependencies SELECT ?1,0,source_id,revision_id,'resolved' FROM source_revision_receipts WHERE revision_id=?2",
+            params![owner, metadata],
+        )
+        .unwrap();
+    }
+
+    fn candidate_query(predicate: &str) -> String {
+        format!(
+            "SELECT r.revision_id FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND {predicate} ORDER BY r.revision_seq DESC,r.revision_id LIMIT ?1"
+        )
+    }
+
+    fn candidates(conn: &Connection, predicate: &str, limit: usize) -> Vec<String> {
+        conn.prepare(&candidate_query(predicate))
+            .unwrap()
+            .query_map([limit as i64], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn receipt_candidates_preserve_null_self_reuse_metadata_and_limit_semantics() {
+        for shape in 0..4 {
+            let conn = receipt_schema();
+            assert!(candidates(&conn, DELETABLE_RECEIPT, 64).is_empty());
+            let mut content_heads: [Option<String>; 4] = Default::default();
+            let mut revisions = Vec::new();
+            for index in 0..128 {
+                let group = index % 4;
+                let seq = index / 4 + 1;
+                let source = format!("source-{group}");
+                let revision = format!("revision-{source}-{seq:06}");
+                let content = match (index * 13 + shape * 7) % 5 {
+                    0 => None,
+                    1 | 2 => {
+                        content_heads[group] = Some(revision.clone());
+                        Some(revision.clone())
+                    }
+                    _ => content_heads[group].clone(),
+                };
+                assert_eq!(
+                    insert_receipt(&conn, &source, seq, content.as_deref()),
+                    revision
+                );
+                if index % 7 == 0 {
+                    conn.execute("INSERT INTO history_keep_receipts VALUES(?1)", [&revision])
+                        .unwrap();
+                }
+                revisions.push(revision);
+            }
+            for pair in revisions.chunks(13) {
+                if pair.len() >= 2 {
+                    insert_dependency(&conn, &pair[0], &pair[1]);
+                }
+            }
+            for limit in [0, 1, 2, 16, 64, 256] {
+                let expected = candidates(&conn, CORRELATED_RECEIPT, limit);
+                assert_eq!(
+                    candidates(&conn, DELETABLE_RECEIPT, limit),
+                    expected,
+                    "shape {shape}, limit {limit}"
+                );
+                conn.execute("DELETE FROM history_delete_receipts", [])
+                    .unwrap();
+                select_delete_receipts(&conn, limit).unwrap();
+                let selected = conn
+                    .prepare("SELECT r.revision_id FROM history_delete_receipts d JOIN source_revision_receipts r USING(revision_id) ORDER BY r.revision_seq DESC,r.revision_id")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(selected, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_candidate_plan_builds_content_reference_set_once() {
+        let conn = receipt_schema();
+        let details = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                candidate_query(DELETABLE_RECEIPT)
+            ))
+            .unwrap()
+            .query_map([64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|line| line.contains("LIST SUBQUERY")),
+            "content references must be materialized once: {details:?}"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|line| line.contains("CORRELATED SCALAR SUBQUERY"))
+                .count(),
+            1,
+            "only the indexed metadata lookup may remain correlated: {details:?}"
+        );
+        assert!(
+            details.iter().any(
+                |line| line.contains("SEARCH d USING COVERING INDEX source_dependency_receipt")
+            ),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual fixed-workload A/B timing, not a CI wall-clock assertion"]
+    fn receipt_candidate_fixed_workload_timing() {
+        for (count, reuse_span) in [
+            (1_000, 1),
+            (2_000, 1),
+            (4_000, 1),
+            (8_000, 1),
+            (16_384, 1),
+            (4_000, 8),
+            (16_384, 8),
+        ] {
+            let conn = receipt_schema();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            for seq in 1..=count {
+                // Exercise independent content and groups of repeated no-op
+                // observations sharing content. Both require a full scan of
+                // the old child relation for each unreferenced candidate.
+                let content_seq = (seq - 1) / reuse_span * reuse_span + 1;
+                let content = format!("revision-source-{content_seq:06}");
+                insert_receipt(&conn, "source", seq, Some(&content));
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            let expected = candidates(&conn, CORRELATED_RECEIPT, 64);
+            assert_eq!(candidates(&conn, DELETABLE_RECEIPT, 64), expected);
+            let mut old_ms = Vec::new();
+            let mut new_ms = Vec::new();
+            for round in 0..3 {
+                let order = if round % 2 == 0 {
+                    [CORRELATED_RECEIPT, DELETABLE_RECEIPT]
+                } else {
+                    [DELETABLE_RECEIPT, CORRELATED_RECEIPT]
+                };
+                for (index, predicate) in order.into_iter().enumerate() {
+                    let start = Instant::now();
+                    assert_eq!(candidates(&conn, predicate, 64), expected);
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if (round % 2 == 0) == (index == 0) {
+                        old_ms.push(ms);
+                    } else {
+                        new_ms.push(ms);
+                    }
+                }
+            }
+            println!(
+                "sqlite={} receipts={count} reuse_span={reuse_span} correlated_ms={old_ms:?} candidate_ms={new_ms:?}",
+                rusqlite::version()
+            );
+        }
+    }
 }
