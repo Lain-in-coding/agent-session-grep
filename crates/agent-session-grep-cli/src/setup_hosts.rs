@@ -334,6 +334,9 @@ pub(crate) fn remove_owned_registration(
         &locator.transaction_root,
         locator.host,
     )?;
+    store
+        .recover_pending()
+        .map_err(|_| HostConfigError::from(ErrorCode::RecoveryRequired))?;
     let prior = prior_receipt(
         &store,
         &locator.config_path,
@@ -1326,6 +1329,12 @@ fn prior_receipt(
     root: &Path,
     host: Host,
 ) -> Result<Option<HostConfigReceipt>> {
+    // Recover an interrupted host edit before reconstructing the latest
+    // receipt chain. Without this, setup treats a repairable exchange journal
+    // as permanently blocked and never reaches HostConfigStore::install.
+    store
+        .recover_pending()
+        .map_err(|_| SetupHostsError::from(SetupHostsErrorCode::RecoveryRequired))?;
     let infos = store
         .inspect_recovery()
         .map_err(|_| SetupHostsError::from(SetupHostsErrorCode::RecoveryRequired))?;
@@ -1583,6 +1592,11 @@ pub fn setup_selected_hosts_checked(
                 continue;
             }
         };
+        if let Err(error) = preflight(SetupStage::BeforeConfig) {
+            report.interruption = Some(error.code);
+            report.hosts.push(summary);
+            break;
+        }
         let prior = match prior_receipt(&store, &config, &root, host) {
             Ok(receipt) => receipt,
             Err(_) => {
@@ -1603,11 +1617,6 @@ pub fn setup_selected_hosts_checked(
                 continue;
             }
         };
-        if let Err(error) = preflight(SetupStage::BeforeConfig) {
-            report.interruption = Some(error.code);
-            report.hosts.push(summary);
-            break;
-        }
         let configured = if host == Host::ZCode {
             store.install_with_zcode_fallback(
                 &registration,

@@ -1274,11 +1274,19 @@ impl HostConfigStore {
             if matches!(info.phase, Phase::Verified | Phase::Settled) {
                 continue;
             }
-            if self.recover(&info.transaction_id).is_ok() {
-                recovered += 1;
-            }
+            self.recover(&info.transaction_id)?;
+            recovered += 1;
         }
         Ok(recovered)
+    }
+    #[cfg(test)]
+    pub(crate) fn change_with_test_hook(
+        &self,
+        desired: Option<Value>,
+        prior: Option<&HostConfigReceipt>,
+        hook: &mut dyn FnMut(TestPoint) -> Result<()>,
+    ) -> Result<HostConfigReceipt> {
+        self.change(desired, prior, hook)
     }
     fn inspect_locked(&self) -> Result<Vec<RecoveryInfo>> {
         let mut result = Vec::new();
@@ -1323,6 +1331,11 @@ impl HostConfigStore {
         fallback: Option<&Path>,
         hook: &mut dyn FnMut(TestPoint) -> Result<()>,
     ) -> Result<HostConfigReceipt> {
+        // A previous exchange can be interrupted while the host still holds
+        // the target. Give the durable journal one bounded repair opportunity
+        // before admitting a new change; inspect_locked below still refuses
+        // any conflict or changed artifact that could not be proven safe.
+        self.recover_pending()?;
         let _lock = self.lock()?;
         if self.inspect_locked()?.iter().any(|i| {
             !matches!(i.phase, Phase::Verified | Phase::Settled) || i.retained_artifact_changed
@@ -1806,6 +1819,9 @@ impl HostConfigStore {
     pub fn recover(&self, transaction_id: &str) -> Result<HostConfigReceipt> {
         let _lock = self.lock()?;
         let mut journal = self.load(transaction_id)?;
+        if journal.receipt.is_some() && !matches!(journal.phase, Phase::Verified | Phase::Settled) {
+            return Err(ErrorCode::RecoveryRequired.into());
+        }
         if matches!(journal.phase, Phase::Verified | Phase::Settled)
             && !self.artifacts_changed(&journal)?
         {
@@ -1951,7 +1967,7 @@ impl HostConfigStore {
 }
 
 #[derive(Clone, Copy)]
-enum TestPoint {
+pub(crate) enum TestPoint {
     BeforeRead,
     Prepared,
     Exchanged,

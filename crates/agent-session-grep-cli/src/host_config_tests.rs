@@ -298,6 +298,37 @@ fn recover_pending_repairs_an_interrupted_journal_for_later_changes() {
 }
 
 #[test]
+fn install_automatically_recovers_an_interrupted_journal_before_new_change() {
+    let f = Fixture::new(Host::ClaudeCode, Some(r#"{"preserve":true}"#));
+    let error = f
+        .store
+        .change(
+            Some(f.registration().value(Host::ClaudeCode)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Exchanged) {
+                    return Err(ErrorCode::Io.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Io);
+    // The next production configuration call repairs the durable exchange
+    // journal before it evaluates ownership and continues the new request.
+    let receipt = f.store.install(&f.registration(), None).unwrap();
+    assert_eq!(receipt.status, EditStatus::Unchanged);
+    assert!(
+        f.store
+            .inspect_recovery()
+            .unwrap()
+            .iter()
+            .all(|info| matches!(info.phase, Phase::Verified | Phase::Settled))
+    );
+    assert_eq!(f.document().value["preserve"], true);
+}
+
+#[test]
 fn retained_old_handle_write_is_detected_and_reconciled_before_success() {
     let f = Fixture::new(Host::ClaudeCode, Some(r#"{"before":1}"#));
     let mut old = OpenOptions::new().write(true).open(&f.config).unwrap();

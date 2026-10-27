@@ -189,6 +189,60 @@ fn both_hosts_preserve_unrelated_settings_and_reuse_owned_receipts() {
 }
 
 #[test]
+fn setup_recovers_host_config_exchange_before_rebuilding_receipts() {
+    use crate::host_config::TestPoint as HostTestPoint;
+
+    let f = Fixture::new(vec![Host::ClaudeCode]);
+    f.write(Host::ClaudeCode, r#"{"preserve":true,"theme":"synthetic"}"#);
+    let config = f.path(Host::ClaudeCode);
+    let root = transaction_root(&config, Host::ClaudeCode).unwrap();
+    let store = HostConfigStore::open(&config, &root, Host::ClaudeCode).unwrap();
+    let registration = McpRegistration::new(
+        f.request.launcher.to_str().unwrap().into(),
+        vec![
+            "--db".into(),
+            f.request.catalog.to_str().unwrap().into(),
+            "mcp".into(),
+        ],
+    )
+    .unwrap();
+    let error = store
+        .change_with_test_hook(
+            Some(registration.value(Host::ClaudeCode)),
+            None,
+            &mut |point| {
+                if matches!(point, HostTestPoint::Exchanged) {
+                    Err(ConfigErrorCode::Io.into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ConfigErrorCode::Io);
+    assert_eq!(store.inspect_recovery().unwrap()[0].phase, Phase::Exchanged);
+    drop(store);
+
+    let report = f.run();
+    assert_eq!(report.hosts[0].configuration, ConfigurationStage::Unchanged);
+    assert!(report.hosts[0].owned_by_asg);
+    let value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(value["preserve"], true);
+    assert_eq!(value["theme"], "synthetic");
+    assert_eq!(
+        value["mcpServers"]["agent-session-grep"]["command"],
+        f.request.launcher.to_str().unwrap()
+    );
+    assert_eq!(report.private_receipts.len(), 1);
+    assert!(
+        report.private_receipts[0]
+            .read_receipt()
+            .unwrap()
+            .owned_by_asg
+    );
+}
+
+#[test]
 fn only_selected_host_is_created_and_missing_parent_needs_explicit_permission() {
     let mut f = Fixture::new(vec![Host::ClaudeCode]);
     f.request.create_missing_parents = false;
@@ -337,10 +391,8 @@ fn malformed_or_incomplete_journal_stops_before_another_edit() {
         }
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let before = fs::read(&loc.config_path).unwrap();
-        assert_eq!(
-            f.run().hosts[0].configuration,
-            ConfigurationStage::RecoveryRequired
-        );
+        let stage = f.run().hosts[0].configuration;
+        assert_eq!(stage, ConfigurationStage::RecoveryRequired, "{mutation}");
         assert_eq!(fs::read(&loc.config_path).unwrap(), before);
     }
 }
