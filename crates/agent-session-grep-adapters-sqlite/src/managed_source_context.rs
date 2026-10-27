@@ -1531,8 +1531,8 @@ pub(crate) fn history_roots(
     {
         return Err(busy());
     }
-    let orphan:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM source_dependencies d LEFT JOIN source_publication_contexts c ON c.revision_id=d.owner_revision_id WHERE c.revision_id IS NULL)",[],|r|r.get(0)).map_err(sql)?;
-    if orphan {
+    let invalid_dependency:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM source_dependencies d LEFT JOIN source_publication_contexts c ON c.revision_id=d.owner_revision_id LEFT JOIN source_revision_receipts r ON r.revision_id=d.metadata_revision_id WHERE c.revision_id IS NULL OR (d.metadata_revision_id IS NOT NULL AND (r.revision_id IS NULL OR r.source_id!=d.metadata_source_id OR c.source_id=d.metadata_source_id)))",[],|r|r.get(0)).map_err(sql)?;
+    if invalid_dependency {
         return Err(corrupt());
     }
     let mut roots = BTreeSet::new();

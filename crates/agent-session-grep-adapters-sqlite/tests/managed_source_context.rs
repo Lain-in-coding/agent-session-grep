@@ -1404,6 +1404,95 @@ fn corrupt_obsolete_context_refuses_retirement_instead_of_vanishing() {
     c.execute_batch("ROLLBACK").unwrap();
 }
 
+/// A corrupt dependency must not make an obsolete receipt ineligible for
+/// retirement and thereby bypass the validation that would reject it.
+#[test]
+fn obsolete_self_dependency_fails_closed_instead_of_completing_gc() {
+    let c = schema();
+    let provider = SearchProvider::parse("workbuddy").unwrap();
+    let p = policy(provider);
+    for seq in 1..=4 {
+        let original = observe("transcript", seq, provider);
+        publish(
+            &c,
+            &original,
+            &batch(&original, Some(&format!("revision {seq}")), "native"),
+            &unresolved("native"),
+            &p,
+        );
+    }
+    c.execute(
+        "UPDATE source_dependencies SET metadata_source_id='transcript',metadata_revision_id=owner_revision_id,resolution='resolved' WHERE owner_revision_id='revision-transcript-2'",
+        [],
+    )
+    .unwrap();
+    foreign_keys_valid(&c);
+    let limits = HistoryLimits {
+        receipt_tail_per_source: 1,
+        batch_rows: 1,
+        ..HistoryLimits::default()
+    };
+    let dependencies = history(&c);
+    c.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        prune_in_tx(&c, &dependencies, &[], limits, deadline()),
+        Err(PortError::SchemaIncompatible(_))
+    ));
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_revision_receipts"),
+        4
+    );
+    foreign_keys_valid(&c);
+    c.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn obsolete_dependency_cycle_refuses_completion_and_rolls_back_other_deletions() {
+    let c = schema();
+    let provider = SearchProvider::parse("workbuddy").unwrap();
+    let p = policy(provider);
+    for source in ["first", "second"] {
+        for seq in 1..=4 {
+            let original = observe(source, seq, provider);
+            publish(
+                &c,
+                &original,
+                &batch(&original, None, ""),
+                &unresolved("native"),
+                &p,
+            );
+        }
+    }
+    // These cross-source edges satisfy SQL's immediate constraints, but no
+    // valid publication order can create their cycle. Neither old context
+    // would otherwise be selected for retirement and manifest validation.
+    for (source, other) in [("first", "second"), ("second", "first")] {
+        c.execute(
+            "UPDATE source_dependencies SET metadata_source_id=?1,metadata_revision_id=?2,resolution='resolved' WHERE owner_revision_id=?3",
+            params![other, format!("revision-{other}-2"), format!("revision-{source}-2")],
+        )
+        .unwrap();
+    }
+    foreign_keys_valid(&c);
+    let dependencies = history(&c);
+    let limits = HistoryLimits {
+        receipt_tail_per_source: 1,
+        ..HistoryLimits::default()
+    };
+    c.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        prune_in_tx(&c, &dependencies, &[], limits, deadline()),
+        Err(PortError::SchemaIncompatible(_))
+    ));
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_revision_receipts"),
+        8,
+        "an invalid residual graph must roll back even unrelated deletions"
+    );
+    foreign_keys_valid(&c);
+    c.execute_batch("ROLLBACK").unwrap();
+}
+
 struct FacadeFixture {
     _temp: tempfile::TempDir,
     root: std::path::PathBuf,

@@ -294,15 +294,22 @@ fn prune_inner(
     counts.receipt_claims_deleted = conn.execute("DELETE FROM receipt_selection_claims WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
     counts.retained_proofs_deleted = conn.execute("DELETE FROM retained_source_receipts WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
     counts.receipts_deleted = conn.execute("DELETE FROM source_revision_receipts WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
-    let has_more: bool = conn
+    let (more_discoveries, more_receipts, deletable_receipts): (bool, bool, bool) = conn
         .query_row(
             &format!(
-                "SELECT EXISTS(SELECT 1 FROM discovery_receipts d LEFT JOIN history_keep_discoveries k USING(cycle_seq,selection_id) WHERE k.cycle_seq IS NULL) OR EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND {DELETABLE_RECEIPT})"
+                "SELECT EXISTS(SELECT 1 FROM discovery_receipts d LEFT JOIN history_keep_discoveries k USING(cycle_seq,selection_id) WHERE k.cycle_seq IS NULL), EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL), EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND {DELETABLE_RECEIPT})"
             ),
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(sql)?;
+    // Valid obsolete history is acyclic: publishing a context can reference
+    // only an already committed metadata receipt. A residual component with
+    // no deletable leaf is corrupt, not successful cleanup or retryable work.
+    if more_receipts && !deletable_receipts {
+        return Err(corrupt());
+    }
+    let has_more = more_discoveries || more_receipts;
     let cycles = retained_tokens(conn, limits.max_cycle_tokens, deadline)?;
     time(deadline)?;
     conn.execute_batch(CLEAN_TEMP).map_err(sql)?;
