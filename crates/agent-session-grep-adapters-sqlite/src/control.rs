@@ -1719,8 +1719,20 @@ fn load_status(conn: &Connection) -> PortResult<ControlStatus> {
     Ok(status)
 }
 
-// Runtime callers decode it once in their own pinned transaction. Normal
-// policy callers still perform the complete runtime validation through load_status.
+fn validate_policy_admission_capacity(conn: &Connection) -> PortResult<()> {
+    for query in [
+        "SELECT 1 FROM cycles WHERE state IN ('queued','observing')",
+        "SELECT 1 FROM barriers WHERE state='pending'",
+        "SELECT 1 FROM source_updates",
+    ] {
+        runtime_rows_within(conn, query, MAX_RUNTIME_REFERENCES)?;
+    }
+    Ok(())
+}
+
+// Runtime callers decode it once in their own pinned transaction. Status and
+// runtime-read callers perform the complete validation through load_status;
+// policy admission uses the core policy plus capacity checks above.
 fn load_status_core(conn: &Connection) -> PortResult<ControlStatus> {
     runtime_tick()?;
     validate_schema(conn)?;
@@ -2307,8 +2319,27 @@ fn load_backups(conn: &Connection, current_epoch: PolicyEpoch) -> PortResult<Vec
 
 impl ControlStore for SqliteControlStore {
     fn read_policy(&self, request: RequestIntersection) -> PortResult<ReadPolicy> {
-        let mut policy = self.status()?.policy;
+        if runtime_deadline().is_none() {
+            return self.with_runtime_deadline(Instant::now() + BUSY_TIMEOUT, || {
+                self.read_policy(request)
+            });
+        }
+        runtime_tick()?;
+        self.validate_live_root()?;
+        let mut conn = self.conn.borrow_mut();
+        configure_runtime_deadline(&conn)?;
+        let tx = conn.transaction().map_err(sql_error)?;
+        // Policy admission must validate the control schema and all policy
+        // dependencies, but it does not need to decode cycles, barriers, or
+        // source progress. Those are runtime proof and belong to status/
+        // read_runtime callers. Keeping this path core-only avoids repeating
+        // the corpus-sized runtime scan for every managed admission.
+        validate_policy_admission_capacity(&tx)?;
+        let mut policy = load_status_core(&tx)?.policy;
         policy.request_intersection = request;
+        runtime_tick()?;
+        tx.commit().map_err(sql_error)?;
+        self.validate_live_root()?;
         Ok(policy)
     }
     fn status(&self) -> PortResult<ControlStatus> {

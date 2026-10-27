@@ -632,12 +632,16 @@ fn source_row_and_policy_inventory_capacity_refuse_before_typed_decode() {
             }
         }
         tx.commit().unwrap();
-        assert_capacity(
-            f.control
-                .with_runtime_deadline(Instant::now() + Duration::from_secs(2), || {
-                    f.control.status()
-                }),
-        );
+        assert_capacity(f.control.with_runtime_deadline(
+            Instant::now() + Duration::from_secs(2),
+            || {
+                if table == "source_updates" {
+                    f.control.read_policy(RequestIntersection::Selected)
+                } else {
+                    f.control.status().map(|status| status.policy)
+                }
+            },
+        ));
         assert!(
             conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
                 .get::<_, i64>(0))
@@ -645,4 +649,37 @@ fn source_row_and_policy_inventory_capacity_refuse_before_typed_decode() {
                 > number(MAX_RUNTIME_REFERENCES)
         );
     }
+}
+
+#[test]
+#[ignore = "raw timing microbenchmark; run explicitly in release mode"]
+fn policy_admission_skips_runtime_decode_timing() {
+    const SOURCES: usize = 4_000;
+    let f = Fixture::new();
+    let mut conn = raw(&f.root);
+    let tx = conn.transaction().unwrap();
+    for n in 0..SOURCES {
+        tx.execute(
+            "INSERT INTO source_updates(source_id,provider_id,coverage,update_state,backfill_state)
+             VALUES(?1,'codex','empty','offline','pending')",
+            [format!("synthetic-source-{n}")],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let mut policy_ms = Vec::new();
+    let mut status_ms = Vec::new();
+    for _ in 0..4 {
+        let start = Instant::now();
+        f.control
+            .read_policy(RequestIntersection::Selected)
+            .unwrap();
+        policy_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        f.control.status().unwrap();
+        status_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("sources={SOURCES} read_policy_ms={policy_ms:?} status_ms={status_ms:?}");
 }
