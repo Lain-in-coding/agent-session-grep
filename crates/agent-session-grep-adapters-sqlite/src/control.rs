@@ -18,6 +18,7 @@ pub const CONTROL_SCHEMA_VERSION: i64 = VERSION;
 const LEGACY_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x41534331;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_CREATE_PENDING: &str = "control.db.creating";
 /// Diagnostic tail only. Every live source/confirmation/barrier reference is
 /// loaded in addition, regardless of its age or originating worker boot.
 const RUNTIME_HISTORY_TAIL: i64 = 64;
@@ -1180,72 +1181,15 @@ impl SqliteControlStore {
     ) -> PortResult<Self> {
         private_directory(private_root, true)?;
         let handle_lease = admit_control_handle(private_root, true)?;
-        let root_identity = handle_lease.root_identity();
-        let path = Self::path(private_root);
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(io_error)?
-        };
-        #[cfg(windows)]
-        let file = windows_private::create_file(&path)?;
-        #[cfg(not(any(unix, windows)))]
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io_error)?;
-        // create_new is the sole creation gate, including existing empty files.
-        file.sync_all().map_err(io_error)?;
-        drop(file);
-        private_file(&path)?;
-        let mut conn = connect(&path, true)?;
-        let journal: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-            .map_err(sql_error)?;
-        if journal != "wal" {
-            return Err(corrupt());
-        }
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(SCHEMA).map_err(sql_error)?;
-        tx.execute_batch(RUNTIME_INDEXES).map_err(sql_error)?;
-        tx.execute("INSERT INTO control_meta(singleton,schema_version,installation_id,policy_epoch,control_seq,next_cycle_seq,desired_updates,autostart_enabled,maintenance_state) VALUES(1,2,?1,0,0,1,?2,0,'idle')", params![installation.as_str(), desired_wire(desired)]).map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO worker_state(singleton,effective_state) VALUES(1,'offline')",
-            [],
-        )
-        .map_err(sql_error)?;
-        tx.pragma_update(None, "application_id", APPLICATION_ID)
-            .map_err(sql_error)?;
-        tx.pragma_update(None, "user_version", VERSION)
-            .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)?;
-        mark_runtime_committed();
-        let store = Self {
-            conn: RefCell::new(conn),
+        let create = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
+        control_create::prepare(
+            private_root,
+            installation,
+            desired,
             handle_lease,
-            writable: true,
-            root_identity,
-            private_root: private_root.to_path_buf(),
-        };
-        if RootIdentity::read(private_root)? != root_identity {
-            return Err(corrupt());
-        }
-        store.handle_lease.validate_admission(private_root)?;
-        store.status()?;
-        verify_sidecars(&path)?;
-        #[cfg(unix)]
-        fs::File::open(private_root)
-            .and_then(|f| f.sync_all())
-            .map_err(io_error)?;
-        Ok(store)
+            create,
+            &mut |_| Ok(()),
+        )
     }
 
     pub fn open_read_only(private_root: &Path, installation: &ControlId) -> PortResult<Self> {
@@ -1633,6 +1577,212 @@ impl SqliteControlStore {
             changed,
             value,
         })
+    }
+}
+
+mod control_create {
+    use super::*;
+
+    pub(super) fn prepare(
+        root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+        lease: ControlHandleLease,
+        create_lock: ExclusiveGuard,
+        hook: &mut dyn FnMut(u8) -> PortResult<()>,
+    ) -> PortResult<SqliteControlStore> {
+        let root_identity = lease.root_identity();
+        if SqliteControlStore::path(root)
+            .try_exists()
+            .map_err(io_error)?
+        {
+            return Err(invalid());
+        }
+        clear_stage(root)?;
+        let pending = stage_path(root);
+        let file = create_private_owned_file(&pending)?;
+        file.sync_all().map_err(io_error)?;
+        drop(file);
+        private_file(&pending)?;
+        hook(0)?;
+
+        let mut conn = connect(&pending, true)?;
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        if journal != "wal" {
+            return fail(root, corrupt());
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(SCHEMA).map_err(sql_error)?;
+        tx.execute_batch(RUNTIME_INDEXES).map_err(sql_error)?;
+        tx.execute("INSERT INTO control_meta(singleton,schema_version,installation_id,policy_epoch,control_seq,next_cycle_seq,desired_updates,autostart_enabled,maintenance_state) VALUES(1,2,?1,0,0,1,?2,0,'idle')", params![installation.as_str(), desired_wire(desired)]).map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO worker_state(singleton,effective_state) VALUES(1,'offline')",
+            [],
+        )
+        .map_err(sql_error)?;
+        tx.pragma_update(None, "application_id", APPLICATION_ID)
+            .map_err(sql_error)?;
+        tx.pragma_update(None, "user_version", VERSION)
+            .map_err(sql_error)?;
+        verify_control_state(&tx, installation, desired)?;
+        tx.commit().map_err(sql_error)?;
+        hook(1)?;
+        let checkpoint: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(sql_error)?;
+        if checkpoint.0 != 0 {
+            return fail(root, corrupt());
+        }
+        drop(conn);
+        remove_empty_sidecars(&pending)?;
+        #[cfg(unix)]
+        fs::File::open(&pending)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+        hook(2)?;
+        let final_path = SqliteControlStore::path(root);
+        if final_path.try_exists().map_err(io_error)?
+            || sidecar(&final_path, "-wal")
+                .try_exists()
+                .map_err(io_error)?
+            || sidecar(&final_path, "-shm")
+                .try_exists()
+                .map_err(io_error)?
+            || sidecar(&final_path, "-journal")
+                .try_exists()
+                .map_err(io_error)?
+        {
+            return fail(root, invalid());
+        }
+        hook(3)?;
+        lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db")?;
+
+        // Publication is irreversible from this point. Keep a complete final
+        // database if any reopening/verification step fails.
+        drop(create_lock);
+        if RootIdentity::read(root)? != root_identity {
+            return Err(corrupt());
+        }
+        lease.validate_admission(root)?;
+        let store = SqliteControlStore::open_existing_writable(root, installation)?;
+        store.status()?;
+        hook(4)?;
+        Ok(store)
+    }
+
+    fn fail<T>(root: &Path, error: PortError) -> PortResult<T> {
+        match clear_stage(root) {
+            Ok(()) => Err(error),
+            Err(_) => Err(PortError::Backend(
+                "control creation cleanup requires recovery".into(),
+            )),
+        }
+    }
+
+    fn clear_stage(root: &Path) -> PortResult<()> {
+        let stage = stage_path(root);
+        // Remove journals before the main staging inode. No live connection is
+        // open under the exclusive creation lock, so this abandons only this
+        // protocol's fixed, incomplete attempt and never rolls it into a DB.
+        for path in [
+            sidecar(&stage, "-journal"),
+            sidecar(&stage, "-shm"),
+            sidecar(&stage, "-wal"),
+            stage,
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    private_file(&path)?;
+                    fs::remove_file(&path).map_err(io_error)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_empty_sidecars(path: &Path) -> PortResult<()> {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = sidecar(path, suffix);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                    fs::remove_file(path).map_err(io_error)?;
+                }
+                Ok(_) => return Err(corrupt()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_control_state(
+        conn: &Connection,
+        installation: &ControlId,
+        expected_desired: DesiredUpdates,
+    ) -> PortResult<()> {
+        validate_schema(conn)?;
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        let (schema, stored, desired, epoch, seq_value, next_cycle, catalog, restart, autostart, maintenance, owner, phase, supervisor) =
+            conn.query_row(
+                "SELECT schema_version,installation_id,desired_updates,policy_epoch,control_seq,next_cycle_seq,catalog_incarnation,restart_request_seq,autostart_enabled,maintenance_state,maintenance_owner,maintenance_phase,supervisor_failed FROM control_meta",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(12)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?;
+        if mode != "wal"
+            || schema != VERSION
+            || stored != installation.as_str()
+            || desired != desired_wire(expected_desired)
+            || epoch != 0
+            || seq_value != 0
+            || next_cycle != 1
+            || catalog.is_some()
+            || restart != 0
+            || autostart != 0
+            || maintenance != "idle"
+            || owner.is_some()
+            || phase.is_some()
+            || supervisor != 0
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
+    fn stage_path(root: &Path) -> PathBuf {
+        root.join(CONTROL_CREATE_PENDING)
+    }
+
+    fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
     }
 }
 
@@ -6241,5 +6391,58 @@ mod runtime_deadline_tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn stale_owned_stage_is_discarded_before_fresh_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        super::private_directory(&root, true).unwrap();
+        let stale = root.join(CONTROL_CREATE_PENDING);
+        let mut file = platform_test_file(&stale);
+        std::io::Write::write_all(&mut file, b"not a database").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let control = SqliteControlStore::create(
+            &root,
+            &cid("synthetic-stage-installation"),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        assert_eq!(
+            control.status().unwrap().desired_updates,
+            DesiredUpdates::Paused
+        );
+        assert!(!stale.exists());
+        assert!(
+            !root
+                .join(format!("{CONTROL_CREATE_PENDING}-journal"))
+                .exists()
+        );
+    }
+
+    fn platform_test_file(path: &Path) -> std::fs::File {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            windows_private::create_file(path).unwrap()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+        }
     }
 }

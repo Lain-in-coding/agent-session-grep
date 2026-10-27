@@ -246,7 +246,7 @@ try {
     }
     if ($plan.installation_lock.relative -cne 'maintenance-job-696e7374616c6c6174696f6e2d757064617465.lock' -or $plan.installation_lock.size -ne 0 -or $plan.installation_lock.digest -cne $plan.parent_exit.digest) { throw 'identity_changed' }
     $handles.Add([AsgUninstallV1.Native]::ExitLock([AsgUninstallV1.Native]::Child($Prefix, $plan.installation_lock.relative), [UInt64]$plan.installation_lock.identity[0], [UInt64]$plan.installation_lock.identity[1], $DeadlineTick))
-    $lockNames = @('policy-owner.lock','policy-emission.lock','catalog-handles.lock','history-readers.lock','background.lock','supervisor.lock','maintenance-job-6f776e65642d7075726765.lock')
+    $lockNames = @('policy-owner.lock','policy-emission.lock','control-create.lock','catalog-handles.lock','history-readers.lock','background.lock','supervisor.lock','maintenance-job-6f776e65642d7075726765.lock')
     if (@($plan.data_locks).Count -ne $lockNames.Count) { throw 'identity_changed' }
     foreach ($proof in $plan.data_locks) {
         if ($proof.relative -cnotin $lockNames -or $proof.size -ne 0 -or $proof.digest -cne $plan.parent_exit.digest) { throw 'identity_changed' }

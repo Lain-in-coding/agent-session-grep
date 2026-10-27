@@ -54,6 +54,7 @@ impl fmt::Debug for JobLockKey {
 pub enum LockKind {
     PolicyOwner,
     PolicyEmission,
+    ControlCreate,
     CatalogHandles,
     ControlHandles,
     HistoryReaders,
@@ -67,6 +68,7 @@ impl LockKind {
         match self {
             Self::PolicyOwner => "policy-owner.lock".into(),
             Self::PolicyEmission => "policy-emission.lock".into(),
+            Self::ControlCreate => "control-create.lock".into(),
             Self::CatalogHandles => "catalog-handles.lock".into(),
             Self::ControlHandles => "control-handles.lock".into(),
             Self::HistoryReaders => "history-readers.lock".into(),
@@ -413,6 +415,14 @@ impl SharedGuard {
 
     pub(crate) fn child_exists(&self, name: &str) -> PortResult<bool> {
         self.0.child_exists(name)
+    }
+
+    pub(crate) fn publish_child_no_replace(
+        &self,
+        pending: &str,
+        final_name: &str,
+    ) -> PortResult<()> {
+        self.0.publish_child_no_replace(pending, final_name)
     }
 }
 
@@ -1130,6 +1140,7 @@ mod tests {
         let kinds = [
             LockKind::PolicyOwner,
             LockKind::PolicyEmission,
+            LockKind::ControlCreate,
             LockKind::CatalogHandles,
             LockKind::ControlHandles,
             LockKind::HistoryReaders,

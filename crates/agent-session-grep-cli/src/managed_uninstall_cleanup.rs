@@ -15,6 +15,7 @@ const INSTALLATION_LOCK: &str = "maintenance-job-696e7374616c6c6174696f6e2d75706
 const DATA_LOCKS: &[&str] = &[
     "policy-owner.lock",
     "policy-emission.lock",
+    "control-create.lock",
     "catalog-handles.lock",
     "history-readers.lock",
     "background.lock",
@@ -24,6 +25,7 @@ const DATA_LOCKS: &[&str] = &[
 const EMPTY_RENDEZVOUS: &[&str] = &[
     "policy-owner.lock",
     "policy-emission.lock",
+    "control-create.lock",
     "catalog-handles.lock",
     "control-handles.lock",
     "history-readers.lock",

@@ -1348,6 +1348,7 @@ fn private_root_is_accounted(
         "writer.lock",
         "policy-owner.lock",
         "policy-emission.lock",
+        "control-create.lock",
         "catalog-handles.lock",
         "control-handles.lock",
         "history-readers.lock",

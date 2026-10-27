@@ -221,6 +221,47 @@ fn fresh_schema_has_all_normative_tables_and_roundtrips() {
         SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Stopped).is_err()
     );
     assert_eq!(read.status().unwrap(), status);
+    assert!(!root.join("control.db.creating").exists());
+    assert!(!root.join("control.db.creating-wal").exists());
+    assert!(!root.join("control.db.creating-shm").exists());
+    assert!(!root.join("control.db.creating-journal").exists());
+}
+
+#[test]
+fn occupied_final_name_and_sidecars_are_never_replaced_by_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("private");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+    }
+    #[cfg(windows)]
+    std::fs::create_dir(&root).unwrap();
+    let path = SqliteControlStore::path(&root);
+    std::fs::write(&path, b"occupied").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal = std::path::PathBuf::from(wal_name);
+    std::fs::write(&wal, b"sidecar").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(
+        SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running).is_err()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"occupied");
+    assert_eq!(std::fs::read(wal).unwrap(), b"sidecar");
 }
 
 #[test]

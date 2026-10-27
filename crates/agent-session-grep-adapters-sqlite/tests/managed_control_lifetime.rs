@@ -656,6 +656,7 @@ fn terminal_control_file_removal_rejects_unowned_aliases_and_preserves_locks() {
     for name in [
         RETIREMENT_MARKER,
         "control-handles.lock",
+        "control-create.lock",
         "catalog-handles.lock",
         "policy-owner.lock",
         "background.lock",

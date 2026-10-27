@@ -495,6 +495,7 @@ fn tail_handoff(fixture: &mut PackageFixture, keep: bool) -> (Journal, Seal) {
         let kind = match *relative {
             "policy-owner.lock" => LockKind::PolicyOwner,
             "policy-emission.lock" => LockKind::PolicyEmission,
+            "control-create.lock" => LockKind::ControlCreate,
             "catalog-handles.lock" => LockKind::CatalogHandles,
             "history-readers.lock" => LockKind::HistoryReaders,
             "background.lock" => LockKind::Background,

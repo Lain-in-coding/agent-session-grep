@@ -179,6 +179,14 @@ impl ControlHandleLease {
     pub fn root_identity(&self) -> RootIdentity {
         self.guard.root_identity()
     }
+
+    pub(crate) fn publish_child_no_replace(
+        &self,
+        pending: &str,
+        final_name: &str,
+    ) -> PortResult<()> {
+        self.guard.publish_child_no_replace(pending, final_name)
+    }
 }
 
 impl fmt::Debug for ControlHandleLease {
