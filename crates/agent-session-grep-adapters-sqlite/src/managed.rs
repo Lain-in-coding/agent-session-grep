@@ -208,6 +208,46 @@ CREATE TRIGGER session_projection_delete AFTER DELETE ON source_session_projecti
 CREATE TRIGGER session_projection_update AFTER UPDATE OF fts_text ON source_session_projections BEGIN INSERT INTO session_metadata_fts(session_metadata_fts,rowid,fts_text) VALUES('delete',old.session_projection_rowid,old.fts_text); INSERT INTO session_metadata_fts(rowid,fts_text) VALUES(new.session_projection_rowid,new.fts_text); END;
 ";
 
+/// Per-request scratch relations of one session metadata search. Primary keys
+/// make every probe of them a keyed search; nothing here is persisted.
+const METADATA_SCRATCH: &str = "
+CREATE TEMP TABLE IF NOT EXISTS qualified_session_metadata(rowid INTEGER PRIMARY KEY) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS metadata_first_user_candidates(source_id TEXT NOT NULL,session_id TEXT NOT NULL,metadata_rowid INTEGER NOT NULL,PRIMARY KEY(source_id,session_id)) WITHOUT ROWID;
+DELETE FROM qualified_session_metadata;
+DELETE FROM metadata_first_user_candidates;
+";
+
+/// Keys of the metadata variants still eligible. The catalog's
+/// UNIQUE(source_id,session_id) makes each key appear once.
+const METADATA_FIRST_USER_CANDIDATES: &str = "
+INSERT INTO metadata_first_user_candidates(source_id,session_id,metadata_rowid)
+SELECT p.source_id,p.session_id,q.rowid
+FROM qualified_session_metadata q
+JOIN source_session_projections p ON p.session_projection_rowid=q.rowid
+";
+
+/// Drop each candidate whose first user occurrence includes one this query
+/// filters out; a tie at the minimum ordinal counts if any tied occurrence is
+/// unqualified. One grouped pass decides every candidate. CROSS JOIN pins the
+/// loop order: each candidate source is visited once through the
+/// (source_id,placement_id) unique index, so a database-backed source holding
+/// many sessions is read once rather than once per session, and candidates
+/// and qualified occurrences are probed by primary key.
+const METADATA_FIRST_USER_FILTER: &str = "
+DELETE FROM qualified_session_metadata
+WHERE rowid IN (
+    SELECT c.metadata_rowid
+    FROM (SELECT DISTINCT source_id FROM metadata_first_user_candidates) s
+    CROSS JOIN source_occurrences o ON o.source_id=s.source_id
+    CROSS JOIN metadata_first_user_candidates c
+      ON c.source_id=o.source_id AND c.session_id=o.session_id
+    LEFT JOIN qualified_occurrences q ON q.occurrence_rowid=o.occurrence_rowid
+    WHERE o.role='user'
+    GROUP BY c.source_id,c.session_id,c.metadata_rowid
+    HAVING MIN(o.source_ordinal)=MIN(CASE WHEN q.occurrence_rowid IS NULL THEN o.source_ordinal END)
+)
+";
+
 pub fn initialize_catalog_in_tx(
     conn: &Connection,
     installation: &str,
@@ -2247,7 +2287,9 @@ impl ProjectionRead for ManagedRead<'_> {
         }
         self.qualify_entities(query)?;
         let expression = safe_fts_query(&fts_tokens_cjk(text));
-        self.transaction.execute_batch("CREATE TEMP TABLE IF NOT EXISTS qualified_session_metadata(rowid INTEGER PRIMARY KEY) WITHOUT ROWID; DELETE FROM qualified_session_metadata;").map_err(sql)?;
+        self.transaction
+            .execute_batch(METADATA_SCRATCH)
+            .map_err(sql)?;
         self.transaction.execute_batch("INSERT INTO qualified_session_metadata SELECT p.session_projection_rowid FROM source_session_projections p JOIN source_entity_projections e ON e.source_id=p.source_id AND e.entity_id=p.session_id AND e.kind='session' JOIN qualified_entities q USING(entity_projection_rowid) JOIN source_revision_receipts r ON r.revision_id=p.revision_id AND r.source_id=p.source_id WHERE r.published=1").map_err(sql)?;
         let removed=self.transaction.execute("DELETE FROM qualified_session_metadata WHERE rowid IN(SELECT p.session_projection_rowid FROM source_session_projections p JOIN qualified_session_metadata q ON q.rowid=p.session_projection_rowid WHERE EXISTS(SELECT 1 FROM source_session_projections other JOIN qualified_session_metadata oq ON oq.rowid=other.session_projection_rowid WHERE other.session_id=p.session_id AND (other.title IS NOT p.title OR other.repo_slug IS NOT p.repo_slug)))",[]).map_err(sql)?;
         // Session titles may derive from the original first user message. The
@@ -2255,8 +2297,15 @@ impl ProjectionRead for ManagedRead<'_> {
         // If that occurrence is filtered out, omit this metadata variant BEFORE
         // MATCH/statistics/LIMIT. A partial flag records this conservative gap.
         // Ties at the minimum ordinal must all qualify because preparation may
-        // have chosen either document's first user message.
-        let filtered=self.transaction.execute("DELETE FROM qualified_session_metadata WHERE rowid IN(SELECT p.session_projection_rowid FROM source_session_projections p WHERE EXISTS(SELECT 1 FROM source_occurrences o LEFT JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=p.source_id AND o.session_id=p.session_id AND o.role='user' AND o.source_ordinal=(SELECT MIN(first.source_ordinal) FROM source_occurrences first WHERE first.source_id=o.source_id AND first.session_id=o.session_id AND first.role='user') AND q.occurrence_rowid IS NULL))",[]).map_err(sql)?;
+        // have chosen either document's first user message. Only variants still
+        // eligible are examined, all in one grouped pass (review 4.3.4 #4).
+        self.transaction
+            .execute(METADATA_FIRST_USER_CANDIDATES, [])
+            .map_err(sql)?;
+        let filtered = self
+            .transaction
+            .execute(METADATA_FIRST_USER_FILTER, [])
+            .map_err(sql)?;
         let mut page = SessionMetadataPage {
             hits: Vec::new(),
             truncated: false,
@@ -3479,6 +3528,233 @@ mod token_probe_tests {
     }
 }
 
+#[cfg(test)]
+mod metadata_first_user_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The real managed schema plus the read-side scratch relations. Foreign
+    /// keys are disabled after creation: these tests pin the first-user
+    /// filter's SQL semantics and plan. Publication-path behavior is covered
+    /// by the managed_projections integration tests.
+    fn catalog() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE store_metadata(singleton INTEGER PRIMARY KEY,active_generation INTEGER NOT NULL,projection_contract_version INTEGER NOT NULL DEFAULT 0,managed_mode INTEGER NOT NULL DEFAULT 0,destructive_epoch INTEGER NOT NULL DEFAULT 0); INSERT INTO store_metadata VALUES(1,0,0,0,0); BEGIN IMMEDIATE;").unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch("COMMIT; PRAGMA foreign_keys=OFF; CREATE TEMP TABLE qualified_occurrences(occurrence_rowid INTEGER PRIMARY KEY) WITHOUT ROWID;").unwrap();
+        conn.execute_batch(METADATA_SCRATCH).unwrap();
+        conn
+    }
+
+    fn add_session(conn: &Connection, rowid: i64, source: &str, session: &str, candidate: bool) {
+        conn.execute(
+            "INSERT INTO source_session_projections(session_projection_rowid,source_id,revision_id,session_id,search_text,search_digest,fts_text) VALUES(?1,?2,'revision',?3,'','','')",
+            params![rowid, source, session],
+        )
+        .unwrap();
+        if candidate {
+            conn.execute("INSERT INTO qualified_session_metadata VALUES(?1)", [rowid])
+                .unwrap();
+        }
+    }
+
+    fn add_occurrence(
+        conn: &Connection,
+        rowid: i64,
+        source: &str,
+        session: &str,
+        user: bool,
+        ordinal: i64,
+        qualified: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO source_occurrences(occurrence_rowid,source_id,revision_id,message_id,session_id,document_id,placement_id,provider_id,role,is_sidechain,source_ordinal,precision,payload,payload_digest) VALUES(?1,?2,'revision','message',?3,'document',CAST(?1 AS TEXT),'provider',?4,0,?5,'exact',x'','')",
+            params![rowid, source, session, if user { "user" } else { "assistant" }, ordinal],
+        )
+        .unwrap();
+        if qualified {
+            conn.execute("INSERT INTO qualified_occurrences VALUES(?1)", [rowid])
+                .unwrap();
+        }
+    }
+
+    fn members(conn: &Connection) -> BTreeSet<i64> {
+        conn.prepare("SELECT rowid FROM qualified_session_metadata")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Run the production statements; return the metadata rowids removed.
+    fn filter(conn: &Connection) -> BTreeSet<i64> {
+        let before = members(conn);
+        conn.execute(METADATA_FIRST_USER_CANDIDATES, []).unwrap();
+        let removed = conn.execute(METADATA_FIRST_USER_FILTER, []).unwrap();
+        let gone: BTreeSet<i64> = before.difference(&members(conn)).copied().collect();
+        assert_eq!(gone.len(), removed);
+        gone
+    }
+
+    #[test]
+    fn first_user_filter_applies_the_tie_rule_per_source_and_session() {
+        let conn = catalog();
+        // (metadata rowid, source, session, still a metadata candidate)
+        for (rowid, source, session, candidate) in [
+            (1, "db", "tie", true),
+            (2, "db", "both-qualified", true),
+            (3, "db", "later-hidden", true),
+            (4, "db", "first-hidden", true),
+            (5, "db", "no-user", true),
+            (6, "db", "assistant-first", true),
+            (7, "db", "shared", true),
+            (8, "file", "shared", true),
+            (9, "file", "borrowed", true),
+            (10, "db", "borrowed", false),
+            (11, "denied", "hidden", false),
+        ] {
+            add_session(&conn, rowid, source, session, candidate);
+        }
+        // (source, session, user role, ordinal, qualified by the query)
+        for (rowid, (source, session, user, ordinal, qualified)) in (1..).zip([
+            ("db", "tie", true, 0, true),
+            ("db", "tie", true, 0, false),
+            ("db", "both-qualified", true, 0, true),
+            ("db", "both-qualified", true, 0, true),
+            ("db", "later-hidden", true, 0, true),
+            ("db", "later-hidden", true, 1, false),
+            ("db", "first-hidden", true, 0, false),
+            ("db", "first-hidden", true, 1, true),
+            ("db", "no-user", false, 0, false),
+            ("db", "assistant-first", false, 0, false),
+            ("db", "assistant-first", true, 1, true),
+            ("db", "shared", true, 0, true),
+            ("file", "shared", true, 0, false),
+            ("db", "borrowed", true, 0, false),
+            ("denied", "hidden", true, 0, false),
+        ]) {
+            add_occurrence(&conn, rowid, source, session, user, ordinal, qualified);
+        }
+        let candidates = members(&conn);
+        // A tie hides the variant if any tied first user occurrence is hidden;
+        // later or non-user rows, other sources and non-candidates never do.
+        assert_eq!(filter(&conn), BTreeSet::from([1, 4, 8]));
+        // Differential check: the correlated statement this replaced removes
+        // exactly the same variants from the same candidate set.
+        conn.execute("DELETE FROM qualified_session_metadata", [])
+            .unwrap();
+        for rowid in &candidates {
+            conn.execute("INSERT INTO qualified_session_metadata VALUES(?1)", [rowid])
+                .unwrap();
+        }
+        conn.execute(CORRELATED_BASELINE, []).unwrap();
+        let kept: BTreeSet<i64> = candidates
+            .difference(&BTreeSet::from([1, 4, 8]))
+            .copied()
+            .collect();
+        assert_eq!(members(&conn), kept);
+    }
+
+    #[test]
+    fn first_user_filter_reads_each_candidate_source_once_by_index() {
+        let conn = catalog();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {METADATA_FIRST_USER_FILTER}"))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let has = |prefix: &str, detail: &str| {
+            plan.iter()
+                .any(|step| step.starts_with(prefix) && step.contains(detail))
+        };
+        assert!(has("SEARCH o USING INDEX", "(source_id=?)"), "{plan:?}");
+        assert!(
+            has("SEARCH c USING PRIMARY KEY", "session_id=?"),
+            "{plan:?}"
+        );
+        assert!(
+            has("SEARCH q USING PRIMARY KEY", "occurrence_rowid=?"),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN o")),
+            "{plan:?}"
+        );
+    }
+
+    /// The pre-optimization statement, kept only as the timing baseline.
+    const CORRELATED_BASELINE: &str = "DELETE FROM qualified_session_metadata WHERE rowid IN(SELECT p.session_projection_rowid FROM source_session_projections p WHERE EXISTS(SELECT 1 FROM source_occurrences o LEFT JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=p.source_id AND o.session_id=p.session_id AND o.role='user' AND o.source_ordinal=(SELECT MIN(first.source_ordinal) FROM source_occurrences first WHERE first.source_id=o.source_id AND first.session_id=o.session_id AND first.role='user') AND q.occurrence_rowid IS NULL))";
+
+    #[test]
+    #[ignore = "raw timing microbenchmark; run explicitly in release mode"]
+    fn first_user_filter_timing_against_correlated_baseline() {
+        const RESET: &str = "DELETE FROM metadata_first_user_candidates; DELETE FROM qualified_session_metadata; INSERT INTO qualified_session_metadata SELECT session_projection_rowid FROM source_session_projections;";
+        let ms = |samples: &[Duration]| {
+            samples
+                .iter()
+                .map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0)
+                .collect::<Vec<_>>()
+        };
+        // (shape, sources, sessions per source, occurrences per session)
+        for (shape, sources, sessions, per_session) in [
+            ("one-database-source", 1, 400, 40),
+            ("single-session-files", 2_000, 1, 40),
+            ("one-long-session", 1, 1, 6_000),
+        ] {
+            let conn = catalog();
+            let tx = conn.unchecked_transaction().unwrap();
+            let (mut metadata, mut occurrence) = (0_i64, 0_i64);
+            for source in 0..sources {
+                let source = format!("source-{source}");
+                for session in 0..sessions {
+                    metadata += 1;
+                    let session = format!("session-{session}");
+                    add_session(&tx, metadata, &source, &session, true);
+                    for ordinal in 0..per_session {
+                        occurrence += 1;
+                        // Every fourth variant hides its first user occurrence,
+                        // and later hidden user rows must not filter anything.
+                        // The single long session keeps its first row visible:
+                        // the correlated statement's worst case.
+                        let hidden = (ordinal == 0 && metadata % 4 == 2) || ordinal % 10 == 8;
+                        add_occurrence(
+                            &tx,
+                            occurrence,
+                            &source,
+                            &session,
+                            ordinal % 2 == 0,
+                            ordinal,
+                            !hidden,
+                        );
+                    }
+                }
+            }
+            tx.commit().unwrap();
+            let (mut baseline, mut setwise) = (Vec::new(), Vec::new());
+            for _ in 0..3 {
+                conn.execute_batch(RESET).unwrap();
+                let start = Instant::now();
+                let old = conn.execute(CORRELATED_BASELINE, []).unwrap();
+                baseline.push(start.elapsed());
+                let old_members = members(&conn);
+                conn.execute_batch(RESET).unwrap();
+                let start = Instant::now();
+                conn.execute(METADATA_FIRST_USER_CANDIDATES, []).unwrap();
+                let new = conn.execute(METADATA_FIRST_USER_FILTER, []).unwrap();
+                setwise.push(start.elapsed());
+                assert_eq!((new, members(&conn)), (old, old_members));
+            }
+            eprintln!(
+                "shape={shape} occurrences={occurrence} baseline_ms={:?} setwise_ms={:?}",
+                ms(&baseline),
+                ms(&setwise)
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod latest_proof_tests {
     use super::*;

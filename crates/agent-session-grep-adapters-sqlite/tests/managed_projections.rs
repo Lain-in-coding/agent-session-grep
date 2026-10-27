@@ -2321,3 +2321,161 @@ fn metadata_first_user_cannot_bypass_filtered_occurrence_or_title_conflict() {
         1
     );
 }
+
+#[test]
+fn metadata_first_user_filter_preserves_tied_minimum_and_ignores_later_hidden_rows() {
+    fn two_user_batch(source: &SourceObservation, tied: bool) -> SourceBatch {
+        let mut data = batch(source, "original question");
+        let first = data
+            .entries
+            .iter_mut()
+            .find(|entry| entry.0.kind() == IdKind::Message)
+            .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&first.1).unwrap();
+        payload["timestamp"] = "2026-10-17T03:00:00Z".into();
+        first.1 = serde_json::to_vec(&payload).unwrap();
+        let document = if tied {
+            // Equal ordinals are valid across documents, never within one document.
+            let mut document = data
+                .entries
+                .iter()
+                .find(|entry| entry.0.kind() == IdKind::Document)
+                .unwrap()
+                .clone();
+            document.0 = id(IdKind::Document, "tied-second-document");
+            let document_id = document.0.clone();
+            data.entries.push(document);
+            document_id
+        } else {
+            data.placements[0].source_document_id.clone()
+        };
+        let documents: Vec<_> = data
+            .entries
+            .iter()
+            .filter(|entry| entry.0.kind() == IdKind::Document)
+            .map(|entry| entry.0.as_str().to_owned())
+            .collect();
+        data.entries
+            .iter_mut()
+            .find(|entry| entry.0.kind() == IdKind::Session)
+            .unwrap()
+            .1 = serde_json::to_vec(&serde_json::json!({
+            "title":"metadata-marker",
+            "documents":documents
+        }))
+        .unwrap();
+        let hidden = id(
+            IdKind::Message,
+            &format!("hidden-{}", source.binding.source_id.as_str()),
+        );
+        data.entries.push((
+            hidden.clone(),
+            serde_json::to_vec(&serde_json::json!({
+                "role":"user",
+                "text":"hidden question",
+                "timestamp":"2026-10-17T01:00:00Z"
+            }))
+            .unwrap(),
+            "hidden question".into(),
+        ));
+        data.placements.push(MessagePlacement::new(
+            data.placements[0].session_id.clone(),
+            document,
+            hidden,
+            if tied { 0 } else { 1 },
+            false,
+            None,
+        ));
+        data
+    }
+
+    let conn = Connection::open_in_memory().unwrap();
+    schema(&conn);
+    let tied = observation("tied", 1);
+    assert!(
+        publish(&conn, &two_user_batch(&tied, true), &tied)
+            .receipt
+            .published
+    );
+    let all = ProjectionQuery::default();
+    let mut since_two = ProjectionQuery::default();
+    since_two.filters.since =
+        agent_session_grep_application::parse_search_instant("2026-10-17T02:00:00Z");
+    let read = open_read(&conn, &[&tied]);
+    let before = read
+        .query_session_metadata("metadata-marker", &all, 1)
+        .unwrap();
+    assert_eq!(before.hits.len(), 1);
+    assert_eq!(before.hits[0].fields, vec![SessionMetadataField::Title]);
+    assert!(!before.incomplete && !before.truncated);
+    for _ in 0..2 {
+        let filtered = read
+            .query_session_metadata("metadata-marker", &since_two, 1)
+            .unwrap();
+        assert!(filtered.hits.is_empty() && filtered.incomplete && !filtered.truncated);
+        assert_eq!(
+            read.query_lexical("original", &since_two, 1)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            read.query_lexical("hidden", &since_two, 1)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let restored = read
+            .query_session_metadata("metadata-marker", &all, 1)
+            .unwrap();
+        assert_eq!(restored.hits, before.hits);
+        assert!(!restored.incomplete && !restored.truncated);
+    }
+    drop(read);
+
+    let later = observation("later", 1);
+    assert!(
+        publish(&conn, &two_user_batch(&later, false), &later)
+            .receipt
+            .published
+    );
+    let read = open_read(&conn, &[&later]);
+    let allowed = read
+        .query_session_metadata("metadata-marker", &since_two, 1)
+        .unwrap();
+    assert_eq!(allowed.hits.len(), 1);
+    assert_eq!(allowed.hits[0].fields, vec![SessionMetadataField::Title]);
+    assert_eq!(
+        allowed.hits[0].projection.proof.source_id,
+        later.binding.source_id
+    );
+    assert!(!allowed.incomplete && !allowed.truncated);
+    assert!(
+        read.query_lexical("hidden", &since_two, 1)
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+    drop(read);
+
+    // Both sources claim the same Session with the same title, avoiding a title conflict.
+    let read = open_read(&conn, &[&tied, &later]);
+    let mut excluded = ProjectionQuery::default();
+    excluded.filters.providers = vec![SearchProvider::Codex];
+    for reset in [&all, &excluded, &all] {
+        let filtered = read
+            .query_session_metadata("metadata-marker", &since_two, 1)
+            .unwrap();
+        assert_eq!(filtered.hits, allowed.hits);
+        assert!(filtered.incomplete && !filtered.truncated);
+        let page = read
+            .query_session_metadata("metadata-marker", reset, 1)
+            .unwrap();
+        assert_eq!(
+            page.hits.len(),
+            usize::from(reset.filters.providers.is_empty())
+        );
+        assert!(!page.incomplete && !page.truncated);
+    }
+}
