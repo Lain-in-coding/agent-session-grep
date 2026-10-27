@@ -1481,16 +1481,48 @@ pub fn authority_prior(
 
 /// Validate the complete bounded context/authority graph and return exact
 /// receipt roots for GC. Missing/unknown links cannot mean an empty graph.
+///
+/// With `retained_contexts_only`, publication contexts are validated only when
+/// their owner receipt is already in `temp.history_keep_receipts`: an obsolete
+/// context neither counts toward the live inventory bound nor pins its
+/// metadata dependency. Retention validates each obsolete context before it
+/// joins a bounded deletion batch. Authority roots and transitions are always
+/// validated and retained completely.
 pub(crate) fn history_roots(
     conn: &Connection,
     max: usize,
     deadline: Instant,
+    retained_contexts_only: bool,
 ) -> PortResult<Vec<RevisionId>> {
     time(deadline)?;
     if !has_schema(conn)? {
         return Ok(Vec::new());
     }
-    let count:i64=conn.query_row("SELECT (SELECT COUNT(*) FROM source_publication_contexts)+(SELECT COUNT(*) FROM source_authorities)+(SELECT COUNT(*) FROM source_authority_transitions)",[],|r|r.get(0)).map_err(sql)?;
+    let context_count: i64 = if retained_contexts_only {
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_publication_contexts c JOIN temp.history_keep_receipts k ON k.revision_id=c.revision_id",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_publication_contexts",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?
+    };
+    let authority_count: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM source_authorities)+(SELECT COUNT(*) FROM source_authority_transitions)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    let count = context_count
+        .checked_add(authority_count)
+        .ok_or_else(corrupt)?;
     let side_count:i64=conn.query_row("SELECT (SELECT COUNT(*) FROM source_context_heads)+(SELECT COUNT(*) FROM source_authority_members)+(SELECT COUNT(*) FROM source_authority_tombstones)",[],|r|r.get(0)).map_err(sql)?;
     if count < 0
         || count as usize > max
@@ -1504,17 +1536,22 @@ pub(crate) fn history_roots(
         return Err(corrupt());
     }
     let mut roots = BTreeSet::new();
-    let mut stmt = conn
-        .prepare("SELECT revision_id FROM source_publication_contexts ORDER BY revision_id")
-        .map_err(sql)?;
+    let context_query = if retained_contexts_only {
+        "SELECT c.revision_id FROM source_publication_contexts c
+         JOIN temp.history_keep_receipts k ON k.revision_id=c.revision_id
+         ORDER BY c.revision_id"
+    } else {
+        "SELECT revision_id FROM source_publication_contexts ORDER BY revision_id"
+    };
+    let mut stmt = conn.prepare(context_query).map_err(sql)?;
     let mut rows = stmt.query([]).map_err(sql)?;
     while let Some(row) = rows.next().map_err(sql)? {
         time(deadline)?;
         let revision: String = row.get(0).map_err(sql)?;
         let context = load_context(conn, &revision)?.ok_or_else(corrupt)?;
-        // Even an obsolete owner's context still has a real metadata FK until
-        // that owner is retired in this batch. Pin the edge for one more batch
-        // rather than selecting its receipt before the owner cascade runs.
+        // A full inventory pins every context edge. Retention mode reaches
+        // here only for live owners; obsolete owners are validated separately
+        // and retired before their dependency receipts can become deletable.
         for dependency in context.dependencies {
             if let DependencyResolution::Resolved(proof) = dependency.resolution {
                 roots.insert(proof.receipt.revision_id);
@@ -1627,6 +1664,19 @@ pub(crate) fn history_roots(
     )?;
     Ok(closure)
 }
+
+/// Validate one obsolete publication context immediately before retention
+/// cascades it with its owner receipt. Old rows are not exempt from checks.
+pub(crate) fn verify_context_for_retirement(
+    conn: &Connection,
+    revision: &str,
+    source: &str,
+) -> PortResult<()> {
+    managed_receipt::read_checked(conn, revision, Some(source))?;
+    load_context(conn, revision)?.ok_or_else(corrupt)?;
+    Ok(())
+}
+
 pub(crate) fn dependency_closure(
     conn: &Connection,
     seeds: &[RevisionId],
@@ -1730,7 +1780,7 @@ pub fn purge_sources_in_tx(
             return Err(stale());
         }
     }
-    history_roots(conn, MAX_AUTHORITY_KEYS, deadline)?;
+    history_roots(conn, MAX_AUTHORITY_KEYS, deadline, false)?;
     conn.execute_batch("SAVEPOINT asg_context_purge;")
         .map_err(sql)?;
     let result = (|| {

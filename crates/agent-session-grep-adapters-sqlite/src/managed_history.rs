@@ -288,18 +288,21 @@ fn prune_inner(
         ..HistoryCounts::default()
     };
     let remaining = limits.batch_rows - counts.discoveries_deleted as usize;
-    conn.execute(
-        "INSERT INTO history_delete_receipts SELECT r.revision_id FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND NOT EXISTS(SELECT 1 FROM source_revision_receipts child WHERE child.content_revision_id=r.revision_id AND child.revision_id!=r.revision_id) ORDER BY r.revision_seq DESC,r.revision_id LIMIT ?1",
-        [remaining as i64],
-    ).map_err(sql)?;
+    select_delete_receipts(conn, remaining)?;
     verify_delete_receipts(conn, deadline)?;
+    verify_retired_contexts(conn, deadline)?;
     counts.receipt_claims_deleted = conn.execute("DELETE FROM receipt_selection_claims WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
     counts.retained_proofs_deleted = conn.execute("DELETE FROM retained_source_receipts WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
     counts.receipts_deleted = conn.execute("DELETE FROM source_revision_receipts WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
-    let has_more: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM discovery_receipts d LEFT JOIN history_keep_discoveries k USING(cycle_seq,selection_id) WHERE k.cycle_seq IS NULL) OR EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND NOT EXISTS(SELECT 1 FROM source_revision_receipts child WHERE child.content_revision_id=r.revision_id AND child.revision_id!=r.revision_id))",
-        [], |row| row.get(0),
-    ).map_err(sql)?;
+    let has_more: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM discovery_receipts d LEFT JOIN history_keep_discoveries k USING(cycle_seq,selection_id) WHERE k.cycle_seq IS NULL) OR EXISTS(SELECT 1 FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND {DELETABLE_RECEIPT})"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
     let cycles = retained_tokens(conn, limits.max_cycle_tokens, deadline)?;
     time(deadline)?;
     conn.execute_batch(CLEAN_TEMP).map_err(sql)?;
@@ -311,7 +314,7 @@ fn prune_inner(
 }
 
 fn retain_source_context(conn: &Connection, max: usize, deadline: Instant) -> PortResult<()> {
-    for revision in crate::managed_source_context::history_roots(conn, max, deadline)? {
+    for revision in crate::managed_source_context::history_roots(conn, max, deadline, true)? {
         conn.execute(
             "INSERT OR IGNORE INTO history_keep_receipts VALUES(?1)",
             [revision.as_str()],
@@ -341,6 +344,46 @@ fn retain_source_context(conn: &Connection, max: usize, deadline: Instant) -> Po
         )
         .map_err(sql)?;
     }
+    Ok(())
+}
+
+/// Every context whose owner receipt is in this deletion batch is cascaded
+/// with it. Validate each one first so retention never deletes a malformed
+/// graph row merely because its receipt is old.
+fn verify_retired_contexts(conn: &Connection, deadline: Instant) -> PortResult<()> {
+    let mut statement = conn
+        .prepare(
+            "SELECT c.revision_id,c.source_id FROM source_publication_contexts c
+             JOIN history_delete_receipts d USING(revision_id) ORDER BY c.revision_id",
+        )
+        .map_err(sql)?;
+    let mut rows = statement.query([]).map_err(sql)?;
+    while let Some(row) = rows.next().map_err(sql)? {
+        time(deadline)?;
+        crate::managed_source_context::verify_context_for_retirement(
+            conn,
+            &row.get::<_, String>(0).map_err(sql)?,
+            &row.get::<_, String>(1).map_err(sql)?,
+        )?;
+    }
+    Ok(())
+}
+
+/// A receipt is deletable only after no other receipt reuses its content and
+/// no surviving publication context names it as metadata. Obsolete contexts
+/// are not retention roots, but their dependency rows still hold a real FK.
+/// Filtering before LIMIT lets each bounded batch retire unreferenced owners
+/// first instead of repeatedly selecting a referenced metadata receipt.
+const DELETABLE_RECEIPT: &str = "NOT EXISTS(SELECT 1 FROM source_revision_receipts child WHERE child.content_revision_id=r.revision_id AND child.revision_id!=r.revision_id) AND NOT EXISTS(SELECT 1 FROM source_dependencies d WHERE d.metadata_revision_id=r.revision_id)";
+
+fn select_delete_receipts(conn: &Connection, limit: usize) -> PortResult<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO history_delete_receipts SELECT r.revision_id FROM source_revision_receipts r LEFT JOIN history_keep_receipts k USING(revision_id) WHERE k.revision_id IS NULL AND {DELETABLE_RECEIPT} ORDER BY r.revision_seq DESC,r.revision_id LIMIT ?1"
+        ),
+        [limit as i64],
+    )
+    .map_err(sql)?;
     Ok(())
 }
 

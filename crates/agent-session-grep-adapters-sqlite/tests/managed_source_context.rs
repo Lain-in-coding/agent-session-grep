@@ -1250,6 +1250,160 @@ fn dependency_gc_orders_obsolete_context_edges_before_metadata_deletion() {
     assert!(context::source_read_eligible(&c, "transcript").unwrap());
 }
 
+/// Review 4.3.4 #2: every observation stores a publication context, so the
+/// table grows with history. Retention must bound the LIVE context inventory,
+/// not the total, or GC fails forever exactly when cleanup is needed.
+#[test]
+fn obsolete_context_history_above_live_bound_still_prunes_in_bounded_batches() {
+    for batch_rows in [1, 2] {
+        prune_obsolete_context_history(batch_rows);
+    }
+}
+
+/// A one-row batch would select a still-referenced metadata receipt ahead of
+/// its owner forever. Each batch must instead retire an unreferenced receipt.
+fn prune_obsolete_context_history(batch_rows: usize) {
+    let c = schema();
+    let provider = SearchProvider::parse("workbuddy").unwrap();
+    let p = policy(provider);
+    for seq in 1..=8 {
+        let meta = observe("metadata", seq, provider);
+        let m = publish(
+            &c,
+            &meta,
+            &batch(&meta, None, ""),
+            &SourcePublicationContext::default(),
+            &p,
+        );
+        let original = observe("transcript", seq, provider);
+        publish(
+            &c,
+            &original,
+            &batch(&original, Some(&format!("revision {seq}")), "native"),
+            &dependency(&meta, m.receipt, LifecycleState::ActiveLocal),
+            &p,
+        );
+    }
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_publication_contexts"),
+        16
+    );
+    // The total exceeds this bound, which used to refuse every batch.
+    let limits = HistoryLimits {
+        receipt_tail_per_source: 1,
+        batch_rows,
+        max_dependencies: 8,
+        ..HistoryLimits::default()
+    };
+    let mut batches = 0;
+    loop {
+        let dependencies = history(&c);
+        c.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let pruned = prune_in_tx(&c, &dependencies, &[], limits, deadline())
+            .unwrap_or_else(|error| panic!("batch {batches}/{batch_rows} refused: {error:?}"));
+        assert!(pruned.counts.receipts_deleted <= batch_rows as u64);
+        foreign_keys_valid(&c);
+        c.execute_batch("COMMIT").unwrap();
+        batches += 1;
+        if !pruned.has_more {
+            break;
+        }
+        assert!(
+            pruned.counts.receipts_deleted > 0,
+            "a pending {batch_rows}-row batch must make progress"
+        );
+        assert!(batches < 32, "bounded retention stopped converging");
+    }
+    assert!(batches > 1);
+    let survivors: Vec<String> = c
+        .prepare("SELECT revision_id FROM source_revision_receipts ORDER BY revision_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    // Each source keeps its newest observation plus revision 1, which still
+    // owns unchanged content: the metadata source's empty content set and
+    // the transcript's unchanged session/resume entity rows. Every obsolete
+    // middle revision and its publication context is gone.
+    assert_eq!(
+        survivors,
+        [
+            "revision-metadata-1",
+            "revision-metadata-8",
+            "revision-transcript-1",
+            "revision-transcript-8",
+        ]
+    );
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_publication_contexts"),
+        4
+    );
+    assert!(context::source_read_eligible(&c, "transcript").unwrap());
+    assert!(
+        context::receipt_context_current(&c, "revision-transcript-8", Some(&p), deadline())
+            .unwrap()
+    );
+}
+
+/// An obsolete context is not a retention root, but retirement still
+/// validates it. A corrupt old row refuses cleanup instead of vanishing.
+#[test]
+fn corrupt_obsolete_context_refuses_retirement_instead_of_vanishing() {
+    let c = schema();
+    let provider = SearchProvider::parse("workbuddy").unwrap();
+    let p = policy(provider);
+    for seq in 1..=4 {
+        let original = observe("transcript", seq, provider);
+        publish(
+            &c,
+            &original,
+            &batch(&original, Some(&format!("revision {seq}")), "native"),
+            &unresolved("native"),
+            &p,
+        );
+    }
+    // Revision 1 still owns unchanged content and revision 4 is the head.
+    // Damage an obsolete middle context without removing the schema guard;
+    // only retirement validation should encounter the wrong digest.
+    let raw = context::context_manifest(&unresolved("native")).unwrap();
+    c.execute(
+        "DELETE FROM source_publication_contexts WHERE revision_id='revision-transcript-2'",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO source_publication_contexts(revision_id,source_id,manifest,context_digest,dependency_count,authority_id) VALUES('revision-transcript-2','transcript',?1,?2,1,NULL)",
+        params![raw, "0".repeat(64)],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO source_dependencies(owner_revision_id,ordinal,metadata_source_id,metadata_revision_id,resolution) VALUES('revision-transcript-2',0,NULL,NULL,'unresolved')",
+        [],
+    )
+    .unwrap();
+    foreign_keys_valid(&c);
+    let limits = HistoryLimits {
+        receipt_tail_per_source: 1,
+        ..HistoryLimits::default()
+    };
+    let dependencies = history(&c);
+    c.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        prune_in_tx(&c, &dependencies, &[], limits, deadline()),
+        Err(PortError::SchemaIncompatible(_))
+    ));
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_publication_contexts"),
+        4
+    );
+    assert_eq!(
+        scalar(&c, "SELECT COUNT(*) FROM source_revision_receipts"),
+        4
+    );
+    c.execute_batch("ROLLBACK").unwrap();
+}
+
 struct FacadeFixture {
     _temp: tempfile::TempDir,
     root: std::path::PathBuf,
