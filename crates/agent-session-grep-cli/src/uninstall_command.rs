@@ -1748,7 +1748,6 @@ fn verified_remove_file(path: &Path, identity: &(u64, u64)) -> Result<(), Reason
     }
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
         let file = platform::open_file(path).map_err(|_| Reason::FileLocked)?;
         let handle = file.metadata().map_err(|_| Reason::FileChanged)?;
         if !handle.is_file()

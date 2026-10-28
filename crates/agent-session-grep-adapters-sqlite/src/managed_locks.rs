@@ -826,7 +826,7 @@ pub(crate) mod platform {
     ),
     target_os = "macos"
 ))]
-mod platform {
+pub(crate) mod platform {
     use super::*;
     use std::{
         ffi::CString,

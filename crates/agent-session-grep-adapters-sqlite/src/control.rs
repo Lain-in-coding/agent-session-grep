@@ -3378,6 +3378,7 @@ pub(crate) fn validate_private_owned_file(path: &Path) -> PortResult<()> {
 /// Create one new user-only file in an existing private directory. The caller
 /// retains the open handle and its physical parent capability through writes.
 /// This never creates directories or replaces an existing file.
+#[cfg(windows)]
 pub(crate) fn create_private_owned_file(path: &Path) -> PortResult<fs::File> {
     private_directory(path.parent().ok_or_else(invalid)?, false)?;
     #[cfg(windows)]
@@ -3427,6 +3428,7 @@ fn private_file_observed(path: &Path, meta: &fs::Metadata, sidecar: bool) -> Por
     }
 }
 
+#[cfg(windows)]
 fn private_file_io(error: std::io::Error, sidecar: bool) -> PortError {
     private_file_io_at(error, sidecar, "file_io")
 }

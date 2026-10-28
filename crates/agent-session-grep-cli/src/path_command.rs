@@ -1475,7 +1475,9 @@ mod unix {
         let candidates: Vec<&str> = match shell.file_name().and_then(|name| name.to_str()) {
             Some("bash") => vec![".bash_profile", ".bash_login", ".profile"],
             Some("zsh") => {
-                if std::env::var_os("ZDOTDIR").is_some_and(|value| PathBuf::from(value) != home) {
+                if std::env::var_os("ZDOTDIR")
+                    .is_some_and(|value| Path::new(&value) != home.as_path())
+                {
                     return Err(PathReason::ProfileUnavailable);
                 }
                 vec![".zprofile"]
@@ -1926,7 +1928,7 @@ mod target {
             Location::Windows { .. } => {
                 #[cfg(not(windows))]
                 {
-                    return Err(PathReason::Unsupported);
+                    Err(PathReason::Unsupported)
                 }
                 #[cfg(windows)]
                 {
