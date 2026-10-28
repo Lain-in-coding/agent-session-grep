@@ -419,6 +419,26 @@ fn identity_and_protocol_failures_never_write_profiles_or_leak_output() {
     assert!(!f.root.join("profile").exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn local_check_allows_catalog_sharing_during_background_write() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let f = Fixture::new(vec![Host::ClaudeCode]);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).share_mode(1 | 2 | 4);
+    let _worker_catalog_handle = options.open(&f.request.catalog).unwrap();
+
+    let checked = check_local_asg(
+        &f.request.launcher,
+        &f.request.catalog,
+        &f.request.expected_identity,
+    )
+    .expect("setup self-check must coexist with an active catalog writer");
+    assert!(checked.version_verified);
+    assert!(checked.mcp_initialized);
+}
+
 #[test]
 fn probe_budget_caps_output_and_reaps_descendants() {
     for mode in ["flood", "hang", "tree"] {

@@ -471,17 +471,26 @@ fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn open_pinned(path: &Path) -> Result<File> {
+    open_checked(path, 1)
+}
+fn open_shared(path: &Path) -> Result<File> {
+    // A managed worker may hold the catalog for writing while setup performs
+    // its local self-check. FILE_SHARE_READ|WRITE|DELETE is validation-only;
+    // no catalog bytes are read through this handle.
+    open_checked(path, 1 | 2 | 4)
+}
+fn open_checked(path: &Path, share_mode: u32) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // Keep the selected binary/receipt from being renamed or overwritten.
-        options.share_mode(1).custom_flags(0x00200000);
+        options.share_mode(share_mode).custom_flags(0x00200000);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let _ = share_mode;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = options.open(path).map_err(io)?;
@@ -531,8 +540,12 @@ pub fn check_local_asg(
         return Err(SetupHostsErrorCode::IdentityMismatch.into());
     }
     // Do not retain a restrictive sharing handle while SQLite opens its own
-    // read-only connection (which may update SHM reader bookkeeping).
-    drop(open_pinned(catalog)?);
+    // read-only connection (which may update SHM reader bookkeeping). On
+    // Windows, an active managed worker may already hold the catalog with
+    // write access, so this validation handle must allow the same sharing
+    // modes as SQLite. The managed identity is revalidated before every
+    // configuration mutation.
+    drop(open_shared(catalog)?);
     let binary = open_pinned(launcher)?;
     #[cfg(unix)]
     {
