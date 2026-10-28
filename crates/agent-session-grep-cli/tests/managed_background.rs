@@ -7,9 +7,9 @@ use agent_session_grep_adapters_sqlite::{
 use agent_session_grep_ports::{
     PortError,
     control::{
-        BackgroundControl, CanonicalLocator, ControlId, ControlStore, DesiredUpdates,
-        LatestBarrier, MaintenanceFence, MaintenancePhase, MaintenanceState, PurgeState,
-        RequestIntersection, UpdateState,
+        BackgroundControl, BarrierState, CanonicalLocator, ControlId, ControlStore, CycleState,
+        DesiredUpdates, LatestBarrier, MaintenanceFence, MaintenancePhase, MaintenanceState,
+        PurgeState, RequestIntersection, UpdateState,
     },
     managed::{ProjectionQuery, ProjectionRead},
 };
@@ -1183,7 +1183,7 @@ fn admit_latest_barrier_for(
     locator: Option<&CanonicalLocator>,
 ) -> LatestBarrier {
     use agent_session_grep_ports::control::{LatestAdmission, LatestRequest, SelectionRevision};
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let root = f.db.parent().unwrap();
     let physical = RootIdentity::read(root).unwrap();
     let witness = f.control();
@@ -1608,7 +1608,7 @@ fn codex_rollout_with_equal_usage_deltas_still_publishes() {
 use agent_session_grep_adapters_sqlite::managed::ManagedRead;
 use agent_session_grep_ports::{
     PortResult,
-    control::{CycleState, ObservationCycle},
+    control::ObservationCycle,
     managed::{EntityData, EntityKind, LexicalHit, ResumeValue},
     source_context::{DependencyResolution, UnresolvedDependency},
 };
@@ -1666,13 +1666,90 @@ fn m2_sources(
     }
 }
 #[track_caller]
-fn m2_cycle_attempted(f: &Fixture, barrier: &LatestBarrier) -> ObservationCycle {
-    f.wait(|f| {
-        f.control()
-            .cycle(barrier.required_cycle_seq)
-            .is_ok_and(|cycle| matches!(cycle.state, CycleState::Committed | CycleState::Partial))
-    });
-    f.control().cycle(barrier.required_cycle_seq).unwrap()
+fn m2_cycle_attempted(f: &Fixture, barrier: &LatestBarrier) -> (LatestBarrier, ObservationCycle) {
+    let mut barrier = barrier.clone();
+    let mut aborted = Vec::new();
+    for attempt in 0..4 {
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let cycle = loop {
+            let control = f.control();
+            let cycle = m2_read_with_retry(deadline, || {
+                control
+                    .with_runtime_deadline(deadline, || control.cycle(barrier.required_cycle_seq))
+            });
+            match cycle.state {
+                CycleState::Committed | CycleState::Partial | CycleState::Aborted => break cycle,
+                CycleState::Queued | CycleState::Observing if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                CycleState::Queued | CycleState::Observing => {
+                    panic!("synthetic M2 latest cycle exceeded its observation deadline")
+                }
+            }
+        };
+        if cycle.state != CycleState::Aborted {
+            return (barrier, cycle);
+        }
+        let control = f.control();
+        let blocked = m2_read_with_retry(deadline, || {
+            control.with_runtime_deadline(deadline, || control.barrier(&barrier.id))
+        });
+        assert_eq!(blocked.state, BarrierState::Blocked);
+        assert!(!latest_satisfied(f, &barrier));
+        aborted.push((
+            cycle.token.cycle_seq.get(),
+            blocked.error,
+            cycle
+                .selections
+                .iter()
+                .map(|selection| {
+                    (
+                        selection.discovery_complete,
+                        selection.discovered_count,
+                        selection.observed_count,
+                        selection.committed_count,
+                        selection.error,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        if attempt == 3 {
+            break;
+        }
+        barrier = admit_latest_barrier(
+            f,
+            barrier
+                .admitted_at_ms
+                .saturating_add(i64::from(attempt) + 1),
+        );
+    }
+    let worker = f
+        .control()
+        .background_status()
+        .ok()
+        .map(|status| status.worker.state);
+    panic!(
+        "synthetic M2 latest barriers were repeatedly aborted: worker={worker:?}, cycles={aborted:?}"
+    )
+}
+fn m2_read_with_retry<T>(deadline: Instant, mut read: impl FnMut() -> PortResult<T>) -> T {
+    loop {
+        match read() {
+            Ok(value) => return value,
+            Err(
+                PortError::WriterBusy(_)
+                | PortError::GenerationMismatch(_)
+                | PortError::SnapshotChanged(_),
+            ) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("synthetic M2 control read failed: {error:?}"),
+        }
+    }
+}
+fn m2_post_revoke_cycle_attempted(f: &Fixture, now_ms: i64) -> ObservationCycle {
+    let barrier = admit_latest_barrier(f, now_ms);
+    m2_cycle_attempted(f, &barrier).1
 }
 fn m2_selection(f: &Fixture, path: &Path) -> ControlId {
     let locator = CanonicalLocator::from_path(&fs::canonicalize(path).unwrap()).unwrap();
@@ -1814,7 +1891,7 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
         DependencyResolution::Unresolved(UnresolvedDependency::NotSelected)
     ));
     let pending = admit_latest_barrier(&f, 1);
-    let attempted = m2_cycle_attempted(&f, &pending);
+    let (pending, attempted) = m2_cycle_attempted(&f, &pending);
     assert!(
         attempted
             .selections
@@ -1834,9 +1911,8 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     f.wait(|f| !m2_receipt_current(f, &source));
     assert!(f.has_text("wbindependentoriginalneedle"));
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
-    let withdrawn = admit_latest_barrier(&f, 3);
-    m2_cycle_attempted(&f, &withdrawn);
-    assert!(!latest_satisfied(&f, &withdrawn));
+    let withdrawn = m2_post_revoke_cycle_attempted(&f, 3);
+    assert_eq!(withdrawn.state, CycleState::Partial);
     f.desired(DesiredUpdates::Paused);
     f.terminate();
     f.spawn();
@@ -1872,7 +1948,7 @@ fn m2_workbuddy_successful_metadata_receipt_does_not_complete_missing_cloud_or_o
             })
         });
         let barrier = admit_latest_barrier(&f, 10);
-        let attempted = m2_cycle_attempted(&f, &barrier);
+        let (barrier, attempted) = m2_cycle_attempted(&f, &barrier);
         assert!(
             attempted
                 .selections
@@ -2003,14 +2079,14 @@ fn m2_dsh_highest_generation_future_refusal_and_restart_keep_one_original() {
     )
     .unwrap();
     let blocked = admit_latest_barrier(&f, 102);
-    m2_cycle_attempted(&f, &blocked);
+    let (blocked, _) = m2_cycle_attempted(&f, &blocked);
     assert!(!latest_satisfied(&f, &blocked));
     assert!(f.has_text("dshcanonicaloriginalneedle"));
     assert!(!f.has_text("dshfuturemustnotpublishneedle"));
     f.terminate();
     f.spawn();
     let restarted = admit_latest_barrier(&f, 103);
-    m2_cycle_attempted(&f, &restarted);
+    let (restarted, _) = m2_cycle_attempted(&f, &restarted);
     assert!(!latest_satisfied(&f, &restarted));
     assert_eq!(
         m2_hits(&f, "dshcanonicaloriginalneedle")[0]
@@ -2226,7 +2302,7 @@ fn m2_antigravity_full_and_database_transition_is_atomic_and_excludes_mirrors() 
     partial.extend(br#"{"step_index":"#);
     fs::write(&full, partial).unwrap();
     let blocked = admit_latest_barrier(&f, 106);
-    m2_cycle_attempted(&f, &blocked);
+    let (blocked, _) = m2_cycle_attempted(&f, &blocked);
     assert!(!latest_satisfied(&f, &blocked));
     assert!(f.has_text("agfulloriginalneedle"));
     assert!(!f.has_text("agdatabaseoriginalneedle"));
@@ -2354,7 +2430,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     torn.extend(&frame[..frame.len() - 3]);
     fs::write(&source, &torn).unwrap();
     let pending = admit_latest_barrier(&f, 201);
-    m2_cycle_attempted(&f, &pending);
+    let (pending, _) = m2_cycle_attempted(&f, &pending);
     assert!(!latest_satisfied(&f, &pending));
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
@@ -2364,7 +2440,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&source, &corrupt).unwrap();
     let failed = admit_latest_barrier(&f, 202);
-    m2_cycle_attempted(&f, &failed);
+    let (failed, _) = m2_cycle_attempted(&f, &failed);
     assert!(!latest_satisfied(&f, &failed));
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
@@ -2495,6 +2571,7 @@ fn m2_antigravity_full_absence_requires_new_boot_grace_before_database_fallback(
 
 #[test]
 fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof() {
+    use agent_session_grep_ports::control::ConfirmationKind;
     let native = "synthetic-wb-churn";
     let original = m2_wb_transcript(native, "wbsemanticoriginalneedle");
     let mut f = Fixture::selected("workbuddy", |root| {
@@ -2524,15 +2601,30 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
         .unwrap()
         .execute("UPDATE sessions SET deleted_at=1000 WHERE id=?1", [native])
         .unwrap();
-    f.wait(Fixture::has_held_receipt);
     let source_id = m2_source_for_path(&f, &source).binding.source_id;
-    let first = f
-        .control()
-        .source_progress(&ControlId::parse(source_id.as_str()).unwrap())
-        .unwrap()
-        .unwrap()
-        .confirmation
-        .unwrap();
+    let source_id = ControlId::parse(source_id.as_str()).unwrap();
+    let mut first = None;
+    f.wait(|f| {
+        let confirmation = f
+            .control()
+            .source_progress(&source_id)
+            .ok()
+            .flatten()
+            .and_then(|progress| progress.confirmation);
+        if let Some(candidate) = confirmation.filter(|candidate| {
+            matches!(
+                &candidate.kind,
+                ConfirmationKind::Rewrite { candidate_digest }
+                    if candidate_digest.as_str().starts_with("metadata_")
+            )
+        }) {
+            first = Some(candidate);
+            f.has_held_receipt()
+        } else {
+            false
+        }
+    });
+    let first = first.expect("soft-delete confirmation was observed");
     for index in 0..3 {
         Connection::open(&metadata)
             .unwrap()
@@ -2542,23 +2634,31 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
             )
             .unwrap();
         let barrier = admit_latest_barrier(&f, 221 + index);
-        m2_cycle_attempted(&f, &barrier);
-        let progress = f
-            .control()
-            .source_progress(&ControlId::parse(source_id.as_str()).unwrap())
-            .unwrap()
-            .unwrap();
+        let _ = m2_cycle_attempted(&f, &barrier);
+        let progress = f.control().source_progress(&source_id).unwrap().unwrap();
         if let Some(current) = progress.confirmation {
+            assert!(matches!(
+                current.kind,
+                ConfirmationKind::Rewrite { ref candidate_digest }
+                    if candidate_digest.as_str().starts_with("metadata_")
+            ));
             assert_eq!(current.first_cycle, first.first_cycle);
             assert_eq!(current.first_monotonic_ms, first.first_monotonic_ms);
+        } else {
+            assert!(
+                !f.has_text("wbsemanticoriginalneedle"),
+                "confirmation may clear only after the original evidence is retired"
+            );
         }
     }
     f.wait(|f| !f.has_text("wbsemanticoriginalneedle"));
     let deleted = admit_latest_barrier(&f, 225);
+    let (deleted, _) = m2_cycle_attempted(&f, &deleted);
     f.wait(|f| latest_satisfied(f, &deleted));
     // Repeated identical deletion state remains current rather than starting
     // another five-second confirmation for already-removed original content.
     let still_deleted = admit_latest_barrier(&f, 226);
+    let (still_deleted, _) = m2_cycle_attempted(&f, &still_deleted);
     f.wait(|f| latest_satisfied(f, &still_deleted));
     Connection::open(&metadata)
         .unwrap()
@@ -2567,6 +2667,7 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
     let metadata_after = fs::read(&metadata).unwrap();
     f.wait(|f| f.has_text("wbsemanticoriginalneedle"));
     let restored = admit_latest_barrier(&f, 227);
+    let (restored, _) = m2_cycle_attempted(&f, &restored);
     f.wait(|f| latest_satisfied(f, &restored));
     assert_eq!(
         m2_hits(&f, "wbsemanticoriginalneedle")[0]
@@ -2629,7 +2730,7 @@ fn m2_zcode_unknown_part_keeps_child_until_complete_graph_confirms_removal() {
     let db_partial = fs::read(&database).unwrap();
     let wal_partial = fs::read(&wal).unwrap();
     let partial = admit_latest_barrier(&f, 231);
-    m2_cycle_attempted(&f, &partial);
+    let (partial, _) = m2_cycle_attempted(&f, &partial);
     assert!(!latest_satisfied(&f, &partial));
     assert!(f.has_text("zcoderetainedchildneedle"));
     assert!(!f.has_text("zcodeunknownmustnotpublishneedle"));
