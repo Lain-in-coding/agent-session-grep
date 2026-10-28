@@ -550,6 +550,17 @@ current control policy. It grants no new source, dependency or currentness proof
 and does not establish a callable old-program upgrade. Normal managed read/write
 opens still refuse older schema and never perform this migration.
 
+Starting a new update never unlinks the previous terminal journal first. After
+all update/package/control/catalog preflight succeeds, a private supersede intent
+records both complete journal images. The new state is staged and atomically
+published, then the old state is atomically archived before cleanup. Recovery
+uses the hash of the actual `state.json` to finish either side of that switch;
+the intent, state and archive staging files are themselves published from
+complete temporary files. A Linux/macOS exchange stopped before its displaced
+old image moved is also recognized. This keeps one complete active journal
+available throughout the replacement instead of relying on an archive-and-then-
+restore window.
+
 Status reports the retained journal, including phase/sequence, from/to versions,
 target, pointer generation, `cleanup_pending`, `recovery_required`, `error_code`
 and `freshness: unknown`. It may reconcile interrupted journal-file publication
@@ -583,7 +594,10 @@ It restarts the proven owned native registration when autostart is enabled;
 otherwise it launches the supervisor detached and hidden without enabling login
 startup. Current pause/stop is rechecked before launch and during readiness checks.
 A restart failure while intent is still running retains a nonterminal partial
-report with `error_code: restart_failed`; run recover after resolving the failure.
+report with `error_code: restart_failed`. Because that failure is recorded,
+recover rolls back to the old verified program instead of retrying forward
+completion forever. It preserves the current desired-updates intent and restarts
+the old supervisor when that intent is running.
 A concurrent pause/stop is preserved rather than treated as a restart failure.
 Rollback completion also restarts the verified old supervisor only when current
 intent is running; a restart failure remains recoverable and partial. Inspect
@@ -616,11 +630,13 @@ is not deletion evidence. This grace window is a correctness rule, not measured
 five-second performance acceptance. Automatic rename/alias identity preservation
 and full overlapping-root acceptance remain under implementation/review.
 
-Current source and local synthetic tests establish implementation seams, not a
-real two-version recovery drill, six-host flow, four-target native installation,
-minimum-OS support or latency/resource acceptance. Those receipts remain
-separate release requirements. Setup accepts explicit history selection for
-all six confirmed providers as described above; later permission changes use
+Current source and local tests include a Windows x64 private two-version drill:
+the injected beta.5 supervisor failed after the pointer switch, beta.5 recovered
+to beta.4, and the old supervisor, selected scope and exact stored evidence
+resumed. This is not final-package evidence for all four targets. Six-host flow,
+macOS targets, minimum-OS support and latency/resource acceptance remain separate
+release requirements. Setup accepts explicit history selection for all six
+confirmed providers as described above; later permission changes use
 `sources add/revoke`.
 `background autostart enable|disable` manages owned login registration.
 Managed default/keep-data uninstall is implemented with bounded pending cleanup;
@@ -784,6 +800,14 @@ agent-session-grep --robot doctor --db C:/data/example.db
 
 That form reports `schema`, `generation`, and `interrupted_batches` for the
 store. See `rebuild-and-migration-runbook.md` for how to read those fields.
+
+When the database has a sibling managed `control.db`, `doctor --db` uses the
+managed control/admission path instead of treating the catalog as a legacy
+store. Its response contains `managed: true`, a bounded catalog check and the
+authorized generation/destructive-epoch/policy-epoch snapshot. The current
+managed doctor is intentionally diagnostic rather than exhaustive and reports
+`diagnostics_complete: false`; a successful value does not prove source
+freshness, host loading, model continuation or release acceptance.
 
 When loading transcripts with `ingest <file>` or `sync <file>...`, one source
 may contain multiple sessions if the adapter supplies per-message session

@@ -285,6 +285,12 @@ journal-file publication, without catalog recovery or worker start. A new instal
 without a journal has no idle-status response yet. Terminal `failed`/`rolled_back`
 is a successful inspection, not successful upgrade; nonterminal state is partial
 (exit 10). Apply returns an existing unfinished state instead of starting again.
+Replacing a terminal journal is a hash-bound supersede transaction: all update
+preflight finishes before the old terminal state is superseded, both complete
+images are durable before publication, and the active `state.json` name never
+disappears. Recovery accepts every complete staging side, including a Unix
+exchange interrupted before the displaced old image moved, and finishes the old
+archive before removing the intent.
 
 `update_recovery_required` is a canonical business error (exit 10,
 `retryable: false`, `partial_allowed: true`). It directs inspection of status and
@@ -294,14 +300,16 @@ metadata effects, can finish an already switched candidate, or reconcile old
 owned metadata for the equal-schema rollback. Rollback rotates incarnation and
 invalidates freshness/progress/barrier/confirmation/continuation proof while
 preserving current pause/stop/revoke policy. This is not generic backup restore
-or legacy-to-managed migration.
+or legacy-to-managed migration. A recorded `restart_failed` self-check never
+continues forward; recover selects rollback and reuses one recovery incarnation
+so a repeated recover does not rotate or increment again.
 
 Forward completion starts the verified next-version supervisor only for current
 running intent, using the owned native registration or a hidden detached launch
 without enabling autostart. Launch/readiness rechecks pause/stop; intentional
 changes preserve that intent, while `restart_failed` under running intent keeps
-the journal nonterminal and returns partial for recovery. Rollback currently
-leaves worker restart to an explicit control action. Neither
+the journal nonterminal and returns partial for recovery. Rollback restarts the
+verified old supervisor when current intent is still running. Neither
 completion nor heartbeat establishes refreshed history, actual host MCP reload
 or native login identity. Update binds the private owned native-registration
 receipt chain before replacing its supervisor command, and rollback reconciles
@@ -309,8 +317,10 @@ the original owned command. Unowned/changed/ambiguous registration is not adopte
 autostart is not newly enabled. Manager reload/readback is distinct from a login
 receipt. Explicit selected-host setup remains available for registration/host
 repair. Native two-version recovery, schema-changing/legacy
-migration, managed uninstall, six-host/four-target flows and measured latency
-acceptance remain separate open requirements. Setup history selection continues
+repair. A Windows x64 private same-schema two-version rollback/recover drill has
+passed; schema-changing/legacy migration, other native targets, managed
+uninstall, six-host flows and measured latency acceptance remain separate open
+requirements. Setup history selection continues
 through separate `sources add`; public background autostart enable/disable,
 managed uninstall/default purge and keep-data are still unimplemented.
 
@@ -435,6 +445,11 @@ termination stops this stdout transport; no normal error envelope is appended
 to a possibly partial evidence frame. A pending helper never becomes a false
 revocation acknowledgement. This composition contract does not certify all
 MCP/TUI/Web routing, native cross-platform cancellation or full Beta acceptance.
+For `doctor --db`, a sibling `control.db` selects this managed read path instead
+of the legacy store reader. The managed response reports `managed: true`, a
+bounded catalog check and its control-authorized snapshot, while
+`diagnostics_complete: false` prevents that check from being advertised as
+full freshness or host verification.
 
 ### Managed MCP transport and discovery recovery
 

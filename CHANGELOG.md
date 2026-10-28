@@ -343,6 +343,14 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Managed program updates now replace a terminal update journal through a
+  durable, hash-bound supersede transaction instead of unlinking it before all
+  preflight has passed. Recovery handles interrupted intent/state/archive
+  staging and the Unix exchange window, never retries a recorded
+  `restart_failed` forward self-check, and restores the old supervisor while
+  preserving desired-update intent. `doctor --db` now recognizes a sibling
+  managed `control.db` and uses the managed control path rather than reporting a
+  false legacy `schema_incompatible` result.
 - The loopback Web API now constructs typed commands and executes them through
   the same read path as the CLI. It no longer turns query values back into
   synthetic argv, so a value equal to a CLI flag name (`q=--repo`) is searched

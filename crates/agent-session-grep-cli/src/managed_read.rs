@@ -739,12 +739,53 @@ pub(crate) fn run(
     started: Instant,
 ) -> Result<Outcome, CliError> {
     let request = parse(rest, crate::app_clock_ms())?;
+    emit_cli_request(db, &request, mode, request_id, started)
+}
+
+pub(crate) fn run_doctor(
+    db: &str,
+    mode: OutputMode,
+    request_id: Option<&str>,
+    offline: bool,
+    started: Instant,
+) -> Result<Outcome, CliError> {
+    let request = Request {
+        command: "doctor",
+        operation: Operation::Status,
+        intersection: ProjectionQuery::default(),
+        budget: ResponseBudget {
+            max_items: DEFAULT_ITEMS,
+            max_messages: DEFAULT_ITEMS,
+            max_response_bytes: DEFAULT_FRAME_BYTES,
+            ..ResponseBudget::default()
+        },
+        frame_bytes: DEFAULT_FRAME_BYTES,
+        latest: None,
+        override_data: Some(json!({
+            "managed": true,
+            "offline": offline,
+            "checks": [{"name": "catalog", "status": "ok"}],
+            "diagnostics_complete": false
+        })),
+        cursor: None,
+        now_ms: crate::app_clock_ms(),
+    };
+    emit_cli_request(db, &request, mode, request_id, started)
+}
+
+fn emit_cli_request(
+    db: &str,
+    request: &Request,
+    mode: OutputMode,
+    request_id: Option<&str>,
+    started: Instant,
+) -> Result<Outcome, CliError> {
     if request_id.is_some_and(|s| !protocol::valid_request_id(s)) {
         return Err(invalid());
     }
     let (result, authority) = execute(
         Path::new(db),
-        &request,
+        request,
         RenderTarget::Cli(mode, request_id),
         started,
         None,

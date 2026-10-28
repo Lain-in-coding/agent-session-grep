@@ -1891,6 +1891,23 @@ fn doctor(
             if !std::path::Path::new(&path).exists() {
                 return Err(missing_catalog_error(&path));
             }
+            let managed_root = std::path::Path::new(&path)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            match std::fs::symlink_metadata(managed_root.join("control.db")) {
+                Ok(_) => {
+                    return managed_read::run_doctor(&path, mode, request_id, offline, started);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(ProtocolError::new(
+                        CanonicalCode::SchemaIncompatible,
+                        "managed control state is unavailable",
+                    )
+                    .into());
+                }
+            }
             let store = SqliteStore::open(&path).map_err(ProtocolError::from)?;
             doctor_store_data(&store, offline)?
         }

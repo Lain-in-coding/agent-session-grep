@@ -414,6 +414,20 @@ fn not_found(output: Output) {
 }
 
 #[test]
+fn doctor_uses_the_managed_control_path_for_a_real_managed_catalog() {
+    let f = Fixture::new(1, "needle");
+    let output = f.run(&["doctor"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "doctor");
+    assert_eq!(value["data"]["managed"], true);
+    assert_eq!(value["data"]["checks"][0]["name"], "catalog");
+    assert_eq!(value["data"]["checks"][0]["status"], "ok");
+    assert_eq!(value["data"]["diagnostics_complete"], false);
+}
+
+#[test]
 fn search_show_and_context_share_safe_original_proof() {
     let f = Fixture::new(2, "original evidence");
     let search = response(f.run(&["search", "original"]));

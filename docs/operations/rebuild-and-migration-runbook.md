@@ -70,24 +70,29 @@ For an interrupted update:
    and may reconcile interrupted journal-file publication under the real lock.
    A fresh install with no journal has no idle-status response yet. Inspect
    `phase` and `error_code`; an inspection of terminal `failed`/`rolled_back`
-   is not a successful upgrade. Nonterminal state returns partial (exit 10).
+   is not a successful upgrade. A recorded `restart_failed` state is a failed
+   forward self-check, not a reason to repeat it. Nonterminal state returns
+   partial (exit 10).
 3. Run `asg --robot --db <path> update recover`. It verifies the selected
    catalog and installation identity, owns the maintenance fence, drains
    cooperating catalog handles and reconciles recorded metadata effects. A
-   verified switched candidate may finish forward. For the supported public
-   catalog22/control2 program path, rollback rotates the catalog incarnation
-   and restores old metadata. A recorded schema-changing pair is refused rather
-   than treated as an executable old-program handoff; the internal exact21
-   restore seam remains separately owned. A busy live owner or changed or
-   unverified identity is a reason to stop and resolve the reported failure,
-   never to delete a lock/fence or overwrite metadata by hand.
+   verified switched candidate may finish forward, except a recorded
+   `restart_failed` self-check, which uses the rollback path. For the supported
+   public catalog22/control2 program path, rollback rotates the catalog
+   incarnation and restores old metadata. A recorded schema-changing pair is
+   refused rather than treated as an executable old-program handoff; the
+   internal exact21 restore seam remains separately owned. A busy live owner or
+   changed or unverified identity is a reason to stop and resolve the reported
+   failure, never to delete a lock/fence or overwrite metadata by hand.
 4. Recheck `update status`, both command versions and `background status`.
    Forward completion starts the verified next-version supervisor only for
    running intent, using the owned native registration or a hidden detached
    launch when login startup is disabled. It rechecks current pause/stop;
-   `restart_failed` while still running leaves a recoverable partial state.
-   Rollback also restarts the verified old supervisor only for current running
-   intent; restart failure remains partial and recoverable. `background start` preserves intent;
+   `restart_failed` while still running leaves a recoverable partial state and
+   explicit recover selects rollback. Rollback also restarts the verified old
+   supervisor only for current running intent; restart failure remains partial
+   and recoverable. A second successful recover does not rotate the catalog or
+   increment the destructive epoch again. `background start` preserves intent;
    `background resume` explicitly changes paused/stopped intent to running.
 5. Run a permitted evidence read with `--latest` to obtain a new post-request
    observation. Update status always reports `freshness: unknown`; package
@@ -161,6 +166,14 @@ If `doctor` fails instead of reporting, the error envelope names the reason —
 most usefully `schema_incompatible` when the store schema differs from the
 binary's supported version, whether older or newer. `doctor` is read-only and
 does not perform an upgrade.
+
+For a managed catalog with a sibling `control.db`, `doctor` returns
+`managed: true` instead. It runs the managed control/admission path, reports a
+bounded catalog check plus `snapshot.generation`,
+`snapshot.destructive_epoch` and `snapshot.policy_epoch`, and sets
+`diagnostics_complete: false`. The legacy `schema`, `interrupted_batches` and
+index-projection fields do not describe this response. A successful managed
+doctor does not prove selected-source freshness or host/model acceptance.
 
 ## Procedure 1: Schema upgrade
 
