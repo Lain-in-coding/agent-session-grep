@@ -40,6 +40,9 @@ const SCHEMA: &str = "asg.legacy-migration-command/v1";
 const INTENT: &str = "legacy-migration-command.json";
 const PENDING: &str = "legacy-migration-command.pending";
 const CONTROL_STARTED: &str = "legacy-migration-control-start.json";
+const CONTROL_CREATE_INTENT: &str = "control.db.creating.intent";
+const CONTROL_CREATE_PENDING: &str = "control.db.creating";
+const CONTROL_CREATE_PUBLISH: &str = "control.db.creating.publish";
 const MAX_INTENT: u64 = 64 * 1024;
 const TOTAL_BUDGET: Duration = Duration::from_secs(30);
 const LOCK_BUDGET: Duration = Duration::from_secs(5);
@@ -578,11 +581,6 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
             }
             SqliteControlStore::open_existing_writable(&paths.root, &installation).map_err(port)?
         } else {
-            // Once control creation was attempted, absence cannot distinguish
-            // failed creation from lost later policy. Stop, never reset policy.
-            if started {
-                return Err(invalid());
-            }
             for path in [
                 &paths.destination,
                 &suffix(&paths.destination, ".asg-managed-create"),
@@ -592,19 +590,60 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
                     return Err(invalid());
                 }
             }
-            let bytes = serde_json::to_vec(&expected_start).map_err(io)?;
-            let mut file = platform::create_file(&started_path).map_err(io)?;
-            file.write_all(&bytes).map_err(io)?;
-            file.sync_all().map_err(io)?;
-            drop(file);
-            platform::sync_directory(&paths.root).map_err(io)?;
-            #[cfg(test)]
-            fault(Fault::ControlIntent)?;
-            check(end)?;
-            paths.validate(root)?;
-            SqliteControlStore::create(&paths.root, &installation, DesiredUpdates::Paused)
-                .map_err(port)?
+            if started {
+                // Only the exact unpublished intent bound to this start may be
+                // rebuilt. A publish marker without the final name means policy
+                // may once have been live and can never be reset.
+                let pending = SqliteControlStore::read_create_intent(&paths.root).map_err(port)?;
+                match pending {
+                    Some((stored, DesiredUpdates::Paused)) if stored == installation => {
+                        paths.validate(root)?;
+                        acquire(end, || {
+                            SqliteControlStore::recover_create(
+                                &paths.root,
+                                &installation,
+                                DesiredUpdates::Paused,
+                            )
+                        })?
+                    }
+                    _ => return Err(invalid()),
+                }
+            } else {
+                // A creation intent without its durable command binding is
+                // never adopted by a fresh migration operation.
+                if SqliteControlStore::read_create_intent(&paths.root)
+                    .map_err(port)?
+                    .is_some()
+                {
+                    return Err(invalid());
+                }
+                for name in [
+                    CONTROL_CREATE_INTENT,
+                    CONTROL_CREATE_PENDING,
+                    CONTROL_CREATE_PUBLISH,
+                    "control.db.creating-wal",
+                    "control.db.creating-shm",
+                    "control.db.creating-journal",
+                ] {
+                    if exists(&paths.root.join(name))? {
+                        return Err(invalid());
+                    }
+                }
+                let bytes = serde_json::to_vec(&expected_start).map_err(io)?;
+                let mut file = platform::create_file(&started_path).map_err(io)?;
+                file.write_all(&bytes).map_err(io)?;
+                file.sync_all().map_err(io)?;
+                drop(file);
+                platform::sync_directory(&paths.root).map_err(io)?;
+                #[cfg(test)]
+                fault(Fault::ControlIntent)?;
+                check(end)?;
+                paths.validate(root)?;
+                SqliteControlStore::create(&paths.root, &installation, DesiredUpdates::Paused)
+                    .map_err(port)?
+            }
         };
+        acquire(end, || control.finish_create())?;
         let bound = control.bind_control_root(&owner).map_err(port)?;
         if let (Some(install), Some(lock)) = (&install, &installation_lock) {
             control

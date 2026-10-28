@@ -238,6 +238,25 @@ fn retry_control<T>(
     }
 }
 
+/// Creation recovery is not a CAS loop. A pending-creation GenerationMismatch
+/// is terminal here; only handle-admission Busy retries under the same end.
+fn retry_create_busy<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    loop {
+        if deadline.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(PortError::WriterBusy("control deadline reached".into()));
+        }
+        match operation() {
+            Err(PortError::WriterBusy(_)) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Run one control mutation inside the command's original deadline and retain
 /// its committed result. The store can commit and then report Busy from its
 /// trailing deadline check; retrying that acknowledgement makes the caller
@@ -484,11 +503,40 @@ fn prepare_setup_before(db: &str, deadline: Instant) -> Result<Value, CliError> 
             if let Some(parent) = root.parent() {
                 std::fs::create_dir_all(parent).map_err(io)?;
             }
-            SqliteControlStore::create(root, &random_id("installation")?, DesiredUpdates::Running)
+            let root_exists = match std::fs::symlink_metadata(root) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(io(error)),
+            };
+            if root_exists {
+                // Resume only the exact durable intent. A fresh random identity
+                // here would strand the recorded installation forever.
+                match SqliteControlStore::read_create_intent(root).map_err(port)? {
+                    Some((installation, desired)) => retry_create_busy(deadline, || {
+                        SqliteControlStore::recover_create(root, &installation, desired)
+                    })
+                    .map_err(port)?,
+                    None => {
+                        let installation = random_id("installation")?;
+                        retry_create_busy(deadline, || {
+                            SqliteControlStore::create(root, &installation, DesiredUpdates::Running)
+                        })
+                        .map_err(port)?
+                    }
+                }
+            } else {
+                let installation = random_id("installation")?;
+                retry_create_busy(deadline, || {
+                    SqliteControlStore::create(root, &installation, DesiredUpdates::Running)
+                })
                 .map_err(port)?
+            }
         }
         Err(e) => return Err(io(e)),
     };
+    // Retire matching creation records before the catalog can exist; a later
+    // retry must never mistake stale records for recoverable policy.
+    retry_create_busy(deadline, || control.finish_create()).map_err(port)?;
     if path.exists() {
         drop(ManagedStore::open(&path, &control).map_err(port)?);
     } else {
@@ -739,6 +787,102 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn creation_intent_bytes(root: &Path, installation: &str, desired: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema": "asg.control-create-intent/v2",
+            "root": RootIdentity::read(root).unwrap().control_id().as_str(),
+            "installation": installation,
+            "desired": desired,
+        }))
+        .unwrap()
+    }
+
+    fn write_creation_record(root: &Path, name: &str, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut file = crate::native_autostart::platform::create_file(&root.join(name)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        crate::native_autostart::platform::sync_directory(root).unwrap();
+    }
+
+    fn write_empty_creation_lock(root: &Path) {
+        let file =
+            crate::native_autostart::platform::create_file(&root.join("control-create.lock"))
+                .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        crate::native_autostart::platform::sync_directory(root).unwrap();
+    }
+
+    #[test]
+    fn setup_resumes_exact_pending_control_creation_and_preserves_desired() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let installation = ControlId::parse("installation_setup_recovery").unwrap();
+        crate::native_autostart::platform::create_private_directory(&root).unwrap();
+        write_empty_creation_lock(&root);
+        let bytes = creation_intent_bytes(&root, installation.as_str(), "paused");
+        write_creation_record(&root, "control.db.creating.intent", &bytes);
+        let data = prepare_setup_before(catalog.to_str().unwrap(), Instant::now() + COMMAND_BUDGET)
+            .unwrap();
+        assert_eq!(data["desired_updates"], "paused");
+        let control = SqliteControlStore::open_existing_writable(&root, &installation).unwrap();
+        let status = control.status().unwrap();
+        assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+        assert_eq!(status.policy.installation_id, installation);
+        assert!(catalog.exists());
+        assert!(!root.join("control.db.creating.intent").exists());
+        assert!(!root.join("control.db.creating.publish").exists());
+        assert!(!root.join("control.db.creating").exists());
+    }
+
+    #[test]
+    fn setup_refuses_unrecoverable_creation_artifacts_without_catalog_creation() {
+        // A publish marker without the final database can never justify
+        // rebuilding: the final name may once have held live policy.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let installation = ControlId::parse("installation_setup_published").unwrap();
+        crate::native_autostart::platform::create_private_directory(&root).unwrap();
+        write_empty_creation_lock(&root);
+        let bytes = creation_intent_bytes(&root, installation.as_str(), "paused");
+        write_creation_record(&root, "control.db.creating.intent", &bytes);
+        write_creation_record(&root, "control.db.creating.publish", &bytes);
+        let error =
+            prepare_setup_before(catalog.to_str().unwrap(), Instant::now() + COMMAND_BUDGET)
+                .unwrap_err();
+        assert_eq!(error.0.code, CanonicalCode::SchemaIncompatible);
+        assert!(!catalog.exists());
+        assert_eq!(
+            std::fs::read(root.join("control.db.creating.intent")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(root.join("control.db.creating.publish")).unwrap(),
+            bytes
+        );
+
+        // An orphan stage has no intent to resume and is never deleted.
+        let orphan = tempfile::tempdir().unwrap();
+        let orphan_root = orphan.path().join("private");
+        crate::native_autostart::platform::create_private_directory(&orphan_root).unwrap();
+        write_creation_record(&orphan_root, "control.db.creating", b"partial");
+        let error = prepare_setup_before(
+            orphan_root.join("catalog.db").to_str().unwrap(),
+            Instant::now() + COMMAND_BUDGET,
+        )
+        .unwrap_err();
+        assert_eq!(error.0.code, CanonicalCode::GenerationMismatch);
+        assert!(!orphan_root.join("catalog.db").exists());
+        assert_eq!(
+            std::fs::read(orphan_root.join("control.db.creating")).unwrap(),
+            b"partial"
+        );
+    }
 
     #[test]
     fn control_open_retries_real_handle_contention_with_original_command_deadline() {

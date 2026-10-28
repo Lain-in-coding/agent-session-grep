@@ -30,6 +30,30 @@ fn options(source: &Path) -> Options {
 fn inject(point: Fault) {
     INJECTED.with(|slot| slot.set(Some(point)));
 }
+fn control_creation_bytes(root: &Path, installation: &str, desired: &str) -> Vec<u8> {
+    let root_id = RootIdentity::read(root).unwrap().control_id();
+    serde_json::to_vec(&json!({
+        "schema": "asg.control-create-intent/v2",
+        "root": root_id.as_str(),
+        "installation": installation,
+        "desired": desired,
+    }))
+    .unwrap()
+}
+fn write_control_creation_record(root: &Path, name: &str, bytes: &[u8]) {
+    platform::create_private_directory(root).unwrap();
+    let mut file = platform::create_file(&root.join(name)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    platform::sync_directory(root).unwrap();
+}
+fn write_empty_control_create_lock(root: &Path) {
+    let file = platform::create_file(&root.join("control-create.lock")).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    platform::sync_directory(root).unwrap();
+}
 fn code(value: Result<Value, CliError>) -> CanonicalCode {
     value.unwrap_err().0.code
 }
@@ -696,6 +720,166 @@ fn control_precreation_interruption_is_diagnosed_without_assuming_no_prior_polic
     assert_eq!(code(fixture.run()), CanonicalCode::SchemaIncompatible);
     assert!(!fixture.root().join("control.db").exists());
     assert!(!fixture.destination.exists());
+}
+
+#[test]
+fn migration_recovers_only_matching_unpublished_paused_control_creation() {
+    let fixture = Fixture::new();
+    inject(Fault::ControlIntent);
+    assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+    let start: ControlStart = read_private(&fixture.root().join(CONTROL_STARTED)).unwrap();
+    let installation = ControlId::parse(&start.installation).unwrap();
+    write_empty_control_create_lock(fixture.root());
+    let bytes = control_creation_bytes(fixture.root(), installation.as_str(), "paused");
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+
+    let result = fixture.run().unwrap();
+    assert_eq!(result["phase"], "managed_activated");
+    assert_eq!(result["recovered"], true);
+    assert_eq!(result["desired_updates"], "paused");
+    assert!(fixture.destination.exists());
+    let control = SqliteControlStore::open_read_only(fixture.root(), &installation).unwrap();
+    let status = control.status().unwrap();
+    assert_eq!(status.policy.installation_id, installation);
+    assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+    assert!(!fixture.root().join(CONTROL_CREATE_INTENT).exists());
+    assert!(!fixture.root().join(CONTROL_CREATE_PUBLISH).exists());
+    assert!(!fixture.root().join(CONTROL_CREATE_PENDING).exists());
+}
+
+#[test]
+fn migration_recovers_unpublished_stopped_identity_without_resetting_desired() {
+    let fixture = Fixture::new();
+    inject(Fault::ControlIntent);
+    assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+    let start: ControlStart = read_private(&fixture.root().join(CONTROL_STARTED)).unwrap();
+    write_empty_control_create_lock(fixture.root());
+    let bytes = control_creation_bytes(fixture.root(), &start.installation, "stopped");
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+
+    assert_eq!(code(fixture.run()), CanonicalCode::SchemaIncompatible);
+    assert!(!fixture.root().join("control.db").exists());
+    assert!(!fixture.destination.exists());
+    assert_eq!(
+        fs::read(fixture.root().join(CONTROL_CREATE_INTENT)).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn migration_refuses_mismatched_creation_intent_without_mutating_it() {
+    for (installation_suffix, desired) in [("_other", "paused"), ("", "running")] {
+        let fixture = Fixture::new();
+        inject(Fault::ControlIntent);
+        assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+        let start: ControlStart = read_private(&fixture.root().join(CONTROL_STARTED)).unwrap();
+        let installation = if installation_suffix.is_empty() {
+            start.installation.clone()
+        } else {
+            format!("{}{}", start.installation, installation_suffix)
+        };
+        write_empty_control_create_lock(fixture.root());
+        let bytes = control_creation_bytes(fixture.root(), &installation, desired);
+        write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+        let started_before = fs::read(fixture.root().join(CONTROL_STARTED)).unwrap();
+        let source_before = hash(&fixture.source);
+
+        assert_eq!(code(fixture.run()), CanonicalCode::SchemaIncompatible);
+        assert!(!fixture.destination.exists());
+        assert!(!fixture.root().join("control.db").exists());
+        assert!(!fixture.root().join(CONTROL_CREATE_PENDING).exists());
+        assert_eq!(
+            fs::read(fixture.root().join(CONTROL_CREATE_INTENT)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(fixture.root().join(CONTROL_STARTED)).unwrap(),
+            started_before
+        );
+        assert_eq!(hash(&fixture.source), source_before);
+    }
+}
+
+#[test]
+fn migration_refuses_published_creation_marker_without_final_control() {
+    let fixture = Fixture::new();
+    inject(Fault::ControlIntent);
+    assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+    let start: ControlStart = read_private(&fixture.root().join(CONTROL_STARTED)).unwrap();
+    write_empty_control_create_lock(fixture.root());
+    let bytes = control_creation_bytes(fixture.root(), &start.installation, "paused");
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+    // The marker is the exact original v2 intent wire image.
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_PUBLISH, &bytes);
+    let before = (
+        fs::read(fixture.root().join(CONTROL_CREATE_INTENT)).unwrap(),
+        fs::read(fixture.root().join(CONTROL_CREATE_PUBLISH)).unwrap(),
+        fs::read(fixture.root().join(CONTROL_STARTED)).unwrap(),
+    );
+
+    assert_eq!(code(fixture.run()), CanonicalCode::SchemaIncompatible);
+    assert!(!fixture.destination.exists());
+    assert!(!fixture.root().join("control.db").exists());
+    assert_eq!(
+        fs::read(fixture.root().join(CONTROL_CREATE_INTENT)).unwrap(),
+        before.0
+    );
+    assert_eq!(
+        fs::read(fixture.root().join(CONTROL_CREATE_PUBLISH)).unwrap(),
+        before.1
+    );
+    assert_eq!(
+        fs::read(fixture.root().join(CONTROL_STARTED)).unwrap(),
+        before.2
+    );
+}
+
+#[test]
+fn migration_rebuilds_exact_intent_when_publish_marker_and_stage_both_remain() {
+    let fixture = Fixture::new();
+    inject(Fault::ControlIntent);
+    assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+    let start: ControlStart = read_private(&fixture.root().join(CONTROL_STARTED)).unwrap();
+    write_empty_control_create_lock(fixture.root());
+    let bytes = control_creation_bytes(fixture.root(), &start.installation, "paused");
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_PUBLISH, &bytes);
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_PENDING, b"partial stage");
+
+    let result = fixture.run().unwrap();
+    assert_eq!(result["phase"], "managed_activated");
+    assert_eq!(result["desired_updates"], "paused");
+    assert!(fixture.destination.exists());
+    let installation = ControlId::parse(&start.installation).unwrap();
+    let control = SqliteControlStore::open_read_only(fixture.root(), &installation).unwrap();
+    assert_eq!(
+        control.status().unwrap().desired_updates,
+        DesiredUpdates::Paused
+    );
+    assert!(!fixture.root().join(CONTROL_CREATE_INTENT).exists());
+    assert!(!fixture.root().join(CONTROL_CREATE_PUBLISH).exists());
+    assert!(!fixture.root().join(CONTROL_CREATE_PENDING).exists());
+}
+
+#[test]
+fn creation_intent_without_control_start_is_not_adopted() {
+    let fixture = Fixture::new();
+    inject(Fault::IntentPublished);
+    assert_eq!(code(fixture.run()), CanonicalCode::SourceIo);
+    assert!(!fixture.root().join(CONTROL_STARTED).exists());
+    let intent = fixture.intent();
+    write_empty_control_create_lock(fixture.root());
+    let bytes = control_creation_bytes(fixture.root(), &intent.installation, "paused");
+    write_control_creation_record(fixture.root(), CONTROL_CREATE_INTENT, &bytes);
+
+    assert_eq!(code(fixture.run()), CanonicalCode::SchemaIncompatible);
+    assert!(!fixture.root().join(CONTROL_STARTED).exists());
+    assert!(!fixture.root().join("control.db").exists());
+    assert!(!fixture.destination.exists());
+    assert_eq!(
+        fs::read(fixture.root().join(CONTROL_CREATE_INTENT)).unwrap(),
+        bytes
+    );
 }
 
 #[test]
