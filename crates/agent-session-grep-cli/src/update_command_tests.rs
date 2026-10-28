@@ -125,6 +125,44 @@ fn build_identity() -> VersionIdentity {
         launcher_protocol: 1,
     }
 }
+
+#[test]
+fn recorded_restart_failure_recovery_rolls_back_instead_of_repeating_forward() {
+    let identity = build_identity();
+    let mut state = State::new(UpdateStart {
+        update_id: ControlId::parse("update").unwrap(),
+        owner: ControlId::parse("owner").unwrap(),
+        old: identity.clone(),
+        new: identity,
+        archive_sha256: "c".repeat(64),
+        manifest_sha256: "d".repeat(64),
+        old_pointer_generation: 1,
+        stable_launcher_sha256: "e".repeat(64),
+        catalog: std::env::temp_dir().join("catalog.db"),
+        checkpoint: Checkpoint {
+            installation_id: "install".into(),
+            policy_epoch: 0,
+            control_seq: 0,
+            desired_updates: "running".into(),
+            catalog_incarnation: "catalog".into(),
+            catalog_generation: 1,
+            catalog_schema: current_catalog_schema(),
+        },
+    })
+    .unwrap();
+    state.phase = Phase::SelfChecked;
+    state.self_checked = true;
+    state.error_code = Some("restart_failed".into());
+    assert!(!recovery_can_finish_active_update(&state));
+
+    state.error_code = None;
+    assert!(recovery_can_finish_active_update(&state));
+    state.phase = Phase::Switched;
+    assert!(recovery_can_finish_active_update(&state));
+    state.phase = Phase::Staged;
+    assert!(!recovery_can_finish_active_update(&state));
+}
+
 fn build_capture(success: bool) -> crate::setup_hosts::LocalCapture {
     let expected = build_identity();
     crate::setup_hosts::LocalCapture {

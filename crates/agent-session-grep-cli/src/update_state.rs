@@ -27,6 +27,8 @@ use std::{
 pub(crate) const SCHEMA: &str = "asg.update-state/v1";
 const MAX_STATE: u64 = 64 * 1024;
 const MAX_IMAGE: u64 = 1024 * 1024;
+const MAX_SUPERSEDE: u64 = MAX_STATE * 5;
+const SUPERSEDE_SCHEMA: &str = "asg.update-supersede/v1";
 
 fn error(code: CanonicalCode) -> CliError {
     ProtocolError::new(code, "update state needs verified recovery; inspect update status and retry recover with the owned installation").into()
@@ -54,6 +56,13 @@ enum Fault {
     ArchiveIntent,
     ArchivePublished,
     ArchiveCleaned,
+    SupersedeIntentStaged,
+    SupersedeIntent,
+    SupersedeStaged,
+    SupersedePublished,
+    SupersedeArchiveStaged,
+    SupersedeArchived,
+    SupersedeCleaned,
     MetadataPublished,
 }
 #[cfg(test)]
@@ -757,6 +766,7 @@ impl<'a> Journal<'a> {
     ) -> Result<Self, CliError> {
         deadline(end)?;
         let (prefix, root, identity, directory) = Self::root(prefix, guard, true)?;
+        recover_supersede(&root, &identity, end)?;
         recover_archive(&root, &identity, end)?;
         if state_paths(&root)
             .iter()
@@ -782,6 +792,61 @@ impl<'a> Journal<'a> {
         journal.write_state(end)?;
         Ok(journal)
     }
+
+    /// Create a new journal while replacing one verified terminal journal.
+    /// The prior state remains the active recovery record until the caller has
+    /// completed every preflight check and this method is ready to create the
+    /// new journal. If creation fails before publishing any state slot, restore
+    /// the exact archived terminal bytes rather than leaving update status with
+    /// no journal to inspect.
+    pub(crate) fn create_after_terminal(
+        prefix: &Path,
+        guard: &'a ExclusiveGuard,
+        mut state: State,
+        end: Instant,
+    ) -> Result<Self, CliError> {
+        let (prefix, root, identity, directory) = Self::root(prefix, guard, true)?;
+        recover_supersede(&root, &identity, end)?;
+        recover_archive(&root, &identity, end)?;
+        let current = root.join("state.json");
+        match fs::symlink_metadata(&current) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::create(&prefix, guard, state, end);
+            }
+            Ok(_) => {}
+            Err(error) => return Err(io(error)),
+        }
+
+        let old_bytes = {
+            let journal = Self::open(&prefix, guard, end)?;
+            if !journal.state.phase.terminal() {
+                return Err(invalid());
+            }
+            read(&current, MAX_STATE)?.ok_or_else(invalid)?
+        };
+        state.seq = 1;
+        state.prefix_binding = identity.control_id().as_str().into();
+        state.validate()?;
+        supersede_terminal(&root, &identity, &old_bytes, &state, end)?;
+        if read(&current, MAX_STATE)?.as_ref().map(|bytes| hash(bytes))
+            != Some(hash(&serde_json::to_vec(&state).map_err(io)?))
+        {
+            return Err(invalid());
+        }
+        ordinary(&root.join(&state.update_id))?;
+        platform::validate_private(&root.join(&state.update_id)).map_err(io)?;
+        Ok(Self {
+            prefix,
+            root,
+            identity,
+            directory,
+            _lock: guard,
+            durable: state.clone(),
+            state,
+            poisoned: false,
+        })
+    }
+
     pub(crate) fn open(
         prefix: &Path,
         guard: &'a ExclusiveGuard,
@@ -789,6 +854,7 @@ impl<'a> Journal<'a> {
     ) -> Result<Self, CliError> {
         deadline(end)?;
         let (prefix, root, identity, directory) = Self::root(prefix, guard, false)?;
+        recover_supersede(&root, &identity, end)?;
         recover_archive(&root, &identity, end)?;
         reconcile_state(&root, &identity, end)?;
         let bytes = read(&root.join("state.json"), MAX_STATE)?.ok_or_else(invalid)?;
@@ -810,6 +876,7 @@ impl<'a> Journal<'a> {
     }
     /// A terminal update can be moved into its already owned run directory
     /// before creating the next one. A working pointer is never reset here.
+    #[cfg(test)]
     pub(crate) fn archive_terminal(
         prefix: &Path,
         guard: &'a ExclusiveGuard,
@@ -817,6 +884,7 @@ impl<'a> Journal<'a> {
     ) -> Result<(), CliError> {
         deadline(end)?;
         let (_, root, identity, _) = Self::root(prefix, guard, false)?;
+        recover_supersede(&root, &identity, end)?;
         if recover_archive(&root, &identity, end)? {
             return Ok(());
         }
@@ -1211,6 +1279,309 @@ fn publish(target: &Path, next: &Path, previous: &Path) -> Result<(), CliError> 
     if next.parent() != target.parent() {
         platform::sync_directory(next.parent().ok_or_else(invalid)?).map_err(io)?;
     }
+    Ok(())
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SupersedeIntent {
+    schema: String,
+    old_update_id: String,
+    new_update_id: String,
+    old_sha256: String,
+    new_sha256: String,
+    old_bytes_hex: String,
+    new_bytes_hex: String,
+}
+fn bytes_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+fn decode_bytes_hex(value: &str) -> Result<Vec<u8>, CliError> {
+    if !value.len().is_multiple_of(2) || !hex(value, value.len()) {
+        return Err(invalid());
+    }
+    value
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).map_err(|_| invalid())?;
+            u8::from_str_radix(text, 16).map_err(|_| invalid())
+        })
+        .collect()
+}
+fn supersede_intent_path(root: &Path) -> PathBuf {
+    root.join("state.supersede.json")
+}
+fn supersede_intent_next_path(root: &Path) -> PathBuf {
+    root.join("state.supersede.intent.next.json")
+}
+fn supersede_next_path(root: &Path) -> PathBuf {
+    root.join("state.supersede.next.json")
+}
+fn supersede_displaced_path(root: &Path) -> PathBuf {
+    root.join("state.supersede.displaced.json")
+}
+fn supersede_archive_path(old_run: &Path) -> PathBuf {
+    old_run.join("completed-state.json")
+}
+fn supersede_archive_next_path(old_run: &Path) -> PathBuf {
+    old_run.join("completed-state.next.json")
+}
+/// These names are private transaction staging slots. They never contain the
+/// authoritative active journal, so an incomplete write can be discarded only
+/// after `read` has established the occupied slot is one regular private file.
+fn remove_owned_stage(path: &Path, limit: u64) -> Result<(), CliError> {
+    if read(path, limit)?.is_none() {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(io)?;
+    platform::sync_directory(path.parent().ok_or_else(invalid)?).map_err(io)
+}
+fn recover_supersede_intent_stage(root: &Path) -> Result<(), CliError> {
+    let intent = supersede_intent_path(root);
+    let next = supersede_intent_next_path(root);
+    match fs::symlink_metadata(&intent) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_owned_stage(&next, MAX_SUPERSEDE)
+        }
+        Ok(_) => {
+            if fs::symlink_metadata(&next).is_ok() {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+        Err(error) => Err(io(error)),
+    }
+}
+fn decode_supersede(
+    root: &Path,
+    identity: &RootIdentity,
+) -> Result<Option<DecodedSupersede>, CliError> {
+    recover_supersede_intent_stage(root)?;
+    let Some(bytes) = read(&supersede_intent_path(root), MAX_SUPERSEDE)? else {
+        return Ok(None);
+    };
+    let intent: SupersedeIntent = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if intent.schema != SUPERSEDE_SCHEMA
+        || intent.old_update_id == intent.new_update_id
+        || !valid_id(&intent.old_update_id)
+        || !valid_id(&intent.new_update_id)
+    {
+        return Err(invalid());
+    }
+    let old_bytes = decode_bytes_hex(&intent.old_bytes_hex)?;
+    let new_bytes = decode_bytes_hex(&intent.new_bytes_hex)?;
+    if old_bytes.len() as u64 > MAX_STATE
+        || new_bytes.len() as u64 > MAX_STATE
+        || hash(&old_bytes) != intent.old_sha256
+        || hash(&new_bytes) != intent.new_sha256
+    {
+        return Err(invalid());
+    }
+    let old = decode_state(&old_bytes, identity)?;
+    let new_state = decode_state(&new_bytes, identity)?;
+    if !old.phase.terminal()
+        || old.update_id != intent.old_update_id
+        || new_state.update_id != intent.new_update_id
+        || new_state.seq != 1
+    {
+        return Err(invalid());
+    }
+    Ok(Some(DecodedSupersede {
+        intent,
+        old_bytes,
+        new_bytes,
+        old,
+    }))
+}
+
+struct DecodedSupersede {
+    intent: SupersedeIntent,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+    old: State,
+}
+fn remove_optional_matching(path: &Path, expected: &[u8]) -> Result<(), CliError> {
+    match read(path, MAX_STATE)? {
+        Some(actual) if hash(&actual) == hash(expected) => {
+            remove_matching(path, &actual, MAX_STATE)
+        }
+        Some(_) => Err(invalid()),
+        None => Ok(()),
+    }
+}
+fn remove_empty_supersede_run(root: &Path, update_id: &str) -> Result<(), CliError> {
+    let run = root.join(update_id);
+    match fs::symlink_metadata(&run) {
+        Ok(_) => {
+            ordinary(&run)?;
+            platform::validate_private(&run).map_err(io)?;
+            if fs::read_dir(&run).map_err(io)?.next().is_some() {
+                return Err(invalid());
+            }
+            fs::remove_dir(&run).map_err(io)?;
+            platform::sync_directory(root).map_err(io)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io(error)),
+    }
+}
+fn ensure_supersede_archive(old_run: &Path, old_bytes: &[u8]) -> Result<(), CliError> {
+    let archive = supersede_archive_path(old_run);
+    let next = supersede_archive_next_path(old_run);
+    match read(&archive, MAX_STATE)? {
+        Some(existing) if hash(&existing) == hash(old_bytes) => {
+            remove_owned_stage(&next, MAX_STATE)
+        }
+        Some(_) => Err(invalid()),
+        None => {
+            remove_owned_stage(&next, MAX_STATE)?;
+            write_new(&next, old_bytes)?;
+            #[cfg(test)]
+            fault(Fault::SupersedeArchiveStaged)?;
+            platform::move_new(&next, &archive).map_err(io)?;
+            platform::sync_directory(old_run).map_err(io)
+        }
+    }
+}
+/// The active state name never disappears during supersession. A durable intent
+/// owns the staged new image and the exact old image; recovery either aborts
+/// before publication or completes the archive after publication.
+fn recover_supersede(root: &Path, identity: &RootIdentity, end: Instant) -> Result<(), CliError> {
+    let Some(DecodedSupersede {
+        intent,
+        old_bytes,
+        new_bytes,
+        old,
+    }) = decode_supersede(root, identity)?
+    else {
+        return Ok(());
+    };
+    deadline(end)?;
+    let current = root.join("state.json");
+    let current_bytes = read(&current, MAX_STATE)?.ok_or_else(invalid)?;
+    match hash(&current_bytes) {
+        value if value == hash(&old_bytes) => {
+            // A process can stop while writing the non-authoritative new-state
+            // staging slot. The exact old state is still active, so discard the
+            // owned slot and abandon the unpublished transaction.
+            remove_owned_stage(&supersede_next_path(root), MAX_STATE)?;
+            remove_optional_matching(&supersede_displaced_path(root), &old_bytes)?;
+            remove_empty_supersede_run(root, &intent.new_update_id)?;
+            remove_matching(
+                &supersede_intent_path(root),
+                &serde_json::to_vec(&intent).map_err(io)?,
+                MAX_SUPERSEDE,
+            )?;
+        }
+        value if value == hash(&new_bytes) => {
+            let run = root.join(&intent.new_update_id);
+            ordinary(&run)?;
+            platform::validate_private(&run).map_err(io)?;
+            let old_run = root.join(&old.update_id);
+            ordinary(&old_run)?;
+            platform::validate_private(&old_run).map_err(io)?;
+            // Unix exchange publishes the new active image before moving the
+            // exchanged old image from `next` to `displaced`. Validate either
+            // exact old-image slot, then finish the archive and clean both.
+            match read(&supersede_next_path(root), MAX_STATE)? {
+                Some(existing) if hash(&existing) == hash(&old_bytes) => {}
+                Some(_) => return Err(invalid()),
+                None => {}
+            }
+            ensure_supersede_archive(&old_run, &old_bytes)?;
+            #[cfg(test)]
+            fault(Fault::SupersedeArchived)?;
+            remove_optional_matching(&supersede_next_path(root), &old_bytes)?;
+            remove_optional_matching(&supersede_displaced_path(root), &old_bytes)?;
+            remove_matching(
+                &supersede_intent_path(root),
+                &serde_json::to_vec(&intent).map_err(io)?,
+                MAX_SUPERSEDE,
+            )?;
+        }
+        _ => return Err(invalid()),
+    }
+    platform::sync_directory(root).map_err(io)
+}
+fn supersede_terminal(
+    root: &Path,
+    identity: &RootIdentity,
+    old_bytes: &[u8],
+    new_state: &State,
+    end: Instant,
+) -> Result<(), CliError> {
+    deadline(end)?;
+    let old = decode_state(old_bytes, identity)?;
+    if !old.phase.terminal() {
+        return Err(invalid());
+    }
+    new_state.validate()?;
+    if new_state.prefix_binding != identity.control_id().as_str() || new_state.seq != 1 {
+        return Err(invalid());
+    }
+    let new_bytes = serde_json::to_vec(new_state).map_err(io)?;
+    let intent = SupersedeIntent {
+        schema: SUPERSEDE_SCHEMA.into(),
+        old_update_id: old.update_id.clone(),
+        new_update_id: new_state.update_id.clone(),
+        old_sha256: hash(old_bytes),
+        new_sha256: hash(&new_bytes),
+        old_bytes_hex: bytes_hex(old_bytes),
+        new_bytes_hex: bytes_hex(&new_bytes),
+    };
+    let old_run = root.join(&old.update_id);
+    ordinary(&old_run)?;
+    platform::validate_private(&old_run).map_err(io)?;
+    match read(&supersede_archive_path(&old_run), MAX_STATE)? {
+        Some(existing) if hash(&existing) == hash(old_bytes) => {}
+        Some(_) => return Err(invalid()),
+        None => {}
+    }
+    let intent_bytes = serde_json::to_vec(&intent).map_err(io)?;
+    write_new(&supersede_intent_next_path(root), &intent_bytes)?;
+    #[cfg(test)]
+    fault(Fault::SupersedeIntentStaged)?;
+    platform::move_new(
+        &supersede_intent_next_path(root),
+        &supersede_intent_path(root),
+    )
+    .map_err(io)?;
+    platform::sync_directory(root).map_err(io)?;
+    #[cfg(test)]
+    fault(Fault::SupersedeIntent)?;
+    platform::create_private_directory(&root.join(&new_state.update_id)).map_err(io)?;
+    write_new(&supersede_next_path(root), &new_bytes)?;
+    #[cfg(test)]
+    fault(Fault::SupersedeStaged)?;
+    publish(
+        &root.join("state.json"),
+        &supersede_next_path(root),
+        &supersede_displaced_path(root),
+    )?;
+    #[cfg(test)]
+    fault(Fault::SupersedePublished)?;
+    let actual = read(&root.join("state.json"), MAX_STATE)?.ok_or_else(invalid)?;
+    if hash(&actual) != hash(&new_bytes) {
+        return Err(invalid());
+    }
+    ensure_supersede_archive(&old_run, old_bytes)?;
+    #[cfg(test)]
+    fault(Fault::SupersedeArchived)?;
+    remove_optional_matching(&supersede_next_path(root), &new_bytes)?;
+    remove_optional_matching(&supersede_displaced_path(root), old_bytes)?;
+    remove_matching(
+        &supersede_intent_path(root),
+        &serde_json::to_vec(&intent).map_err(io)?,
+        MAX_SUPERSEDE,
+    )?;
+    platform::sync_directory(root).map_err(io)?;
+    #[cfg(test)]
+    fault(Fault::SupersedeCleaned)?;
     Ok(())
 }
 const STATE_SLOTS: [&str; 5] = [

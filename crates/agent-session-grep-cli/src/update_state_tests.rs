@@ -694,6 +694,148 @@ fn interrupted_terminal_archive_finishes_without_resurrecting_previous_phase() {
 }
 
 #[test]
+fn supersede_recovery_always_exposes_one_complete_update_journal() {
+    for point in [
+        Fault::SupersedeIntentStaged,
+        Fault::SupersedeIntent,
+        Fault::SupersedeStaged,
+        Fault::SupersedePublished,
+        Fault::SupersedeArchiveStaged,
+        Fault::SupersedeArchived,
+        Fault::SupersedeCleaned,
+    ] {
+        let f = Fixture::new();
+        let mut j = f.journal();
+        j.transition(Phase::Failed, end()).unwrap();
+        let terminal = j.state.clone();
+        drop(j);
+
+        let mut next = state(f.catalog.clone());
+        next.update_id = "update_two".into();
+        inject(point);
+        assert!(Journal::create_after_terminal(&f.prefix, &f.lock, next, end()).is_err());
+
+        let j = Journal::open(&f.prefix, &f.lock, end()).unwrap();
+        let published = matches!(
+            point,
+            Fault::SupersedePublished
+                | Fault::SupersedeArchiveStaged
+                | Fault::SupersedeArchived
+                | Fault::SupersedeCleaned
+        );
+        if published {
+            assert_eq!(j.state.update_id, "update_two");
+            assert_eq!(j.state.phase, Phase::Verified);
+            assert!(
+                j.root
+                    .join(&terminal.update_id)
+                    .join("completed-state.json")
+                    .exists()
+            );
+        } else {
+            assert_eq!(j.state, terminal);
+            assert!(!j.root.join("update_two").exists());
+        }
+        assert!(!j.root.join("state.supersede.json").exists());
+        assert!(!j.root.join("state.supersede.intent.next.json").exists());
+        assert!(!j.root.join("state.supersede.next.json").exists());
+        assert!(!j.root.join("state.supersede.displaced.json").exists());
+        assert!(
+            !j.root
+                .join(&terminal.update_id)
+                .join("completed-state.next.json")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn supersede_recovery_handles_exchange_left_in_the_next_slot() {
+    let f = Fixture::new();
+    let mut j = f.journal();
+    j.transition(Phase::Failed, end()).unwrap();
+    let terminal = j.state.clone();
+    let old_bytes = serde_json::to_vec(&terminal).unwrap();
+    let root = j.root.clone();
+    let current = root.join("state.json");
+    drop(j);
+
+    let mut next = state(f.catalog.clone());
+    next.update_id = "update_two".into();
+    next.seq = 1;
+    next.prefix_binding = f.lock.root_identity().control_id().as_str().into();
+    next.validate().unwrap();
+    let new_bytes = serde_json::to_vec(&next).unwrap();
+    let intent = SupersedeIntent {
+        schema: SUPERSEDE_SCHEMA.into(),
+        old_update_id: terminal.update_id.clone(),
+        new_update_id: next.update_id.clone(),
+        old_sha256: hash(&old_bytes),
+        new_sha256: hash(&new_bytes),
+        old_bytes_hex: bytes_hex(&old_bytes),
+        new_bytes_hex: bytes_hex(&new_bytes),
+    };
+    write_new(
+        &supersede_intent_path(&root),
+        &serde_json::to_vec(&intent).unwrap(),
+    )
+    .unwrap();
+    platform::create_private_directory(&root.join(&next.update_id)).unwrap();
+    write_new(&supersede_next_path(&root), &new_bytes).unwrap();
+    let displaced = supersede_displaced_path(&root);
+    publish(&current, &supersede_next_path(&root), &displaced).unwrap();
+
+    // Unix exchange is complete once `state.json` is new. A process may stop
+    // before the exchanged old image is moved from `next` to `displaced`.
+    remove_matching(&displaced, &old_bytes, MAX_STATE).unwrap();
+    write_new(&supersede_next_path(&root), &old_bytes).unwrap();
+
+    let j = Journal::open(&f.prefix, &f.lock, end()).unwrap();
+    assert_eq!(j.state.update_id, "update_two");
+    assert_eq!(j.state.phase, Phase::Verified);
+    assert_eq!(
+        read(
+            &supersede_archive_path(&j.root.join(&terminal.update_id)),
+            MAX_STATE
+        )
+        .unwrap()
+        .unwrap(),
+        old_bytes
+    );
+    assert!(!supersede_intent_path(&root).exists());
+    assert!(!supersede_next_path(&root).exists());
+    assert!(!displaced.exists());
+}
+
+#[test]
+fn supersede_preflight_preserves_a_conflicting_old_archive() {
+    let f = Fixture::new();
+    let mut j = f.journal();
+    j.transition(Phase::Failed, end()).unwrap();
+    let terminal = j.state.clone();
+    let current = read(&j.root.join("state.json"), MAX_STATE)
+        .unwrap()
+        .unwrap();
+    let archive = supersede_archive_path(&j.run_root());
+    write_new(&archive, b"unrelated archive").unwrap();
+    drop(j);
+
+    let mut next = state(f.catalog.clone());
+    next.update_id = "update_two".into();
+    assert!(Journal::create_after_terminal(&f.prefix, &f.lock, next, end()).is_err());
+    assert_eq!(
+        read(&f.prefix.join("update/state.json"), MAX_STATE)
+            .unwrap()
+            .unwrap(),
+        current
+    );
+    assert_eq!(fs::read(archive).unwrap(), b"unrelated archive");
+    assert!(!f.prefix.join("update/update_two").exists());
+    let j = Journal::open(&f.prefix, &f.lock, end()).unwrap();
+    assert_eq!(j.state, terminal);
+}
+
+#[test]
 fn create_reconciles_archive_after_terminal_name_was_already_moved() {
     let f = Fixture::new();
     let mut j = f.journal();

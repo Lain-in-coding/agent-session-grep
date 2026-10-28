@@ -841,7 +841,7 @@ fn apply(
 ) -> Result<(Outcome, Value), CliError> {
     let prefix = resolve_prefix(prefix)?;
     let lock = update_state::acquire_installation_lock(&prefix, end)?;
-    let archive_terminal = if prefix
+    if prefix
         .join("update/state.json")
         .try_exists()
         .map_err(package_installation::invalid_install)?
@@ -850,10 +850,7 @@ fn apply(
         if !old.state.phase.terminal() {
             return Ok((Outcome::Partial, state_report(&old.state)));
         }
-        true
-    } else {
-        false
-    };
+    }
     let mut installed = package_installation::inspect_installation_for_update(&prefix)?;
     let db = package_installation::absolute(db)?;
     let root = db
@@ -870,10 +867,6 @@ fn apply(
             CanonicalCode::SchemaIncompatible,
             "program update requires both packages to use current catalog and control schemas; installation retained",
         ));
-    }
-    // A refused program pair must not archive the prior terminal update.
-    if archive_terminal {
-        Journal::archive_terminal(&prefix, &lock, end)?;
     }
     let control_read =
         SqliteControlStore::open_current_read_only_with_deadline(root, end).map_err(port)?;
@@ -956,7 +949,10 @@ fn apply(
             checkpoint,
         })?;
         let installation = control.bind_installation(&prefix, &lock).map_err(port)?;
-        let mut journal = Journal::create(&prefix, &lock, state, end)?;
+        // Every preflight above may refuse or race without losing the prior
+        // terminal recovery record. Archive and create only after the writable
+        // control, policy, catalog identity and installation binding agree.
+        let mut journal = Journal::create_after_terminal(&prefix, &lock, state, end)?;
         // The journal is authoritative before maintenance can change any catalog
         // lifetime. Mutable package pins must be released before publication.
         if let Err(error) = prepare_native_binding(
@@ -1568,6 +1564,11 @@ fn recovered_catalog_matches_program(
         && identity.generation >= checkpoint.catalog_generation
 }
 
+fn recovery_can_finish_active_update(state: &State) -> bool {
+    matches!(state.phase, Phase::Switched | Phase::SelfChecked)
+        && state.error_code.as_deref() != Some("restart_failed")
+}
+
 fn verify_catalog_program_pair(
     control: &SqliteControlStore,
     installation: &InstallationLockAuthority<'_>,
@@ -1718,7 +1719,7 @@ fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<(Outcome, V
             MaintenanceCatalog::open_authorized(&control, &installation, &owner, &db, drain)
                 .map_err(port)?;
         journal.reconcile_metadata(end)?;
-        if matches!(journal.state.phase, Phase::Switched | Phase::SelfChecked)
+        if recovery_can_finish_active_update(&journal.state)
             && verify_active(
                 &journal,
                 &journal.state.new,
