@@ -273,16 +273,36 @@ def verify_hook(asg_bin: str, data_root: str) -> bool:
     )
 
 
+EXPECTED_PROVIDER_IDS = {
+    "aider",
+    "antigravity",
+    "claude-code",
+    "cline",
+    "codex",
+    "cursor",
+    "deepseek-harness",
+    "grok-build",
+    "hermes",
+    "kimi-code",
+    "openclaw",
+    "opencode",
+    "pi",
+    "qoder",
+    "tencent-codebuddy",
+    "workbuddy",
+    "zcode",
+}
+
+
 def verify_providers(asg_bin: str, data_root: str) -> bool:
     providers = run_asg(asg_bin, data_root, ["providers"])["data"].get("providers", [])
     maturities = {provider.get("maturity") for provider in providers}
     ids = {provider.get("provider_id") for provider in providers}
-    ok = len(providers) == 16 and maturities == {"experimental", "unsupported"} and {
-        "claude-code",
-        "codex",
-        "deepseek-harness",
-        "zcode",
-    }.issubset(ids)
+    ok = (
+        len(providers) == len(EXPECTED_PROVIDER_IDS)
+        and maturities == {"experimental"}
+        and ids == EXPECTED_PROVIDER_IDS
+    )
     return step("providers matrix", ok, f"providers={len(providers)}")
 
 

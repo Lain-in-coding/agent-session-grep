@@ -66,6 +66,41 @@ class VerifyReleaseTests(unittest.TestCase):
         with mock.patch.object(verify_release, "run_asg", side_effect=lambda *args, **kwargs: next(frames)):
             self.assertTrue(verify_release.verify_semantic("synthetic-binary", "synthetic-root"))
 
+    def test_provider_check_requires_the_complete_experimental_matrix(self) -> None:
+        providers = [
+            {"provider_id": provider_id, "maturity": "experimental"}
+            for provider_id in sorted(verify_release.EXPECTED_PROVIDER_IDS)
+        ]
+        with mock.patch.object(
+            verify_release,
+            "run_asg",
+            return_value={"data": {"providers": providers}},
+        ):
+            self.assertTrue(
+                verify_release.verify_providers("synthetic-binary", "synthetic-root")
+            )
+
+        missing = providers[:-1]
+        with mock.patch.object(
+            verify_release,
+            "run_asg",
+            return_value={"data": {"providers": missing}},
+        ):
+            self.assertFalse(
+                verify_release.verify_providers("synthetic-binary", "synthetic-root")
+            )
+
+        unsupported = [dict(provider) for provider in providers]
+        unsupported[0]["maturity"] = "unsupported"
+        with mock.patch.object(
+            verify_release,
+            "run_asg",
+            return_value={"data": {"providers": unsupported}},
+        ):
+            self.assertFalse(
+                verify_release.verify_providers("synthetic-binary", "synthetic-root")
+            )
+
     def test_handoff_requires_schema_10_and_deterministic_pack(self) -> None:
         frames = iter(
             [
