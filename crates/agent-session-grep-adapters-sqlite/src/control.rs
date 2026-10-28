@@ -19,6 +19,8 @@ const LEGACY_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x41534331;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const CONTROL_CREATE_PENDING: &str = "control.db.creating";
+const CONTROL_CREATE_INTENT: &str = "control.db.creating.intent";
+const CONTROL_CREATE_INTENT_SCHEMA: &str = "asg.control-create-intent/v1";
 /// Diagnostic tail only. Every live source/confirmation/barrier reference is
 /// loaded in addition, regardless of its age or originating worker boot.
 const RUNTIME_HISTORY_TAIL: i64 = 64;
@@ -31,6 +33,25 @@ thread_local! {
     static RUNTIME_BUSY_END: Cell<Option<Instant>> = const { Cell::new(None) };
     static RUNTIME_BUSY_ALLOWANCE: Cell<Duration> = const { Cell::new(BUSY_TIMEOUT) };
     static RUNTIME_COMMIT_SEQ: Cell<u64> = const { Cell::new(0) };
+    #[cfg(test)]
+    static CREATE_FAULT: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn create_fault(point: u8) -> PortResult<()> {
+    CREATE_FAULT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            Err(PortError::Backend("injected create interruption".into()))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn create_fault(_: u8) -> PortResult<()> {
+    Ok(())
 }
 
 fn runtime_deadline() -> Option<Instant> {
@@ -1181,14 +1202,33 @@ impl SqliteControlStore {
     ) -> PortResult<Self> {
         private_directory(private_root, true)?;
         let handle_lease = admit_control_handle(private_root, true)?;
-        let create = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
+        let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
         control_create::prepare(
             private_root,
             installation,
             desired,
             handle_lease,
-            create,
-            &mut |_| Ok(()),
+            create_lock,
+            &mut create_fault,
+        )
+    }
+
+    /// A staged creation can be resumed only with its exact installation and
+    /// desired state. It is never adopted by a fresh caller.
+    pub fn recover_create(
+        private_root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+    ) -> PortResult<Self> {
+        private_directory(private_root, false)?;
+        let handle_lease = admit_control_handle(private_root, true)?;
+        let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
+        control_create::recover(
+            private_root,
+            installation,
+            desired,
+            handle_lease,
+            create_lock,
         )
     }
 
@@ -1598,7 +1638,18 @@ mod control_create {
         {
             return Err(invalid());
         }
-        clear_stage(root)?;
+        if root
+            .join(CONTROL_CREATE_INTENT)
+            .try_exists()
+            .map_err(io_error)?
+            || stage_path(root).try_exists().map_err(io_error)?
+        {
+            return Err(PortError::GenerationMismatch(
+                "control creation is pending recovery".into(),
+            ));
+        }
+        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
+        write_intent(root, installation, desired)?;
         let pending = stage_path(root);
         let file = create_private_owned_file(&pending)?;
         file.sync_all().map_err(io_error)?;
@@ -1611,7 +1662,7 @@ mod control_create {
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
             .map_err(sql_error)?;
         if journal != "wal" {
-            return fail(root, corrupt());
+            return Err(corrupt());
         }
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1637,7 +1688,7 @@ mod control_create {
             })
             .map_err(sql_error)?;
         if checkpoint.0 != 0 {
-            return fail(root, corrupt());
+            return Err(corrupt());
         }
         drop(conn);
         remove_empty_sidecars(&pending)?;
@@ -1645,6 +1696,7 @@ mod control_create {
         fs::File::open(&pending)
             .and_then(|file| file.sync_all())
             .map_err(io_error)?;
+        hook(5)?;
         hook(2)?;
         let final_path = SqliteControlStore::path(root);
         if final_path.try_exists().map_err(io_error)?
@@ -1658,54 +1710,113 @@ mod control_create {
                 .try_exists()
                 .map_err(io_error)?
         {
-            return fail(root, invalid());
+            return Err(invalid());
         }
         hook(3)?;
         lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db")?;
 
         // Publication is irreversible from this point. Keep a complete final
         // database if any reopening/verification step fails.
-        drop(create_lock);
         if RootIdentity::read(root)? != root_identity {
             return Err(corrupt());
         }
         lease.validate_admission(root)?;
         let store = SqliteControlStore::open_existing_writable(root, installation)?;
         store.status()?;
+        drop(create_lock);
+        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
         hook(4)?;
         Ok(store)
     }
 
-    fn fail<T>(root: &Path, error: PortError) -> PortResult<T> {
-        match clear_stage(root) {
-            Ok(()) => Err(error),
-            Err(_) => Err(PortError::Backend(
-                "control creation cleanup requires recovery".into(),
-            )),
+    pub(super) fn recover(
+        root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+        lease: ControlHandleLease,
+        create_lock: ExclusiveGuard,
+    ) -> PortResult<SqliteControlStore> {
+        let Some((stored_installation, stored_desired)) = read_intent(root)? else {
+            return Err(invalid());
+        };
+        if stored_installation != *installation || stored_desired != desired {
+            return Err(invalid());
         }
+        let pending = stage_path(root);
+        if !pending.is_file() {
+            return Err(invalid());
+        }
+        private_file(&pending)?;
+        let conn = connect(&pending, false)?;
+        verify_control_state(&conn, installation, desired)?;
+        drop(conn);
+        let final_path = SqliteControlStore::path(root);
+        if final_paths_exist(&final_path)? {
+            return Err(invalid());
+        }
+        lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db")?;
+        let store = SqliteControlStore::open_existing_writable(root, installation)?;
+        store.status()?;
+        drop(create_lock);
+        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
+        Ok(store)
     }
 
-    fn clear_stage(root: &Path) -> PortResult<()> {
-        let stage = stage_path(root);
-        // Remove journals before the main staging inode. No live connection is
-        // open under the exclusive creation lock, so this abandons only this
-        // protocol's fixed, incomplete attempt and never rolls it into a DB.
-        for path in [
-            sidecar(&stage, "-journal"),
-            sidecar(&stage, "-shm"),
-            sidecar(&stage, "-wal"),
-            stage,
-        ] {
-            match fs::symlink_metadata(&path) {
-                Ok(_) => {
-                    private_file(&path)?;
-                    fs::remove_file(&path).map_err(io_error)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(error)),
-            }
+    fn final_paths_exist(path: &Path) -> PortResult<bool> {
+        Ok(path.try_exists().map_err(io_error)?
+            || sidecar(path, "-wal").try_exists().map_err(io_error)?
+            || sidecar(path, "-shm").try_exists().map_err(io_error)?
+            || sidecar(path, "-journal").try_exists().map_err(io_error)?)
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Intent {
+        schema: String,
+        installation: String,
+        desired: String,
+    }
+
+    fn write_intent(
+        root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+    ) -> PortResult<()> {
+        let intent = Intent {
+            schema: CONTROL_CREATE_INTENT_SCHEMA.into(),
+            installation: installation.as_str().into(),
+            desired: desired_wire(desired).into(),
+        };
+        let bytes = serde_json::to_vec(&intent).map_err(io_error)?;
+        if bytes.len() > 1024 {
+            return Err(corrupt());
         }
-        Ok(())
+        let path = root.join(CONTROL_CREATE_INTENT);
+        let mut file = create_private_owned_file(&path)?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        drop(file);
+        private_file(&path)
+    }
+
+    fn read_intent(root: &Path) -> PortResult<Option<(ControlId, DesiredUpdates)>> {
+        let path = root.join(CONTROL_CREATE_INTENT);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() <= 1024 => {}
+            Ok(_) => return Err(corrupt()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(error)),
+        }
+        private_file(&path)?;
+        let intent: Intent =
+            serde_json::from_slice(&fs::read(&path).map_err(io_error)?).map_err(|_| corrupt())?;
+        if intent.schema != CONTROL_CREATE_INTENT_SCHEMA {
+            return Err(corrupt());
+        }
+        Ok(Some((
+            id(intent.installation)?,
+            desired_decode(&intent.desired)?,
+        )))
     }
 
     fn remove_empty_sidecars(path: &Path) -> PortResult<()> {
@@ -6394,7 +6505,7 @@ mod runtime_deadline_tests {
     }
 
     #[test]
-    fn stale_owned_stage_is_discarded_before_fresh_creation() {
+    fn stale_unowned_stage_refuses_creation_and_remains_private() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("private");
         super::private_directory(&root, true).unwrap();
@@ -6403,22 +6514,53 @@ mod runtime_deadline_tests {
         std::io::Write::write_all(&mut file, b"not a database").unwrap();
         file.sync_all().unwrap();
         drop(file);
-        let control = SqliteControlStore::create(
-            &root,
-            &cid("synthetic-stage-installation"),
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
-        assert_eq!(
-            control.status().unwrap().desired_updates,
-            DesiredUpdates::Paused
-        );
-        assert!(!stale.exists());
+        assert!(matches!(
+            SqliteControlStore::create(
+                &root,
+                &cid("synthetic-stage-installation"),
+                DesiredUpdates::Paused,
+            ),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert!(stale.exists());
+        assert!(!SqliteControlStore::path(&root).exists());
+        assert!(!root.join(CONTROL_CREATE_INTENT).exists());
         assert!(
             !root
                 .join(format!("{CONTROL_CREATE_PENDING}-journal"))
                 .exists()
         );
+    }
+
+    #[test]
+    fn interrupted_complete_stage_recovers_only_with_the_exact_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let installation = cid("synthetic-stage-installation");
+        CREATE_FAULT.with(|slot| slot.set(Some(5)));
+        assert!(matches!(
+            SqliteControlStore::create(&root, &installation, DesiredUpdates::Paused),
+            Err(PortError::Backend(_))
+        ));
+        assert!(!SqliteControlStore::path(&root).exists());
+        assert!(root.join(CONTROL_CREATE_PENDING).exists());
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &cid("other-stage-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        let control =
+            SqliteControlStore::recover_create(&root, &installation, DesiredUpdates::Paused)
+                .unwrap();
+        assert_eq!(
+            control.status().unwrap().desired_updates,
+            DesiredUpdates::Paused
+        );
+        assert!(!root.join(CONTROL_CREATE_PENDING).exists());
+        assert!(!root.join(CONTROL_CREATE_INTENT).exists());
     }
 
     fn platform_test_file(path: &Path) -> std::fs::File {
