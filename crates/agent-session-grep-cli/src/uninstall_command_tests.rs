@@ -386,6 +386,36 @@ fn default_waits_for_live_control_handle_before_removing_catalog_or_control() {
     );
     fixture.preserved();
 }
+
+#[test]
+fn path_removal_runs_only_after_the_uninstalling_fence() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        control_status(&fixture.control).policy.maintenance.state,
+        MaintenanceState::Idle
+    );
+    let report = execute(
+        fixture.catalog.to_str().unwrap(),
+        Options {
+            keep_data: true,
+            prefix: Some(fixture.prefix.clone()),
+        },
+        deadline(),
+        &mut |_| Ok(fixture.installation()),
+        &mut |_, _, _| Err(native_manager::ErrorCode::Unavailable.into()),
+        &mut |_, _, _| {
+            assert_eq!(
+                control_status(&fixture.control).policy.maintenance.state,
+                MaintenanceState::Uninstalling
+            );
+            Ok(json!({"status":"complete","registration_present":false,"owned":true}))
+        },
+    )
+    .unwrap();
+    assert!(report.maintenance_fenced);
+    fixture.preserved();
+}
+
 #[test]
 fn keep_data_keeps_catalog_policy_and_denies_without_clearing_pause() {
     let fixture = Fixture::new();

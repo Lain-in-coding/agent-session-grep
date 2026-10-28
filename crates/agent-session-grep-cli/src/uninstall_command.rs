@@ -1105,14 +1105,10 @@ fn execute(
         (incarnation, identity)
     };
     drop(first_lock);
-    let path = if prior
+    let mut path = prior
         .as_ref()
-        .is_some_and(|state| state.report.maintenance_fenced)
-    {
-        prior.as_ref().and_then(|state| state.report.path.clone())
-    } else {
-        Some(remove_path(&catalog, &install.prefix, end)?)
-    };
+        .filter(|state| state.report.maintenance_fenced)
+        .and_then(|state| state.report.path.clone());
     let lock = update_state::acquire_installation_lock(&install.prefix, end)?;
     let installation = control
         .bind_installation(&install.prefix, &lock)
@@ -1126,19 +1122,7 @@ fn execute(
         catalog_file_identity,
         end,
     )?;
-    journal.state.report.path = path;
-    if journal
-        .state
-        .report
-        .path
-        .as_ref()
-        .is_some_and(|path| path["status"] != "complete" && path["reason"] != "unowned")
-    {
-        journal
-            .state
-            .report
-            .pending(Reason::PathConfigurationRetained);
-    }
+    journal.state.report.path = path.clone();
     if journal.state.package_files.is_empty() {
         match package_plan(&install, &journal, &control, end) {
             Ok(plan) => journal.state.package_files = plan,
@@ -1159,6 +1143,29 @@ fn execute(
         journal.state.report.pending(reason);
         journal.save_before_deadline(end)?;
         return Ok(journal.state.report);
+    }
+    journal.save(end)?;
+    // PATH is external state that setup can recreate. Mutate it only after the
+    // durable Uninstalling fence is visible, and resume an unfinished PATH
+    // transition on the same fenced journal.
+    if path
+        .as_ref()
+        .is_none_or(|path| path["status"] != "complete" && path["reason"] != "unowned")
+    {
+        path = Some(remove_path(&catalog, &install.prefix, end)?);
+        journal.state.report.path = path.clone();
+    }
+    if journal
+        .state
+        .report
+        .path
+        .as_ref()
+        .is_some_and(|path| path["status"] != "complete" && path["reason"] != "unowned")
+    {
+        journal
+            .state
+            .report
+            .pending(Reason::PathConfigurationRetained);
     }
     journal.save(end)?;
     let retirement = if options.keep_data {
