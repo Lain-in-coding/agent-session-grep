@@ -120,6 +120,39 @@ fn actual_managed_catalog_local_initialize_does_not_grant_host_acceptance() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn actual_setup_coexists_with_live_managed_catalog_writer() {
+    let (_temp, mut request) = request();
+    let root = request.catalog.parent().unwrap().join("live-managed");
+    let control = SqliteControlStore::create(
+        &root,
+        &ControlId::parse("setup-live-writer-installation").unwrap(),
+        DesiredUpdates::Running,
+    )
+    .unwrap();
+    request.catalog = root.join("catalog.db");
+    drop(
+        ManagedStore::create(
+            &request.catalog,
+            &control,
+            ControlId::parse("setup-live-writer-catalog").unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
+    let _writer = ManagedStore::open_for_write(&request.catalog, &control).unwrap();
+
+    let report = setup_selected_hosts(&request).unwrap();
+    assert!(report.local_asg.version_verified && report.local_asg.mcp_initialized);
+    assert_eq!(report.hosts.len(), 2);
+    assert!(report.hosts.iter().all(|host| {
+        host.configuration == ConfigurationStage::Configured
+            && host.owned_by_asg
+            && host.host_handshake == HostHandshakeStage::Pending
+    }));
+}
+
 fn managed_fixture(root: &std::path::Path, installation: &str, incarnation: &str) -> PathBuf {
     let control = SqliteControlStore::create(
         root,

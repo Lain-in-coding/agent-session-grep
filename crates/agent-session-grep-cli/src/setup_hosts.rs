@@ -471,28 +471,51 @@ fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn open_pinned(path: &Path) -> Result<File> {
-    open_checked(path, 1)
+    #[cfg(windows)]
+    {
+        open_checked(
+            path,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+        )
+    }
+    #[cfg(unix)]
+    {
+        open_checked(path)
+    }
 }
 fn open_shared(path: &Path) -> Result<File> {
     // A managed worker may hold the catalog for writing while setup performs
     // its local self-check. FILE_SHARE_READ|WRITE|DELETE is validation-only;
     // no catalog bytes are read through this handle.
-    open_checked(path, 1 | 2 | 4)
-}
-fn open_checked(path: &Path, share_mode: u32) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(share_mode).custom_flags(0x00200000);
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        open_checked(path, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = share_mode;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        open_checked(path)
     }
+}
+#[cfg(windows)]
+fn open_checked(path: &Path, share_mode: u32) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    use std::os::windows::fs::OpenOptionsExt;
+    options.share_mode(share_mode).custom_flags(0x00200000);
+    finish_checked_open(options, path)
+}
+#[cfg(unix)]
+fn open_checked(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    finish_checked_open(options, path)
+}
+fn finish_checked_open(options: OpenOptions, path: &Path) -> Result<File> {
     let file = options.open(path).map_err(io)?;
     let metadata = file.metadata().map_err(io)?;
     if !metadata.is_file() || linked(&metadata) {
@@ -543,8 +566,8 @@ pub fn check_local_asg(
     // read-only connection (which may update SHM reader bookkeeping). On
     // Windows, an active managed worker may already hold the catalog with
     // write access, so this validation handle must allow the same sharing
-    // modes as SQLite. The managed identity is revalidated before every
-    // configuration mutation.
+    // modes as SQLite. The setup command's composition owner revalidates the
+    // managed identity before every configuration mutation.
     drop(open_shared(catalog)?);
     let binary = open_pinned(launcher)?;
     #[cfg(unix)]

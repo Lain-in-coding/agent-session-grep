@@ -423,10 +423,16 @@ fn identity_and_protocol_failures_never_write_profiles_or_leak_output() {
 #[test]
 fn local_check_allows_catalog_sharing_during_background_write() {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let f = Fixture::new(vec![Host::ClaudeCode]);
     let mut options = OpenOptions::new();
-    options.read(true).write(true).share_mode(1 | 2 | 4);
+    options
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     let _worker_catalog_handle = options.open(&f.request.catalog).unwrap();
 
     let checked = check_local_asg(
