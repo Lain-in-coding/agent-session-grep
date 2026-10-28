@@ -20,7 +20,7 @@ const APPLICATION_ID: i64 = 0x41534331;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const CONTROL_CREATE_PENDING: &str = "control.db.creating";
 const CONTROL_CREATE_INTENT: &str = "control.db.creating.intent";
-const CONTROL_CREATE_INTENT_SCHEMA: &str = "asg.control-create-intent/v1";
+const CONTROL_CREATE_INTENT_SCHEMA: &str = "asg.control-create-intent/v2";
 /// Diagnostic tail only. Every live source/confirmation/barrier reference is
 /// loaded in addition, regardless of its age or originating worker boot.
 const RUNTIME_HISTORY_TAIL: i64 = 64;
@@ -35,6 +35,16 @@ thread_local! {
     static RUNTIME_COMMIT_SEQ: Cell<u64> = const { Cell::new(0) };
     #[cfg(test)]
     static CREATE_FAULT: Cell<Option<u8>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static CREATE_FAULT_EXIT: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static CREATE_FAULT_WAIT: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static CREATE_FAULT_READY_FILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static CREATE_FAULT_SYNC_EXIT: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static CREATE_FAULT_SYNC_FAIL: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -42,6 +52,26 @@ fn create_fault(point: u8) -> PortResult<()> {
     CREATE_FAULT.with(|slot| {
         if slot.get() == Some(point) {
             slot.set(None);
+            if CREATE_FAULT_EXIT.with(Cell::get) {
+                // Simulate a killed process: no unwinding, Drop or cleanup.
+                std::process::exit(86);
+            }
+            if CREATE_FAULT_WAIT.with(Cell::get) {
+                if let Some(path) = CREATE_FAULT_READY_FILE.with(|slot| slot.borrow().clone()) {
+                    fs::write(path, b"ready").expect("test ready signal");
+                }
+                loop {
+                    std::thread::park();
+                }
+            }
+            if point == 3 && CREATE_FAULT_SYNC_EXIT.with(Cell::get) {
+                crate::managed_locks::exit_next_publication_sync();
+                return Ok(());
+            }
+            if point == 3 && CREATE_FAULT_SYNC_FAIL.with(Cell::get) {
+                crate::managed_locks::fail_next_publication_sync();
+                return Ok(());
+            }
             Err(PortError::Backend("injected create interruption".into()))
         } else {
             Ok(())
@@ -1200,6 +1230,7 @@ impl SqliteControlStore {
         installation: &ControlId,
         desired: DesiredUpdates,
     ) -> PortResult<Self> {
+        runtime_tick()?;
         private_directory(private_root, true)?;
         let handle_lease = admit_control_handle(private_root, true)?;
         let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
@@ -1213,13 +1244,15 @@ impl SqliteControlStore {
         )
     }
 
-    /// A staged creation can be resumed only with its exact installation and
-    /// desired state. It is never adopted by a fresh caller.
+    /// Resume an interrupted creation only with its exact durable installation
+    /// and initial desired state. An unpublished stage is rebuilt; a creation
+    /// that may have reached the final name is never reset.
     pub fn recover_create(
         private_root: &Path,
         installation: &ControlId,
         desired: DesiredUpdates,
     ) -> PortResult<Self> {
+        runtime_tick()?;
         private_directory(private_root, false)?;
         let handle_lease = admit_control_handle(private_root, true)?;
         let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
@@ -1229,7 +1262,32 @@ impl SqliteControlStore {
             desired,
             handle_lease,
             create_lock,
+            &mut create_fault,
         )
+    }
+
+    /// Read the exact creation intent without changing it. Callers use this
+    /// only to resume the recorded installation; it grants no adoption.
+    pub fn read_create_intent(
+        private_root: &Path,
+    ) -> PortResult<Option<(ControlId, DesiredUpdates)>> {
+        runtime_tick()?;
+        private_directory(private_root, false)?;
+        // Every durable intent is written after the creator acquires this
+        // rendezvous. Reuse the existing pinned capability instead of creating
+        // any lock or handle lease during a read-only admission.
+        let Some(create_lock) =
+            ExclusiveGuard::try_acquire_existing(private_root, LockKind::ControlCreate)?
+        else {
+            return Ok(None);
+        };
+        control_create::read_public(&create_lock, private_root)
+    }
+
+    /// After a published database is opened, retire its matching creation
+    /// records. This never compares or resets the current policy.
+    pub fn finish_create(&self) -> PortResult<()> {
+        control_create::finish(self)
     }
 
     pub fn open_read_only(private_root: &Path, installation: &ControlId) -> PortResult<Self> {
@@ -1622,6 +1680,81 @@ impl SqliteControlStore {
 
 mod control_create {
     use super::*;
+    use std::io::Read;
+
+    /// Durable creation is two separate facts. The intent binds the physical
+    /// root, installation and initial policy. The publish marker, published
+    /// atomically before the stage rename, records that the final name may
+    /// already hold this policy. Without that marker no stage could have been
+    /// published, so the exact initial state may be rebuilt deterministically.
+    const PUBLISH_MARKER: &str = "control.db.creating.publish";
+    const INTENT_PENDING: &str = "control.db.creating.intent.pending";
+    const MARKER_PENDING: &str = "control.db.creating.publish.pending";
+    const LEGACY_INTENT_SCHEMA: &str = "asg.control-create-intent/v1";
+    const MAX_INTENT_BYTES: u64 = 1024;
+    const STAGE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub(super) struct Intent {
+        pub(super) installation: ControlId,
+        pub(super) desired: DesiredUpdates,
+        /// None only for a legacy v1 record, which lacks publication proof.
+        root: Option<ControlId>,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyWire {
+        schema: String,
+        installation: String,
+        desired: String,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        schema: String,
+        root: String,
+        installation: String,
+        desired: String,
+    }
+
+    pub(super) trait RecordAccess {
+        fn record_exists(&self, name: &str) -> PortResult<bool>;
+        fn open_record(&self, name: &str) -> PortResult<fs::File>;
+        fn validate_record(&self, name: &str, file: &fs::File) -> PortResult<()>;
+    }
+
+    impl RecordAccess for ControlHandleLease {
+        fn record_exists(&self, name: &str) -> PortResult<bool> {
+            self.child_exists(name)
+        }
+        fn open_record(&self, name: &str) -> PortResult<fs::File> {
+            self.open_child_read(name)
+        }
+        fn validate_record(&self, name: &str, file: &fs::File) -> PortResult<()> {
+            self.validate_child(name, file)
+        }
+    }
+
+    impl RecordAccess for ExclusiveGuard {
+        fn record_exists(&self, name: &str) -> PortResult<bool> {
+            self.child_exists(name)
+        }
+        fn open_record(&self, name: &str) -> PortResult<fs::File> {
+            self.open_child_read(name)
+        }
+        fn validate_record(&self, name: &str, file: &fs::File) -> PortResult<()> {
+            self.validate_child(name, file)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct StageInspection {
+        present: bool,
+        sidecars_present: bool,
+    }
 
     pub(super) fn prepare(
         root: &Path,
@@ -1631,27 +1764,316 @@ mod control_create {
         create_lock: ExclusiveGuard,
         hook: &mut dyn FnMut(u8) -> PortResult<()>,
     ) -> PortResult<SqliteControlStore> {
-        let root_identity = lease.root_identity();
-        if SqliteControlStore::path(root)
-            .try_exists()
-            .map_err(io_error)?
+        runtime_tick()?;
+        validate_guard(root, &lease, &create_lock)?;
+        if final_paths_exist(root)? {
+            return Err(invalid());
+        }
+        let stage = inspect_stage(&create_lock, root)?;
+        if stage.present
+            || stage.sidecars_present
+            || exists(&create_lock, CONTROL_CREATE_INTENT)?
+            || exists(&create_lock, PUBLISH_MARKER)?
+        {
+            return Err(pending());
+        }
+        // A pending record was never durably published. With every final name,
+        // stage and durable record absent, no creation state exists and a new
+        // attempt need not guess the interrupted installation.
+        for name in [INTENT_PENDING, MARKER_PENDING] {
+            if exists(&create_lock, name)? {
+                validate_owned_record(&create_lock, root, name)?;
+                remove_owned(&create_lock, name)?;
+            }
+        }
+        let intent = Intent::new(lease.root_identity(), installation, desired)?;
+        publish_record(
+            &create_lock,
+            root,
+            INTENT_PENDING,
+            CONTROL_CREATE_INTENT,
+            &intent.bytes,
+        )?;
+        hook(9)?;
+        build_and_publish(root, &intent, lease, create_lock, hook)
+    }
+
+    /// Resume only the exact durable intent. A published final database is
+    /// opened, never reset; its current policy is not compared with the intent.
+    pub(super) fn recover(
+        root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+        lease: ControlHandleLease,
+        create_lock: ExclusiveGuard,
+        hook: &mut dyn FnMut(u8) -> PortResult<()>,
+    ) -> PortResult<SqliteControlStore> {
+        runtime_tick()?;
+        validate_guard(root, &lease, &create_lock)?;
+        let mut intent_bytes = read_record(&lease, root, CONTROL_CREATE_INTENT)?;
+        let marker_bytes = read_record(&lease, root, PUBLISH_MARKER)?;
+        let final_present = final_paths_exist(root)?;
+        let stage = inspect_stage(&create_lock, root)?;
+
+        if final_present && marker_bytes.is_none() && exists(&create_lock, MARKER_PENDING)? {
+            return Err(unproven());
+        }
+        if intent_bytes.is_some() && exists(&create_lock, INTENT_PENDING)? {
+            return Err(unproven());
+        }
+        if marker_bytes.is_some() && exists(&create_lock, MARKER_PENDING)? {
+            return Err(unproven());
+        }
+
+        // A synced pre-intent record is safe only in the exact retry window
+        // proven by the absence of every later durable creation artifact.
+        if intent_bytes.is_none()
+            && marker_bytes.is_none()
+            && !final_present
+            && !stage.present
+            && !stage.sidecars_present
+            && !exists(&create_lock, MARKER_PENDING)?
+            && let Some(pending) = read_record(&lease, root, INTENT_PENDING)?
+        {
+            let expected = Intent::new(lease.root_identity(), installation, desired)?;
+            if pending != expected.bytes {
+                return Err(corrupt());
+            }
+            let pending_intent = Intent::decode(pending.clone())?;
+            validate_recovery_binding(root, &lease, &pending_intent, installation, desired)?;
+            promote_pending_record(
+                &create_lock,
+                root,
+                INTENT_PENDING,
+                CONTROL_CREATE_INTENT,
+                &pending,
+            )?;
+            intent_bytes = Some(pending);
+        }
+
+        let Some(intent) = intent_bytes.clone().map(Intent::decode).transpose()? else {
+            let Some(marker) = marker_bytes else {
+                return Err(invalid());
+            };
+            let marker_intent = Intent::decode(marker)?;
+            if marker_intent.installation != *installation
+                || marker_intent.root.as_ref() != Some(&lease.root_identity().control_id())
+            {
+                return Err(invalid());
+            }
+            lease.validate_admission(root)?;
+            if !final_present || stage.present || stage.sidecars_present {
+                return Err(unproven());
+            }
+            return open_published(root, &marker_intent, lease, create_lock, hook);
+        };
+        validate_recovery_binding(root, &lease, &intent, installation, desired)?;
+        if final_present {
+            if marker_bytes.is_none() || stage.present || stage.sidecars_present {
+                return Err(unproven());
+            }
+            return open_published(root, &intent, lease, create_lock, hook);
+        }
+
+        if let Some(marker) = &marker_bytes
+            && marker.as_slice() != intent.bytes.as_slice()
+        {
+            if intent.root.is_none()
+                || !stage.present
+                || stage.sidecars_present
+                || !intent.bytes.starts_with(marker)
+            {
+                return Err(corrupt());
+            }
+            // A torn pre-publish record is repairable only when the exact v2
+            // intent and extant stage prove the final rename did not consume it.
+            remove_owned(&create_lock, PUBLISH_MARKER)?;
+            hook(12)?;
+            if exists(&create_lock, MARKER_PENDING)? {
+                validate_owned_record(&create_lock, root, MARKER_PENDING)?;
+                remove_owned(&create_lock, MARKER_PENDING)?;
+            }
+            remove_stage_artifacts(&create_lock)?;
+            return build_and_publish(root, &intent, lease, create_lock, hook);
+        }
+
+        if marker_bytes.is_some() {
+            // The marker and stage together prove the no-replace rename did not
+            // consume this stage. Remove the publication proof first; a crash
+            // then leaves a safely rebuildable no-marker state.
+            if intent.root.is_none() || !stage.present || stage.sidecars_present {
+                return Err(unproven());
+            }
+            remove_owned(&create_lock, PUBLISH_MARKER)?;
+            hook(12)?;
+            remove_stage_artifacts(&create_lock)?;
+        } else if intent.root.is_some() && (stage.present || stage.sidecars_present) {
+            // No marker means no rename was attempted. Sidecars and an incomplete
+            // stage are private unpublished artifacts and may be discarded.
+            remove_stage_artifacts(&create_lock)?;
+        } else if intent.root.is_none() {
+            // Legacy v1 cannot prove that publication was never attempted.
+            return Err(unproven());
+        }
+        build_and_publish(root, &intent, lease, create_lock, hook)
+    }
+
+    /// Remove creation records only against a live final store. The intent is
+    /// removed first and the marker last, so every interruption either retains
+    /// proof or leaves a marker-only state that still refuses recreation.
+    pub(super) fn finish(store: &SqliteControlStore) -> PortResult<()> {
+        let root = store.private_root.as_path();
+        let create_lock = ExclusiveGuard::try_acquire(root, LockKind::ControlCreate)?;
+        validate_guard(root, &store.handle_lease, &create_lock)?;
+        let status = store.status()?;
+        if exists(&create_lock, INTENT_PENDING)? || exists(&create_lock, MARKER_PENDING)? {
+            return Err(corrupt());
+        }
+        let stage = inspect_stage(&store.handle_lease, root)?;
+        if stage.present || stage.sidecars_present {
+            return Err(corrupt());
+        }
+        let intent_bytes = read_record(&store.handle_lease, root, CONTROL_CREATE_INTENT)?;
+        let marker_bytes = read_record(&store.handle_lease, root, PUBLISH_MARKER)?;
+        if let Some(bytes) = intent_bytes {
+            let intent = Intent::decode(bytes.clone())?;
+            if intent.installation != status.policy.installation_id
+                || intent
+                    .root
+                    .as_ref()
+                    .is_some_and(|bound| *bound != store.root_identity.control_id())
+            {
+                return Err(corrupt());
+            }
+            if marker_bytes.as_ref().is_some_and(|marker| marker != &bytes) {
+                return Err(corrupt());
+            }
+            if read_record(&store.handle_lease, root, CONTROL_CREATE_INTENT)? != Some(bytes) {
+                return Err(conflict());
+            }
+            remove_owned(&create_lock, CONTROL_CREATE_INTENT)?;
+            create_fault(11)?;
+            if let Some(marker) = marker_bytes {
+                if read_record(&store.handle_lease, root, PUBLISH_MARKER)? != Some(marker) {
+                    return Err(conflict());
+                }
+                remove_owned(&create_lock, PUBLISH_MARKER)?;
+            }
+            return Ok(());
+        }
+        let Some(marker) = marker_bytes else {
+            return Ok(());
+        };
+        let marker_intent = Intent::decode(marker.clone())?;
+        if marker_intent.installation != status.policy.installation_id
+            || marker_intent.root.as_ref() != Some(&store.root_identity.control_id())
+        {
+            return Err(corrupt());
+        }
+        if read_record(&store.handle_lease, root, PUBLISH_MARKER)? != Some(marker) {
+            return Err(conflict());
+        }
+        remove_owned(&create_lock, PUBLISH_MARKER)
+    }
+
+    pub(super) fn read_public(
+        access: &impl RecordAccess,
+        root: &Path,
+    ) -> PortResult<Option<(ControlId, DesiredUpdates)>> {
+        Ok(read_record(access, root, CONTROL_CREATE_INTENT)?
+            .map(Intent::decode)
+            .transpose()?
+            .map(|intent| (intent.installation, intent.desired)))
+    }
+
+    fn validate_recovery_binding(
+        root: &Path,
+        lease: &ControlHandleLease,
+        intent: &Intent,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+    ) -> PortResult<()> {
+        if intent.installation != *installation
+            || intent.desired != desired
+            || intent
+                .root
+                .as_ref()
+                .is_some_and(|bound| *bound != lease.root_identity().control_id())
         {
             return Err(invalid());
         }
-        if root
-            .join(CONTROL_CREATE_INTENT)
-            .try_exists()
-            .map_err(io_error)?
-            || stage_path(root).try_exists().map_err(io_error)?
-        {
-            return Err(PortError::GenerationMismatch(
-                "control creation is pending recovery".into(),
-            ));
+        lease.validate_admission(root)
+    }
+
+    fn open_published(
+        root: &Path,
+        intent: &Intent,
+        lease: ControlHandleLease,
+        create_lock: ExclusiveGuard,
+        hook: &mut dyn FnMut(u8) -> PortResult<()>,
+    ) -> PortResult<SqliteControlStore> {
+        validate_guard(root, &lease, &create_lock)?;
+        let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
+        store.status()?;
+        drop(create_lock);
+        hook(4)?;
+        finish(&store)?;
+        Ok(store)
+    }
+
+    fn build_and_publish(
+        root: &Path,
+        intent: &Intent,
+        lease: ControlHandleLease,
+        create_lock: ExclusiveGuard,
+        hook: &mut dyn FnMut(u8) -> PortResult<()>,
+    ) -> PortResult<SqliteControlStore> {
+        build_stage(root, intent, &create_lock, hook)?;
+        hook(2)?;
+        if final_paths_exist(root)? {
+            return Err(invalid());
         }
-        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
-        write_intent(root, installation, desired)?;
-        let pending = stage_path(root);
-        let file = create_private_owned_file(&pending)?;
+        publish_record(
+            &create_lock,
+            root,
+            MARKER_PENDING,
+            PUBLISH_MARKER,
+            &intent.bytes,
+        )?;
+        hook(3)?;
+        validate_guard(root, &lease, &create_lock)?;
+        if final_paths_exist(root)? {
+            return Err(invalid());
+        }
+
+        let publication = lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db");
+        hook(6)?;
+        publication?;
+        if !final_paths_exist(root)? || exists(&create_lock, CONTROL_CREATE_PENDING)? {
+            return Err(invalid());
+        }
+        sync_root(&create_lock)?;
+
+        // Publication is irreversible from here. Any directory-sync ambiguity
+        // is returned only after the complete final database is opened and its
+        // records are cleaned or retained fail-closed.
+        validate_guard(root, &lease, &create_lock)?;
+        let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
+        store.status()?;
+        drop(create_lock);
+        hook(4)?;
+        finish(&store)?;
+        Ok(store)
+    }
+
+    fn build_stage(
+        root: &Path,
+        intent: &Intent,
+        create_lock: &ExclusiveGuard,
+        hook: &mut dyn FnMut(u8) -> PortResult<()>,
+    ) -> PortResult<()> {
+        let pending = root.join(CONTROL_CREATE_PENDING);
+        let file = create_lock.create_child_new(CONTROL_CREATE_PENDING)?;
         file.sync_all().map_err(io_error)?;
         drop(file);
         private_file(&pending)?;
@@ -1669,7 +2091,7 @@ mod control_create {
             .map_err(sql_error)?;
         tx.execute_batch(SCHEMA).map_err(sql_error)?;
         tx.execute_batch(RUNTIME_INDEXES).map_err(sql_error)?;
-        tx.execute("INSERT INTO control_meta(singleton,schema_version,installation_id,policy_epoch,control_seq,next_cycle_seq,desired_updates,autostart_enabled,maintenance_state) VALUES(1,2,?1,0,0,1,?2,0,'idle')", params![installation.as_str(), desired_wire(desired)]).map_err(sql_error)?;
+        tx.execute("INSERT INTO control_meta(singleton,schema_version,installation_id,policy_epoch,control_seq,next_cycle_seq,desired_updates,autostart_enabled,maintenance_state) VALUES(1,2,?1,0,0,1,?2,0,'idle')", params![intent.installation.as_str(), desired_wire(intent.desired)]).map_err(sql_error)?;
         tx.execute(
             "INSERT INTO worker_state(singleton,effective_state) VALUES(1,'offline')",
             [],
@@ -1679,7 +2101,8 @@ mod control_create {
             .map_err(sql_error)?;
         tx.pragma_update(None, "user_version", VERSION)
             .map_err(sql_error)?;
-        verify_control_state(&tx, installation, desired)?;
+        verify_control_state(&tx, &intent.installation, intent.desired)?;
+        hook(7)?;
         tx.commit().map_err(sql_error)?;
         hook(1)?;
         let checkpoint: (i64, i64, i64) = conn
@@ -1690,146 +2113,293 @@ mod control_create {
         if checkpoint.0 != 0 {
             return Err(corrupt());
         }
+        verify_control_state(&conn, &intent.installation, intent.desired)?;
         drop(conn);
-        remove_empty_sidecars(&pending)?;
-        #[cfg(unix)]
-        fs::File::open(&pending)
-            .and_then(|file| file.sync_all())
+        remove_empty_sidecars(create_lock, root)?;
+        create_lock
+            .sync_child(CONTROL_CREATE_PENDING)
             .map_err(io_error)?;
+        let inspection = inspect_stage(create_lock, root)?;
+        if !inspection.present || inspection.sidecars_present {
+            return Err(corrupt());
+        }
         hook(5)?;
-        hook(2)?;
-        let final_path = SqliteControlStore::path(root);
-        if final_path.try_exists().map_err(io_error)?
-            || sidecar(&final_path, "-wal")
-                .try_exists()
-                .map_err(io_error)?
-            || sidecar(&final_path, "-shm")
-                .try_exists()
-                .map_err(io_error)?
-            || sidecar(&final_path, "-journal")
-                .try_exists()
-                .map_err(io_error)?
-        {
-            return Err(invalid());
-        }
-        hook(3)?;
-        lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db")?;
-
-        // Publication is irreversible from this point. Keep a complete final
-        // database if any reopening/verification step fails.
-        if RootIdentity::read(root)? != root_identity {
-            return Err(corrupt());
-        }
-        lease.validate_admission(root)?;
-        let store = SqliteControlStore::open_existing_writable(root, installation)?;
-        store.status()?;
-        drop(create_lock);
-        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
-        hook(4)?;
-        Ok(store)
+        Ok(())
     }
 
-    pub(super) fn recover(
+    impl Intent {
+        fn new(
+            root: RootIdentity,
+            installation: &ControlId,
+            desired: DesiredUpdates,
+        ) -> PortResult<Self> {
+            let root = root.control_id();
+            let bytes = serde_json::to_vec(&Wire {
+                schema: CONTROL_CREATE_INTENT_SCHEMA.into(),
+                root: root.as_str().into(),
+                installation: installation.as_str().into(),
+                desired: desired_wire(desired).into(),
+            })
+            .map_err(io_error)?;
+            if bytes.len() as u64 > MAX_INTENT_BYTES {
+                return Err(corrupt());
+            }
+            Ok(Self {
+                installation: installation.clone(),
+                desired,
+                root: Some(root),
+                bytes,
+            })
+        }
+
+        fn decode(bytes: Vec<u8>) -> PortResult<Self> {
+            if bytes.len() as u64 > MAX_INTENT_BYTES {
+                return Err(corrupt());
+            }
+            if let Ok(wire) = serde_json::from_slice::<Wire>(&bytes) {
+                if wire.schema != CONTROL_CREATE_INTENT_SCHEMA {
+                    return Err(corrupt());
+                }
+                return Ok(Self {
+                    installation: id(wire.installation)?,
+                    desired: desired_decode(&wire.desired)?,
+                    root: Some(id(wire.root)?),
+                    bytes,
+                });
+            }
+            let wire: LegacyWire = serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
+            if wire.schema != LEGACY_INTENT_SCHEMA {
+                return Err(corrupt());
+            }
+            Ok(Self {
+                installation: id(wire.installation)?,
+                desired: desired_decode(&wire.desired)?,
+                root: None,
+                bytes,
+            })
+        }
+    }
+
+    /// Publish a small record through a private pending file and a no-replace
+    /// rename. A torn write can leave only the pending name, never a malformed
+    /// durable intent or publish marker.
+    fn publish_record(
+        create_lock: &ExclusiveGuard,
         root: &Path,
-        installation: &ControlId,
-        desired: DesiredUpdates,
-        lease: ControlHandleLease,
-        create_lock: ExclusiveGuard,
-    ) -> PortResult<SqliteControlStore> {
-        let Some((stored_installation, stored_desired)) = read_intent(root)? else {
-            return Err(invalid());
-        };
-        if stored_installation != *installation || stored_desired != desired {
-            return Err(invalid());
-        }
-        let pending = stage_path(root);
-        if !pending.is_file() {
-            return Err(invalid());
-        }
-        private_file(&pending)?;
-        let conn = connect(&pending, false)?;
-        verify_control_state(&conn, installation, desired)?;
-        drop(conn);
-        let final_path = SqliteControlStore::path(root);
-        if final_paths_exist(&final_path)? {
-            return Err(invalid());
-        }
-        lease.publish_child_no_replace(CONTROL_CREATE_PENDING, "control.db")?;
-        let store = SqliteControlStore::open_existing_writable(root, installation)?;
-        store.status()?;
-        drop(create_lock);
-        let _ = fs::remove_file(root.join(CONTROL_CREATE_INTENT));
-        Ok(store)
-    }
-
-    fn final_paths_exist(path: &Path) -> PortResult<bool> {
-        Ok(path.try_exists().map_err(io_error)?
-            || sidecar(path, "-wal").try_exists().map_err(io_error)?
-            || sidecar(path, "-shm").try_exists().map_err(io_error)?
-            || sidecar(path, "-journal").try_exists().map_err(io_error)?)
-    }
-
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Intent {
-        schema: String,
-        installation: String,
-        desired: String,
-    }
-
-    fn write_intent(
-        root: &Path,
-        installation: &ControlId,
-        desired: DesiredUpdates,
+        pending_name: &str,
+        final_name: &str,
+        bytes: &[u8],
     ) -> PortResult<()> {
-        let intent = Intent {
-            schema: CONTROL_CREATE_INTENT_SCHEMA.into(),
-            installation: installation.as_str().into(),
-            desired: desired_wire(desired).into(),
-        };
-        let bytes = serde_json::to_vec(&intent).map_err(io_error)?;
-        if bytes.len() > 1024 {
-            return Err(corrupt());
+        runtime_tick()?;
+        if exists(create_lock, final_name)? {
+            return Err(conflict());
         }
-        let path = root.join(CONTROL_CREATE_INTENT);
-        let mut file = create_private_owned_file(&path)?;
-        std::io::Write::write_all(&mut file, &bytes).map_err(io_error)?;
+        if exists(create_lock, pending_name)? {
+            validate_owned_record(create_lock, root, pending_name)?;
+            remove_owned(create_lock, pending_name)?;
+        }
+        let mut file = create_lock.create_child_new(pending_name)?;
+        let split = (bytes.len() / 2).max(1).min(bytes.len());
+        std::io::Write::write_all(&mut file, &bytes[..split]).map_err(io_error)?;
+        create_fault(8)?;
+        std::io::Write::write_all(&mut file, &bytes[split..]).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
         drop(file);
+        validate_owned_record(create_lock, root, pending_name)?;
+        create_fault(13)?;
+        match create_lock.publish_child_no_replace(pending_name, final_name) {
+            Ok(()) => sync_root(create_lock),
+            Err(error) if exists(create_lock, final_name)? => {
+                if read_record(create_lock, root, final_name)?.as_deref() == Some(bytes) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn promote_pending_record(
+        create_lock: &ExclusiveGuard,
+        root: &Path,
+        pending_name: &str,
+        final_name: &str,
+        bytes: &[u8],
+    ) -> PortResult<()> {
+        runtime_tick()?;
+        if exists(create_lock, final_name)? {
+            return Err(conflict());
+        }
+        if read_record(create_lock, root, pending_name)?.as_deref() != Some(bytes) {
+            return Err(conflict());
+        }
+        match create_lock.publish_child_no_replace(pending_name, final_name) {
+            Ok(()) => sync_root(create_lock),
+            Err(error) if exists(create_lock, final_name)? => {
+                if read_record(create_lock, root, final_name)?.as_deref() == Some(bytes) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_record(
+        access: &impl RecordAccess,
+        root: &Path,
+        name: &str,
+    ) -> PortResult<Option<Vec<u8>>> {
+        if !access.record_exists(name)? {
+            return Ok(None);
+        }
+        let path = root.join(name);
+        private_file(&path)?;
+        let file = access.open_record(name)?;
+        access.validate_record(name, &file)?;
+        let before = file.metadata().map_err(io_error)?;
+        if before.len() > MAX_INTENT_BYTES {
+            return Err(corrupt());
+        }
+        let mut bytes = Vec::new();
+        let mut source = file.take(MAX_INTENT_BYTES + 1);
+        std::io::Read::read_to_end(&mut source, &mut bytes).map_err(io_error)?;
+        access.validate_record(name, source.get_ref())?;
+        private_file(&path)?;
+        let after = source.get_ref().metadata().map_err(io_error)?;
+        if bytes.len() as u64 > MAX_INTENT_BYTES
+            || bytes.len() as u64 != before.len()
+            || after.len() != before.len()
+        {
+            return Err(corrupt());
+        }
+        Ok(Some(bytes))
+    }
+
+    fn validate_owned_record(
+        access: &impl RecordAccess,
+        root: &Path,
+        name: &str,
+    ) -> PortResult<()> {
+        let path = root.join(name);
+        private_file(&path)?;
+        let file = access.open_record(name)?;
+        access.validate_record(name, &file)?;
         private_file(&path)
     }
 
-    fn read_intent(root: &Path) -> PortResult<Option<(ControlId, DesiredUpdates)>> {
-        let path = root.join(CONTROL_CREATE_INTENT);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() && metadata.len() <= 1024 => {}
-            Ok(_) => return Err(corrupt()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io_error(error)),
+    fn inspect_stage(access: &impl RecordAccess, root: &Path) -> PortResult<StageInspection> {
+        let present = access.record_exists(CONTROL_CREATE_PENDING)?;
+        if present {
+            validate_stage_name(access, root, CONTROL_CREATE_PENDING)?;
         }
-        private_file(&path)?;
-        let intent: Intent =
-            serde_json::from_slice(&fs::read(&path).map_err(io_error)?).map_err(|_| corrupt())?;
-        if intent.schema != CONTROL_CREATE_INTENT_SCHEMA {
-            return Err(corrupt());
+        let mut sidecars_present = false;
+        for suffix in STAGE_SIDECARS {
+            let name = stage_sidecar_name(suffix);
+            if access.record_exists(&name)? {
+                sidecars_present = true;
+                validate_stage_name(access, root, &name)?;
+            }
         }
-        Ok(Some((
-            id(intent.installation)?,
-            desired_decode(&intent.desired)?,
-        )))
+        Ok(StageInspection {
+            present,
+            sidecars_present,
+        })
     }
 
-    fn remove_empty_sidecars(path: &Path) -> PortResult<()> {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let path = sidecar(path, suffix);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
-                    fs::remove_file(path).map_err(io_error)?;
-                }
-                Ok(_) => return Err(corrupt()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(error)),
+    fn validate_stage_name(access: &impl RecordAccess, root: &Path, name: &str) -> PortResult<()> {
+        private_file(&root.join(name))?;
+        let file = access.open_record(name)?;
+        access.validate_record(name, &file)
+    }
+
+    fn remove_stage_artifacts(create_lock: &ExclusiveGuard) -> PortResult<()> {
+        for suffix in STAGE_SIDECARS {
+            let name = stage_sidecar_name(suffix);
+            if exists(create_lock, &name)? {
+                remove_owned(create_lock, &name)?;
             }
+        }
+        if exists(create_lock, CONTROL_CREATE_PENDING)? {
+            remove_owned(create_lock, CONTROL_CREATE_PENDING)?;
+        }
+        Ok(())
+    }
+
+    fn remove_owned(create_lock: &ExclusiveGuard, name: &str) -> PortResult<()> {
+        if !create_lock.remove_child(name)? {
+            return Err(conflict());
+        }
+        sync_root(create_lock)
+    }
+
+    fn sync_root(create_lock: &ExclusiveGuard) -> PortResult<()> {
+        create_lock.sync_directory().map_err(io_error)
+    }
+
+    fn validate_guard(
+        root: &Path,
+        lease: &ControlHandleLease,
+        create_lock: &ExclusiveGuard,
+    ) -> PortResult<()> {
+        lease.validate_admission(root)?;
+        create_lock.validate_current(root)?;
+        if create_lock.kind() != &LockKind::ControlCreate
+            || create_lock.root_identity() != lease.root_identity()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn pending() -> PortError {
+        PortError::GenerationMismatch("control creation is pending recovery".into())
+    }
+
+    fn unproven() -> PortError {
+        PortError::SchemaIncompatible("control creation state requires explicit recovery".into())
+    }
+
+    fn exists(access: &impl RecordAccess, name: &str) -> PortResult<bool> {
+        access.record_exists(name)
+    }
+
+    fn path_occupied(path: &Path) -> PortResult<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
+    fn final_paths_exist(root: &Path) -> PortResult<bool> {
+        let path = SqliteControlStore::path(root);
+        Ok(path_occupied(&path)?
+            || path_occupied(&sidecar(&path, "-wal"))?
+            || path_occupied(&sidecar(&path, "-shm"))?
+            || path_occupied(&sidecar(&path, "-journal"))?)
+    }
+
+    fn stage_sidecar_name(suffix: &str) -> String {
+        format!("{CONTROL_CREATE_PENDING}{suffix}")
+    }
+
+    fn remove_empty_sidecars(create_lock: &ExclusiveGuard, root: &Path) -> PortResult<()> {
+        for suffix in STAGE_SIDECARS {
+            let name = stage_sidecar_name(suffix);
+            if !exists(create_lock, &name)? {
+                continue;
+            }
+            let file = create_lock.open_child_read(&name)?;
+            create_lock.validate_child(&name, &file)?;
+            private_file(&root.join(&name))?;
+            if file.metadata().map_err(io_error)?.len() != 0 {
+                return Err(corrupt());
+            }
+            drop(file);
+            remove_owned(create_lock, &name)?;
         }
         Ok(())
     }
@@ -1886,17 +2456,12 @@ mod control_create {
         Ok(())
     }
 
-    fn stage_path(root: &Path) -> PathBuf {
-        root.join(CONTROL_CREATE_PENDING)
-    }
-
     fn sidecar(path: &Path, suffix: &str) -> PathBuf {
         let mut value = path.as_os_str().to_os_string();
         value.push(suffix);
         PathBuf::from(value)
     }
 }
-
 fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -2777,20 +3342,26 @@ fn private_directory(path: &Path, create: bool) -> PortResult<()> {
     if !path.is_absolute() {
         return Err(invalid());
     }
-    if create && !path.try_exists().map_err(io_error)? {
-        reject_links(path.parent().ok_or_else(invalid)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(path)
-                .map_err(io_error)?;
+    if create {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reject_links(path.parent().ok_or_else(invalid)?)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(path)
+                        .map_err(io_error)?;
+                }
+                #[cfg(windows)]
+                windows_private::create_directory(path)?;
+                #[cfg(not(any(unix, windows)))]
+                return Err(io_error(()));
+            }
+            Err(error) => return Err(io_error(error)),
         }
-        #[cfg(windows)]
-        windows_private::create_directory(path)?;
-        #[cfg(not(any(unix, windows)))]
-        return Err(io_error(()));
     }
     reject_links(path)?;
     let meta = fs::symlink_metadata(path)
@@ -5403,6 +5974,10 @@ mod windows_private {
     }
 
     pub(super) fn open_private_read(path: &Path) -> PortResult<File> {
+        open_private_read_with_sidecar(path, false)
+    }
+
+    fn open_private_read_with_sidecar(path: &Path, sidecar: bool) -> PortResult<File> {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, READ_CONTROL,
         };
@@ -5413,18 +5988,26 @@ mod windows_private {
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
-            .map_err(|error| private_file_io(error, false))?;
-        verify_handle(&file, true, false)?;
+            .map_err(|error| private_file_io(error, sidecar))?;
+        verify_handle(&file, true, sidecar)?;
         Ok(file)
     }
 
     pub(super) fn validate_private_read(path: &Path, file: &File) -> PortResult<()> {
+        validate_private_read_with_sidecar(path, file, false)
+    }
+
+    fn validate_private_read_with_sidecar(
+        path: &Path,
+        file: &File,
+        sidecar: bool,
+    ) -> PortResult<()> {
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
-        verify_handle(file, true, false)?;
-        let named = open_for_verification(path, false)?;
-        verify_handle(&named, true, false)?;
+        verify_handle(file, true, sidecar)?;
+        let named = open_for_verification(path, sidecar)?;
+        verify_handle(&named, true, sidecar)?;
         let mut opened_info = BY_HANDLE_FILE_INFORMATION::default();
         let mut named_info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: both Files own live handles; each output is the exact matching
@@ -5432,7 +6015,7 @@ mod windows_private {
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut opened_info) } == 0
             || unsafe { GetFileInformationByHandle(named.as_raw_handle(), &mut named_info) } == 0
         {
-            return Err(private_file_io(std::io::Error::last_os_error(), false));
+            return Err(private_file_io(std::io::Error::last_os_error(), sidecar));
         }
         if (
             opened_info.dwVolumeSerialNumber,
@@ -6586,5 +7169,666 @@ mod runtime_deadline_tests {
                 .open(path)
                 .unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod control_create_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+
+    const CHILD_NAME: &str = "control::control_create_tests::control_create_child_process_entry";
+
+    fn id(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    fn root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().join("private")
+    }
+
+    fn write_new_private(path: &Path, bytes: &[u8]) {
+        let mut file = platform_test_file(path);
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn platform_test_file(path: &Path) -> std::fs::File {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            windows_private::create_file(path).unwrap()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+        }
+    }
+
+    fn overwrite_private(path: &Path, bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn child_command(root: &Path, mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", CHILD_NAME, "--nocapture"])
+            .env("ASG_TEST_CONTROL_CREATE_CHILD", mode)
+            .env("ASG_TEST_CONTROL_CREATE_ROOT", root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        command
+    }
+
+    fn crash_child(root: &Path, point: u8, sync_exit: bool) -> std::process::ExitStatus {
+        child_command(root, "crash")
+            .env("ASG_TEST_CONTROL_CREATE_POINT", point.to_string())
+            .env("ASG_TEST_CONTROL_CREATE_SYNC_EXIT", sync_exit.to_string())
+            .status()
+            .unwrap()
+    }
+
+    fn assert_clean(root: &Path) {
+        for name in [
+            "control.db.creating",
+            "control.db.creating-wal",
+            "control.db.creating-shm",
+            "control.db.creating-journal",
+            "control.db.creating.intent",
+            "control.db.creating.intent.pending",
+            "control.db.creating.publish",
+            "control.db.creating.publish.pending",
+        ] {
+            assert!(
+                fs::symlink_metadata(root.join(name)).is_err(),
+                "creation artifact remained: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_create_child_process_entry() {
+        let Ok(mode) = std::env::var("ASG_TEST_CONTROL_CREATE_CHILD") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var("ASG_TEST_CONTROL_CREATE_ROOT").unwrap());
+        match mode.as_str() {
+            "crash" => {
+                let point = std::env::var("ASG_TEST_CONTROL_CREATE_POINT")
+                    .unwrap()
+                    .parse::<u8>()
+                    .unwrap();
+                let sync_exit = std::env::var("ASG_TEST_CONTROL_CREATE_SYNC_EXIT")
+                    .unwrap_or_default()
+                    == "true";
+                CREATE_FAULT.with(|slot| slot.set(Some(point)));
+                CREATE_FAULT_EXIT.with(|slot| slot.set(!sync_exit));
+                CREATE_FAULT_SYNC_EXIT.with(|slot| slot.set(sync_exit));
+                let _ = SqliteControlStore::create(
+                    &root,
+                    &id("synthetic-crash-installation"),
+                    DesiredUpdates::Paused,
+                );
+                std::process::exit(99);
+            }
+            "hold" => {
+                let _guard = ExclusiveGuard::try_acquire(&root, LockKind::ControlCreate).unwrap();
+                println!("ready");
+                std::io::stdout().flush().unwrap();
+                let mut input = std::io::stdin();
+                let mut byte = [0_u8; 1];
+                input.read_exact(&mut byte).unwrap();
+            }
+            _ => panic!("unknown child mode"),
+        }
+    }
+
+    #[test]
+    fn control_create_recovers_durable_crash_points() {
+        for (point, sync_exit, expect_intent) in [
+            (2, false, true),
+            (3, true, true),
+            (6, false, true),
+            (11, false, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = root(&temp);
+            let status = crash_child(&root, point, sync_exit);
+            assert_eq!(status.code(), Some(if sync_exit { 87 } else { 86 }));
+            assert_eq!(
+                SqliteControlStore::read_create_intent(&root)
+                    .unwrap()
+                    .map(|(installation, desired)| (installation.as_str().to_owned(), desired)),
+                expect_intent.then_some((
+                    "synthetic-crash-installation".into(),
+                    DesiredUpdates::Paused
+                ))
+            );
+            if point == 11 {
+                assert!(!root.join("control.db.creating.intent").exists());
+                assert!(root.join("control.db.creating.publish").exists());
+            }
+            let store = SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-crash-installation"),
+                DesiredUpdates::Paused,
+            )
+            .unwrap();
+            assert_eq!(
+                store.status().unwrap().policy.installation_id,
+                id("synthetic-crash-installation")
+            );
+            assert!(SqliteControlStore::path(&root).exists());
+            assert_clean(&root);
+        }
+    }
+
+    #[test]
+    fn control_create_discards_only_a_pre_intent_pending_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        let status = crash_child(&root, 8, false);
+        assert_eq!(status.code(), Some(86));
+        assert!(root.join("control.db.creating.intent.pending").exists());
+        assert!(!root.join("control.db.creating.intent").exists());
+        assert!(!root.join("control.db.creating").exists());
+        assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
+        let store = SqliteControlStore::create(
+            &root,
+            &id("synthetic-retry-installation"),
+            DesiredUpdates::Running,
+        )
+        .unwrap();
+        assert_eq!(
+            store.status().unwrap().policy.installation_id,
+            id("synthetic-retry-installation")
+        );
+        assert_clean(&root);
+    }
+
+    #[test]
+    fn control_create_recovery_promotes_only_the_exact_synced_pending_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        let status = crash_child(&root, 13, false);
+        assert_eq!(status.code(), Some(86));
+        let pending = root.join("control.db.creating.intent.pending");
+        let bytes = fs::read(&pending).unwrap();
+        assert!(!root.join("control.db.creating.intent").exists());
+        assert!(!root.join("control.db.creating").exists());
+        assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-crash-installation"),
+                DesiredUpdates::Running,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        let store = SqliteControlStore::recover_create(
+            &root,
+            &id("synthetic-crash-installation"),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        assert_eq!(
+            store.status().unwrap().policy.installation_id,
+            id("synthetic-crash-installation")
+        );
+        assert_clean(&root);
+    }
+
+    #[test]
+    fn control_create_recovery_preserves_a_malformed_pending_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        assert_eq!(crash_child(&root, 13, false).code(), Some(86));
+        let pending = root.join("control.db.creating.intent.pending");
+        overwrite_private(&pending, b"foreign-intent");
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-crash-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(pending).unwrap(), b"foreign-intent");
+        assert!(!SqliteControlStore::path(&root).exists());
+    }
+
+    #[test]
+    fn control_create_stale_marker_pending_requires_the_pre_publish_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(9)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-marker-pending"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        write_new_private(&root.join("control.db.creating.publish.pending"), b"stale");
+        SqliteControlStore::recover_create(
+            &root,
+            &id("synthetic-marker-pending"),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        assert_clean(&root);
+
+        let after_publish = tempfile::tempdir().unwrap();
+        let root = self::root(&after_publish);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(6)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-published-marker"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        fs::remove_file(root.join("control.db.creating.publish")).unwrap();
+        write_new_private(
+            &root.join("control.db.creating.publish.pending"),
+            b"foreign",
+        );
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-published-marker"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(SqliteControlStore::path(&root).exists());
+        assert_eq!(
+            fs::read(root.join("control.db.creating.publish.pending")).unwrap(),
+            b"foreign"
+        );
+    }
+
+    #[test]
+    fn control_create_publish_sync_failure_is_recovered_by_opening_final() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(3)));
+        CREATE_FAULT_SYNC_FAIL.with(|slot| slot.set(true));
+        let result = SqliteControlStore::create(
+            &root,
+            &id("synthetic-sync-installation"),
+            DesiredUpdates::Paused,
+        );
+        CREATE_FAULT_SYNC_FAIL.with(|slot| slot.set(false));
+        assert!(result.is_err());
+        assert!(SqliteControlStore::path(&root).exists());
+        assert!(root.join("control.db.creating.intent").exists());
+        assert!(root.join("control.db.creating.publish").exists());
+        let store =
+            SqliteControlStore::open_existing_writable(&root, &id("synthetic-sync-installation"))
+                .unwrap();
+        let current = store.status().unwrap();
+        store
+            .set_desired_updates(current.policy.control_seq, DesiredUpdates::Running)
+            .unwrap();
+        let final_bytes = fs::read(SqliteControlStore::path(&root)).unwrap();
+        store.finish_create().unwrap();
+        assert_eq!(
+            store.status().unwrap().desired_updates,
+            DesiredUpdates::Running
+        );
+        assert_eq!(
+            fs::read(SqliteControlStore::path(&root)).unwrap(),
+            final_bytes
+        );
+        assert_clean(&root);
+    }
+
+    #[test]
+    fn control_create_finish_is_intent_first_and_marker_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(11)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-finish-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(!root.join("control.db.creating.intent").exists());
+        assert!(root.join("control.db.creating.publish").exists());
+        assert!(SqliteControlStore::path(&root).exists());
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-finish-installation"),
+                DesiredUpdates::Running,
+            )
+            .is_err()
+        );
+        let store =
+            SqliteControlStore::open_existing_writable(&root, &id("synthetic-finish-installation"))
+                .unwrap();
+        store.finish_create().unwrap();
+        assert_clean(&root);
+    }
+
+    #[test]
+    fn control_create_marker_only_missing_final_never_recreates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(11)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-marker-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = fs::remove_file(root.join(format!("control.db{suffix}")));
+        }
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-marker-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-marker-other"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(!SqliteControlStore::path(&root).exists());
+        assert!(root.join("control.db.creating.publish").exists());
+    }
+
+    #[test]
+    fn control_create_repairs_only_a_torn_marker_with_an_exact_stage() {
+        for with_stage in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = root(&temp);
+            private_directory(&root, true).unwrap();
+            CREATE_FAULT.with(|slot| slot.set(Some(3)));
+            assert!(
+                SqliteControlStore::create(
+                    &root,
+                    &id("synthetic-torn-marker"),
+                    DesiredUpdates::Paused,
+                )
+                .is_err()
+            );
+            let marker = root.join("control.db.creating.publish");
+            let full = fs::read(&marker).unwrap();
+            overwrite_private(&marker, &full[..full.len() / 2]);
+            if !with_stage {
+                let _ = fs::remove_file(root.join("control.db.creating"));
+            }
+            let result = SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-torn-marker"),
+                DesiredUpdates::Paused,
+            );
+            if with_stage {
+                result.unwrap();
+                assert_clean(&root);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(fs::read(marker).unwrap(), full[..full.len() / 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn control_create_preserves_an_unmatched_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(3)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-unmatched-marker"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        let marker = root.join("control.db.creating.publish");
+        overwrite_private(&marker, b"foreign-marker");
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-unmatched-marker"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(marker).unwrap(), b"foreign-marker");
+        assert!(!SqliteControlStore::path(&root).exists());
+    }
+
+    #[test]
+    fn control_create_marker_cleanup_crash_leaves_a_rebuildable_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(3)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-cleanup-crash"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(root.join("control.db.creating").exists());
+        assert!(root.join("control.db.creating.publish").exists());
+        CREATE_FAULT.with(|slot| slot.set(Some(12)));
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-cleanup-crash"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(!root.join("control.db.creating.publish").exists());
+        assert!(root.join("control.db.creating").exists());
+        SqliteControlStore::recover_create(
+            &root,
+            &id("synthetic-cleanup-crash"),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        assert_clean(&root);
+    }
+
+    #[test]
+    fn control_create_removes_unmarked_stage_sidecars_then_rebuilds() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = root(&temp);
+            private_directory(&root, true).unwrap();
+            CREATE_FAULT.with(|slot| slot.set(Some(2)));
+            assert!(SqliteControlStore::create(
+                &root,
+                &id("synthetic-sidecar"),
+                DesiredUpdates::Paused,
+            )
+            .is_err());
+            let _ = fs::remove_file(root.join("control.db.creating"));
+            write_new_private(
+                &root.join(format!("control.db.creating{suffix}")),
+                b"private",
+            );
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-sidecar"),
+                DesiredUpdates::Paused,
+            )
+            .unwrap();
+            assert_clean(&root);
+        }
+    }
+
+    #[test]
+    fn control_create_v1_intent_only_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        CREATE_FAULT.with(|slot| slot.set(Some(9)));
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-v1-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        let intent = root.join("control.db.creating.intent");
+        overwrite_private(
+            &intent,
+            br#"{"schema":"asg.control-create-intent/v1","installation":"synthetic-v1-installation","desired":"paused"}"#,
+        );
+        assert!(
+            SqliteControlStore::recover_create(
+                &root,
+                &id("synthetic-v1-installation"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(!SqliteControlStore::path(&root).exists());
+        assert!(intent.exists());
+    }
+
+    #[test]
+    fn control_create_does_not_follow_or_replace_a_dangling_final_link() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let temp = tempfile::tempdir().unwrap();
+            let root = root(&temp);
+            private_directory(&root, true).unwrap();
+            symlink("missing-control", SqliteControlStore::path(&root)).unwrap();
+            assert!(
+                SqliteControlStore::create(
+                    &root,
+                    &id("synthetic-link-installation"),
+                    DesiredUpdates::Paused,
+                )
+                .is_err()
+            );
+            assert!(
+                fs::symlink_metadata(SqliteControlStore::path(&root))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn control_create_preserves_a_foreign_final_sidecar_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        let foreign = root.join("control.db-wal");
+        fs::create_dir(&foreign).unwrap();
+        assert!(
+            SqliteControlStore::create(
+                &root,
+                &id("synthetic-sidecar-node"),
+                DesiredUpdates::Paused,
+            )
+            .is_err()
+        );
+        assert!(foreign.is_dir());
+        assert!(!root.join("control.db.creating.intent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_create_intent_read_does_not_follow_a_dangling_record_link() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        let _lease = ControlHandleLease::try_acquire_for_create(&root).unwrap();
+        let lock = ExclusiveGuard::try_acquire(&root, LockKind::ControlCreate).unwrap();
+        drop(lock);
+        symlink("missing-intent", root.join("control.db.creating.intent")).unwrap();
+        assert!(SqliteControlStore::read_create_intent(&root).is_err());
+        assert!(
+            fs::symlink_metadata(root.join("control.db.creating.intent"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn control_create_honors_an_existing_create_lock_from_another_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        let mut child = child_command(&root, "hold").spawn().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(lines.any(|line| line.unwrap().contains("ready")));
+        assert!(
+            SqliteControlStore::create(&root, &id("synthetic-contention"), DesiredUpdates::Paused,)
+                .is_err()
+        );
+        assert!(!SqliteControlStore::path(&root).exists());
+        child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        SqliteControlStore::create(&root, &id("synthetic-contention"), DesiredUpdates::Paused)
+            .unwrap();
+    }
+
+    #[test]
+    fn control_create_read_intent_is_strictly_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     }
 }

@@ -180,6 +180,18 @@ impl ControlHandleLease {
         self.guard.root_identity()
     }
 
+    pub(crate) fn child_exists(&self, name: &str) -> PortResult<bool> {
+        self.guard.child_exists(name)
+    }
+
+    pub(crate) fn open_child_read(&self, name: &str) -> PortResult<fs::File> {
+        self.guard.open_child_read(name)
+    }
+
+    pub(crate) fn validate_child(&self, name: &str, file: &fs::File) -> PortResult<()> {
+        self.guard.validate_child(name, file)
+    }
+
     pub(crate) fn publish_child_no_replace(
         &self,
         pending: &str,

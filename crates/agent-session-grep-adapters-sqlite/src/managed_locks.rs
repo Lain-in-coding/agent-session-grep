@@ -24,6 +24,34 @@ use std::{
     sync::{Mutex, OnceLock, TryLockError},
 };
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_PUBLICATION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXIT_PUBLICATION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_publication_sync() {
+    FAIL_PUBLICATION_SYNC.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn exit_next_publication_sync() {
+    EXIT_PUBLICATION_SYNC.with(|slot| slot.set(true));
+}
+
+fn publication_sync_boundary() -> io::Result<()> {
+    #[cfg(test)]
+    if EXIT_PUBLICATION_SYNC.with(|slot| slot.replace(false)) {
+        std::process::exit(87);
+    }
+    #[cfg(test)]
+    if FAIL_PUBLICATION_SYNC.with(|slot| slot.replace(false)) {
+        return Err(io::Error::from(io::ErrorKind::Other));
+    }
+    Ok(())
+}
+
 /// Opaque job identifier, 1..=64 ASCII letters, digits, underscores or hyphens.
 /// Its filename uses hex encoding so Windows case folding cannot merge jobs.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -248,8 +276,17 @@ struct Guard {
 
 impl Guard {
     fn acquire(root: &Path, kind: LockKind, mode: Mode) -> PortResult<Self> {
+        Self::acquire_existing_or_create(root, kind, mode, true)
+    }
+
+    fn acquire_existing_or_create(
+        root: &Path,
+        kind: LockKind,
+        mode: Mode,
+        create: bool,
+    ) -> PortResult<Self> {
         let root = RootDirectory::open(root)?;
-        let file = root.open_lock(&kind, true)?;
+        let file = root.open_lock(&kind, create)?;
         let identity = platform::identity(&file).map_err(io_error)?;
         let claim = Claim::acquire(
             RegistryKey {
@@ -277,6 +314,14 @@ impl Guard {
             return Err(invalid());
         }
         Ok(guard)
+    }
+
+    fn acquire_existing(root: &Path, kind: LockKind, mode: Mode) -> PortResult<Option<Self>> {
+        let directory = RootDirectory::open(root)?;
+        if !platform::child_exists(&directory, &kind.filename()).map_err(io_error)? {
+            return Ok(None);
+        }
+        Self::acquire_existing_or_create(root, kind, mode, false).map(Some)
     }
 }
 
@@ -417,6 +462,14 @@ impl SharedGuard {
         self.0.child_exists(name)
     }
 
+    pub(crate) fn open_child_read(&self, name: &str) -> PortResult<File> {
+        self.0.open_child_read(name)
+    }
+
+    pub(crate) fn validate_child(&self, name: &str, file: &File) -> PortResult<()> {
+        self.0.validate_child(name, file)
+    }
+
     pub(crate) fn publish_child_no_replace(
         &self,
         pending: &str,
@@ -435,6 +488,15 @@ impl ExclusiveGuard {
     /// Callers retain this capability until protected work is complete.
     pub fn try_acquire(root: &Path, kind: LockKind) -> PortResult<Self> {
         Guard::acquire(root, kind, Mode::Exclusive).map(Self)
+    }
+
+    /// Read-only admission may reuse an existing create rendezvous without
+    /// creating one. A missing rendezvous means no durable creation began.
+    pub(crate) fn try_acquire_existing(root: &Path, kind: LockKind) -> PortResult<Option<Self>> {
+        if !matches!(kind, LockKind::ControlCreate) {
+            return Err(invalid());
+        }
+        Guard::acquire_existing(root, kind, Mode::Exclusive).map(|guard| guard.map(Self))
     }
 
     pub fn root_identity(&self) -> RootIdentity {
@@ -661,7 +723,7 @@ pub(crate) mod platform {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        publication_sync_boundary()
     }
 
     pub(super) fn remove_child(root: &RootDirectory, name: &str) -> io::Result<bool> {
@@ -945,6 +1007,7 @@ mod platform {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
+        publication_sync_boundary()?;
         root.file.sync_all()
     }
 
