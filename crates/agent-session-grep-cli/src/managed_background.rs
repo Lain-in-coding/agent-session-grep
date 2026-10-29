@@ -40,6 +40,8 @@ use std::{
 const CHILD: &str = "__managed-background";
 const CADENCE: Duration = Duration::from_secs(1);
 const CONFIRMATION_MS: i64 = 5_000;
+/// One short control step: a status read, a heartbeat or a quiesce check.
+/// Each SQLite lock wait inside any control call keeps its own 250ms allowance.
 const CONTROL_BUDGET: Duration = Duration::from_millis(250);
 // The worker heartbeats once per cadence (one second). A held lock corroborates
 // a live worker only within a bounded multiple of that cadence, so a lock left
@@ -556,13 +558,19 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         let (state, error) = if current.desired_updates == DesiredUpdates::Paused {
             (UpdateState::Paused, Some(BackgroundFailure::Paused))
         } else {
+            // One cycle runs about five sequential control changes before
+            // observation (heartbeat, prior finish, policy, queue, start),
+            // each with a status read and a durable commit. They share this
+            // tick's cadence, as history retention below does. A single
+            // CONTROL_BUDGET for all of them starved every cycle on a slow or
+            // contended disk although no lock was ever held.
             match run_cycle(
                 db,
                 &control,
                 &authority,
                 boot,
                 rounds,
-                tick + CONTROL_BUDGET,
+                tick + CADENCE,
                 &mut pending_cycle,
             ) {
                 Ok(complete) => (
