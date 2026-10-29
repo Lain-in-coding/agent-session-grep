@@ -834,30 +834,32 @@ mod tests {
     fn purge_child_retries_control_handle_admission_then_completes_original_job() {
         let fixture = Fixture::new();
         let held = guard(fixture.root(), LockKind::ControlHandles);
-        std::thread::scope(|scope| {
-            let (started_tx, started_rx) = mpsc::channel();
-            let (result_tx, result_rx) = mpsc::channel();
-            let catalog = &fixture.catalog;
-            let child = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                result_tx.send(run_child(catalog)).unwrap();
-            });
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            // Longer than the old 250ms control admission, still inside the
-            // child's one five-second startup end. No guessed PID is involved.
-            std::thread::sleep(Duration::from_millis(450));
-            let before_release = result_rx.try_recv();
-            drop(held);
-            assert!(
-                matches!(before_release, Err(mpsc::TryRecvError::Empty)),
-                "purge child exited during temporary control contention"
-            );
-            result_rx
-                .recv_timeout(Duration::from_secs(8))
-                .unwrap()
-                .unwrap();
-            child.join().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let catalog = fixture.catalog.clone();
+        // Detached on purpose: run_child is the long-lived purge worker and
+        // keeps retrying an incomplete job. A scoped thread would turn a
+        // missed completion into a hang of the whole test binary instead of
+        // this test's timeout failure.
+        let child = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = result_tx.send(run_child(&catalog));
         });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Longer than the old 250ms control admission, still inside the
+        // child's one five-second startup end. No guessed PID is involved.
+        std::thread::sleep(Duration::from_millis(450));
+        let before_release = result_rx.try_recv();
+        drop(held);
+        assert!(
+            matches!(before_release, Err(mpsc::TryRecvError::Empty)),
+            "purge child exited during temporary control contention"
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("purge child did not complete the original job in time")
+            .unwrap();
+        child.join().unwrap();
         let control = fixture.control();
         let job = control.purge_job_status(&fixture.job).unwrap();
         assert_eq!(job.job.state, PurgeState::Complete);
