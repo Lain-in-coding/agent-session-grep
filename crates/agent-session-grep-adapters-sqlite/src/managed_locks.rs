@@ -177,12 +177,17 @@ impl RootDirectory {
         // Resolve aliases once, then identify the opened directory itself.
         // Windows retains a non-delete-sharing handle; Unix opens children
         // relative to this descriptor, even if the directory is renamed.
-        let path = fs::canonicalize(root).map_err(io_error)?;
-        let file = platform::open_root(&path).map_err(io_error)?;
-        if !file.metadata().map_err(io_error)?.is_dir() {
-            return Err(invalid());
+        let path = fs::canonicalize(root).map_err(lock_io("root", "resolve"))?;
+        let file = platform::open_root(&path).map_err(lock_io("root", "open"))?;
+        if !file
+            .metadata()
+            .map_err(lock_io("root", "metadata"))?
+            .is_dir()
+        {
+            return Err(lock_invalid("root", "kind"));
         }
-        let identity = RootIdentity(platform::identity(&file).map_err(io_error)?);
+        let identity =
+            RootIdentity(platform::identity(&file).map_err(lock_io("root", "identity"))?);
         Ok(Self {
             file,
             #[cfg(windows)]
@@ -191,15 +196,21 @@ impl RootDirectory {
         })
     }
 
-    fn open_lock(&self, kind: &LockKind, create: bool) -> PortResult<File> {
-        let file = platform::open_lock(self, &kind.filename(), create).map_err(io_error)?;
-        let metadata = file.metadata().map_err(io_error)?;
+    /// `site` names the caller in diagnostics only: first acquisition, the
+    /// post-lock recheck or a later currency check.
+    fn open_lock(&self, kind: &LockKind, create: bool, site: &'static str) -> PortResult<File> {
+        let file =
+            platform::open_lock(self, &kind.filename(), create).map_err(lock_io(site, "open"))?;
+        let metadata = file.metadata().map_err(lock_io(site, "metadata"))?;
         // Never truncate unexpected content or touch bytes protected by a
         // Windows mandatory byte-range lock. Hard links are rejected as aliases.
-        if !metadata.is_file() || metadata.len() != 0 {
-            return Err(invalid());
+        if !metadata.is_file() {
+            return Err(lock_invalid(site, "kind"));
         }
-        platform::validate_lock(&file).map_err(io_error)?;
+        if metadata.len() != 0 {
+            return Err(lock_invalid(site, "length"));
+        }
+        platform::validate_lock(&file).map_err(lock_io(site, "links"))?;
         Ok(file)
     }
 }
@@ -236,7 +247,9 @@ impl Claim {
         // it holds no filesystem call or user callback, so contention for an
         // unrelated root or lock kind is never a lock conflict. Only an
         // incompatible holder of this exact key below reports busy.
-        let mut held = registry().lock().map_err(|_| invalid())?;
+        let mut held = registry()
+            .lock()
+            .map_err(|_| lock_invalid("claim", "registry"))?;
         if let Some(previous) = held.get_mut(&key) {
             if previous.mode != Mode::Shared || mode != Mode::Shared || previous.file != file {
                 return Err(busy());
@@ -288,8 +301,8 @@ impl Guard {
         create: bool,
     ) -> PortResult<Self> {
         let root = RootDirectory::open(root)?;
-        let file = root.open_lock(&kind, create)?;
-        let identity = platform::identity(&file).map_err(io_error)?;
+        let file = root.open_lock(&kind, create, if create { "lock" } else { "existing" })?;
+        let identity = platform::identity(&file).map_err(lock_io("acquire", "identity"))?;
         let claim = Claim::acquire(
             RegistryKey {
                 root: root.identity,
@@ -311,16 +324,20 @@ impl Guard {
         // Detect replacement during acquisition without reading lock-file data.
         // A later noncooperating unlink on Unix is outside advisory lock safety;
         // all ASG cleanup/update paths must retain these persistent inodes.
-        let named = guard.root.open_lock(&guard.claim.0.kind, false)?;
-        if platform::identity(&named).map_err(io_error)? != identity {
-            return Err(invalid());
+        let named = guard
+            .root
+            .open_lock(&guard.claim.0.kind, false, "recheck")?;
+        if platform::identity(&named).map_err(lock_io("recheck", "identity"))? != identity {
+            return Err(lock_invalid("recheck", "replaced"));
         }
         Ok(guard)
     }
 
     fn acquire_existing(root: &Path, kind: LockKind, mode: Mode) -> PortResult<Option<Self>> {
         let directory = RootDirectory::open(root)?;
-        if !platform::child_exists(&directory, &kind.filename()).map_err(io_error)? {
+        if !platform::child_exists(&directory, &kind.filename())
+            .map_err(lock_io("existing", "probe"))?
+        {
             return Ok(None);
         }
         Self::acquire_existing_or_create(root, kind, mode, false).map(Some)
@@ -330,74 +347,88 @@ impl Guard {
 impl Guard {
     fn validate_current(&self, path: &Path) -> PortResult<()> {
         if RootIdentity::read(path)? != self.root.identity {
-            return Err(invalid());
+            return Err(lock_invalid("current", "root"));
         }
-        let held = self.file.as_ref().ok_or_else(invalid)?;
-        let named = self.root.open_lock(&self.claim.0.kind, false)?;
-        if platform::identity(held).map_err(io_error)?
-            != platform::identity(&named).map_err(io_error)?
+        let held = self
+            .file
+            .as_ref()
+            .ok_or_else(|| lock_invalid("current", "released"))?;
+        let named = self.root.open_lock(&self.claim.0.kind, false, "current")?;
+        if platform::identity(held).map_err(lock_io("current", "held_identity"))?
+            != platform::identity(&named).map_err(lock_io("current", "named_identity"))?
         {
-            return Err(invalid());
+            return Err(lock_invalid("current", "replaced"));
         }
         Ok(())
     }
 
     fn child_exists(&self, name: &str) -> PortResult<bool> {
         validate_child_name(name)?;
-        platform::child_exists(&self.root, name).map_err(io_error)
+        platform::child_exists(&self.root, name).map_err(lock_io("child", "probe"))
     }
 
     fn open_child_read(&self, name: &str) -> PortResult<File> {
         validate_child_name(name)?;
-        let file = platform::open_child_read(&self.root, name).map_err(io_error)?;
+        let file = platform::open_child_read(&self.root, name).map_err(lock_io("child", "open"))?;
         self.validate_child(name, &file)?;
         Ok(file)
     }
 
     fn validate_child(&self, name: &str, file: &File) -> PortResult<()> {
         validate_child_name(name)?;
-        if !file.metadata().map_err(io_error)?.is_file() {
-            return Err(invalid());
-        }
-        platform::validate_lock(file).map_err(io_error)?;
-        let named = platform::open_child_read(&self.root, name).map_err(io_error)?;
-        platform::validate_lock(&named).map_err(io_error)?;
-        if platform::identity(file).map_err(io_error)?
-            != platform::identity(&named).map_err(io_error)?
+        if !file
+            .metadata()
+            .map_err(lock_io("child", "metadata"))?
+            .is_file()
         {
-            return Err(invalid());
+            return Err(lock_invalid("child", "kind"));
+        }
+        platform::validate_lock(file).map_err(lock_io("child", "links"))?;
+        let named =
+            platform::open_child_read(&self.root, name).map_err(lock_io("child", "reopen"))?;
+        platform::validate_lock(&named).map_err(lock_io("child", "reopen_links"))?;
+        if platform::identity(file).map_err(lock_io("child", "identity"))?
+            != platform::identity(&named).map_err(lock_io("child", "reopen_identity"))?
+        {
+            return Err(lock_invalid("child", "replaced"));
         }
         Ok(())
     }
 
     fn create_child_new(&self, name: &str) -> PortResult<File> {
         validate_child_name(name)?;
-        platform::create_child_new(&self.root, name).map_err(io_error)
+        platform::create_child_new(&self.root, name).map_err(lock_io("child", "create"))
     }
 
     fn remove_child(&self, name: &str) -> PortResult<bool> {
         validate_child_name(name)?;
-        platform::remove_child(&self.root, name).map_err(io_error)
+        platform::remove_child(&self.root, name).map_err(lock_io("child", "remove"))
     }
 
     fn sync_child(&self, name: &str) -> PortResult<()> {
         validate_child_name(name)?;
-        let file = platform::open_lock(&self.root, name, false).map_err(io_error)?;
-        if !file.metadata().map_err(io_error)?.is_file() {
-            return Err(invalid());
+        let file =
+            platform::open_lock(&self.root, name, false).map_err(lock_io("child", "sync_open"))?;
+        if !file
+            .metadata()
+            .map_err(lock_io("child", "sync_metadata"))?
+            .is_file()
+        {
+            return Err(lock_invalid("child", "sync_kind"));
         }
-        platform::validate_lock(&file).map_err(io_error)?;
-        file.sync_all().map_err(io_error)
+        platform::validate_lock(&file).map_err(lock_io("child", "sync_links"))?;
+        file.sync_all().map_err(lock_io("child", "sync"))
     }
 
     fn publish_child_no_replace(&self, pending: &str, final_name: &str) -> PortResult<()> {
         validate_child_name(pending)?;
         validate_child_name(final_name)?;
-        platform::publish_child_no_replace(&self.root, pending, final_name).map_err(io_error)
+        platform::publish_child_no_replace(&self.root, pending, final_name)
+            .map_err(lock_io("child", "publish"))
     }
 
     fn sync_directory(&self) -> PortResult<()> {
-        platform::sync_directory(&self.root).map_err(io_error)
+        platform::sync_directory(&self.root).map_err(lock_io("root", "sync"))
     }
 }
 
@@ -410,7 +441,7 @@ fn validate_child_name(name: &str) -> PortResult<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(invalid());
+        return Err(lock_invalid("child", "name"));
     }
     Ok(())
 }
@@ -575,6 +606,28 @@ fn invalid() -> PortError {
     PortError::SourceIo("managed lock storage or request is invalid".into())
 }
 
+/// Fixed diagnosis for one refused lock step: a static call site and step,
+/// never a path, file name, native identifier or OS message.
+fn lock_invalid(site: &'static str, step: &'static str) -> PortError {
+    PortError::SourceIo(format!(
+        "managed lock storage or request is invalid (site={site}, step={step})"
+    ))
+}
+
+/// Like `io_error`, plus the static site/step and the numeric OS cause (zero
+/// when absent). Busy classification is unchanged.
+fn lock_io(site: &'static str, step: &'static str) -> impl Fn(io::Error) -> PortError {
+    move |error| {
+        let code = error.raw_os_error().unwrap_or(0);
+        match io_error(error) {
+            PortError::SourceIo(_) => PortError::SourceIo(format!(
+                "managed lock storage is unavailable (site={site}, step={step}, code={code})"
+            )),
+            busy => busy,
+        }
+    }
+}
+
 fn io_error(error: io::Error) -> PortError {
     #[cfg(windows)]
     if matches!(error.raw_os_error(), Some(32 | 33)) {
@@ -591,7 +644,7 @@ fn classify_lock_result(result: io::Result<bool>) -> PortResult<()> {
     match result {
         Ok(true) => Ok(()),
         Ok(false) => Err(busy()),
-        Err(error) => Err(io_error(error)),
+        Err(error) => Err(lock_io("acquire", "try_lock")(error)),
     }
 }
 
@@ -1121,7 +1174,7 @@ mod tests {
     // accidentally ended when a different independently opened handle closed.
     fn assert_os_exclusive_busy(root: &Path, kind: &LockKind) {
         let directory = RootDirectory::open(root).unwrap();
-        let contender = directory.open_lock(kind, false).unwrap();
+        let contender = directory.open_lock(kind, false, "test").unwrap();
         assert_busy(classify_lock_result(FileExt::try_lock_exclusive(
             &contender,
         )));
@@ -1465,7 +1518,9 @@ mod tests {
         let pinned = RootDirectory::open(&root).unwrap();
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
-        let file = pinned.open_lock(&LockKind::PolicyOwner, true).unwrap();
+        let file = pinned
+            .open_lock(&LockKind::PolicyOwner, true, "test")
+            .unwrap();
         assert_eq!(
             pinned.identity.control_id(),
             RootIdentity::read(&moved).unwrap().control_id()
