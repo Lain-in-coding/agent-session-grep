@@ -758,7 +758,9 @@ mod tests {
                 DesiredUpdates::Paused,
             )
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // Setup only, not the behavior under test. Hosted Windows runners
+            // have stalled this whole fsync-heavy sequence past ten seconds.
+            let deadline = Instant::now() + Duration::from_secs(60);
             let job = control
                 .with_runtime_deadline(deadline, || {
                     let store =

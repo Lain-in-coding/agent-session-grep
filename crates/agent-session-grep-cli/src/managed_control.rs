@@ -1012,6 +1012,11 @@ mod tests {
         // Two terminals, or an installer and a user, can run first setup on the
         // same data root together. Every participant must adopt the winner's
         // control and catalog instead of reporting a lock or "invalid" error.
+        // Each racer gets a wide end: a hosted runner can stall every fsync for
+        // seconds, and four setups released together share that stall. An
+        // exhausted end reports Busy (covered below); this test checks
+        // convergence. The setup command tests run one setup under its real 5s
+        // budget.
         for _ in 0..6 {
             let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = temp.path().join("private");
@@ -1023,14 +1028,16 @@ mod tests {
                     let db = catalog.to_str().unwrap().to_owned();
                     std::thread::spawn(move || {
                         start.wait();
+                        let began = Instant::now();
                         // Keep the typed cause: macOS reports a bare SourceIo
                         // that the fixed public message cannot explain.
-                        prepare_setup_before(&db, Instant::now() + COMMAND_BUDGET)
+                        let outcome = prepare_setup_before(&db, began + Duration::from_secs(30))
                             .map(|_| ())
                             .map_err(|error| {
                                 let cause = LAST_PORT_ERROR.with(|slot| slot.borrow_mut().take());
                                 format!("{:?} cause={cause:?}", error.0)
-                            })
+                            });
+                        (outcome, began.elapsed().as_millis())
                     })
                 })
                 .collect();
@@ -1038,7 +1045,10 @@ mod tests {
                 .into_iter()
                 .map(|thread| thread.join().unwrap())
                 .collect();
-            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+            assert!(
+                outcomes.iter().all(|(outcome, _)| outcome.is_ok()),
+                "(outcome, elapsed_ms): {outcomes:?}"
+            );
             let control =
                 open_control_before(&root, false, Instant::now() + COMMAND_BUDGET).unwrap();
             drop(ManagedStore::open(&catalog, &control).unwrap());
