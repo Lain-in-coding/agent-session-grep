@@ -70,6 +70,31 @@ struct Fixture {
     child: Option<Child>,
     purge_child: Option<Child>,
 }
+
+/// A bare store read outside a runtime scope has a 250ms window, which a
+/// loaded host can exhaust although nothing holds a lock. Synthetic fixtures
+/// read under one explicit three-second end and retry only typed control or
+/// snapshot contention; any other error still fails the test.
+trait BoundedRead {
+    fn bounded<T>(&self, read: impl FnMut(&Self) -> PortResult<T>) -> T;
+}
+impl BoundedRead for SqliteControlStore {
+    #[track_caller]
+    fn bounded<T>(&self, mut read: impl FnMut(&Self) -> PortResult<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.with_runtime_deadline(deadline, || read(self)) {
+                Ok(value) => return value,
+                Err(
+                    PortError::WriterBusy(_)
+                    | PortError::GenerationMismatch(_)
+                    | PortError::SnapshotChanged(_),
+                ) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("synthetic control read failed: {error:?}"),
+            }
+        }
+    }
+}
 impl Fixture {
     fn new(provider: &str) -> Self {
         Self::selected(provider, |root| {
@@ -216,7 +241,7 @@ impl Fixture {
         }
         self.child = Some(command.spawn().unwrap());
         self.wait(|f| {
-            let worker = f.control().background_status().unwrap().worker;
+            let worker = f.control().bounded(|c| c.background_status()).worker;
             worker.pid_hint == f.child.as_ref().map(Child::id)
         });
     }
@@ -572,10 +597,7 @@ fn real_child_imports_both_providers_and_preserves_original_bytes() {
             ExclusiveGuard::try_acquire(f.db.parent().unwrap(), LockKind::Background),
             Err(PortError::WriterBusy(_))
         ));
-        let sources = ManagedStore::open(&f.db, &f.control())
-            .unwrap()
-            .background_sources(&f.control())
-            .unwrap();
+        let sources = m2_sources(&f);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].latest_receipt.as_ref().unwrap().published);
     }
@@ -592,14 +614,13 @@ fn held_lock_with_offline_worker_record_reports_not_running() {
     f.spawn();
     f.wait(|f| {
         f.control()
-            .background_status()
-            .unwrap()
+            .bounded(|c| c.background_status())
             .worker
             .heartbeat_at_ms
             .is_some()
     });
     f.desired(DesiredUpdates::Stopped);
-    f.wait(|f| f.control().background_status().unwrap().worker.state == UpdateState::Offline);
+    f.wait(|f| f.control().bounded(|c| c.background_status()).worker.state == UpdateState::Offline);
     // The worker records Offline before its process finishes exiting, and a
     // loaded host can still be closing its catalog. Wait, bounded, for the
     // exit so the drain lock below never races the departing worker's lock.
@@ -616,7 +637,7 @@ fn held_lock_with_offline_worker_record_reports_not_running() {
     let drain = ExclusiveGuard::try_acquire(root, LockKind::Background).unwrap();
     let control = f.control();
     assert_eq!(
-        control.background_status().unwrap().worker.state,
+        control.bounded(|c| c.background_status()).worker.state,
         UpdateState::Offline
     );
     let status = successful(run(&f.db, &["background", "status"]));
@@ -634,8 +655,7 @@ fn held_lock_with_live_worker_and_fresh_heartbeat_reports_running() {
     f.spawn();
     f.wait(|f| {
         f.control()
-            .background_status()
-            .unwrap()
+            .bounded(|c| c.background_status())
             .worker
             .heartbeat_at_ms
             .is_some()
@@ -659,7 +679,7 @@ fn pause_restart_new_files_and_append_use_real_control_and_catalog_receipts() {
     f.wait(|f| f.has_text("beforepauseneedle"));
     successful(run(&f.db, &["background", "pause"]));
     f.wait(|f| {
-        f.control().background_status().unwrap().worker.state
+        f.control().bounded(|c| c.background_status()).worker.state
             == agent_session_grep_ports::control::UpdateState::Paused
     });
     let second = f.history.join("second.jsonl");
@@ -673,24 +693,36 @@ fn pause_restart_new_files_and_append_use_real_control_and_catalog_receipts() {
         .write_all(&append)
         .unwrap();
     original.extend(append);
-    let paused_cycle = f.control().background_status().unwrap().next_cycle_seq;
+    let paused_cycle = f
+        .control()
+        .bounded(|c| c.background_status())
+        .next_cycle_seq;
     std::thread::sleep(Duration::from_millis(1200));
     assert_eq!(
-        f.control().background_status().unwrap().next_cycle_seq,
+        f.control()
+            .bounded(|c| c.background_status())
+            .next_cycle_seq,
         paused_cycle
     );
     assert!(!f.has_text("afterresumeneedle"));
     assert!(!f.has_text("appendedneedle"));
     assert!(f.has_text("beforepauseneedle"));
-    let boot = f.control().background_status().unwrap().worker.boot_id;
+    let boot = f
+        .control()
+        .bounded(|c| c.background_status())
+        .worker
+        .boot_id;
     f.terminate();
     f.spawn();
     assert_eq!(
-        f.control().status().unwrap().desired_updates,
+        f.control().bounded(|c| c.status()).desired_updates,
         DesiredUpdates::Paused
     );
     assert_ne!(
-        f.control().background_status().unwrap().worker.boot_id,
+        f.control()
+            .bounded(|c| c.background_status())
+            .worker
+            .boot_id,
         boot
     );
     successful(run(&f.db, &["background", "resume"]));
@@ -735,7 +767,8 @@ fn maintenance_exits_live_and_new_workers_zero_without_changing_intent() {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match control.set_desired_updates(control.status().unwrap().policy.control_seq, desired)
+            match control
+                .set_desired_updates(control.bounded(|c| c.status()).policy.control_seq, desired)
             {
                 Ok(_) => break,
                 Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_))
@@ -748,7 +781,7 @@ fn maintenance_exits_live_and_new_workers_zero_without_changing_intent() {
         }
         loop {
             match control.set_maintenance(
-                control.status().unwrap().policy.control_seq,
+                control.bounded(|c| c.status()).policy.control_seq,
                 &owner,
                 fence.clone(),
             ) {
@@ -782,10 +815,10 @@ fn maintenance_exits_live_and_new_workers_zero_without_changing_intent() {
                 );
                 std::thread::sleep(Duration::from_millis(25));
             }
-            assert_eq!(control.status().unwrap().desired_updates, desired);
-            assert_eq!(control.status().unwrap().policy.maintenance, fence);
+            assert_eq!(control.bounded(|c| c.status()).desired_updates, desired);
+            assert_eq!(control.bounded(|c| c.status()).policy.maintenance, fence);
             assert_eq!(
-                control.background_status().unwrap().worker.state,
+                control.bounded(|c| c.background_status()).worker.state,
                 UpdateState::Offline
             );
             assert!(
@@ -814,11 +847,10 @@ fn malformed_empty_and_missing_root_retain_previous_evidence() {
     // A rejected malformed parse publishes no catalog attempt. Its typed
     // control failure must be observed while the exact old receipt survives.
     f.wait(|f| {
+        let source_id =
+            ControlId::parse(m2_source_for_path(f, &path).binding.source_id.as_str()).unwrap();
         f.control()
-            .source_progress(
-                &ControlId::parse(m2_source_for_path(f, &path).binding.source_id.as_str()).unwrap(),
-            )
-            .unwrap()
+            .bounded(|c| c.source_progress(&source_id))
             .is_some_and(|progress| {
                 progress.error == Some(BackgroundFailure::ScopeUnverified)
                     && progress
@@ -844,14 +876,17 @@ fn duplicate_child_cannot_replace_live_boot_and_query_does_not_start_worker() {
     successful(run(&f.db, &["background", "status"]));
     assert!(
         f.control()
-            .background_status()
-            .unwrap()
+            .bounded(|c| c.background_status())
             .worker
             .boot_id
             .is_none()
     );
     f.spawn();
-    let boot = f.control().background_status().unwrap().worker.boot_id;
+    let boot = f
+        .control()
+        .bounded(|c| c.background_status())
+        .worker
+        .boot_id;
     let duplicate = Command::new(BIN)
         .arg("__managed-background")
         .arg("--db")
@@ -861,7 +896,10 @@ fn duplicate_child_cannot_replace_live_boot_and_query_does_not_start_worker() {
     assert!(!duplicate.status.success());
     assert!(duplicate.stdout.is_empty() && duplicate.stderr.is_empty());
     assert_eq!(
-        f.control().background_status().unwrap().worker.boot_id,
+        f.control()
+            .bounded(|c| c.background_status())
+            .worker
+            .boot_id,
         boot
     );
 }
@@ -875,19 +913,14 @@ fn deleted_source_requires_durable_hold_and_restart_begins_a_new_grace_period() 
     f.wait(|f| f.has_text("deletionretainedneedle"));
     fs::remove_file(&path).unwrap();
     f.wait(|f| {
-        let c = f.control();
-        let sources = ManagedStore::open(&f.db, &c)
-            .unwrap()
-            .background_sources(&c)
-            .unwrap();
-        c.source_progress(
-            &agent_session_grep_ports::control::ControlId::parse(
-                sources[0].binding.source_id.as_str(),
-            )
-            .unwrap(),
+        let sources = m2_sources(f);
+        let source_id = agent_session_grep_ports::control::ControlId::parse(
+            sources[0].binding.source_id.as_str(),
         )
-        .unwrap()
-        .is_some_and(|p| p.confirmation.is_some())
+        .unwrap();
+        f.control()
+            .bounded(|c| c.source_progress(&source_id))
+            .is_some_and(|p| p.confirmation.is_some())
     });
     assert!(f.has_text("deletionretainedneedle"));
     f.terminate();
@@ -948,11 +981,7 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
         f.spawn();
         f.wait(|f| f.has_text("shrinkremovedneedle") && f.has_text("shrinkretainedneedle"));
         let c = f.control();
-        let before = ManagedStore::open(&f.db, &c)
-            .unwrap()
-            .background_sources(&c)
-            .unwrap()
-            .remove(0);
+        let before = m2_sources(&f).remove(0);
         let source_id = ControlId::parse(before.binding.source_id.as_str()).unwrap();
         let rewritten_at = Instant::now();
         fs::write(&path, &retained).unwrap();
@@ -960,7 +989,7 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
         let digest = format!("digest_{:x}", Sha256::digest(fingerprint.as_bytes()));
         let mut first = None;
         f.wait(|f| {
-            let confirmation = c.source_progress(&source_id).unwrap().and_then(|p| p.confirmation);
+            let confirmation = c.bounded(|c| c.source_progress(&source_id)).and_then(|p| p.confirmation);
             if let Some(candidate) = confirmation.filter(|candidate| matches!(&candidate.kind,
                 ConfirmationKind::Rewrite { candidate_digest } if candidate_digest.as_str() == digest)) {
                 first = Some(candidate);
@@ -979,11 +1008,7 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
         assert!(rewritten_at.elapsed() >= Duration::from_secs(5));
         assert!(f.has_text("shrinkretainedneedle"));
         assert!(!f.has_text("shrinksecondremovedneedle"));
-        let after = ManagedStore::open(&f.db, &c)
-            .unwrap()
-            .background_sources(&c)
-            .unwrap()
-            .remove(0);
+        let after = m2_sources(&f).remove(0);
         let receipt = after.latest_receipt.as_ref().unwrap();
         assert!(receipt.published && receipt.cycle_seq > first.first_cycle.get());
         assert_eq!(receipt.worker_boot_id, first.worker_boot_id.as_str());
@@ -1032,7 +1057,7 @@ fn public_start_returns_pipe_eof_while_its_background_worker_remains_alive() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match c.set_desired_updates(
-            c.status().unwrap().policy.control_seq,
+            c.bounded(|c| c.status()).policy.control_seq,
             DesiredUpdates::Stopped,
         ) {
             Ok(_) => break,
@@ -1068,7 +1093,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     let control = SqliteControlStore::open_current_writable(f.db.parent().unwrap()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let barrier = loop {
-        let status = control.status().unwrap();
+        let status = control.bounded(|c| c.status());
         let selections = status
             .policy
             .selections
@@ -1104,10 +1129,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     };
     f.wait(|f| latest_satisfied(f, &barrier));
     let c = f.control();
-    let source = ManagedStore::open(&f.db, &c)
-        .unwrap()
-        .background_sources(&c)
-        .unwrap();
+    let source = m2_sources(&f);
     assert!(
         source[0].latest_receipt.as_ref().unwrap().cycle_seq >= barrier.required_cycle_seq.get()
     );
@@ -1117,7 +1139,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     f.wait(|f| !f.has_text("latestproofneedle"));
     let deadline = Instant::now() + Duration::from_secs(5);
     let after_delete = loop {
-        let status = control.status().unwrap();
+        let status = control.bounded(|c| c.status());
         let result = control.admit_latest(
             status.policy.control_seq,
             LatestRequest {
@@ -1150,10 +1172,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
             .unwrap()
     });
     let c = f.control();
-    let sources = ManagedStore::open(&f.db, &c)
-        .unwrap()
-        .background_sources(&c)
-        .unwrap();
+    let sources = m2_sources(&f);
     let receipt = sources[0].latest_receipt.as_ref().unwrap();
     assert_eq!(receipt.digest, "confirmed_absent");
     assert!(receipt.cycle_seq >= after_delete.required_cycle_seq.get());
@@ -1165,7 +1184,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     // newest cycle can miss every one of them on a slow runner.
     f.wait(|f| {
         let c = f.control();
-        let runtime = c.background_status().unwrap();
+        let runtime = c.bounded(|c| c.background_status());
         (previous_cycle + 1..runtime.next_cycle_seq.get()).any(|seq| {
             agent_session_grep_ports::control::CycleSeq::new(seq)
                 .and_then(|seq| c.cycle(seq))
@@ -1264,19 +1283,36 @@ fn admit_latest_barrier_for(
     }
 }
 
+/// One barrier observation. Typed control or snapshot contention retries
+/// within three seconds; `None` means no definite answer was read, which is
+/// neither proof of freshness nor proof of its absence.
+fn latest_state(f: &Fixture, barrier: &LatestBarrier) -> Option<bool> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let control = f.control();
+        let result = ManagedStore::open(&f.db, &control).and_then(|store| {
+            store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
+                read.latest_satisfied(barrier)
+            })
+        });
+        match result {
+            Ok(satisfied) => return Some(satisfied),
+            Err(
+                PortError::WriterBusy(_)
+                | PortError::GenerationMismatch(_)
+                | PortError::SnapshotChanged(_),
+            ) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+}
 fn latest_satisfied(f: &Fixture, barrier: &LatestBarrier) -> bool {
-    let control = f.control();
-    let Ok(store) = ManagedStore::open(&f.db, &control) else {
-        return false;
-    };
-    store
-        .with_read(
-            &control,
-            RequestIntersection::Selected,
-            Instant::now() + Duration::from_secs(2),
-            |read| read.latest_satisfied(barrier),
-        )
-        .unwrap_or(false)
+    latest_state(f, barrier) == Some(true)
+}
+/// A negative claim needs an actual unsatisfied read. A refused read must not
+/// end a wait for staleness early or pass an assertion that latest is unmet.
+fn latest_unsatisfied(f: &Fixture, barrier: &LatestBarrier) -> bool {
+    latest_state(f, barrier) == Some(false)
 }
 
 #[test]
@@ -1298,11 +1334,7 @@ fn overlapping_parent_and_child_roots_import_one_transcript_for_both_claims() {
         f.wait(|f| f.has_text("overlapneedle"));
         let barrier = admit_latest_barrier(&f, 1);
         f.wait(|f| latest_satisfied(f, &barrier));
-        let control = f.control();
-        let sources = ManagedStore::open(&f.db, &control)
-            .unwrap()
-            .background_sources(&control)
-            .unwrap();
+        let sources = m2_sources(&f);
         assert_eq!(
             sources.len(),
             1,
@@ -1330,8 +1362,7 @@ fn revoked_parent_root_cannot_be_reallowed_by_surviving_child() {
     let parent_locator =
         CanonicalLocator::from_path(&fs::canonicalize(&f.history).unwrap()).unwrap();
     let parent = control
-        .status()
-        .unwrap()
+        .bounded(|c| c.status())
         .policy
         .selections
         .into_iter()
@@ -1363,7 +1394,7 @@ fn offline_selected_root_keeps_partial_coverage_without_blocking_healthy_evidenc
     let barrier = admit_latest_barrier(&f, 1);
     f.wait(|f| latest_satisfied(f, &barrier));
     fs::remove_dir_all(&offline).unwrap();
-    f.wait(|f| !latest_satisfied(f, &barrier));
+    f.wait(|f| latest_unsatisfied(f, &barrier));
     assert!(f.has_text("healthyneedle"));
     // The healthy root keeps publishing even while its own coverage stays
     // partial because another selected root cannot be observed.
@@ -1371,7 +1402,7 @@ fn offline_selected_root_keeps_partial_coverage_without_blocking_healthy_evidenc
     appended.extend(claude("healthy-two", "healthyafterneedle"));
     fs::write(&path, appended).unwrap();
     f.wait(|f| f.has_text("healthyafterneedle"));
-    assert!(!latest_satisfied(&f, &barrier));
+    assert!(latest_unsatisfied(&f, &barrier));
 }
 
 #[test]
@@ -1479,7 +1510,7 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
     let _link = RejectedDirectoryLink::new(f.history.join("rejected-link"), &rejected_target);
     // The refused sibling makes only the parent discovery incomplete. Its
     // absence must not turn the independently complete child into a failed root.
-    f.wait(|f| !latest_satisfied(f, &all));
+    f.wait(|f| latest_unsatisfied(f, &all));
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
     fs::write(&path, &replacement).unwrap();
     fs::File::options()
@@ -1488,43 +1519,38 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
         .unwrap()
         .set_modified(modified)
         .unwrap();
-    f.wait(|f| f.has_held_receipt());
-    assert!(f.has_text("childbeforexneedle"));
-    let sources = {
-        let control = f.control();
-        ManagedStore::open(&f.db, &control)
-            .unwrap()
-            .background_sources(&control)
-            .unwrap()
-    };
+    let sources = m2_sources(&f);
     assert_eq!(sources.len(), 1);
     assert_eq!(
         sources[0].binding.root_identity,
         parent.selections[0].root_identity.as_str()
     );
-    let progress = f
-        .control()
-        .source_progress(
-            &agent_session_grep_ports::control::ControlId::parse(
-                sources[0].binding.source_id.as_str(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-    let confirmation = progress.confirmation.unwrap();
+    let source_id =
+        agent_session_grep_ports::control::ControlId::parse(sources[0].binding.source_id.as_str())
+            .unwrap();
+    // The held catalog receipt commits before the control acknowledgement
+    // that records its confirmation, and a failed cycle clears that pending
+    // confirmation; wait for both rather than reading once in between.
+    let confirmation = || {
+        f.control()
+            .bounded(|c| c.source_progress(&source_id))
+            .and_then(|progress| progress.confirmation)
+    };
+    f.wait(|f| f.has_held_receipt() && confirmation().is_some());
+    assert!(f.has_text("childbeforexneedle"));
+    let confirmation = confirmation().unwrap();
     assert_eq!(confirmation.root_identity, child_root);
     assert!(matches!(
         confirmation.kind,
         agent_session_grep_ports::control::ConfirmationKind::Rewrite { .. }
     ));
-    assert!(!latest_satisfied(&f, &child));
-    assert!(!latest_satisfied(&f, &parent));
+    assert!(latest_unsatisfied(&f, &child));
+    assert!(latest_unsatisfied(&f, &parent));
 
     f.wait(|f| f.has_text("childafterxxneedle") && latest_satisfied(f, &child));
     assert!(!f.has_text("childbeforexneedle"));
-    assert!(!latest_satisfied(&f, &parent));
-    assert!(!latest_satisfied(&f, &all));
+    assert!(latest_unsatisfied(&f, &parent));
+    assert!(latest_unsatisfied(&f, &all));
     assert!(!f.has_text("unselectedlinkneedle"));
     assert_eq!(fs::read(&path).unwrap(), replacement);
     assert_eq!(fs::read(&rejected_path).unwrap(), rejected_bytes);
@@ -1558,10 +1584,7 @@ fn completed_codex_rollout_with_known_environment_metadata_publishes_and_keeps_e
     f.wait(|f| f.has_text("moderncodex"));
     assert!(!f.has_text("environment_context"));
     f.wait(|f| {
-        ManagedStore::open(&f.db, &f.control())
-            .unwrap()
-            .background_sources(&f.control())
-            .unwrap()
+        m2_sources(f)
             .iter()
             .all(|s| s.latest_receipt.as_ref().is_some_and(|r| r.published))
     });
@@ -1608,10 +1631,7 @@ fn codex_rollout_with_equal_usage_deltas_still_publishes() {
     f.spawn();
     f.wait(|f| f.has_text("equalusage"));
     f.wait(|f| {
-        ManagedStore::open(&f.db, &f.control())
-            .unwrap()
-            .background_sources(&f.control())
-            .unwrap()
+        m2_sources(f)
             .iter()
             .all(|s| s.latest_receipt.as_ref().is_some_and(|r| r.published))
     });
@@ -1790,8 +1810,7 @@ fn m2_post_revoke_cycle_attempted(f: &Fixture, now_ms: i64) -> (LatestBarrier, O
 fn m2_selection(f: &Fixture, path: &Path) -> ControlId {
     let locator = CanonicalLocator::from_path(&fs::canonicalize(path).unwrap()).unwrap();
     f.control()
-        .status()
-        .unwrap()
+        .bounded(|c| c.status())
         .policy
         .selections
         .into_iter()
@@ -1934,7 +1953,7 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
             .iter()
             .all(|selection| !selection.discovery_complete)
     );
-    assert!(!latest_satisfied(&f, &pending));
+    assert!(latest_unsatisfied(&f, &pending));
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
 
     m2_add_selection(&f, "workbuddy", &metadata);
@@ -1949,12 +1968,12 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
     let (withdrawn, cycle) = m2_post_revoke_cycle_attempted(&f, 3);
     assert_eq!(cycle.state, CycleState::Partial);
-    assert!(!latest_satisfied(&f, &withdrawn));
+    assert!(latest_unsatisfied(&f, &withdrawn));
     f.desired(DesiredUpdates::Paused);
     f.terminate();
     f.spawn();
     assert_eq!(
-        f.control().status().unwrap().desired_updates,
+        f.control().bounded(|c| c.status()).desired_updates,
         DesiredUpdates::Paused
     );
     assert!(f.has_text("wbindependentoriginalneedle"));
@@ -1993,7 +2012,7 @@ fn m2_workbuddy_successful_metadata_receipt_does_not_complete_missing_cloud_or_o
                 .all(|selection| !selection.discovery_complete)
         );
         assert!(
-            !latest_satisfied(&f, &barrier),
+            latest_unsatisfied(&f, &barrier),
             "metadata success cannot invent missing local/cloud originals"
         );
         let stats = m2_read(&f, |read| read.stats(&ProjectionQuery::default(), 16));
@@ -2117,14 +2136,14 @@ fn m2_dsh_highest_generation_future_refusal_and_restart_keep_one_original() {
     .unwrap();
     let blocked = admit_latest_barrier(&f, 102);
     let (blocked, _) = m2_cycle_attempted(&f, &blocked);
-    assert!(!latest_satisfied(&f, &blocked));
+    assert!(latest_unsatisfied(&f, &blocked));
     assert!(f.has_text("dshcanonicaloriginalneedle"));
     assert!(!f.has_text("dshfuturemustnotpublishneedle"));
     f.terminate();
     f.spawn();
     let restarted = admit_latest_barrier(&f, 103);
     let (restarted, _) = m2_cycle_attempted(&f, &restarted);
-    assert!(!latest_satisfied(&f, &restarted));
+    assert!(latest_unsatisfied(&f, &restarted));
     assert_eq!(
         m2_hits(&f, "dshcanonicaloriginalneedle")[0]
             .projection
@@ -2340,7 +2359,7 @@ fn m2_antigravity_full_and_database_transition_is_atomic_and_excludes_mirrors() 
     fs::write(&full, partial).unwrap();
     let blocked = admit_latest_barrier(&f, 106);
     let (blocked, _) = m2_cycle_attempted(&f, &blocked);
-    assert!(!latest_satisfied(&f, &blocked));
+    assert!(latest_unsatisfied(&f, &blocked));
     assert!(f.has_text("agfulloriginalneedle"));
     assert!(!f.has_text("agdatabaseoriginalneedle"));
     fs::write(&full, &original).unwrap();
@@ -2468,7 +2487,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     fs::write(&source, &torn).unwrap();
     let pending = admit_latest_barrier(&f, 201);
     let (pending, _) = m2_cycle_attempted(&f, &pending);
-    assert!(!latest_satisfied(&f, &pending));
+    assert!(latest_unsatisfied(&f, &pending));
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
     assert!(!m2_receipt_current(&f, &source));
@@ -2478,7 +2497,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     fs::write(&source, &corrupt).unwrap();
     let failed = admit_latest_barrier(&f, 202);
     let (failed, _) = m2_cycle_attempted(&f, &failed);
-    assert!(!latest_satisfied(&f, &failed));
+    assert!(latest_unsatisfied(&f, &failed));
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
     assert_eq!(fs::read(&source).unwrap(), corrupt);
@@ -2556,9 +2575,9 @@ fn m2_antigravity_full_absence_requires_new_boot_grace_before_database_fallback(
             .iter()
             .find(|s| s.binding.source_path == locator.as_str())
             .is_some_and(|s| {
+                let source_id = ControlId::parse(s.binding.source_id.as_str()).unwrap();
                 f.control()
-                    .source_progress(&ControlId::parse(s.binding.source_id.as_str()).unwrap())
-                    .unwrap()
+                    .bounded(|c| c.source_progress(&source_id))
                     .is_some_and(|p| p.confirmation.is_some())
             })
     };
@@ -2672,7 +2691,10 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
             .unwrap();
         let barrier = admit_latest_barrier(&f, 221 + index);
         let _ = m2_cycle_attempted(&f, &barrier);
-        let progress = f.control().source_progress(&source_id).unwrap().unwrap();
+        let progress = f
+            .control()
+            .bounded(|c| c.source_progress(&source_id))
+            .unwrap();
         if let Some(current) = progress.confirmation {
             assert!(matches!(
                 current.kind,
@@ -2768,7 +2790,7 @@ fn m2_zcode_unknown_part_keeps_child_until_complete_graph_confirms_removal() {
     let wal_partial = fs::read(&wal).unwrap();
     let partial = admit_latest_barrier(&f, 231);
     let (partial, _) = m2_cycle_attempted(&f, &partial);
-    assert!(!latest_satisfied(&f, &partial));
+    assert!(latest_unsatisfied(&f, &partial));
     assert!(f.has_text("zcoderetainedchildneedle"));
     assert!(!f.has_text("zcodeunknownmustnotpublishneedle"));
     assert_eq!(fs::read(&database).unwrap(), db_partial);
@@ -2848,7 +2870,11 @@ fn transient_control_writer_does_not_end_background_lifetime_or_lose_next_update
     fs::write(&path, &original).unwrap();
     f.spawn();
     f.wait(|f| f.has_text("controlcontentionoriginalneedle"));
-    let old_boot = f.control().background_status().unwrap().worker.boot_id;
+    let old_boot = f
+        .control()
+        .bounded(|c| c.background_status())
+        .worker
+        .boot_id;
     let contender = Connection::open(SqliteControlStore::path(f.db.parent().unwrap())).unwrap();
     contender.execute_batch("BEGIN IMMEDIATE").unwrap();
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2866,7 +2892,10 @@ fn transient_control_writer_does_not_end_background_lifetime_or_lose_next_update
     contender.execute_batch("ROLLBACK").unwrap();
     f.wait(|f| f.has_text("controlcontentionnextneedle"));
     assert_eq!(
-        f.control().background_status().unwrap().worker.boot_id,
+        f.control()
+            .bounded(|c| c.background_status())
+            .worker
+            .boot_id,
         old_boot
     );
     assert!(f.has_text("controlcontentionoriginalneedle"));
