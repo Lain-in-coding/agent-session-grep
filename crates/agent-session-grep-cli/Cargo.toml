@@ -85,7 +85,7 @@ getrandom = "0.4"
 
 [dev-dependencies]
 # Synthetic DSH fixtures use the same bounded decoder version as the adapter.
-zstd = { version = "=0.13.3", default-features = false }
+zstd = { version = "=0.14.3", default-features = false }
 # default-features = false 与 adapters-sqlite 保持一致,避免 test 图的特性
 # 统一把 cache/ffi-sqlite-wasm-rs 重新拉回来。
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
