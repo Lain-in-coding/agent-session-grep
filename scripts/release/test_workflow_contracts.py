@@ -910,9 +910,11 @@ class InstalledCommandControlTests(unittest.TestCase):
                 # Windows product binary on the other quality-matrix platforms.
                 code = 17 if index == failure else 0
                 # Exercise a real child exit; run_main clears os.environ,
-                # so restore only the Windows process startup variables.
+                # so pass an explicit environment: empty on Unix, and only the
+                # process startup variables that a Windows child needs.
                 probe_kwargs = {**kwargs, "stdin": subprocess.DEVNULL,
                                 "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                startup = {}
                 if os.name == "nt":
                     startup = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
                                "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
@@ -920,8 +922,8 @@ class InstalledCommandControlTests(unittest.TestCase):
                                "PYTHONHOME": sys.prefix,
                                "TEMP": os.environ.get("TEMP", ""),
                                "TMP": os.environ.get("TMP", "")}
-                    startup.update(kwargs.get("env") or {})
-                    probe_kwargs["env"] = startup
+                startup.update(kwargs.get("env") or {})
+                probe_kwargs["env"] = startup
                 return real_run([sys.executable, "-c", f"raise SystemExit({code})"], **probe_kwargs)
 
             with self.subTest(failed_command=failure), patch("subprocess.run", side_effect=synthetic_native):
@@ -949,6 +951,7 @@ class InstalledCommandControlTests(unittest.TestCase):
                     calls.append((argv, kwargs))
                     probe_kwargs = {**kwargs, "stdin": subprocess.DEVNULL,
                                     "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                    startup = {}
                     if os.name == "nt":
                         startup = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
                                    "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
@@ -956,8 +959,8 @@ class InstalledCommandControlTests(unittest.TestCase):
                                    "PYTHONHOME": sys.prefix,
                                    "TEMP": os.environ.get("TEMP", ""),
                                    "TMP": os.environ.get("TMP", "")}
-                        startup.update(kwargs.get("env") or {})
-                        probe_kwargs["env"] = startup
+                    startup.update(kwargs.get("env") or {})
+                    probe_kwargs["env"] = startup
                     return real_run([sys.executable, "-c", f"raise SystemExit({17 if index == failure else 0})"], **probe_kwargs)
 
                 with contextlib.chdir(directory), patch("subprocess.run", side_effect=synthetic_script):
