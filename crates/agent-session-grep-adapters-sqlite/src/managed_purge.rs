@@ -415,6 +415,53 @@ fn retry_control_before<T>(
     }
 }
 
+/// Every control CAS expects the control_seq read just before it, and a live
+/// worker advances that sequence on each heartbeat without changing policy.
+/// Losing that race is not policy drift: retry within the same slice while
+/// `unchanged` still reads this owner's policy and job. Any real change keeps
+/// the original GenerationMismatch; Busy keeps its existing slice retry.
+fn retry_seq_race_before<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> PortResult<T>,
+    mut unchanged: impl FnMut() -> PortResult<bool>,
+) -> PortResult<T> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    loop {
+        match retry_control_before(deadline, &mut operation) {
+            Err(error @ PortError::GenerationMismatch(_)) => {
+                if !retry_control_before(deadline, &mut unchanged)? {
+                    return Err(error);
+                }
+                check(deadline)?;
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The job still belongs to this runner and, when given, to this exact epoch.
+fn still_owned(
+    control: &SqliteControlStore,
+    owner: &PurgeOwner<'_>,
+    job: &ControlId,
+    epoch: Option<PolicyEpoch>,
+) -> PortResult<bool> {
+    if let Some(epoch) = epoch
+        && control.status()?.policy.policy_epoch != epoch
+    {
+        return Ok(false);
+    }
+    Ok(control.purge_job_status(job)?.owner_nonce.as_ref() == Some(owner.nonce()))
+}
+
+fn epoch_unchanged(control: &SqliteControlStore, epoch: PolicyEpoch) -> PortResult<bool> {
+    Ok(control.status()?.policy.policy_epoch == epoch)
+}
+
 fn acquire(root: &Path, kind: LockKind, deadline: Instant) -> PortResult<ExclusiveGuard> {
     let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
     loop {
@@ -538,17 +585,22 @@ fn run_bounded(
     };
     for job in &report.jobs {
         check(deadline)?;
-        retry_control_before(deadline, || {
-            let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-            let bound = control.bind_control_root(&lock)?;
-            control.claim_purge_job(
-                control.status()?.policy.control_seq,
-                owner,
-                &bound,
-                &job.id,
-                now_ms,
-            )
-        })?;
+        // A claim reclaims any earlier owner, so only the epoch is pinned.
+        retry_seq_race_before(
+            deadline,
+            || {
+                let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
+                let bound = control.bind_control_root(&lock)?;
+                control.claim_purge_job(
+                    control.status()?.policy.control_seq,
+                    owner,
+                    &bound,
+                    &job.id,
+                    now_ms,
+                )
+            },
+            || epoch_unchanged(control, status.policy.policy_epoch),
+        )?;
     }
     let outcome = run_claimed(
         control,
@@ -609,21 +661,30 @@ fn block_jobs(
         if previous.owner_nonce.as_ref() != Some(owner.nonce()) {
             continue;
         }
-        let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-        let bound = control.bind_control_root(&lock)?;
-        let policy = control.status()?.policy;
-        control.advance_purge_job(
-            policy.control_seq,
-            owner,
-            &bound,
-            &job.id,
-            PurgeTransition {
-                state: PurgeState::Blocked,
-                checkpoint: previous.checkpoint.unwrap_or(PurgeCheckpoint::Claimed),
-                failure: Some(reason),
-                verified_epoch: policy.policy_epoch,
-                now_ms,
+        let checkpoint = previous.checkpoint.unwrap_or(PurgeCheckpoint::Claimed);
+        // A block records failure under whatever epoch is current; only the
+        // loss of this job's ownership ends the attempt.
+        retry_seq_race_before(
+            deadline,
+            || {
+                let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
+                let bound = control.bind_control_root(&lock)?;
+                let policy = control.status()?.policy;
+                control.advance_purge_job(
+                    policy.control_seq,
+                    owner,
+                    &bound,
+                    &job.id,
+                    PurgeTransition {
+                        state: PurgeState::Blocked,
+                        checkpoint,
+                        failure: Some(reason),
+                        verified_epoch: policy.policy_epoch,
+                        now_ms,
+                    },
+                )
             },
+            || still_owned(control, owner, &job.id, None),
         )?;
     }
     Ok(())
@@ -637,29 +698,33 @@ fn advance_jobs(
     deadline: Instant,
 ) -> PortResult<()> {
     for job in jobs {
-        retry_control_before(deadline, || {
-            let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-            let bound = control.bind_control_root(&lock)?;
-            let prior = control.purge_job_status(&job.id)?;
-            // A completed control commit can return Busy after its durable
-            // point. Recognize only this exact terminal state/checkpoint; do
-            // not reclaim or repeat a completed job after losing its nonce.
-            if transition.state == PurgeState::Complete
-                && prior.job.state == PurgeState::Complete
-                && prior.checkpoint == Some(transition.checkpoint)
-                && prior.failure.is_none()
-            {
-                return Ok(());
-            }
-            control.advance_purge_job(
-                control.status()?.policy.control_seq,
-                owner,
-                &bound,
-                &job.id,
-                PurgeTransition { ..transition },
-            )?;
-            Ok(())
-        })?;
+        retry_seq_race_before(
+            deadline,
+            || {
+                let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
+                let bound = control.bind_control_root(&lock)?;
+                let prior = control.purge_job_status(&job.id)?;
+                // A completed control commit can return Busy after its durable
+                // point. Recognize only this exact terminal state/checkpoint; do
+                // not reclaim or repeat a completed job after losing its nonce.
+                if transition.state == PurgeState::Complete
+                    && prior.job.state == PurgeState::Complete
+                    && prior.checkpoint == Some(transition.checkpoint)
+                    && prior.failure.is_none()
+                {
+                    return Ok(());
+                }
+                control.advance_purge_job(
+                    control.status()?.policy.control_seq,
+                    owner,
+                    &bound,
+                    &job.id,
+                    PurgeTransition { ..transition },
+                )?;
+                Ok(())
+            },
+            || still_owned(control, owner, &job.id, Some(transition.verified_epoch)),
+        )?;
     }
     Ok(())
 }
@@ -700,13 +765,23 @@ fn run_claimed(
             intent.state == agent_session_grep_ports::control::RevocationState::AwaitingDrain
         })
     {
-        let policy_owner = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-        control.settle_revocation(
-            control.status()?.policy.control_seq,
-            &policy_owner,
-            &emission,
-            &intent.id,
-            now_ms,
+        // Settlement of an already settled intent is a no-op, so a lost
+        // sequence race is retried while the epoch stands.
+        let epoch = control.status()?.policy.policy_epoch;
+        retry_seq_race_before(
+            deadline,
+            || {
+                let policy_owner =
+                    acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
+                control.settle_revocation(
+                    control.status()?.policy.control_seq,
+                    &policy_owner,
+                    &emission,
+                    &intent.id,
+                    now_ms,
+                )
+            },
+            || epoch_unchanged(control, epoch),
         )?;
     }
     let policy = control.read_policy(RequestIntersection::Selected)?;

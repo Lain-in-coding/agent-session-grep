@@ -1351,6 +1351,96 @@ fn transient_control_writer_is_retried_inside_one_purge_slice_and_claims_only_on
     assert_eq!(fs::read(&f.source_b).unwrap(), source_b);
 }
 
+/// A live worker advances control_seq on every heartbeat without changing
+/// policy. Each purge CAS that loses that race must retry inside its slice
+/// instead of recording a policy change, blocking the job and redoing the
+/// catalog cleanup in a later slice. One run meets the race only sometimes,
+/// so three independent fixtures each run one purge.
+#[test]
+fn concurrent_sequence_only_control_writes_do_not_block_purge() {
+    for run_index in 0..3 {
+        purge_against_sequence_writer(run_index);
+    }
+}
+
+fn purge_against_sequence_writer(run_index: u32) {
+    let f = Fixture::new();
+    let job = f.revoke();
+    f.control
+        .set_desired_updates(current(&f.control), DesiredUpdates::Paused)
+        .unwrap();
+    let epoch = f.control.status().unwrap().policy.policy_epoch;
+    let root = f.root.clone();
+    let (report, writes) = std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let churn = scope.spawn(move || {
+            let control =
+                SqliteControlStore::open_existing_writable(&root, &id("installation")).unwrap();
+            let mut writes = 0_u32;
+            let mut desired = DesiredUpdates::Stopped;
+            // A dropped sender (an unwinding test) also ends the writer.
+            while matches!(
+                stop_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
+                // Paused <-> Stopped changes control_seq, never policy_epoch.
+                let end = Instant::now() + Duration::from_secs(1);
+                let written = control.with_runtime_deadline(end, || {
+                    control.set_desired_updates(control.status()?.policy.control_seq, desired)
+                });
+                match written {
+                    Ok(_) => {
+                        writes += 1;
+                        if writes == 1 {
+                            ready_tx.send(()).unwrap();
+                        }
+                        desired = if desired == DesiredUpdates::Stopped {
+                            DesiredUpdates::Paused
+                        } else {
+                            DesiredUpdates::Stopped
+                        };
+                    }
+                    Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {}
+                    Err(error) => panic!("synthetic sequence writer failed: {error:?}"),
+                }
+                // Twenty times a real heartbeat rate, yet idle long enough for
+                // the purge's 1ms busy allowance to win the writer lock even
+                // under a parallel test load.
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            writes
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let guard = acquire(&f.root, purge_lock_kind().unwrap());
+        let owner = f
+            .control
+            .with_runtime_deadline(deadline(), || {
+                f.control
+                    .bind_purge_owner(&guard, id("sequence-race-owner"))
+            })
+            .unwrap();
+        let report = run(&f.control, &f.catalog, &owner, None, 20, deadline());
+        stop_tx.send(()).unwrap();
+        (report, churn.join().unwrap())
+    });
+    let report = report.unwrap_or_else(|error| {
+        panic!("purge {run_index} failed after {writes} writes: {error:?}")
+    });
+    assert!(report.complete(), "purge {run_index}: {report:?}");
+    assert!(
+        writes > 1,
+        "the sequence writer never overlapped purge {run_index}"
+    );
+    let progress = retry_expected_success(|| f.control.purge_job_status(&job)).unwrap();
+    assert_eq!(progress.job.state, PurgeState::Complete);
+    assert_eq!(progress.job.attempts.get(), 1);
+    assert_eq!(progress.failure, None);
+    let status = retry_expected_success(|| f.control.status()).unwrap();
+    assert_eq!(status.policy.policy_epoch, epoch);
+    assert!(!status.policy.exclusions.is_empty());
+}
+
 #[test]
 fn nested_purge_control_writer_uses_earlier_end_and_preserves_original_job() {
     let f = Fixture::new();
