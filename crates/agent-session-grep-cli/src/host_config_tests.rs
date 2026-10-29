@@ -391,6 +391,40 @@ fn asg_lock_is_os_owned_and_released_without_deleting_lockfile() {
     assert!(f.store.root.join("owner.lock").is_file());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn lock_shared_with_a_forked_child_until_exec_is_waited_out() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    let f = Fixture::new(Host::ClaudeCode, Some("{}"));
+    let held = f.store.lock().unwrap();
+    let (mut forked, signal) = std::io::pipe().unwrap();
+    let fd = signal.as_raw_fd();
+    let mut command = std::process::Command::new("/bin/true");
+    // SAFETY: write and nanosleep are async-signal-safe; nothing allocates or
+    // takes a lock between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            libc::write(fd, b"f".as_ptr().cast(), 1);
+            let pause = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 150_000_000,
+            };
+            libc::nanosleep(&pause, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    // spawn() returns only after exec, so another thread forks, as a
+    // concurrently running test would.
+    let child = std::thread::spawn(move || command.status().unwrap());
+    std::io::Read::read_exact(&mut forked, &mut [0u8; 1]).unwrap();
+    drop(signal);
+    // The child shares the exclusive lock until it execs.
+    drop(held);
+    assert!(f.store.inspect_recovery().unwrap().is_empty());
+    assert!(child.join().unwrap().success());
+}
+
 #[test]
 fn opening_and_inspection_do_not_create_any_files() {
     let f = Fixture::new(Host::ClaudeCode, Some("{}"));

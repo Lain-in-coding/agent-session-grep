@@ -180,6 +180,25 @@ fn lock_error(error: std::fs::TryLockError) -> HostConfigError {
         std::fs::TryLockError::Error(error) => io(error),
     }
 }
+/// A Unix flock belongs to the open file description, and a child forked by
+/// any thread shares it until exec. A lock this process just released can
+/// therefore stay held for that window; under load it lasted up to about 13ms.
+/// Waiting this long separates that from a real holder, which is still Busy.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+fn acquire(
+    file: &File,
+    attempt: fn(&File) -> std::result::Result<(), std::fs::TryLockError>,
+) -> Result<()> {
+    let end = Instant::now() + LOCK_WAIT;
+    loop {
+        match attempt(file) {
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            result => return result.map_err(lock_error),
+        }
+    }
+}
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1206,7 +1225,7 @@ impl HostConfigStore {
             return Err(ErrorCode::Conflict.into());
         }
         let file = platform::open_lock(&path).map_err(io)?;
-        file.try_lock().map_err(lock_error)?;
+        acquire(&file, File::try_lock)?;
         Ok(file)
     }
     /// Register one stdio MCP server. An identical unowned entry is usable,
@@ -1255,7 +1274,7 @@ impl HostConfigStore {
         let lock_path = self.root.join("owner.lock");
         let _lock = if lock_path.exists() {
             let file = platform::open_regular(&lock_path).map_err(io)?;
-            file.try_lock_shared().map_err(lock_error)?;
+            acquire(&file, File::try_lock_shared)?;
             Some(file)
         } else {
             None
