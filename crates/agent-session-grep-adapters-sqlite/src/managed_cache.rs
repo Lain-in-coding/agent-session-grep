@@ -117,8 +117,9 @@ fn emission_admission(
     deadline: Instant,
     mut attempt: impl FnMut() -> std::result::Result<SharedGuard, PortError>,
 ) -> Result<SharedGuard> {
-    // Other roots can briefly reserve the process lock registry. Use only the
-    // cache's existing 50ms busy allowance, within the original deadline.
+    // Another reader or a policy change can briefly hold or be acquiring this
+    // root's emission lock. Use only the cache's existing 50ms busy allowance,
+    // within the original deadline.
     let admission_end = deadline.min(Instant::now() + Duration::from_millis(50));
     loop {
         time_left(deadline)?;

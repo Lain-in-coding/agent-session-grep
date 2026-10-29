@@ -219,9 +219,9 @@ fn missing() -> PortError {
     PortError::NotFound("control state not found".into())
 }
 
-/// A short process-registry reservation can report Busy even for another
-/// private root. Bound admission by the same existing SQLite busy allowance;
-/// a real retirement holder still fails Busy, and no deadline proves drain.
+/// Another thread's short reservation of this root's handle lock can report
+/// Busy. Bound admission by the same existing SQLite busy allowance; a real
+/// retirement holder still fails Busy, and no deadline proves drain.
 fn admit_control_handle(root: &Path, create: bool) -> PortResult<ControlHandleLease> {
     let deadline = runtime_deadline().map_or(Instant::now() + BUSY_TIMEOUT, |end| {
         end.min(Instant::now() + BUSY_TIMEOUT)

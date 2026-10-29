@@ -1,6 +1,7 @@
 //! OS capabilities for cooperating managed-history processes, separate from
 //! the catalog writer lease. Callers own retry/deadline and admission policy.
-//! A try call can also return busy during a brief process-registry reservation.
+//! A try call can also return busy while another thread of this process holds
+//! or is acquiring the same root and lock kind; other keys never cause busy.
 //!
 //! Lock files stay empty and are never removed or replaced, including on Drop.
 //! Every guard owns an independently opened handle. Shared guards cover one
@@ -21,7 +22,7 @@ use std::{
     fs::{self, File},
     io,
     path::Path,
-    sync::{Mutex, OnceLock, TryLockError},
+    sync::{Mutex, OnceLock},
 };
 
 #[cfg(test)]
@@ -231,10 +232,11 @@ struct Claim(RegistryKey);
 
 impl Claim {
     fn acquire(key: RegistryKey, file: PhysicalIdentity, mode: Mode) -> PortResult<Self> {
-        let mut held = registry().try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => busy(),
-            TryLockError::Poisoned(_) => invalid(),
-        })?;
+        // Wait for the in-memory critical section instead of reporting busy:
+        // it holds no filesystem call or user callback, so contention for an
+        // unrelated root or lock kind is never a lock conflict. Only an
+        // incompatible holder of this exact key below reports busy.
+        let mut held = registry().lock().map_err(|_| invalid())?;
         if let Some(previous) = held.get_mut(&key) {
             if previous.mode != Mode::Shared || mode != Mode::Shared || previous.file != file {
                 return Err(busy());
@@ -1125,8 +1127,8 @@ mod tests {
         )));
     }
 
-    // A try call may encounter the process registry's brief reservation. This
-    // is the caller-owned bounded retry contract, not an ownership timeout.
+    // A try call may meet another thread's brief reservation of the same key.
+    // This is the caller-owned bounded retry contract, not an ownership timeout.
     fn acquire<T>(mut attempt: impl FnMut() -> PortResult<T>) -> T {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
