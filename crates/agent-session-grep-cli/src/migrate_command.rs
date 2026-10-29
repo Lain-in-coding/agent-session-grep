@@ -599,10 +599,11 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
                     Some((stored, DesiredUpdates::Paused)) if stored == installation => {
                         paths.validate(root)?;
                         acquire(end, || {
-                            SqliteControlStore::recover_create(
+                            SqliteControlStore::recover_create_with_deadline(
                                 &paths.root,
                                 &installation,
                                 DesiredUpdates::Paused,
+                                end,
                             )
                         })?
                     }
@@ -639,8 +640,13 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
                 fault(Fault::ControlIntent)?;
                 check(end)?;
                 paths.validate(root)?;
-                SqliteControlStore::create(&paths.root, &installation, DesiredUpdates::Paused)
-                    .map_err(port)?
+                SqliteControlStore::create_with_deadline(
+                    &paths.root,
+                    &installation,
+                    DesiredUpdates::Paused,
+                    end,
+                )
+                .map_err(port)?
             }
         };
         acquire(end, || control.finish_create())?;

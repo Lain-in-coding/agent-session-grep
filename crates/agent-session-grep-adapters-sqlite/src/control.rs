@@ -18,6 +18,11 @@ pub const CONTROL_SCHEMA_VERSION: i64 = VERSION;
 const LEGACY_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x41534331;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+/// Whole-creation bound for `create`/`recover_create` without a caller end.
+/// Creation spans the stage build, publication and the verification reads of
+/// the published database, so it cannot use the per-call BUSY_TIMEOUT budget;
+/// each lock wait inside it still does.
+const CREATE_BUDGET: Duration = Duration::from_secs(30);
 const CONTROL_CREATE_PENDING: &str = "control.db.creating";
 const CONTROL_CREATE_INTENT: &str = "control.db.creating.intent";
 const CONTROL_CREATE_INTENT_SCHEMA: &str = "asg.control-create-intent/v2";
@@ -1225,45 +1230,102 @@ impl SqliteControlStore {
 
     /// Creates a fresh database only. The immediate parent must already exist;
     /// a new private_root is made user-only, existing permissions are not changed.
+    /// The whole creation is bounded by CREATE_BUDGET; a caller with its own
+    /// request end uses `create_with_deadline`.
     pub fn create(
         private_root: &Path,
         installation: &ControlId,
         desired: DesiredUpdates,
     ) -> PortResult<Self> {
-        runtime_tick()?;
-        private_directory(private_root, true)?;
-        let handle_lease = admit_control_handle(private_root, true)?;
-        let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
-        control_create::prepare(
+        Self::create_with_deadline(
             private_root,
             installation,
             desired,
-            handle_lease,
-            create_lock,
-            &mut create_fault,
+            Instant::now() + CREATE_BUDGET,
         )
     }
 
     /// Resume an interrupted creation only with its exact durable installation
     /// and initial desired state. An unpublished stage is rebuilt; a creation
-    /// that may have reached the final name is never reset.
+    /// that may have reached the final name is never reset. Bounded like `create`.
     pub fn recover_create(
         private_root: &Path,
         installation: &ControlId,
         desired: DesiredUpdates,
     ) -> PortResult<Self> {
-        runtime_tick()?;
-        private_directory(private_root, false)?;
-        let handle_lease = admit_control_handle(private_root, true)?;
-        let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
-        control_create::recover(
+        Self::recover_create_with_deadline(
             private_root,
             installation,
             desired,
-            handle_lease,
-            create_lock,
-            &mut create_fault,
+            Instant::now() + CREATE_BUDGET,
         )
+    }
+
+    /// `create` bounded by the caller's original deadline. One creation-wide
+    /// deadline also covers the steps after publication. Once the final name
+    /// exists a repeated `create` can only fail, so a transient Busy there
+    /// (a slow read, a concurrent `finish_create`, a vanishing sidecar) is
+    /// retried under that deadline; Busy is returned only when it has passed.
+    /// Lock waits keep the ordinary per-wait allowance.
+    pub fn create_with_deadline(
+        private_root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        Self::with_creation_deadline(deadline, || {
+            runtime_tick()?;
+            private_directory(private_root, true)?;
+            let handle_lease = admit_control_handle(private_root, true)?;
+            let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
+            control_create::prepare(
+                private_root,
+                installation,
+                desired,
+                handle_lease,
+                create_lock,
+                &mut create_fault,
+            )
+        })
+    }
+
+    /// `recover_create` under the caller's original deadline; see
+    /// `create_with_deadline`.
+    pub fn recover_create_with_deadline(
+        private_root: &Path,
+        installation: &ControlId,
+        desired: DesiredUpdates,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        Self::with_creation_deadline(deadline, || {
+            runtime_tick()?;
+            private_directory(private_root, false)?;
+            let handle_lease = admit_control_handle(private_root, true)?;
+            let create_lock = ExclusiveGuard::try_acquire(private_root, LockKind::ControlCreate)?;
+            control_create::recover(
+                private_root,
+                installation,
+                desired,
+                handle_lease,
+                create_lock,
+                &mut create_fault,
+            )
+        })
+    }
+
+    fn with_creation_deadline(
+        deadline: Instant,
+        create: impl FnOnce() -> PortResult<Self>,
+    ) -> PortResult<Self> {
+        let scope = RuntimeDeadlineScope::enter(deadline)?;
+        // No trailing deadline check: a published, verified creation must not
+        // become a retryable Busy result.
+        let result = create();
+        drop(scope);
+        if let Ok(store) = &result {
+            configure_runtime_deadline(&store.conn.borrow())?;
+        }
+        result
     }
 
     /// Read the exact creation intent without changing it. Callers use this
@@ -2013,12 +2075,32 @@ mod control_create {
         hook: &mut dyn FnMut(u8) -> PortResult<()>,
     ) -> PortResult<SqliteControlStore> {
         validate_guard(root, &lease, &create_lock)?;
-        let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
-        store.status()?;
+        let store = after_publication(|| {
+            let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
+            store.status()?;
+            Ok(store)
+        })?;
         drop(create_lock);
         hook(4)?;
-        finish(&store)?;
+        after_publication(|| finish(&store))?;
         Ok(store)
+    }
+
+    /// After publication a repeated create can only fail. Retry a transient
+    /// Busy (slow read, concurrent `finish_create`, vanishing sidecar) under
+    /// the creation deadline instead of reporting a retryable failure for a
+    /// creation that exists; every other error is returned unchanged.
+    fn after_publication<T>(mut step: impl FnMut() -> PortResult<T>) -> PortResult<T> {
+        loop {
+            match step() {
+                Err(PortError::WriterBusy(_))
+                    if runtime_deadline().is_some_and(|end| Instant::now() < end) =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
     }
 
     fn build_and_publish(
@@ -2058,11 +2140,14 @@ mod control_create {
         // is returned only after the complete final database is opened and its
         // records are cleaned or retained fail-closed.
         validate_guard(root, &lease, &create_lock)?;
-        let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
-        store.status()?;
+        let store = after_publication(|| {
+            let store = SqliteControlStore::open_existing_writable(root, &intent.installation)?;
+            store.status()?;
+            Ok(store)
+        })?;
         drop(create_lock);
         hook(4)?;
-        finish(&store)?;
+        after_publication(|| finish(&store))?;
         Ok(store)
     }
 
@@ -7175,6 +7260,19 @@ mod runtime_deadline_tests {
             )
             .is_err()
         );
+        // An expired caller end touches nothing: the stage stays recoverable.
+        assert!(matches!(
+            SqliteControlStore::recover_create_with_deadline(
+                &root,
+                &installation,
+                DesiredUpdates::Paused,
+                Instant::now(),
+            ),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert!(root.join(CONTROL_CREATE_PENDING).exists());
+        assert!(root.join(CONTROL_CREATE_INTENT).exists());
+        assert!(!SqliteControlStore::path(&root).exists());
         let control =
             SqliteControlStore::recover_create(&root, &installation, DesiredUpdates::Paused)
                 .unwrap();
@@ -7870,5 +7968,103 @@ mod control_create_tests {
         private_directory(&root, true).unwrap();
         assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn published_creation_waits_out_a_concurrent_finisher_instead_of_failing() {
+        // A concurrent setup that adopted the published database polls
+        // finish_create. Holding ControlCreate across our finish must not turn
+        // the existing creation into a Busy that a caller would retry into
+        // InvalidRequest.
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = root(&temp);
+        private_directory(&root, true).unwrap();
+        let installation = id("synthetic-contended-finish");
+        let mut holder = None;
+        let store = SqliteControlStore::with_creation_deadline(
+            Instant::now() + Duration::from_secs(30),
+            || {
+                let lease = admit_control_handle(&root, true)?;
+                let lock = ExclusiveGuard::try_acquire(&root, LockKind::ControlCreate)?;
+                let mut hook = |point: u8| -> PortResult<()> {
+                    if point == 4 {
+                        let contended = root.clone();
+                        let (ready, acquired) = std::sync::mpsc::channel();
+                        holder = Some(std::thread::spawn(move || {
+                            let guard =
+                                ExclusiveGuard::try_acquire(&contended, LockKind::ControlCreate)
+                                    .unwrap();
+                            ready.send(()).unwrap();
+                            std::thread::sleep(Duration::from_millis(100));
+                            drop(guard);
+                        }));
+                        acquired.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                    Ok(())
+                };
+                control_create::prepare(
+                    &root,
+                    &installation,
+                    DesiredUpdates::Paused,
+                    lease,
+                    lock,
+                    &mut hook,
+                )
+            },
+        )
+        .expect("a published creation must outlast a concurrent finisher");
+        holder.take().unwrap().join().unwrap();
+        assert_eq!(store.status().unwrap().policy.installation_id, installation);
+        assert!(!root.join(CONTROL_CREATE_INTENT).exists());
+    }
+
+    #[test]
+    fn create_with_an_expired_end_or_earlier_outer_scope_creates_nothing() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let expired = root(&temp);
+        let result = SqliteControlStore::create_with_deadline(
+            &expired,
+            &id("synthetic-expired-create"),
+            DesiredUpdates::Paused,
+            Instant::now(),
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert!(!expired.exists());
+
+        let outer_end = Instant::now() + Duration::from_secs(60);
+        let outer = RuntimeDeadlineScope::enter(outer_end).unwrap();
+        // The earlier outer end has already passed for this nested caller.
+        RUNTIME_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+        let shortened = temp.path().join("outer-expired");
+        let result = SqliteControlStore::create_with_deadline(
+            &shortened,
+            &id("synthetic-outer-expired"),
+            DesiredUpdates::Paused,
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert!(!shortened.exists());
+        drop(outer);
+        assert!(runtime_deadline().is_none());
+    }
+
+    #[test]
+    fn create_inside_an_outer_scope_restores_the_outer_deadline_and_handlers() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let outer_end = Instant::now() + Duration::from_secs(60);
+        let outer = RuntimeDeadlineScope::enter(outer_end).unwrap();
+        let store = SqliteControlStore::create_with_deadline(
+            &root(&temp),
+            &id("synthetic-nested-create"),
+            DesiredUpdates::Paused,
+            outer_end + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(runtime_deadline(), Some(outer_end));
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        assert!(store.status().is_ok());
+        drop(outer);
+        assert!(runtime_deadline().is_none());
+        assert!(store.status().is_ok());
     }
 }
