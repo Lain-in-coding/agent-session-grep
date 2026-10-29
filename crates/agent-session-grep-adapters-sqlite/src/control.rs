@@ -5795,6 +5795,12 @@ mod windows_private {
         fn IsValidSid(sid: *mut c_void) -> i32;
         fn GetLengthSid(sid: *mut c_void) -> u32;
         fn EqualSid(left: *mut c_void, right: *mut c_void) -> i32;
+        fn CreateWellKnownSid(
+            kind: u32,
+            domain: *mut c_void,
+            sid: *mut c_void,
+            size: *mut u32,
+        ) -> i32;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -6046,6 +6052,37 @@ mod windows_private {
             .map_err(|e| private_file_io_at(e, sidecar, "handle_open"))
     }
 
+    /// SQLite creates WAL/SHM/journal sidecars itself, so they receive the
+    /// process token's default owner. For an elevated administrator that is
+    /// BUILTIN\Administrators instead of the user SID, while the inherited DACL
+    /// still grants only the current user. Only this exact well-known owner is
+    /// accepted, and only for sidecars; files ASG creates name the user owner.
+    fn administrators_owner(owner: *mut c_void) -> PortResult<bool> {
+        const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+        // SECURITY_MAX_SID_SIZE is 68 bytes; u32 storage keeps SID alignment.
+        let mut buffer = [0_u32; 17];
+        let mut size = std::mem::size_of_val(&buffer) as u32;
+        // SAFETY: buffer is writable for `size` bytes; a builtin alias needs no
+        // domain SID.
+        if unsafe {
+            CreateWellKnownSid(
+                WIN_BUILTIN_ADMINISTRATORS_SID,
+                ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(private_validation_error(
+                "security_owner_alias",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                true,
+            ));
+        }
+        // SAFETY: owner borrows the live descriptor; buffer now holds a valid SID.
+        Ok(unsafe { EqualSid(owner, buffer.as_mut_ptr().cast()) } != 0)
+    }
+
     fn verify_handle(file: &File, regular_file: bool, sidecar: bool) -> PortResult<()> {
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -6137,7 +6174,8 @@ mod windows_private {
             return Err(private_validation_error("security_acl_missing", 0, sidecar));
         }
         // SAFETY: owner/acl borrow the live descriptor returned by Win32.
-        if unsafe { EqualSid(owner, user.sid()) } == 0 {
+        if unsafe { EqualSid(owner, user.sid()) } == 0 && !(sidecar && administrators_owner(owner)?)
+        {
             return Err(private_validation_error("security_owner", 0, sidecar));
         }
         // SAFETY: ACL borrows the live descriptor returned by Win32.
