@@ -1,0 +1,16 @@
+# cargo-audit project configuration; cargo-audit reads ./.cargo/audit.toml.
+#
+# RUSTSEC-2026-0367, -0368 and -0369 cover zip's extract helpers, fixed only in
+# zip 9.0.0. The CLI pins zip 9.1.0 itself. zip 7.2.0 remains in Cargo.lock
+# only through candle-core 0.10.2 under the optional `semantic-candle`
+# feature, and no candle release accepts zip 9 (0.11.0 requires ^8.6):
+# - release builds use --no-default-features, so candle is never shipped;
+# - candle reads npz/pth archives in memory through by_index/by_name and never
+#   calls ZipArchive::extract or ZipStreamReader::extract;
+# - ASG only mmap-loads model.safetensors through candle.
+# `cargo deny check` still audits the default graph, including the CLI's zip.
+# scripts/release/test_audit_exception.py fails when this reasoning stops
+# holding or when candle no longer needs these ignores.
+
+[advisories]
+ignore = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]

@@ -78,6 +78,13 @@ is verified with `cargo metadata --locked`, and the workflow has read-only
 repository permissions with checkout credential persistence disabled. It has no
 step that uploads repository source or audit artifacts.
 
+`.cargo/audit.toml` ignores exactly three zip extraction advisories
+(RUSTSEC-2026-0367, -0368 and -0369). The affected zip release is reached only
+through the optional `semantic-candle` Candle stack, which release builds never
+enable and which never calls the affected extraction helpers; the CLI's own zip
+dependency is already fixed. `scripts/release/test_audit_exception.py` fails
+when that stops being true or when the exception is no longer needed.
+
 Dependabot checks Cargo and GitHub Actions dependencies weekly. Keep
 `Cargo.lock` committed for all releases. These controls do not generate or
 attest an SBOM, third-party license bundle, provenance, signature, or
