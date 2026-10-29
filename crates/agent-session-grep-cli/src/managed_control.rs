@@ -660,6 +660,11 @@ fn setup_control(
 /// create, which resumes only a reserved, never-activated (pristine) catalog.
 /// Like the original single create, the first attempt is not gated by the
 /// remaining budget; only retries after Busy are.
+///
+/// While create is Busy, a failed open does not show an incompatible catalog:
+/// a concurrent creator holds the lease over a catalog it has not finished.
+/// Expiry then reports Busy; only a create that ran under the lease may
+/// confirm the open failure.
 fn setup_catalog(
     path: &Path,
     control: &SqliteControlStore,
@@ -680,10 +685,12 @@ fn setup_catalog(
         } else {
             None
         };
+        // Every later pass follows a Busy create, so a concurrent creator may
+        // still be building the catalog that failed to open: expiry is Busy.
         if !first_attempt && deadline.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
-            return Err(port(opened.unwrap_or_else(|| {
-                PortError::WriterBusy("control deadline reached".into())
-            })));
+            return Err(port(PortError::WriterBusy(
+                "control deadline reached".into(),
+            )));
         }
         first_attempt = false;
         match ManagedStore::create(path, control, incarnation.clone(), app_clock_ms()) {
@@ -1043,6 +1050,38 @@ mod tests {
                 assert!(!root.join(leftover).exists(), "{leftover}");
             }
         }
+    }
+
+    #[test]
+    fn setup_catalog_reports_busy_while_another_creator_holds_the_lease() {
+        // A concurrent first setup holds the writer lease over a catalog it has
+        // not finished. That unfinished schema must not surface as an
+        // incompatible catalog when this setup's end arrives: the answer is
+        // Busy. With the lease free, create inspects the same file and
+        // confirms the incompatibility.
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        prepare_setup_before(catalog.to_str().unwrap(), Instant::now() + COMMAND_BUDGET).unwrap();
+        // Roll the schema version back to the state a creator leaves after
+        // stamping the application id and before migrating.
+        let raw = rusqlite::Connection::open(&catalog).unwrap();
+        raw.pragma_update(None, "user_version", 0).unwrap();
+        drop(raw);
+        let control = open_control_before(&root, true, Instant::now() + COMMAND_BUDGET).unwrap();
+        let cause = |deadline: Instant| {
+            LAST_PORT_ERROR.with(|slot| slot.borrow_mut().take());
+            assert!(setup_catalog(&catalog, &control, deadline).is_err());
+            LAST_PORT_ERROR
+                .with(|slot| slot.borrow_mut().take())
+                .unwrap()
+        };
+        let lease = agent_session_grep_adapters_sqlite::WriterLease::try_acquire(&root).unwrap();
+        let busy = cause(Instant::now() + Duration::from_millis(600));
+        assert!(busy.starts_with("WriterBusy("), "{busy}");
+        drop(lease);
+        let refused = cause(Instant::now() + COMMAND_BUDGET);
+        assert!(refused.starts_with("SchemaIncompatible("), "{refused}");
     }
 
     #[test]
