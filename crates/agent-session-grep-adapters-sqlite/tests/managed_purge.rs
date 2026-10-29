@@ -1355,15 +1355,24 @@ fn transient_control_writer_is_retried_inside_one_purge_slice_and_claims_only_on
 /// policy. Each purge CAS that loses that race must retry inside its slice
 /// instead of recording a policy change, blocking the job and redoing the
 /// catalog cleanup in a later slice. One run meets the race only sometimes,
-/// so three independent fixtures each run one purge.
+/// and a fast host can finish a purge between two writer ticks, so at least
+/// three and at most eight fixtures each run one purge until a write has
+/// landed inside some purge.
 #[test]
 fn concurrent_sequence_only_control_writes_do_not_block_purge() {
-    for run_index in 0..3 {
-        purge_against_sequence_writer(run_index);
+    let mut overlapped = 0;
+    for run_index in 0..8 {
+        overlapped += purge_against_sequence_writer(run_index);
+        if run_index >= 2 && overlapped > 0 {
+            return;
+        }
     }
+    panic!("the sequence writer never committed inside any purge");
 }
 
-fn purge_against_sequence_writer(run_index: u32) {
+/// Returns how many sequence writes started and committed inside the purge.
+fn purge_against_sequence_writer(run_index: u32) -> u32 {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let f = Fixture::new();
     let job = f.revoke();
     f.control
@@ -1371,13 +1380,16 @@ fn purge_against_sequence_writer(run_index: u32) {
         .unwrap();
     let epoch = f.control.status().unwrap().policy.policy_epoch;
     let root = f.root.clone();
-    let (report, writes) = std::thread::scope(|scope| {
+    let purging = AtomicBool::new(false);
+    let (report, (writes, overlapped)) = std::thread::scope(|scope| {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let purging = &purging;
         let churn = scope.spawn(move || {
             let control =
                 SqliteControlStore::open_existing_writable(&root, &id("installation")).unwrap();
             let mut writes = 0_u32;
+            let mut overlapped = 0_u32;
             let mut desired = DesiredUpdates::Stopped;
             // A dropped sender (an unwinding test) also ends the writer.
             while matches!(
@@ -1386,12 +1398,18 @@ fn purge_against_sequence_writer(run_index: u32) {
             ) {
                 // Paused <-> Stopped changes control_seq, never policy_epoch.
                 let end = Instant::now() + Duration::from_secs(1);
+                let started_inside = purging.load(Ordering::SeqCst);
                 let written = control.with_runtime_deadline(end, || {
                     control.set_desired_updates(control.status()?.policy.control_seq, desired)
                 });
                 match written {
                     Ok(_) => {
                         writes += 1;
+                        // Started after the purge began and committed before
+                        // it returned; earlier or trailing writes prove nothing.
+                        if started_inside && purging.load(Ordering::SeqCst) {
+                            overlapped += 1;
+                        }
                         if writes == 1 {
                             ready_tx.send(()).unwrap();
                         }
@@ -1409,7 +1427,7 @@ fn purge_against_sequence_writer(run_index: u32) {
                 // under a parallel test load.
                 std::thread::sleep(Duration::from_millis(25));
             }
-            writes
+            (writes, overlapped)
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let guard = acquire(&f.root, purge_lock_kind().unwrap());
@@ -1420,7 +1438,9 @@ fn purge_against_sequence_writer(run_index: u32) {
                     .bind_purge_owner(&guard, id("sequence-race-owner"))
             })
             .unwrap();
+        purging.store(true, Ordering::SeqCst);
         let report = run(&f.control, &f.catalog, &owner, None, 20, deadline());
+        purging.store(false, Ordering::SeqCst);
         stop_tx.send(()).unwrap();
         (report, churn.join().unwrap())
     });
@@ -1428,10 +1448,6 @@ fn purge_against_sequence_writer(run_index: u32) {
         panic!("purge {run_index} failed after {writes} writes: {error:?}")
     });
     assert!(report.complete(), "purge {run_index}: {report:?}");
-    assert!(
-        writes > 1,
-        "the sequence writer never overlapped purge {run_index}"
-    );
     let progress = retry_expected_success(|| f.control.purge_job_status(&job)).unwrap();
     assert_eq!(progress.job.state, PurgeState::Complete);
     assert_eq!(progress.job.attempts.get(), 1);
@@ -1439,6 +1455,7 @@ fn purge_against_sequence_writer(run_index: u32) {
     let status = retry_expected_success(|| f.control.status()).unwrap();
     assert_eq!(status.policy.policy_epoch, epoch);
     assert!(!status.policy.exclusions.is_empty());
+    overlapped
 }
 
 #[test]
