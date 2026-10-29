@@ -1048,7 +1048,12 @@ mod tests {
         assert!(run().is_err());
         fs::rename(&destination, destination.with_extension("retained")).unwrap();
         control.create_private_catalog_file(&destination).unwrap();
-        assert!(matches!(run(), Err(PortError::SnapshotChanged(_))));
+        let replaced = run();
+        assert!(
+            matches!(replaced, Err(PortError::SnapshotChanged(_))),
+            "{:?}",
+            replaced.as_ref().err()
+        );
         assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
     }
 }

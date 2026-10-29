@@ -33,15 +33,17 @@ fn run(db: &Path, args: &[&str]) -> Output {
 }
 #[track_caller]
 fn successful(output: Output) -> Value {
+    // Robot error frames carry `error.code` and `error.message`;
+    // `canonical_code` exists only in MCP error data.
+    let error = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .map(|envelope| envelope["error"].clone());
     assert!(
         matches!(output.status.code(), Some(0 | 10)),
-        "CLI failed: exit={:?}, canonical_code={:?}",
+        "CLI failed: exit={:?}, code={:?}, message={:?}",
         output.status.code(),
-        serde_json::from_slice::<Value>(&output.stdout)
-            .ok()
-            .and_then(|envelope| envelope["error"]["canonical_code"]
-                .as_str()
-                .map(str::to_owned))
+        error.as_ref().and_then(|error| error["code"].as_str()),
+        error.as_ref().and_then(|error| error["message"].as_str()),
     );
     serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"].clone()
 }
