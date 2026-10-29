@@ -1665,6 +1665,20 @@ fn m2_sources(
         }
     }
 }
+/// Only typed control or source-snapshot contention may abort a synthetic
+/// latest cycle and be retried with a newly admitted barrier. A selection that
+/// recorded any other failure is a real defect, not load-sensitive scheduling.
+fn m2_transient_abort(cycle: &ObservationCycle) -> bool {
+    use agent_session_grep_ports::control::BackgroundFailure;
+    cycle.selections.iter().all(|selection| {
+        selection.error.is_none_or(|error| {
+            matches!(
+                error,
+                BackgroundFailure::Busy | BackgroundFailure::SourceChanged
+            )
+        })
+    })
+}
 #[track_caller]
 fn m2_cycle_attempted(f: &Fixture, barrier: &LatestBarrier) -> (LatestBarrier, ObservationCycle) {
     let mut barrier = barrier.clone();
@@ -1694,9 +1708,10 @@ fn m2_cycle_attempted(f: &Fixture, barrier: &LatestBarrier) -> (LatestBarrier, O
         let blocked = m2_read_with_retry(deadline, || {
             control.with_runtime_deadline(deadline, || control.barrier(&barrier.id))
         });
+        // Aborting changes scheduling only. Committed discovery proof can still
+        // satisfy this barrier, so the abort itself makes no freshness claim.
         assert_eq!(blocked.state, BarrierState::Blocked);
-        assert!(!latest_satisfied(f, &barrier));
-        aborted.push((
+        let summary = (
             cycle.token.cycle_seq.get(),
             blocked.error,
             cycle
@@ -1712,7 +1727,13 @@ fn m2_cycle_attempted(f: &Fixture, barrier: &LatestBarrier) -> (LatestBarrier, O
                     )
                 })
                 .collect::<Vec<_>>(),
-        ));
+        );
+        assert!(
+            m2_transient_abort(&cycle),
+            "synthetic M2 latest cycle aborted for a non-transient reason: {summary:?}"
+        );
+        eprintln!("synthetic M2 latest cycle aborted transiently: {summary:?}");
+        aborted.push(summary);
         if attempt == 3 {
             break;
         }
@@ -1747,9 +1768,9 @@ fn m2_read_with_retry<T>(deadline: Instant, mut read: impl FnMut() -> PortResult
         }
     }
 }
-fn m2_post_revoke_cycle_attempted(f: &Fixture, now_ms: i64) -> ObservationCycle {
+fn m2_post_revoke_cycle_attempted(f: &Fixture, now_ms: i64) -> (LatestBarrier, ObservationCycle) {
     let barrier = admit_latest_barrier(f, now_ms);
-    m2_cycle_attempted(f, &barrier).1
+    m2_cycle_attempted(f, &barrier)
 }
 fn m2_selection(f: &Fixture, path: &Path) -> ControlId {
     let locator = CanonicalLocator::from_path(&fs::canonicalize(path).unwrap()).unwrap();
@@ -1911,8 +1932,9 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     f.wait(|f| !m2_receipt_current(f, &source));
     assert!(f.has_text("wbindependentoriginalneedle"));
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
-    let withdrawn = m2_post_revoke_cycle_attempted(&f, 3);
-    assert_eq!(withdrawn.state, CycleState::Partial);
+    let (withdrawn, cycle) = m2_post_revoke_cycle_attempted(&f, 3);
+    assert_eq!(cycle.state, CycleState::Partial);
+    assert!(!latest_satisfied(&f, &withdrawn));
     f.desired(DesiredUpdates::Paused);
     f.terminate();
     f.spawn();
