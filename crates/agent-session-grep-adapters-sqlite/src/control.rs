@@ -3512,6 +3512,13 @@ fn private_file_observed(path: &Path, meta: &fs::Metadata, sidecar: bool) -> Por
     }
     #[cfg(not(windows))]
     {
+        // SQLite unlinks WAL/SHM on its last close. An lstat that resolved the
+        // name just before that unlink returns the dying inode with nlink 0.
+        // Like NotFound, this invalidates the attempt; it never proves safety.
+        #[cfg(unix)]
+        if sidecar && std::os::unix::fs::MetadataExt::nlink(meta) == 0 {
+            return Err(validation_changed("sidecar_unlinked", sidecar, 0));
+        }
         let _ = sidecar;
         verify_private(path, meta)
     }
@@ -3530,13 +3537,19 @@ fn private_file_io_at(error: std::io::Error, sidecar: bool, stage: &'static str)
     if (sidecar && error.kind() == std::io::ErrorKind::NotFound)
         || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33 | 303)))
     {
-        PortError::WriterBusy(format!(
-            "private storage changed during validation (stage={stage}, sidecar={}, code={code})",
-            u8::from(sidecar),
-        ))
+        validation_changed(stage, sidecar, code)
     } else {
         private_validation_error(stage, code, sidecar)
     }
+}
+
+/// A retryable refusal: the observed object changed during this validation
+/// attempt. Same content-free shape as `private_validation_error`.
+fn validation_changed(stage: &'static str, sidecar: bool, code: i32) -> PortError {
+    PortError::WriterBusy(format!(
+        "private storage changed during validation (stage={stage}, sidecar={}, code={code})",
+        u8::from(sidecar),
+    ))
 }
 
 fn verify_private(path: &Path, meta: &fs::Metadata) -> PortResult<()> {
@@ -8073,5 +8086,43 @@ mod control_create_tests {
         drop(outer);
         assert!(runtime_deadline().is_none());
         assert!(store.status().is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_unlinked_after_lookup_is_retryable_and_never_proves_safety() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        private_directory(&root, true).unwrap();
+        let wal = root.join("catalog.db-wal");
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&wal)
+                .unwrap()
+        };
+        // SQLite's last close unlinks the WAL after our lstat resolved it: the
+        // observed metadata then describes a private inode with no links.
+        fs::remove_file(&wal).unwrap();
+        let observed = file.metadata().unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::nlink(&observed), 0);
+        assert!(matches!(
+            private_file_observed(&wal, &observed, true),
+            Err(PortError::WriterBusy(ref detail))
+                if detail == "private storage changed during validation (stage=sidecar_unlinked, sidecar=1, code=0)"
+        ));
+        // A database file is never a disappearing sidecar: stay fail-closed.
+        assert!(matches!(
+            private_file_observed(&wal, &observed, false),
+            Err(PortError::Backend(_))
+        ));
     }
 }
