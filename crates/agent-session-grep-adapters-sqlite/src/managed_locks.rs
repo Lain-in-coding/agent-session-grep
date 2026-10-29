@@ -905,6 +905,13 @@ pub(crate) mod platform {
     pub(crate) const NONBLOCK: i32 = FLAGS.2;
     pub(crate) const DIRECTORY: i32 = FLAGS.3;
     pub(crate) const CREATE: i32 = FLAGS.4;
+    #[cfg(target_os = "linux")]
+    const EXCLUSIVE: i32 = 0x80;
+    #[cfg(target_os = "macos")]
+    const EXCLUSIVE: i32 = 0x800;
+    /// Create-or-open passes. Another pass needs the name to vanish between
+    /// two syscalls; lock files are never removed from a live root.
+    const CREATE_PASSES: usize = 8;
 
     unsafe extern "C" {
         fn openat(directory: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
@@ -919,15 +926,39 @@ pub(crate) mod platform {
 
     pub(super) fn open_lock(root: &RootDirectory, name: &str, create: bool) -> io::Result<File> {
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let flags = 2 | NOFOLLOW | CLOEXEC | NONBLOCK | if create { CREATE } else { 0 };
-        // SAFETY: root owns the live directory descriptor; name is NUL terminated,
-        // and mode is supplied for O_CREAT. A successful fresh fd is owned once.
-        let fd = unsafe { openat(root.file.as_raw_fd(), name.as_ptr(), flags, 0o600_u32) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        let open = |extra: i32| -> io::Result<File> {
+            let flags = 2 | NOFOLLOW | CLOEXEC | NONBLOCK | extra;
+            // SAFETY: root owns the live directory descriptor; name is NUL
+            // terminated, and mode is supplied for O_CREAT. A successful fresh
+            // fd is owned once.
+            let fd = unsafe { openat(root.file.as_raw_fd(), name.as_ptr(), flags, 0o600_u32) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a fresh owned descriptor, transferred to File.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        };
+        if !create {
+            return open(0);
         }
-        // SAFETY: openat returned a fresh owned descriptor, transferred to File.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        // Never create-or-open in one call. On macOS, openat with O_CREAT but
+        // without O_EXCL returns a spurious ENOENT to most callers racing the
+        // first creation of one name (golang/go#81246); O_EXCL and plain opens
+        // stay correct. Open the existing file, else create it exclusively,
+        // and reopen when another caller won that creation.
+        let mut passes = 0;
+        loop {
+            match open(0) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                result => return result,
+            }
+            passes += 1;
+            match open(CREATE | EXCLUSIVE) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists && passes < CREATE_PASSES => {}
+                result => return result,
+            }
+        }
     }
 
     pub(super) fn child_exists(root: &RootDirectory, name: &str) -> io::Result<bool> {
@@ -984,10 +1015,6 @@ pub(crate) mod platform {
     }
 
     pub(super) fn create_child_new(root: &RootDirectory, name: &str) -> io::Result<File> {
-        #[cfg(target_os = "linux")]
-        const EXCLUSIVE: i32 = 0x80;
-        #[cfg(target_os = "macos")]
-        const EXCLUSIVE: i32 = 0x800;
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: creates one owned 0600 regular file relative to the pinned
         // directory; O_EXCL/NOFOLLOW never overwrites or follows an existing file.
@@ -1229,6 +1256,34 @@ mod tests {
                     .len(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn racing_first_creations_of_one_lock_name_all_open_it() {
+        // Concurrent first setups on a new private root race to create the
+        // same lock names, and every racer must receive the file. macOS answers
+        // a plain create-or-open openat race with ENOENT (golang/go#81246).
+        const RACERS: usize = 8;
+        for _ in 0..40 {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let directory = std::sync::Arc::new(RootDirectory::open(temp.path()).unwrap());
+            let start = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let directory = directory.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        directory
+                            .open_lock(&LockKind::ControlHandles, true, "test")
+                            .map(drop)
+                    })
+                })
+                .collect();
+            for racer in racers {
+                racer.join().unwrap().unwrap();
+            }
         }
     }
 
