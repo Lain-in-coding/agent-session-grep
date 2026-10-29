@@ -110,7 +110,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let prefix = root.join("installed candidate");
         let catalog = root.join("private/catalog.db");
@@ -694,7 +694,7 @@ fn changed_pointer_and_unbound_catalog_fail_before_spawn() {
 
 #[test]
 fn malformed_shim_request_is_content_free_and_creates_nothing() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = agent_session_grep_testkit::tempdir().unwrap();
     let missing = temporary.path().join("absent");
     let result = Command::new(SHIM)
         .args(["--prefix", "private-input-marker", "--db"])
@@ -709,7 +709,7 @@ fn malformed_shim_request_is_content_free_and_creates_nothing() {
 
 #[test]
 fn public_open_honors_an_earlier_active_runtime_scope_before_package_access() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = agent_session_grep_testkit::tempdir().unwrap();
     let base = temporary.path().canonicalize().unwrap();
     let root = base.join("private");
     let prefix = base.join("missing-package-metadata");

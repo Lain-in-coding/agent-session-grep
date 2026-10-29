@@ -8,7 +8,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(host: Host, initial: Option<&str>) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = root.join(match host {
             Host::Codex => "codex.toml",

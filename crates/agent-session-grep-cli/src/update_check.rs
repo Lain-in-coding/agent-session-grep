@@ -1322,7 +1322,7 @@ mod tests {
     fn helper_success_rejects_files_outside_the_temp_root() {
         use std::io::Write;
         let request = page_request();
-        let directory = tempfile::tempdir().expect("temp dir");
+        let directory = agent_session_grep_testkit::tempdir().expect("temp dir");
         let path = directory.path().join("asg-update-check-file");
         let mut file = File::create(&path).expect("file");
         file.write_all(b"[]").expect("write");

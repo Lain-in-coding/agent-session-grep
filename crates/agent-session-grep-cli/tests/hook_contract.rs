@@ -32,7 +32,7 @@ fn run_hook(db: &std::path::Path, payload: &str, args: &[&str]) -> Output {
 }
 
 fn temp_db(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = agent_session_grep_testkit::tempdir().expect("temp dir");
     let db = dir.path().join(format!("{tag}.db"));
     (dir, db)
 }

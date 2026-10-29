@@ -778,7 +778,7 @@ fn metadata_only_containers_and_legacy_migration_have_no_fallback() {
 
 #[test]
 fn wal_snapshot_remains_stable_while_source_is_replaced() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();

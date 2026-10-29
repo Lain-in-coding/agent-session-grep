@@ -13,7 +13,7 @@ fn persisted_receipt_reopens_and_removes_only_the_owned_node() {
         Host::Antigravity,
         Host::DeepSeekHarness,
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = root.join(match host {
             Host::ClaudeCode => ".claude.json",
@@ -123,7 +123,7 @@ fn assert_native_shape(host: Host, bytes: &[u8], registration: &McpRegistration)
 
 #[test]
 fn exported_zcode_fallback_receipt_preserves_independent_servers_after_reopen_and_remove() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let config = root.join("native-config.json");
     let transactions = root.join("private-transactions");

@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn derive_none_for_non_git_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         assert_eq!(derive_repo_slug(dir.path().to_str().unwrap()), None);
     }
 
@@ -393,7 +393,7 @@ mod tests {
             );
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
 
         // (1) 普通仓（根与子目录）：Some(宿主仓 slug)
         let repo = temp_git_repo("ctx-plain");

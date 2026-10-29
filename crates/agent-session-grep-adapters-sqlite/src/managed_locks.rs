@@ -1148,7 +1148,7 @@ mod tests {
             LockKind::ControlHandles,
             LockKind::HistoryReaders,
         ] {
-            let root = tempfile::tempdir().unwrap();
+            let root = agent_session_grep_testkit::tempdir().unwrap();
             let first = acquire(|| SharedGuard::try_acquire(root.path(), kind.clone()));
             let second = acquire(|| SharedGuard::try_acquire(root.path(), kind.clone()));
             assert_eq!(
@@ -1179,8 +1179,8 @@ mod tests {
 
     #[test]
     fn control_root_token_uses_physical_identity_without_raw_identifiers() {
-        let root = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
         let first = RootIdentity::read(root.path()).unwrap();
         let reopened = RootIdentity::read(&root.path().canonicalize().unwrap()).unwrap();
         let distinct = RootIdentity::read(other.path()).unwrap();
@@ -1198,8 +1198,8 @@ mod tests {
 
     #[test]
     fn kinds_roots_and_job_case_are_independent() {
-        let root = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
         let kinds = [
             LockKind::PolicyOwner,
             LockKind::PolicyEmission,
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn invalid_inputs_have_no_root_or_catalog_side_effects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let missing = root.path().join("missing");
         assert!(ExclusiveGuard::try_acquire(&missing, LockKind::PolicyOwner).is_err());
         assert!(!missing.exists());
@@ -1250,7 +1250,7 @@ mod tests {
 
     #[test]
     fn hard_link_lock_alias_is_rejected_without_modifying_it() {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let target = root.path().join("synthetic-target");
         fs::write(&target, []).unwrap();
         let lock = root.path().join(LockKind::PolicyOwner.filename());
@@ -1264,7 +1264,7 @@ mod tests {
     fn failures_roll_back_claim_and_redact_details() {
         assert_busy(classify_lock_result(Ok(false)));
         assert_busy(classify_lock_result(Err(io::ErrorKind::WouldBlock.into())));
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let guard = acquire(|| ExclusiveGuard::try_acquire(root.path(), LockKind::Background));
         let error = ExclusiveGuard::try_acquire(root.path(), LockKind::Background).unwrap_err();
         for text in [
@@ -1295,7 +1295,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicBool, Ordering},
         };
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let start = Arc::new(Barrier::new(8));
         let acquired = Arc::new(Barrier::new(8));
         let winner = AtomicBool::new(false);
@@ -1347,7 +1347,7 @@ mod tests {
     fn windows_case_alias_and_delete_sharing() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let holder = acquire(|| ExclusiveGuard::try_acquire(root.path(), LockKind::PolicyOwner));
         let alias = PathBuf::from(root.path().as_os_str().to_string_lossy().to_uppercase());
         assert_eq!(holder.root_identity(), RootIdentity::read(&alias).unwrap());
@@ -1387,7 +1387,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_junction_alias_and_final_reparse_rejection() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = agent_session_grep_testkit::tempdir().unwrap();
         let root = parent.path().join("root");
         fs::create_dir(&root).unwrap();
         let alias = parent.path().join("alias");
@@ -1415,7 +1415,7 @@ mod tests {
     #[test]
     #[ignore = "requires Windows Developer Mode or symlink privilege; run explicitly on a capable host"]
     fn windows_final_file_symlink_never_creates_target() {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let target = root.path().join("missing-target");
         let link = root.path().join(LockKind::PolicyOwner.filename());
         // Junction/reparse rejection runs in the ordinary suite. This additional
@@ -1435,7 +1435,7 @@ mod tests {
     #[test]
     fn unix_symlink_root_alias_and_final_lock_rejection() {
         use std::os::unix::fs::symlink;
-        let parent = tempfile::tempdir().unwrap();
+        let parent = agent_session_grep_testkit::tempdir().unwrap();
         let root = parent.path().join("root");
         fs::create_dir(&root).unwrap();
         let alias = parent.path().join("alias");
@@ -1456,7 +1456,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_directory_descriptor_survives_root_rename() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = agent_session_grep_testkit::tempdir().unwrap();
         let root = parent.path().join("root");
         let moved = parent.path().join("moved");
         fs::create_dir(&root).unwrap();
@@ -1566,7 +1566,7 @@ mod tests {
 
     #[test]
     fn competing_process_shared_exclusive_and_crash_release() {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let child = ChildHolder::start(root.path(), "shared");
         let local = acquire(|| SharedGuard::try_acquire(root.path(), LockKind::PolicyEmission));
         assert_busy(ExclusiveGuard::try_acquire(

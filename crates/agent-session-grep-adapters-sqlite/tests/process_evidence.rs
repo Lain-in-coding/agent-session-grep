@@ -44,7 +44,7 @@ fn start_holder(db: &Path) -> Child {
 
 #[test]
 fn production_open_for_write_allows_exactly_one_process() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let mut holder = start_holder(&db);
 
@@ -67,7 +67,7 @@ fn production_open_for_write_allows_exactly_one_process() {
 
 #[test]
 fn killed_holder_releases_production_writer_lease_without_deleting_lock_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let mut holder = start_holder(&db);
     let lock_path = dir.path().join("writer.lock");
@@ -84,7 +84,7 @@ fn killed_holder_releases_production_writer_lease_without_deleting_lock_file() {
 
 #[test]
 fn production_open_recovers_durable_intent_without_changing_catalog_or_generation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
 
     let seed = run("seed", &db);
@@ -132,7 +132,7 @@ fn production_open_recovers_durable_intent_without_changing_catalog_or_generatio
 
 #[test]
 fn stale_generation_intent_fails_closed_on_production_store() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
 
     let stale = run("stale-commit", &db);

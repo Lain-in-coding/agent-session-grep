@@ -116,7 +116,7 @@ fn assert_envelope_shape(frame: &serde_json::Value, ok: bool) {
 
 /// 每个测试用独立临时目录，避免 WAL/SHM 旁文件互相干扰。
 fn temp_db(tag: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let path = dir.path().join(format!("{tag}.db"));
     let s = path.to_string_lossy().into_owned();
     // Read-only CLI commands require an existing catalog. Initialize the empty
@@ -283,7 +283,7 @@ fn run_bare(args: &[&str]) -> Output {
 
 /// Run either freshly built entrypoint without touching a real user's data roots.
 fn run_identity(binary: &str, args: &[&str]) -> Output {
-    let dir = tempfile::tempdir().expect("identity sandbox");
+    let dir = agent_session_grep_testkit::tempdir().expect("identity sandbox");
     let home = dir.path().join("home");
     let out = Command::new(binary)
         .args(args)
@@ -443,7 +443,7 @@ fn semantic_evidence_floor_env_override_is_explicit_and_validated() {
 
 #[test]
 fn migrated_v6_catalog_stays_readable_until_complete_reingest_enables_context() {
-    let dir = tempfile::tempdir().expect("v6 fixture directory");
+    let dir = agent_session_grep_testkit::tempdir().expect("v6 fixture directory");
     let db = dir
         .path()
         .join("migrated-v6-reingest.db")
@@ -1483,7 +1483,7 @@ fn machine_mode_subcommand_help_echoes_request_id() {
 
 #[test]
 fn help_and_version_require_no_db_and_create_no_file() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let parent = dir.path().join("must-not-exist");
     let db = parent.join("catalog.db");
     let db_s = db.to_string_lossy();
@@ -1515,7 +1515,7 @@ fn help_and_version_require_no_db_and_create_no_file() {
 #[test]
 fn identity_flags_preserve_usage_errors_and_missing_doctor_db() {
     let (_store_dir, existing_db) = temp_db("identity-errors");
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let parent = dir.path().join("missing");
     let db = parent.join("catalog.db");
     let db_s = db.to_string_lossy();
@@ -5123,7 +5123,7 @@ fn sync_directory_rejection_is_path_free_and_platform_neutral() {
     // R2.2：sync 传目录 → invalid_request（exit 2）；消息不含路径，展开示例
     // 平台中立（不给 PowerShell-only 的 Get-ChildItem 例子）。robot envelope
     // 与 human stderr 双验证。
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let dir_path = dir.path().to_string_lossy().into_owned();
     let (_dbdir, db) = temp_db("sync-dir");
 
@@ -6095,7 +6095,7 @@ fn mcp_frames(db: &str, inputs: &[serde_json::Value]) -> Vec<serde_json::Value> 
 /// 在一个带隔离 HOME 的临时目录里构造 provider 数据根，让 `sync --discover`
 /// 能找到合成 fixture 而不触碰真实用户目录。
 fn discover_env() -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("tempdir for discover home");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir for discover home");
     let home = dir.path().to_string_lossy().into_owned();
     // provider_discovery_target 读 HOME（Unix）/ USERPROFILE（Windows）。
     std::fs::create_dir_all(dir.path().join(".claude").join("projects"))
@@ -7935,7 +7935,7 @@ fn assert_relocation_private(output: &Output, roots: &[&str]) {
 
 #[test]
 fn relocate_invalid_arguments_never_open_or_create_the_catalog() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("absent.db").to_string_lossy().into_owned();
     let old = dir
         .path()
@@ -8048,7 +8048,7 @@ fn relocate_invalid_arguments_never_open_or_create_the_catalog() {
 
 #[test]
 fn relocate_preview_and_apply_refuse_missing_or_old_catalogs_without_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("absent.db").to_string_lossy().into_owned();
     let old = dir
         .path()
@@ -8661,7 +8661,7 @@ fn relocate_namespace_reservations_do_not_survive_a_failed_source_batch() {
 
 #[test]
 fn relocate_help_capability_human_and_jsonl_surfaces_share_the_cli_contract() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let absent = dir.path().join("absent.db");
     let help = Command::new(BIN)
         .args([

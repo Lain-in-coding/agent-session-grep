@@ -6254,7 +6254,7 @@ mod tests {
         // （用户往往正是在一个 coding-agent 会话里跑它）。旧实现在快照复核处用 `?`
         // 直接返回 source_changed，一个正在增长的文件就作废本次扫完的全部源——
         // 在本机上等于"只要 Claude Code 开着就永远同步不完"。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let growing = dir.path().join("growing.jsonl");
         let stable = dir.path().join("stable.jsonl");
         std::fs::write(&growing, b"{\"a\":1}\n").unwrap();
@@ -6293,7 +6293,7 @@ mod tests {
     fn an_unreadable_source_still_fails_the_sync() {
         // 推迟只适用于"文件正在被写"。源不可读是另一回事，必须照旧上抛，
         // 否则真正的 I/O 故障会被伪装成"稍后重试即可"。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let missing = dir.path().join("gone.jsonl");
         std::fs::write(&missing, b"{\"a\":1}\n").unwrap();
         let snapshots = vec![(missing.clone(), capture(&missing).unwrap())];
@@ -6308,7 +6308,7 @@ mod tests {
 
     #[test]
     fn discover_provider_sources_collects_jsonl_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let nested = dir.path().join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("one.jsonl"), b"fixture").unwrap();
@@ -6324,7 +6324,7 @@ mod tests {
         // opencode 的源是单个 `.db`。旁文件 `opencode.db-wal` / `-shm` 的
         // extension 是 `db-wal` / `db-shm`，精确匹配把它们排除——否则每个 sidecar
         // 都会被当成一个源交给 probe（非 SQLite magic → 报错噪音）。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         std::fs::write(dir.path().join("opencode.db"), b"fixture").unwrap();
         std::fs::write(dir.path().join("opencode.db-wal"), b"fixture").unwrap();
         std::fs::write(dir.path().join("opencode.db-shm"), b"fixture").unwrap();
@@ -6340,7 +6340,7 @@ mod tests {
     fn discover_provider_sources_extension_filter_is_exact() {
         // 扩展名比对是精确相等而非后缀包含：`jsonl` 不得收走 `.json`，
         // `db` 不得收走 `.dbx`。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         std::fs::write(dir.path().join("a.json"), b"fixture").unwrap();
         std::fs::write(dir.path().join("b.dbx"), b"fixture").unwrap();
 
@@ -6351,7 +6351,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_provider_sources_does_not_follow_symlink_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let real_root = dir.path().join("real-root");
         std::fs::create_dir(&real_root).unwrap();
         std::fs::write(real_root.join("hidden.jsonl"), b"fixture").unwrap();
@@ -6393,7 +6393,7 @@ mod tests {
 
     /// 把内容写入临时文件并 capture，再按生产路径的流式分类。
     fn health_of(content: &[u8]) -> JsonlHealth {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("health.jsonl");
         std::fs::write(&path, content).unwrap();
         let snap = capture(&path).unwrap();
@@ -6629,7 +6629,7 @@ mod tests {
         );
         assert_eq!(source.usage_events[0].session_id, session_a);
         assert_eq!(source.usage_events[1].session_id, session_b);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let store =
             SqliteStore::open_for_write(&dir.path().join("catalog.db").to_string_lossy()).unwrap();
         store.commit_source_batches_if_changed(&[source]).unwrap();

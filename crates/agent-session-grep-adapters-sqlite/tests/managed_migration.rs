@@ -87,7 +87,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let legacy_root = temp.path().join("legacy");
         fs::create_dir(&legacy_root).unwrap();
         let history = temp.path().join("history.jsonl");

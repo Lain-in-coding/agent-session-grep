@@ -53,7 +53,7 @@ fn batch(revision: usize) -> SourceBatch {
 }
 impl Fixture {
     fn new(revisions: usize) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let path = temp.path().join("catalog.sqlite");
         let store = SqliteStore::open_for_write(path.to_str().unwrap()).unwrap();
         for revision in 0..revisions {

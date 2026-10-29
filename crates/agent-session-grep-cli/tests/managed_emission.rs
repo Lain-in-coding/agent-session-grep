@@ -35,7 +35,7 @@ fn id(s: &str) -> ControlId {
     ControlId::parse(s).unwrap()
 }
 fn setup() -> (tempfile::TempDir, PathBuf, SqliteControlStore) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let store = SqliteControlStore::create(
         &root,
@@ -488,7 +488,7 @@ fn maintenance_fence_and_missing_control_fail_without_output_or_creation() {
 fn captured_root_mismatch_rejects_parent_before_spawn() {
     let (_temp, root, store) = setup();
     let policy = store.status().unwrap().policy;
-    let other = tempfile::tempdir().unwrap();
+    let other = agent_session_grep_testkit::tempdir().unwrap();
     let wrong = agent_session_grep_adapters_sqlite::managed_locks::RootIdentity::read(other.path())
         .unwrap();
     let failure = managed_emit::emit_frame(
@@ -529,7 +529,7 @@ fn maximum_frame_survives_input_transfer_and_complete_output() {
 
 #[test]
 fn control_frame_has_exact_bytes_and_needs_no_catalog_or_control_root() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let output_path = temp.path().join("control-frame");
     let frame = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
     let result = managed_emit::emit_control_using_for_test(
@@ -666,7 +666,7 @@ fn control_helper_rejects_malformed_cross_protocol_and_incomplete_frames() {
 
 #[test]
 fn control_parent_preserves_exact_cap_and_rejects_oversize_or_expired_before_spawn() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("maximum-control-frame");
     let frame = vec![b' '; MAX_FRAME_BYTES];
     let result = managed_emit::emit_control_using_for_test(

@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn setup_resumes_exact_pending_control_creation_and_preserves_desired() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let catalog = root.join("catalog.db");
         let installation = ControlId::parse("installation_setup_recovery").unwrap();
@@ -843,7 +843,7 @@ mod tests {
     fn setup_refuses_unrecoverable_creation_artifacts_without_catalog_creation() {
         // A publish marker without the final database can never justify
         // rebuilding: the final name may once have held live policy.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let catalog = root.join("catalog.db");
         let installation = ControlId::parse("installation_setup_published").unwrap();
@@ -867,7 +867,7 @@ mod tests {
         );
 
         // An orphan stage has no intent to resume and is never deleted.
-        let orphan = tempfile::tempdir().unwrap();
+        let orphan = agent_session_grep_testkit::tempdir().unwrap();
         let orphan_root = orphan.path().join("private");
         crate::native_autostart::platform::create_private_directory(&orphan_root).unwrap();
         write_creation_record(&orphan_root, "control.db.creating", b"partial");
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn control_open_retries_real_handle_contention_with_original_command_deadline() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let installation = ControlId::parse("synthetic_control_open").unwrap();
         drop(SqliteControlStore::create(&root, &installation, DesiredUpdates::Paused).unwrap());
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn expired_control_open_never_creates_a_root() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("missing");
         assert!(matches!(
             open_control_before(&root, true, Instant::now()),
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn committed_add_and_revoke_commit_once() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let control_root = temp.path().join("private");
         let source = temp.path().join("history");
         std::fs::create_dir(&source).unwrap();

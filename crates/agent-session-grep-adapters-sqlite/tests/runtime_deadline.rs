@@ -72,7 +72,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let selected_root = temp.path().join("synthetic-selected");
         std::fs::create_dir(&selected_root).unwrap();
@@ -310,7 +310,7 @@ fn schema_allowlist_rejects_unknown_version_missing_or_extra_index() {
 
 #[test]
 fn expired_admission_and_scope_do_not_execute_or_create_artifacts() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("missing");
     for result in [
         SqliteControlStore::open_current_read_only_with_deadline(&root, Instant::now()),

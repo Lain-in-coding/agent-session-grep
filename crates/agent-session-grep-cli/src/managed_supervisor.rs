@@ -984,7 +984,7 @@ mod integration_deadline_tests {
     // Actual private control state; these cases never spawn, inspect a package,
     // touch provider histories, or enter the purge helper.
     fn fixture() -> (tempfile::TempDir, Supervisor) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().join("synthetic-installation");
         std::fs::create_dir(&prefix).unwrap();
         let root = temp.path().join("private");

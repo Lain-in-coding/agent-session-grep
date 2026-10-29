@@ -73,7 +73,7 @@ fn version_dir() -> String {
 fn fixture_launcher() -> &'static Path {
     static BIN: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
     &BIN.get_or_init(|| {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let binary = temp.path().join(app_name());
         let output = Command::new("rustc")
             .arg("--edition=2024")
@@ -109,7 +109,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let prefix = root.join("installed candidate");
         let dir = version_dir();

@@ -204,7 +204,7 @@ fn failed_source_commit_keeps_watermark_fingerprint_and_last_good_rows() {
 
 #[test]
 fn interrupted_intent_never_becomes_a_fresh_full_view_after_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db = db.to_str().unwrap().to_string();
 
@@ -271,7 +271,7 @@ fn invariant_clock() -> i64 {
 
 #[test]
 fn budget_trimmed_response_is_not_persisted_as_a_fresh_full_view() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db = db.to_str().unwrap().to_string();
     let store = SqliteStore::open_for_write(&db).unwrap();

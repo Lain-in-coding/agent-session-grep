@@ -37,7 +37,7 @@ fn internal_parser_is_silent_and_rejects_unbounded_or_unknown_input() {
 }
 #[test]
 fn exact_exit_lock_blocks_then_acquires_without_reading_another_windows_lock() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("private");
     private_root(&root);
     private_file(&root.join("exit.lock"), b"");
@@ -61,7 +61,7 @@ fn exact_exit_lock_blocks_then_acquires_without_reading_another_windows_lock() {
 }
 #[test]
 fn replaced_empty_lock_inode_never_proves_original_owner_exit() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("private");
     private_root(&root);
     private_file(&root.join("exit.lock"), b"");
@@ -78,7 +78,7 @@ fn replaced_empty_lock_inode_never_proves_original_owner_exit() {
 }
 #[test]
 fn finite_inventory_preserves_unknown_same_directory_and_provider_bytes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("private");
     private_root(&root);
     private_root(&root.join("nested"));
@@ -97,7 +97,7 @@ fn finite_inventory_preserves_unknown_same_directory_and_provider_bytes() {
 }
 #[test]
 fn changed_and_hardlinked_files_do_not_gain_per_file_authority() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("private");
     private_root(&root);
     private_file(&root.join("payload"), b"original");
@@ -113,7 +113,7 @@ fn changed_and_hardlinked_files_do_not_gain_per_file_authority() {
 }
 #[test]
 fn source_region_even_with_owned_name_never_grants_cleanup_authority() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("private");
     private_root(&root);
     private_file(&root.join("owned.log"), b"source bytes");
@@ -147,7 +147,7 @@ struct PackageFixture {
 }
 impl PackageFixture {
     fn new(tail: bool) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let prefix = base.join("package");
         let root = base.join("data");

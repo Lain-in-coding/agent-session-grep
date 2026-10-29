@@ -4014,7 +4014,7 @@ mod latest_proof_tests {
 
     #[test]
     fn proof_and_source_heads_remain_pinned_across_wal_writes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let path = temp.path().join("catalog.db");
         let writer = Connection::open(&path).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
@@ -4143,7 +4143,7 @@ mod latest_proof_tests {
 
     #[test]
     fn discovery_begin_completion_and_reopen_keep_same_snapshot_semantics() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let path = temp.path().join("catalog.db");
         let writer = Connection::open(&path).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
@@ -4219,7 +4219,7 @@ mod latest_proof_tests {
             managed_locks::{ExclusiveGuard, LockKind},
             managed_store::ManagedStore,
         };
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let catalog = root.join("catalog.db");
         let control = SqliteControlStore::create(

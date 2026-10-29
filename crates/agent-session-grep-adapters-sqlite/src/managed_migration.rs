@@ -951,7 +951,7 @@ mod tests {
             (Fault::Activated, false),
             (Fault::Activated, true),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let source = temp.path().join("legacy.db");
             legacy(&source);
             let control = SqliteControlStore::create(
@@ -1018,7 +1018,7 @@ mod tests {
     }
     #[test]
     fn identity_bound_target_replacement_is_never_recopied() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let source = temp.path().join("legacy.db");
         legacy(&source);
         let control = SqliteControlStore::create(

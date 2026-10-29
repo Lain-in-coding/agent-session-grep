@@ -1837,7 +1837,7 @@ mod admission_tests {
 
     #[test]
     fn transient_registry_busy_uses_same_budget_and_real_exclusive_gate_stays_busy() {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let mut attempts = 0;
         let deadline = Instant::now() + Duration::from_secs(1);
         let held = emission_admission(deadline, || {

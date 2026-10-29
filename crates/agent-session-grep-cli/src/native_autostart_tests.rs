@@ -8,7 +8,7 @@ struct Fixture {
 }
 impl Fixture {
     fn files(kind: NativeKind) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let directory = root.join("isolated-native-config");
         let location = match kind {

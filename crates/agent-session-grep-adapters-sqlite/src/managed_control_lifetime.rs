@@ -933,7 +933,7 @@ mod retirement_deadline_tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let control = SqliteControlStore::create(
             &root,

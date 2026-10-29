@@ -28,7 +28,7 @@ const SMOKE_PROVIDER: &str = env!("CARGO_BIN_EXE_resume-smoke-provider");
 const ADVERSARIAL_SESSION_ID: &str = "ccdd&echo>asg-resume-pwned.txt";
 
 fn temp_db(tag: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let db = dir.path().join(format!("{tag}.db"));
     let db = db.to_str().unwrap().to_string();
     (dir, db)

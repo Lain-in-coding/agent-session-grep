@@ -333,7 +333,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(provider: &'static str) -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = agent_session_grep_testkit::tempdir().unwrap();
         let marker = match provider {
             "claude-code" => ".claude",
             "codex" => ".codex",
@@ -1408,7 +1408,7 @@ fn v17_case_ambiguous_or_unverifiable_provenance_stays_unregistered_and_readable
     for source in [&first, &second, &missing] {
         assert!(store.get(&source.sessions[0]).unwrap().is_some());
     }
-    let destination = tempfile::tempdir().unwrap();
+    let destination = agent_session_grep_testkit::tempdir().unwrap();
     assert!(matches!(
         store.relocation_preview(
             "claude-code",
@@ -2145,7 +2145,7 @@ fn review_retired_location_does_not_block_another_provider() {
 
 #[test]
 fn review_explicit_scan_must_prove_all_unresolved_legacy_native_sessions() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = agent_session_grep_testkit::tempdir().unwrap();
     let path = locator(&temporary.path().join(".codex/a.jsonl"));
     let second_path = locator(&temporary.path().join(".codex/b.jsonl"));
     let sibling_path = locator(&temporary.path().join(".codex/c.jsonl"));

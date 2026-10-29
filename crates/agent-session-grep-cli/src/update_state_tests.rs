@@ -64,7 +64,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = TempDir::new().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().join("owned-install");
         platform::create_private_directory(&prefix).unwrap();
         let catalog = temp.path().join("private-catalog.db");

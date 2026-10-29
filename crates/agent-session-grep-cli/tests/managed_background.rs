@@ -77,7 +77,7 @@ impl Fixture {
         })
     }
     fn selected(provider: &str, prepare: impl FnOnce(&Path) -> PathBuf) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let db = temp.path().join("private").join("catalog.db");
         let history = prepare(temp.path());
         successful(run(&db, &["setup"]));

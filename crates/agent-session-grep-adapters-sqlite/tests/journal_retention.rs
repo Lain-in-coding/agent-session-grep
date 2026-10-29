@@ -277,7 +277,7 @@ fn start_stage_holder(db_arg: &str) -> (Child, String) {
 
 #[test]
 fn preview_reports_scope_fields_and_savings_without_writing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let store = SqliteStore::open_for_write(&db_arg).unwrap();
@@ -364,7 +364,7 @@ fn preview_reports_scope_fields_and_savings_without_writing() {
 #[test]
 fn negligible_terminal_rows_stay_full_and_out_of_the_plan() {
     // 合同 §2：聚合无收益（明细不大于摘要）的 terminal 行保持 full——有约束治理只做减法。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let store = SqliteStore::open_for_write(&db_arg).unwrap();
@@ -425,7 +425,7 @@ fn negligible_terminal_rows_stay_full_and_out_of_the_plan() {
 
 #[test]
 fn soak_200_messages_21_revisions_reports_sizes_and_keeps_semantics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
 
@@ -510,7 +510,7 @@ fn soak_200_messages_21_revisions_reports_sizes_and_keeps_semantics() {
 
 #[test]
 fn killed_process_after_stage_converges_through_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -570,7 +570,7 @@ fn killed_process_after_stage_converges_through_recovery() {
 
 #[test]
 fn concurrent_reader_sees_one_consistent_journal_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -639,7 +639,7 @@ fn concurrent_reader_sees_one_consistent_journal_state() {
 
 #[test]
 fn legacy_v18_rows_migrate_read_and_compact() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -724,7 +724,7 @@ fn legacy_v18_rows_migrate_read_and_compact() {
 
 #[test]
 fn drifted_staged_plan_is_abandoned_without_touching_detail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -794,7 +794,7 @@ fn drifted_staged_plan_is_abandoned_without_touching_detail() {
 
 #[test]
 fn relocation_manifest_detail_is_never_aggregated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let manifest = r#"{"mapping_key":"synthetic","to_key":"synthetic-root"}"#;
@@ -839,7 +839,7 @@ fn relocation_manifest_detail_is_never_aggregated() {
 
 #[test]
 fn unknown_detail_format_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -887,7 +887,7 @@ fn unknown_detail_format_fails_closed() {
 fn unknown_format_on_unresolved_row_still_fails_closed() {
     // 保留合同 §5 对未知 detail_format 无豁免：即使该行是不进计划的
     // 未决（building）行，preview 也不得静默跳过——跳过只适用于本二进制认识的格式。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let store = SqliteStore::open_for_write(&db_arg).unwrap();
@@ -938,7 +938,7 @@ fn unknown_format_on_unresolved_row_still_fails_closed() {
 #[test]
 fn unknown_state_fails_closed_in_preview_without_rewrite() {
     // 未知状态（未来 schema 才会写入的值）同样不得因“该行已聚合”而被跳过。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     {
@@ -1007,7 +1007,7 @@ fn unknown_state_fails_closed_in_preview_without_rewrite() {
 fn apply_rejects_unknown_format_drift_without_rewrite() {
     // apply 路径的未知格式漂移：整事务拒绝、零改写，且 recover 不得把它当漂移
     // “自动放弃”（未知格式必须向上报错，计划保持 staged）。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let store = SqliteStore::open_for_write(&db_arg).unwrap();
@@ -1047,7 +1047,7 @@ fn apply_rejects_unknown_format_drift_without_rewrite() {
 
 #[test]
 fn unresolved_and_conflict_paths_are_unaffected_by_compaction() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let db_arg = db.to_string_lossy().into_owned();
     let store = SqliteStore::open_for_write(&db_arg).unwrap();

@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn initialize_reports_negotiated_version_and_server_info() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         let v = respond(
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn ping_is_allowed_before_initialization() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         let v = respond(&mut server, &request(3, "ping", json!({})));
@@ -1699,7 +1699,7 @@ mod tests {
 
     #[test]
     fn requests_before_initialized_notification_are_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         let v = respond(&mut server, &request(2, "tools/list", json!({})));
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[test]
     fn initialized_notification_is_silent_and_opens_the_gate_after_handshake() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         // 握手先行：initialize 请求之后，initialized 通知才开门闩（Minor-8）。
@@ -1736,7 +1736,7 @@ mod tests {
 
     #[test]
     fn initialized_notification_without_handshake_does_not_open_gate() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         // 未发过 initialize 请求就发 initialized 通知：门闩保持关闭。
@@ -1758,7 +1758,7 @@ mod tests {
     fn notification_without_string_method_is_invalid_request() {
         // 缺 method / method 非字符串的不是合法 notification，必须回 -32600
         // 而非静默丢弃（JSON-RPC 对无效消息的拒绝义务，Minor-8）。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for line in [
@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn initialize_with_non_object_params_is_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         for params in [json!(42), json!(null), json!("x"), json!([])] {
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[test]
     fn non_2_0_jsonrpc_is_invalid_request_everywhere() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for line in [
@@ -1817,7 +1817,7 @@ mod tests {
 
     #[test]
     fn invalid_id_types_are_invalid_request() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for line in [
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn initialize_requires_protocol_version_capabilities_and_client_info() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         let cases = [
@@ -1881,7 +1881,7 @@ mod tests {
 
     #[test]
     fn failed_initialize_does_not_open_gate_via_initialized_notification() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         // 失败握手（params 非对象）：initialize_seen 不得推进。
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn ping_and_tools_list_require_object_or_absent_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for params in [json!([]), json!("x"), json!(5), json!(null)] {
@@ -1921,7 +1921,7 @@ mod tests {
 
     #[test]
     fn initialized_notification_with_non_object_params_is_rejected_and_does_not_open_gate() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         // 成功握手先行。
@@ -1954,7 +1954,7 @@ mod tests {
 
     #[test]
     fn notifications_never_get_a_response() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for method in ["notifications/cancelled", "totally/unknown", "tools/list"] {
@@ -1966,7 +1966,7 @@ mod tests {
 
     #[test]
     fn request_with_explicit_null_id_is_answered() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = fresh(&store);
         let v = respond(
@@ -1979,7 +1979,7 @@ mod tests {
 
     #[test]
     fn malformed_json_yields_parse_error_with_null_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = respond(&mut server, "{ not json");
@@ -1989,7 +1989,7 @@ mod tests {
 
     #[test]
     fn non_object_and_batch_inputs_are_invalid_request() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let batch = format!("[{}]", request(1, "ping", json!({})));
@@ -2002,7 +2002,7 @@ mod tests {
 
     #[test]
     fn unknown_request_method_yields_method_not_found() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = respond(&mut server, &request(5, "foo/bar", json!({})));
@@ -2064,7 +2064,7 @@ mod tests {
 
     #[test]
     fn tools_list_exposes_exactly_the_nine_contract_tools() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = respond(&mut server, &request(6, "tools/list", json!({})));
@@ -2107,7 +2107,7 @@ mod tests {
 
     #[test]
     fn generate_handoff_tool_returns_deterministic_pack_with_evidence() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let message_a = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"h1"]);
         let message_b = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"h2"]);
@@ -2176,7 +2176,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_yields_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "frobnicate", json!({}));
@@ -2186,7 +2186,7 @@ mod tests {
 
     #[test]
     fn missing_required_query_is_invalid_params_with_canonical_data() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "search_sessions", json!({}));
@@ -2197,7 +2197,7 @@ mod tests {
 
     #[test]
     fn get_session_resume_validates_session_id_at_protocol_layer() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let cases = [
@@ -2221,7 +2221,7 @@ mod tests {
 
     #[test]
     fn get_session_resume_returns_fixed_read_only_metadata_shape() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let session_id = "ses_v1_ccdd1234-5678-4abc-8def-001122334455";
@@ -2254,7 +2254,7 @@ mod tests {
 
     #[test]
     fn out_of_schema_parameter_values_are_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let cases = [
@@ -2317,7 +2317,7 @@ mod tests {
             );
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let over_providers: Vec<Value> =
@@ -2414,7 +2414,7 @@ mod tests {
                 .is_none()
         );
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for arguments in [
@@ -2448,7 +2448,7 @@ mod tests {
         // 库内不存在的 slug 后必须是诚实的空页（success + 无 hits），而不是
         // 静默忽略过滤返回全部命中。seeded_store 只提交消息、无会话 repo 身份，
         // 故任何 slug 都不该匹配（"无行 = 未知"，未知不匹配）。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let unfiltered = call(&mut server, "search_sessions", json!({ "query": "hello" }));
@@ -2491,7 +2491,7 @@ mod tests {
         assert_eq!(properties["include_system"]["type"], "boolean");
         assert_eq!(properties["group_by_session"]["type"], "boolean");
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         for arguments in [
@@ -2530,7 +2530,7 @@ mod tests {
     fn search_echoes_non_default_facets_like_the_cli_robot_surface() {
         // CLI（Robot）search 在非默认 facet 时回显 data.facets；MCP 必须一致
         // （audit P1-5）。默认 facet 请求不出现 facets 键，保持输出字节兼容。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -2555,7 +2555,7 @@ mod tests {
 
     #[test]
     fn unknown_extra_property_is_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -2570,7 +2570,7 @@ mod tests {
     fn list_sessions_rejects_zero_limit_and_max_items_at_protocol_layer() {
         // 分层一致性（Minor-7）：与 search_sessions 一样，list_sessions 的
         // limit:0 / max_items:0 在协议层拒（-32602），不落成 App 层 isError 业务帧。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         for arguments in [json!({ "limit": 0 }), json!({ "max_items": 0 })] {
@@ -2626,7 +2626,7 @@ mod tests {
     fn list_sessions_entries_carry_peek_with_first_and_last_user_text() {
         // Peek Bundle 借用（#7，hstry）：每条会话条目附 1 KiB 级分诊预览，
         // 首/尾用户消息按 member 顺序抽取；结构化输出与 content.text 同源。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let first = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-m1"]);
         let middle = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-m2"]);
@@ -2654,7 +2654,7 @@ mod tests {
     fn list_sessions_peek_stays_within_char_and_byte_budget() {
         // 预算常量（PEEK_FIELD_MAX_CHARS / PEEK_MAX_BYTES）在协议边界成立：
         // 宽字符（4 字节/字符）下字符上限会让字节超支，字节闸必须继续截断。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let msg = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-fat-m"]);
         seed_session(
@@ -2688,7 +2688,7 @@ mod tests {
     fn list_sessions_peek_fields_are_null_when_no_user_message() {
         // 只有 assistant/tool 消息的会话：peek 键恒在，字段为 null——
         // 调用方可以区分"没有用户消息"与"没有 peek 键"。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let a = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-na-m1"]);
         let b = StableId::derive(IdKind::Message, Stability::Reconstructed, &[b"peek-na-m2"]);
@@ -2783,7 +2783,7 @@ mod tests {
         // 标题派生链（#6）：custom-title（session payload `title`）>
         // ai-title（`summary`）> 首条有效 user 消息；展示在条目 title 字段
         // （peek 旁边）；派生链无候选时 title 键缺席。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let custom = seed_titled_session(
             &store,
@@ -2825,7 +2825,7 @@ mod tests {
     fn budget_floors_are_protocol_errors_before_app_request() {
         // R4：max_bytes < 4096、max_messages < 1、max_items < 1、limit < 1 都在
         // 协议层 -32602（构造 AppRequest 之前），不落成 App 层 isError 业务帧。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let cases = [
@@ -2888,7 +2888,7 @@ mod tests {
     #[test]
     fn error_messages_truncate_echoed_values() {
         // R5：method/tool/id/参数值回显进错误消息前截断到 ECHO_CAP 字符。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let long = "x".repeat(500);
@@ -3079,7 +3079,7 @@ mod tests {
 
     #[test]
     fn non_object_params_or_arguments_are_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = respond(&mut server, &request(8, "tools/call", json!(null)));
@@ -3097,7 +3097,7 @@ mod tests {
 
     #[test]
     fn invalid_session_wire_id_is_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3113,7 +3113,7 @@ mod tests {
     fn get_message_wire_id_errors_are_invalid_params() {
         // 与 get_session_context 同层：缺失/非法 wire id 与 max_items:0 都是
         // 请求校验失败（-32602），不得落成 App 层 isError 业务帧（design §2 note）。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for arguments in [
@@ -3140,7 +3140,7 @@ mod tests {
     fn get_session_context_rejects_wrong_kind_session_id() {
         // session_id 必须是 Session 实体；message/document id 属于协议层请求
         // 校验失败，而非 App 层 not_found。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         for arguments in [
@@ -3161,7 +3161,7 @@ mod tests {
     fn get_message_unknown_message_is_business_not_found() {
         // 格式合法但库中不存在的 message_id 走 Application 的 not_found 业务
         // 路径（isError 工具结果），而非协议层 -32602（design §2 note）。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3178,7 +3178,7 @@ mod tests {
 
     #[test]
     fn out_of_enum_policy_is_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3191,7 +3191,7 @@ mod tests {
 
     #[test]
     fn out_of_enum_level_is_invalid_params() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3224,7 +3224,7 @@ mod tests {
 
     #[test]
     fn garbage_cursor_is_a_business_error_with_cursor_invalid() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3244,7 +3244,7 @@ mod tests {
 
     #[test]
     fn unknown_session_with_valid_wire_id_is_business_not_found() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(
@@ -3265,7 +3265,7 @@ mod tests {
         // 上报 `redaction` 块。曾经这里只做脱敏、丢弃状态——调用方拿到
         // "[redacted:api_key]" 却无法区分"服务端涂红"与"原文逐字如此"，也拿不到
         // redacted_count。形状与 Robot envelope 单源（protocol::redaction_block）。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         store
             .commit_batch(&[(
@@ -3318,7 +3318,7 @@ mod tests {
         // 不允许只在 search 上实现。这里覆盖 catalog-only 夹具即可成功的 6 个；
         // 需要关系行的另外 3 个（context/message/handoff）由 mcp_e2e.rs 的
         // `all_tool_results_carry_the_redaction_block` 在真实夹具上覆盖。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let cases = [
@@ -3348,7 +3348,7 @@ mod tests {
 
     #[test]
     fn search_round_trip_projects_the_shared_render_payload() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "search_sessions", json!({ "query": "world" }));
@@ -3388,7 +3388,7 @@ mod tests {
 
     #[test]
     fn semantic_and_provider_search_match_cli_with_real_ingested_sources() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let store = open_store(&dir);
         let claude = dir.path().join("claude.jsonl");
         let grok = dir.path().join("grok.jsonl");
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[test]
     fn search_paginates_with_cursor_across_disjoint_pages() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let first = call(
@@ -3491,7 +3491,7 @@ mod tests {
 
     #[test]
     fn get_status_reports_real_catalog_count() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = seeded_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "get_status", json!({}));
@@ -3503,7 +3503,7 @@ mod tests {
 
     #[test]
     fn doctor_reports_db_ok_with_store_facts() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "doctor", json!({}));
@@ -3525,7 +3525,7 @@ mod tests {
         // orphaned_usage_events / orphaned_usage_memberships）——同一个诊断问题
         // 经 MCP 问会得到严格更弱的答案。两侧现在共用 crate::doctor_store_data；
         // 本测试直接与那个单源比对，任何一侧再分叉都会红。
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "doctor", json!({}));
@@ -3548,7 +3548,7 @@ mod tests {
 
     #[test]
     fn list_providers_enumerates_the_registry() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let store = open_store(&dir);
         let mut server = ready(&store);
         let v = call(&mut server, "list_providers", json!({}));

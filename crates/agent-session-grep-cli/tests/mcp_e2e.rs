@@ -16,7 +16,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_agent-session-grep");
 
 /// 每个测试用独立临时目录，避免 WAL/SHM 旁文件互相干扰。
 fn temp_db(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let path = dir.path().join(format!("{tag}.db"));
     // The MCP server opens an existing catalog read-only. Fixture creation is
     // an explicit writer operation, not a side effect of protocol startup.

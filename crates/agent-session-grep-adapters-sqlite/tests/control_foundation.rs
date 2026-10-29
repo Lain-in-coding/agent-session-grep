@@ -34,7 +34,7 @@ fn request(provider: SearchProvider, relative: &str, kind: RootKind) -> Selectio
     }
 }
 fn setup() -> (tempfile::TempDir, std::path::PathBuf, SqliteControlStore) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let store = loop {
@@ -98,7 +98,7 @@ fn retry_expected_success<T>(
 
 #[test]
 fn read_open_missing_creates_nothing() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let absent = temp.path().join("absent");
     assert!(matches!(
         SqliteControlStore::open_read_only(&absent, &id("installation")),
@@ -229,7 +229,7 @@ fn fresh_schema_has_all_normative_tables_and_roundtrips() {
 
 #[test]
 fn occupied_final_name_and_sidecars_are_never_replaced_by_creation() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     #[cfg(unix)]
     {

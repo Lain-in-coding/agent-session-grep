@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn staged_package_verifies_helpers_and_releases_metadata_pins() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         let (members, _) = fixture(&prefix);
         let mut install = installation_for_staged(&prefix).expect("valid staged package");
@@ -1437,7 +1437,7 @@ mod tests {
             crate::uninstall_command::WINDOWS_TAIL_HELPER,
         ] {
             for removed in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
+                let temp = agent_session_grep_testkit::tempdir().unwrap();
                 let prefix = temp.path().canonicalize().unwrap();
                 fixture(&prefix);
                 let helper = prefix.join(format!("{}/helpers/{name}", version_dir()));
@@ -1455,7 +1455,7 @@ mod tests {
             }
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         fixture(&prefix);
         fs::write(prefix.join("unexpected.bin"), b"extra").unwrap();
@@ -1464,7 +1464,7 @@ mod tests {
 
     #[test]
     fn staged_package_rejects_partial_or_unexpected_helper_roles() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         let (_, tsv) = fixture(&prefix);
         let dir = version_dir();
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn shared_four_target_checksums_accept_other_assets_and_reject_unknown_or_colliding_names() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         fixture(&prefix);
         let mut sums = fs::read_to_string(prefix.join(STAGE_CHECKSUMS)).unwrap();
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[test]
     fn candidate_different_version_with_twenty_payload_members_is_verified() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         let version = "0.2.0-beta.91";
         let (members, tsv) = fixture_version(&prefix, version);
@@ -1581,7 +1581,7 @@ mod tests {
 
     #[test]
     fn historical_nineteen_payload_package_without_uninstall_tail_remains_verified() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         let (members, tsv) = fixture_schema_with_tail(
             &prefix,
@@ -1603,7 +1603,7 @@ mod tests {
 
     #[test]
     fn v2_retained_launcher_and_incremented_pointer_validate_full_current_metadata() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         fixture_version(&prefix, "0.2.0-beta.92");
         let retained = activate_v2(&prefix, 7);
@@ -1624,7 +1624,7 @@ mod tests {
     #[test]
     fn v2_rejects_generation_pointer_and_retained_launcher_mismatch() {
         for case in 0..4 {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let prefix = temp.path().canonicalize().unwrap();
             fixture(&prefix);
             activate_v2(&prefix, 8);
@@ -1648,7 +1648,7 @@ mod tests {
     #[test]
     fn v2_never_skips_receipt_manifest_checksum_or_member_integrity() {
         for case in 0..7 {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let prefix = temp.path().canonicalize().unwrap();
             fixture(&prefix);
             activate_v2(&prefix, 2);
@@ -1721,7 +1721,7 @@ mod tests {
 
     #[test]
     fn v1_absent_both_metadata_compatibility_never_allows_half_a_pair_or_v2() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         fixture(&prefix);
         fs::remove_file(prefix.join(STAGE_MANIFEST)).unwrap();
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn update_inspection_accepts_exact21_package_without_loosening_normal_setup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let prefix = temp.path().canonicalize().unwrap();
         let (members, _) = fixture_schema(&prefix, "0.0.9-beta.1", 21, 2);
         assert!(inspect_installation(&prefix).is_err());
@@ -1755,7 +1755,7 @@ mod tests {
     #[test]
     fn update_inspection_refuses_unsupported_and_cross_control_packages() {
         for (catalog, control) in [(20, 2), (21, 1), (22, 1), (23, 2), (22, 3)] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let prefix = temp.path().canonicalize().unwrap();
             fixture_schema(&prefix, "0.0.9-beta.1", catalog, control);
             assert!(inspect_installation_for_update(&prefix).is_err());

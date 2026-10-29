@@ -243,7 +243,7 @@ fn post_drain_checkpoint_uses_latest_catalog_and_current_pause() {
         SqliteControlStore, managed_maintenance::CatalogIdentity,
     };
     use agent_session_grep_ports::control::{ControlStore, DesiredUpdates};
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = agent_session_grep_testkit::tempdir().unwrap();
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(
             &tmp.path().join("control"),
@@ -289,7 +289,7 @@ fn post_drain_checkpoint_uses_latest_catalog_and_current_pause() {
 #[test]
 fn failed_native_candidate_probe_is_rejected_after_actual_execution() {
     use std::{fs, process::Command};
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = agent_session_grep_testkit::tempdir().unwrap();
     let source = tmp.path().join("candidate.rs");
     let executable = tmp.path().join(if cfg!(windows) {
         "candidate.exe"
@@ -331,7 +331,7 @@ fn failed_native_candidate_probe_is_rejected_after_actual_execution() {
 #[test]
 fn update_drain_requires_real_supervisor_and_worker_locks() {
     use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = agent_session_grep_testkit::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     // The process registry is nonblocking even for distinct roots. Establish
     // fixture ownership within its original finite setup budget, then measure
@@ -368,7 +368,7 @@ fn update_drain_requires_real_supervisor_and_worker_locks() {
 fn private_native_binding_is_hash_confirmed_and_never_leaks_in_report() {
     use sha2::{Digest, Sha256};
     use std::fs;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = agent_session_grep_testkit::tempdir().unwrap();
     let prefix = tmp.path().join("install");
     fs::create_dir(&prefix).unwrap();
     let identity = build_identity();
@@ -518,7 +518,7 @@ fn schema_rollback_never_pairs_current_catalog_with_the_old_program() {
 
 #[test]
 fn update_control_scope_refuses_expired_work_and_restores_nested_original_end() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(
             &temp.path().join("private"),
@@ -555,7 +555,7 @@ fn update_control_scope_refuses_expired_work_and_restores_nested_original_end() 
 
 #[test]
 fn update_control_sql_contention_does_not_start_a_fresh_default_wait() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(
@@ -599,7 +599,7 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
         managed_maintenance::inspect_catalog_identity,
         managed_store::ManagedStore,
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let prefix = temp.path().join("installation");
     std::fs::create_dir(&prefix).unwrap();

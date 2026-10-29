@@ -46,7 +46,7 @@ fn job(id: &str) -> MaintenanceJob {
 }
 #[test]
 fn terminal_jobs_are_pruned_but_runnable_jobs_never_are() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut running = job("running");
     running.state = MaintenanceState::Running;
@@ -74,7 +74,7 @@ fn terminal_jobs_are_pruned_but_runnable_jobs_never_are() {
 
 #[test]
 fn missing_queue_reads_do_not_create_anything() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let root = dir.path().join("absent");
     assert!(
         SqliteMaintenanceQueue::open_existing(&root)
@@ -91,7 +91,7 @@ fn missing_queue_reads_do_not_create_anything() {
 }
 #[test]
 fn durable_idempotency_cancel_pause_and_cas_are_independent_of_catalog() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let accepted = queue.enqueue(&job("one")).unwrap();
     let mut duplicate = job("different");
@@ -123,7 +123,7 @@ fn durable_idempotency_cancel_pause_and_cas_are_independent_of_catalog() {
 }
 #[test]
 fn running_cancel_does_not_lose_progress_or_control() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut j = job("one");
     j.state = MaintenanceState::Running;
@@ -140,7 +140,7 @@ fn running_cancel_does_not_lose_progress_or_control() {
 }
 #[test]
 fn cancelling_uncertain_compact_remains_runnable_with_unknown_public_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut j = job("one");
     j.state = MaintenanceState::Deferred;
@@ -153,7 +153,7 @@ fn cancelling_uncertain_compact_remains_runnable_with_unknown_public_commit() {
 }
 #[test]
 fn immutable_selection_cannot_be_expanded_by_progress() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut saved = queue.enqueue(&job("one")).unwrap();
     saved.target.file_identity = "replacement".into();
@@ -164,7 +164,7 @@ fn immutable_selection_cannot_be_expanded_by_progress() {
 }
 #[test]
 fn completed_token_survives_reopen_and_cancel_is_noop() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut complete = queue.enqueue(&job("one")).unwrap();
     complete.state = MaintenanceState::Completed;
@@ -180,7 +180,7 @@ fn completed_token_survives_reopen_and_cancel_is_noop() {
 }
 #[test]
 fn concurrent_first_open_is_serialized_inside_initialization_transaction() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let root = dir.path().to_owned();
     let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
@@ -209,7 +209,7 @@ fn concurrent_first_open_is_serialized_inside_initialization_transaction() {
 }
 #[test]
 fn unsupported_queue_is_not_migrated_and_errors_hide_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     drop(SqliteMaintenanceQueue::open(dir.path()).unwrap());
     let conn = rusqlite::Connection::open(SqliteMaintenanceQueue::path(dir.path())).unwrap();
     conn.execute_batch("PRAGMA user_version=2").unwrap();
@@ -234,7 +234,7 @@ fn unsupported_queue_is_not_migrated_and_errors_hide_paths() {
 }
 #[test]
 fn worker_probe_is_readonly_and_guards_release() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     drop(SqliteMaintenanceQueue::open(dir.path()).unwrap());
     assert!(!QueueLock::worker_running(dir.path()).unwrap());
     assert!(!dir.path().join(".maintenance/worker.lock").exists());
@@ -249,7 +249,7 @@ fn worker_probe_is_readonly_and_guards_release() {
 #[test]
 fn maintenance_directory_is_private_without_chmod_parent() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let before = std::fs::metadata(dir.path()).unwrap().permissions().mode();
     drop(SqliteMaintenanceQueue::open(dir.path()).unwrap());
     assert_eq!(
@@ -313,7 +313,7 @@ fn queue_child() {
 }
 #[test]
 fn process_worker_lock_is_authoritative_and_crash_releases_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     drop(SqliteMaintenanceQueue::open(dir.path()).unwrap());
     let mut process = child(dir.path(), "worker");
     wait_file(&dir.path().join("ready"));
@@ -325,7 +325,7 @@ fn process_worker_lock_is_authoritative_and_crash_releases_it() {
 }
 #[test]
 fn producer_enqueue_cannot_cross_worker_final_check_lifecycle_guard() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let lifecycle = QueueLock::lifecycle(dir.path()).unwrap();
     let worker = QueueLock::try_worker(dir.path()).unwrap().unwrap();
@@ -343,7 +343,7 @@ fn producer_enqueue_cannot_cross_worker_final_check_lifecycle_guard() {
 
 #[test]
 fn cleanup_claim_atomically_refuses_prior_cancel_and_closes_later_cancel() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut before = job("before");
     before.state = MaintenanceState::Running;
@@ -367,7 +367,7 @@ fn cleanup_claim_atomically_refuses_prior_cancel_and_closes_later_cancel() {
 }
 #[test]
 fn authoritative_done_progress_is_not_overridden_by_prior_cancel() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = agent_session_grep_testkit::tempdir().unwrap();
     let queue = SqliteMaintenanceQueue::open(dir.path()).unwrap();
     let mut j = job("one");
     j.phase = MaintenancePhase::Cleanup;

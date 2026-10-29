@@ -2291,7 +2291,7 @@ mod empty_placeholder_review_tests {
 
     #[test]
     fn empty_repair_preserves_shared_placeholders_until_the_last_source_replaces_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir
             .path()
             .join("first.jsonl")
@@ -2383,7 +2383,7 @@ mod empty_placeholder_review_tests {
     #[test]
     fn empty_repair_revalidates_reservations_and_rolls_back_failed_activation() {
         for failure in ["changed-proof", "activation"] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
             let path = dir
                 .path()
                 .join("source.jsonl")
@@ -2425,7 +2425,7 @@ mod empty_placeholder_review_tests {
     #[test]
     fn empty_repair_keeps_real_provider_and_retired_alias_boundaries_closed() {
         for real_provider in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
             let path = dir
                 .path()
                 .join("source.jsonl")
@@ -2452,7 +2452,7 @@ mod empty_placeholder_review_tests {
             "sidecar-value",
             "sidecar-native",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
             let path = dir
                 .path()
                 .join("source.jsonl")
@@ -2520,7 +2520,7 @@ mod empty_placeholder_review_tests {
             "session",
             "unknown-state",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
             let path = dir
                 .path()
                 .join("source.jsonl")

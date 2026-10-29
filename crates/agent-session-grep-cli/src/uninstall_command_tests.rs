@@ -45,7 +45,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("data");
         let prefix = base.join("package");

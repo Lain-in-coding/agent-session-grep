@@ -1,14 +1,15 @@
 //! Testkit：跨 crate 复用的测试构件，包括 fixture builder、只读断言和 fake Provider。
 //!
 //! 本 crate 只被其他 crate 的 `[dev-dependencies]` 依赖，绝不进入生产依赖图。
-//! 提供五类构件：
+//! 提供六类构件：
 //! 1. [`SessionBuilder`] —— 合成合法的 Canonical 会话，省去每个测试手搓样板；
 //! 2. [`InMemoryStore`] —— 同时实现 `CatalogStore` + `SearchIndex` 的内存后端；
 //! 3. [`FakeProvider`] —— 可配置的 `ProviderAdapter`，用于脱离真实格式测 ingestion；
 //! 4. [`assert_read_only`] —— 只读断言：包裹一段操作，断言目标字节未被改写；
 //! 5. [`golden`] —— Provider 适配器 golden 契约测试的共享脚手架：全字段捕获 sink、
 //!    fixture 读取与 BLAKE3 校验、canonical JSON 投影。消除 14 个适配器 golden.rs
-//!    里逐字复制的 `CollectingSink`/`Captured`/`read_expected`/`canonical_json`。
+//!    里逐字复制的 `CollectingSink`/`Captured`/`read_expected`/`canonical_json`；
+//! 6. [`tempdir`] —— 祖先路径不含符号链接的临时目录，供托管私有根夹具使用。
 //!
 //! 所有合成数据一律用非真实内容，符合 R0 fixture 脱敏规范。
 
@@ -601,6 +602,23 @@ pub fn assert_not_found<T: std::fmt::Debug>(result: PortResult<T>) {
     match result {
         Err(PortError::NotFound(_)) => {}
         other => panic!("expected PortError::NotFound, got {other:?}"),
+    }
+}
+
+/// 在已解析符号链接的系统临时目录下建测试目录，替代 `tempfile::tempdir()`。
+///
+/// 托管私有根在生产上拒绝任何符号链接祖先，而 macOS 的系统临时目录位于
+/// `/var` → `/private/var` 符号链接之下，直接用 `tempfile::tempdir()` 的夹具在
+/// macOS 上会被判为 `ancestor_symlink`。Unix 先解析真实路径再建目录；Windows
+/// 保持系统路径原样，避免 `canonicalize` 加上 `\\?\` 前缀改变路径形态。
+pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    {
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir()
     }
 }
 

@@ -23,7 +23,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(desired: DesiredUpdates) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("private data");
         let control = crate::retry_fixture_busy(|| {
@@ -257,7 +257,7 @@ fn parser_is_strict_and_help_does_not_open_or_create_managed_state() {
             .action,
         Action::Enable
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let absent = temp.path().join("must remain absent").join("catalog.db");
     assert!(matches!(
         run(

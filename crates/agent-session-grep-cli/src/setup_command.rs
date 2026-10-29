@@ -828,7 +828,7 @@ mod identity_tests {
 
     #[test]
     fn setup_binding_admission_uses_original_end_after_transient_control_handle_contention() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let path = catalog(&base.join("data"), "binding-deadline-installation");
         let identity = SetupIdentity::capture(&path).unwrap();
@@ -854,7 +854,7 @@ mod identity_tests {
 
     #[test]
     fn setup_binding_expired_end_never_creates_prefix_receipt() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let path = catalog(&base.join("data"), "expired-binding-installation");
         let identity = SetupIdentity::capture(&path).unwrap();
@@ -877,7 +877,7 @@ mod identity_tests {
 
     #[test]
     fn torn_prefix_receipt_is_repaired_by_explicit_setup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let path = catalog(&base.join("data"), "torn-binding-installation");
         let identity = SetupIdentity::capture(&path).unwrap();
@@ -899,7 +899,7 @@ mod identity_tests {
     #[test]
     fn setup_binding_original_end_never_adopts_replacement_physical_root() {
         for same_installation in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let base = temp.path().canonicalize().unwrap();
             let path = catalog(&base.join("data"), "binding-original-installation");
             let identity = SetupIdentity::capture(&path).unwrap();
@@ -942,7 +942,7 @@ mod identity_tests {
 
     #[test]
     fn held_supervisor_lock_never_proves_selected_package_is_running() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let path = catalog(&base.join("data"), "native-identity-fixture");
         let identity = SetupIdentity::capture(&path).unwrap();
@@ -975,7 +975,7 @@ mod identity_tests {
 
     #[test]
     fn replaced_setup_identity_blocks_native_and_inventory_before_side_effects() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let path = catalog(&base.join("data"), "native-identity-a");
         let identity = SetupIdentity::capture(&path).unwrap();
@@ -1095,7 +1095,7 @@ mod m2_tests {
 
     #[test]
     fn all_six_history_providers_require_exact_selected_host_and_preserve_source_bytes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let history = root.join("synthetic source 空格.jsonl");
         let bytes = b"synthetic original private fixture; parser only checks path metadata";
@@ -1145,7 +1145,7 @@ mod m2_tests {
 
     #[test]
     fn history_duplicates_aliases_and_invalid_flags_are_rejected_before_any_setup_write() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let history = root.join("history.jsonl");
         fs::write(&history, b"unchanged synthetic source").unwrap();
@@ -1209,7 +1209,7 @@ mod m2_tests {
 
     fn deadline_selection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, SetupIdentity) {
         use agent_session_grep_adapters_sqlite::{SqliteControlStore, managed_store::ManagedStore};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("private data");
         let catalog = root.join("catalog.db");

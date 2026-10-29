@@ -26,6 +26,8 @@ fs4 = "0.13"
 
 [dev-dependencies]
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "trace"] }
+# Private-root fixtures need a temp root without symlink ancestors (macOS /var).
+agent-session-grep-testkit = { path = "../agent-session-grep-testkit" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

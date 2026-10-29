@@ -45,7 +45,7 @@ fn parse_first_line(output: &Output) -> serde_json::Value {
 }
 
 fn temp_db(tag: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let path = dir.path().join(format!("{tag}.db"));
     let db = path.to_string_lossy().into_owned();
     let store = agent_session_grep_adapters_sqlite::SqliteStore::open_for_write(&db)

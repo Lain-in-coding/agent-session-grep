@@ -15,6 +15,7 @@ dependencies = [
  "agent-session-grep-application",
  "agent-session-grep-domain",
  "agent-session-grep-ports",
+ "agent-session-grep-testkit",
  "blake3",
  "fs4",
  "rusqlite",
@@ -340,6 +341,7 @@ dependencies = [
  "agent-session-grep-ports",
  "blake3",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

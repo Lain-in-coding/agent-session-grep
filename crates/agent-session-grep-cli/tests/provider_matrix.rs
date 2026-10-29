@@ -3097,7 +3097,7 @@ fn every_adapter_leaves_its_source_directory_untouched_through_probe_and_parse()
             "{provider_id}: capability.rs 缺少该 provider"
         );
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let source = dir.path().join("source.bin");
         std::fs::write(&source, fixture).expect("write source");
         let before = snapshot(dir.path());

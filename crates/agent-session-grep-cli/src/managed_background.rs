@@ -3041,7 +3041,7 @@ mod control_deadline_tests {
 
     impl CycleFixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = temp.path().join("private");
             let history = temp.path().join("history");
             std::fs::create_dir(&history).unwrap();
@@ -3505,7 +3505,7 @@ mod control_deadline_tests {
 
     #[test]
     fn explicit_control_deadline_refuses_expired_work_and_sql_reuses_original_end() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let control = SqliteControlStore::create(
             &temp.path().join("private"),
             &ControlId::parse("install").unwrap(),

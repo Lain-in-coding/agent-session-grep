@@ -747,7 +747,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = temp.path().join("private");
             let catalog = root.join("catalog.db");
             let source = temp.path().join("synthetic-read-only.jsonl");
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn purge_startup_wrong_root_and_unknown_schema_remain_hard_failures() {
         let fixture = Fixture::new();
-        let other = tempfile::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
         assert!(matches!(
             read_before(
                 fixture.root(),

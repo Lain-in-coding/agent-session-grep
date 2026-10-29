@@ -68,7 +68,7 @@ fn dummy_snapshot(path: &Path) -> SourceSnapshot {
 
 #[test]
 fn expired_deadline_and_unsupported_limits_precede_source_io() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let absent = temp.path().join("absent/source.db");
     let snapshot = dummy_snapshot(&absent);
     assert!(matches!(
@@ -114,7 +114,7 @@ fn expired_deadline_and_unsupported_limits_precede_source_io() {
 
 #[test]
 fn text_snapshot_deadline_preserves_full_hash_and_equal_length_rewrite_detection() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("synthetic.jsonl");
     let bytes = vec![b'a'; SOURCE_IO_BUFFER_BYTES * 3 + 7];
     fs::write(&path, &bytes).unwrap();
@@ -155,7 +155,7 @@ fn text_snapshot_deadline_preserves_full_hash_and_equal_length_rewrite_detection
 
 #[test]
 fn file_source_deadline_is_shared_by_clone_reopen_read_and_fill_buf() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("synthetic.jsonl");
     fs::write(&path, vec![b'x'; SOURCE_IO_BUFFER_BYTES * 2]).unwrap();
     let snapshot = capture(&path).unwrap();
@@ -183,7 +183,7 @@ fn file_source_deadline_is_shared_by_clone_reopen_read_and_fill_buf() {
 
 #[test]
 fn file_source_single_read_stays_within_fixed_chunk_even_for_large_caller_buffer() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("synthetic.jsonl");
     fs::write(&path, vec![b'x'; SOURCE_IO_BUFFER_BYTES * 4]).unwrap();
     let snapshot = capture_with_deadline(&path, SQLITE_MAX_SOURCE_BYTES, end()).unwrap();
@@ -198,7 +198,7 @@ fn file_source_single_read_stays_within_fixed_chunk_even_for_large_caller_buffer
 
 #[test]
 fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("live.db");
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE facts(value); INSERT INTO facts VALUES('first synthetic observation');").unwrap();
@@ -249,7 +249,7 @@ fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal(
 
 #[test]
 fn source_write_lock_exhausts_only_original_budget_and_returns_no_snapshot() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("locked.db");
     let writer = Connection::open(&path).unwrap();
     writer
@@ -271,7 +271,7 @@ fn source_write_lock_exhausts_only_original_budget_and_returns_no_snapshot() {
 
 #[test]
 fn malformed_and_missing_sources_return_content_free_errors_without_repair() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let absent = temp.path().join("private-synthetic-source");
     let error = capture_with_deadline(&absent, SQLITE_MAX_SOURCE_BYTES, end()).unwrap_err();
     assert!(matches!(error, PortError::SourceIo(_)));
@@ -286,7 +286,7 @@ fn malformed_and_missing_sources_return_content_free_errors_without_repair() {
 
 #[test]
 fn above_128_mib_logical_snapshot_requires_explicit_256_mib_and_is_never_truncated() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("large-synthetic.db");
     let writer = Connection::open(&path).unwrap();
     writer

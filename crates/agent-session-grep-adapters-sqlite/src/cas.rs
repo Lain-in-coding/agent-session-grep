@@ -79,13 +79,13 @@ mod tests {
 
     #[test]
     fn missing_current_reads_as_zero() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         assert_eq!(read_current(dir.path()).unwrap(), 0);
     }
 
     #[test]
     fn cas_succeeds_when_expected_matches() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         write_current(dir.path(), 17).unwrap();
         assert!(cas_activate(dir.path(), 17, 18).unwrap());
         assert_eq!(read_current(dir.path()).unwrap(), 18);
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn cas_rejects_stale_baseline() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         write_current(dir.path(), 17).unwrap();
         assert!(cas_activate(dir.path(), 17, 18).unwrap());
         // 过期基线 17，CURRENT 已是 18 → 拒，CURRENT 保持 18。
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn cas_from_zero_bootstraps() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         assert!(cas_activate(dir.path(), 0, 1).unwrap());
         assert_eq!(read_current(dir.path()).unwrap(), 1);
     }
@@ -112,7 +112,7 @@ mod tests {
     fn cas_activate_leaves_no_tmp_files_behind() {
         // 回归（Minor-13）：临时文件带 pid 唯一后缀且成功 rename 后必须不残留
         // （崩溃遗留的旧 tmp 会被下次 write 截断复用）。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         write_current(dir.path(), 17).unwrap();
         assert!(cas_activate(dir.path(), 17, 18).unwrap());
         assert_eq!(read_current(dir.path()).unwrap(), 18);

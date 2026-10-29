@@ -73,7 +73,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("owned-data");
         let catalog = root.join("catalog.db");
         let source_a = temp.path().join("synthetic-a.jsonl");
@@ -1829,7 +1829,7 @@ fn inventory_root_epoch_and_duplicate_bindings_cannot_be_reused_for_new_policy()
     let root = RootIdentity::read(&f.root).unwrap();
     let epoch = f.control.status().unwrap().policy.policy_epoch;
     let evidence = inventory(&f, vec![]);
-    let wrong = tempfile::tempdir().unwrap();
+    let wrong = agent_session_grep_testkit::tempdir().unwrap();
     assert!(
         PrivateArtifactInventory::bind(
             &f.control,
@@ -2041,7 +2041,7 @@ fn classified_restore_receipt_preserves_owned_record_but_unknown_stage_stays_pen
 fn public_dsh_authority_rewrite_revoke_purge_completes_without_source_writes_or_resurrection() {
     use agent_session_grep_domain::SessionIdentityNamespace;
     use agent_session_grep_ports::{SourceResumeClaim, source_context::*};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let catalog = root.join("catalog.db");
     let surface_path = temp.path().join(".dsh").join("sessions");

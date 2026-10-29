@@ -15,7 +15,7 @@ const TARGET_MAC_INTEL: &str = "x86_64-apple-darwin";
 const TARGET_MAC_ARM: &str = "aarch64-apple-darwin";
 
 fn temp_root() -> (TempDir, PathBuf) {
-    let directory = TempDir::new().expect("tempdir");
+    let directory = agent_session_grep_testkit::tempdir().expect("tempdir");
     #[cfg(unix)]
     let root = directory.path().canonicalize().expect("canonical tempdir");
     #[cfg(windows)]
@@ -486,7 +486,7 @@ impl Fixture {
     }
 
     fn stage(&self) -> (TempDir, PathBuf) {
-        let directory = TempDir::new().expect("stage tempdir");
+        let directory = agent_session_grep_testkit::tempdir().expect("stage tempdir");
         #[cfg(unix)]
         let path = directory.path().canonicalize().expect("canonical stage");
         #[cfg(windows)]

@@ -30,7 +30,7 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("create isolated home");
         Sandbox { dir, home }

@@ -6220,7 +6220,7 @@ mod windows_private {
         };
 
         fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = temp.path().join("private");
             create_directory(&root).unwrap();
             let db = root.join("synthetic.db");
@@ -6599,7 +6599,7 @@ mod runtime_deadline_tests {
     }
 
     fn running_fixture() -> (tempfile::TempDir, SqliteControlStore) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let control = SqliteControlStore::create(
             &temp.path().join("private"),
             &cid("synthetic-deadline-installation"),
@@ -6610,7 +6610,7 @@ mod runtime_deadline_tests {
     }
 
     fn fixture() -> (tempfile::TempDir, SqliteControlStore) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let control = SqliteControlStore::create(
             &temp.path().join("private"),
             &ControlId::parse("synthetic-deadline-installation").unwrap(),
@@ -7091,7 +7091,7 @@ mod runtime_deadline_tests {
 
     #[test]
     fn stale_unowned_stage_refuses_creation_and_remains_private() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         super::private_directory(&root, true).unwrap();
         let stale = root.join(CONTROL_CREATE_PENDING);
@@ -7119,7 +7119,7 @@ mod runtime_deadline_tests {
 
     #[test]
     fn interrupted_complete_stage_recovers_only_with_the_exact_intent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private");
         let installation = cid("synthetic-stage-installation");
         CREATE_FAULT.with(|slot| slot.set(Some(5)));
@@ -7314,7 +7314,7 @@ mod control_create_tests {
             (6, false, true),
             (11, false, false),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = root(&temp);
             let status = crash_child(&root, point, sync_exit);
             assert_eq!(status.code(), Some(if sync_exit { 87 } else { 86 }));
@@ -7348,7 +7348,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_discards_only_a_pre_intent_pending_record() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         let status = crash_child(&root, 8, false);
         assert_eq!(status.code(), Some(86));
@@ -7371,7 +7371,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_recovery_promotes_only_the_exact_synced_pending_intent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         let status = crash_child(&root, 13, false);
         assert_eq!(status.code(), Some(86));
@@ -7404,7 +7404,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_recovery_preserves_a_malformed_pending_intent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         assert_eq!(crash_child(&root, 13, false).code(), Some(86));
         let pending = root.join("control.db.creating.intent.pending");
@@ -7423,7 +7423,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_stale_marker_pending_requires_the_pre_publish_window() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(9)));
@@ -7444,7 +7444,7 @@ mod control_create_tests {
         .unwrap();
         assert_clean(&root);
 
-        let after_publish = tempfile::tempdir().unwrap();
+        let after_publish = agent_session_grep_testkit::tempdir().unwrap();
         let root = self::root(&after_publish);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(6)));
@@ -7478,7 +7478,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_publish_sync_failure_is_recovered_by_opening_final() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(3)));
@@ -7515,7 +7515,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_finish_is_intent_first_and_marker_last() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(11)));
@@ -7547,7 +7547,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_marker_only_missing_final_never_recreates() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(11)));
@@ -7585,7 +7585,7 @@ mod control_create_tests {
     #[test]
     fn control_create_repairs_only_a_torn_marker_with_an_exact_stage() {
         for with_stage in [true, false] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = root(&temp);
             private_directory(&root, true).unwrap();
             CREATE_FAULT.with(|slot| slot.set(Some(3)));
@@ -7620,7 +7620,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_preserves_an_unmatched_marker() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(3)));
@@ -7648,7 +7648,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_marker_cleanup_crash_leaves_a_rebuildable_stage() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(3)));
@@ -7685,7 +7685,7 @@ mod control_create_tests {
     #[test]
     fn control_create_removes_unmarked_stage_sidecars_then_rebuilds() {
         for suffix in ["-wal", "-shm", "-journal"] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = root(&temp);
             private_directory(&root, true).unwrap();
             CREATE_FAULT.with(|slot| slot.set(Some(2)));
@@ -7712,7 +7712,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_v1_intent_only_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         CREATE_FAULT.with(|slot| slot.set(Some(9)));
@@ -7746,7 +7746,7 @@ mod control_create_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            let temp = tempfile::tempdir().unwrap();
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = root(&temp);
             private_directory(&root, true).unwrap();
             symlink("missing-control", SqliteControlStore::path(&root)).unwrap();
@@ -7769,7 +7769,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_preserves_a_foreign_final_sidecar_node() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         let foreign = root.join("control.db-wal");
@@ -7790,7 +7790,7 @@ mod control_create_tests {
     #[test]
     fn control_create_intent_read_does_not_follow_a_dangling_record_link() {
         use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         let _lease = ControlHandleLease::try_acquire_for_create(&root).unwrap();
@@ -7808,7 +7808,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_honors_an_existing_create_lock_from_another_process() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         let mut child = child_command(&root, "hold").spawn().unwrap();
@@ -7827,7 +7827,7 @@ mod control_create_tests {
 
     #[test]
     fn control_create_read_intent_is_strictly_read_only() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = root(&temp);
         private_directory(&root, true).unwrap();
         assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);

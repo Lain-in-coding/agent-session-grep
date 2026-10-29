@@ -13075,7 +13075,7 @@ mod tests {
     fn write_open_reprojects_stale_projection_from_catalog_without_reparse() {
         // 方案 A（自愈）：写路径打开时检测失配 → 从权威 catalog 重投影。
         // 源文件**不存在于磁盘**，证明重投影无需回到 provider reparse。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("stale.db");
         let p = path.to_string_lossy().into_owned();
         let generation_before;
@@ -13115,7 +13115,7 @@ mod tests {
     fn empty_projection_is_stamped_current_without_rebuild_churn() {
         // 新库/空库：没有任何旧词元可纠正 → 只标记版本，不推进 generation、
         // 不写 outbox 行（否则每个新 data root 一打开就产生 churn）。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("fresh.db");
         let p = path.to_string_lossy().into_owned();
         let store = SqliteStore::open_for_write(&p).unwrap();
@@ -13298,7 +13298,7 @@ mod tests {
 
     #[test]
     fn read_open_never_creates_or_migrates_and_cannot_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("read.db");
         let p = path.to_str().unwrap();
         assert!(SqliteStore::open(p).is_err());
@@ -13327,7 +13327,7 @@ mod tests {
 
     #[test]
     fn reopen_preserves_data_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("catalog.db");
         let p = path.to_string_lossy().into_owned();
         // 用 Message id：非 Message 实体不进 fts 全文表（kind 门，见 index/put）。
@@ -13346,7 +13346,7 @@ mod tests {
 
     #[test]
     fn newer_schema_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let p = path.to_string_lossy().into_owned();
         // 先正常建库，再把 user_version 拨到未来版本，模拟更新的二进制写过的库。
@@ -13369,7 +13369,7 @@ mod tests {
 
     #[test]
     fn v6_db_migrates_to_v7_without_fabricating_relations() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v6.db");
         let p = path.to_string_lossy().into_owned();
         let payload = vec![0x00, 0xff, 0x7f, 0x01, 0x80];
@@ -15407,7 +15407,7 @@ mod tests {
     fn v7_open_backfills_fts_rowid_for_legacy_rows() {
         // 旧 v7 库（fts_rowid 列加入前建成）首次打开必须回填边车：fts 行按
         // id_json 与 fts_ids 一一对应，回填后按 wire 别名删除才能按 rowid 定位。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("legacy-fts.db");
         let p = path.to_string_lossy().into_owned();
         let legacy = sid(IdKind::Message, b"legacy-fts-row");
@@ -15566,7 +15566,7 @@ mod tests {
 
     #[test]
     fn v3_db_migrates_source_membership_table() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v3.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -15606,7 +15606,7 @@ mod tests {
     #[test]
     fn v5_db_migrates_membership_document_id_column() {
         // 带数据的 v5 库升级到 v6：membership 旧行保留且 document_id 为 NULL。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v5.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -17046,7 +17046,7 @@ mod tests {
     fn open_for_write_accepts_bare_relative_filename() {
         // 回归（Minor-4）：裸相对文件名（"catalog.db"）的 parent() 是空串 "",
         // create_dir_all("") 会报错；空 parent 应按当前工作目录处理。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         let result = SqliteStore::open_for_write("catalog.db");
@@ -18191,7 +18191,7 @@ mod tests {
 
     #[test]
     fn v1_db_migrates_to_v2_with_generation_zero() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         let p = path.to_string_lossy().into_owned();
         // 手工造一个 v1 库（只有 catalog + fts，无 store_metadata）。
@@ -18224,7 +18224,7 @@ mod tests {
     fn v7_db_migrates_to_v8_creating_resume_claims_table() {
         // v7 库没有 resume claims 表；打开后升到 v8，表创建且为空——
         // legacy 数据全保留，claims 由 re-sync 回填（ADR-0009）。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v7.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -18306,7 +18306,7 @@ mod tests {
     #[test]
     fn v8_to_v9_migration_adds_provider_id_column_non_destructively() {
         // 从真实 v6 schema 迁移到 v8，模拟尚未升级的旧库。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v8.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -18819,7 +18819,7 @@ mod tests {
 
     #[test]
     fn v12_catalog_migrates_to_v13_adding_session_titles_table() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v12.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -18900,7 +18900,7 @@ mod tests {
         // 旧库迁到 v14 后 source_scans 带 parser_version 列，既有行 DEFAULT 0
         // ——0 永不等于当前 PARSER_SEMANTIC_VERSION（≥1），因此迁移后第一次
         // sync 自动 targeted backfill 全部已扫源，无需手动 rebuild。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v13.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -18996,7 +18996,7 @@ mod tests {
         // 旧库迁到 v15 后 usage_events / usage_event_membership 表存在且为空；
         // usage_totals 返回 Some（有投影）且 sessions == 0——覆盖标记：
         // "有投影但零事实" 与 "无投影（None）" 必须可区分。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v14.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -19080,7 +19080,7 @@ mod tests {
     fn v15_catalog_migrates_to_v16_with_empty_repo_projection() {
         // 旧库（停在 v15）重开：v15→v16 迁移建表；投影为空——repo_totals
         // 返回空列表（未知 ≠ 零），由 rebuild 或后续 affected source 提交回填。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v15.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -19164,7 +19164,7 @@ mod tests {
         // 投影**非空**的旧 v16 库：迁到 v17 后戳留在 DEFAULT 0——0 永不等于当前
         // INDEX_PROJECTION_VERSION（≥1），因此读路径 fail-closed、写路径自动
         // 重投影。绝不因为"迁移刚跑过"就谎报投影已收敛。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v16.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -19214,7 +19214,7 @@ mod tests {
     fn v16_catalog_with_empty_projection_migrates_to_v17_as_current() {
         // 投影为空的旧库（含全新库）：没有任何旧变换写下的词元 → 迁移期直接
         // 标记当前版本，第一次打开不会被判失配、不产生 rebuild churn。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v16-empty.db");
         let p = path.to_string_lossy().into_owned();
         {
@@ -21478,7 +21478,7 @@ mod tests {
 
     #[test]
     fn v7_catalog_migrates_to_v12_adding_activity_tables() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("v7.db");
         let p = path.to_string_lossy().into_owned();
         // 手工造一个 v7 库（最小关系 schema），打开后应迁到 v12 并补建活动表。
@@ -22089,7 +22089,7 @@ mod tests {
         // 会报告这次丢失。git 不在 PATH 时即使先注入真实解析器也一样删空。
         // 修复：repo 身份投影不可从 catalog 重建，自愈路径保留既有行
         // （RepoIdentityRebuild::Preserve）；重派生只属于显式 `index rebuild`。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("repo-heal.db");
         let p = path.to_string_lossy().into_owned();
         let session = sid(IdKind::Session, b"heal-repo-ses");

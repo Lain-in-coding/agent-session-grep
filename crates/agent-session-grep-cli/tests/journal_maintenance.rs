@@ -26,7 +26,7 @@ struct Fixture {
 }
 impl Fixture {
     fn empty() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = agent_session_grep_testkit::tempdir().unwrap();
         let db = root.path().join("catalog.sqlite");
         Self { root, db }
     }

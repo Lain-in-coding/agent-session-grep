@@ -90,7 +90,7 @@ fn indexed_wire_id(output: &Output) -> String {
 
 #[test]
 fn read_commands_probe_no_git_and_search_resolves_repo_once() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = agent_session_grep_testkit::tempdir().expect("tempdir");
     let repo = init_git_repo_with_origin(dir.path(), "repo", "https://example.com/owner/name.git");
     let db = dir.path().join("hotpath.db");
     let trace = dir.path().join("git-trace.log");

@@ -47,7 +47,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let db = temp.path().join("private/catalog.db");
         let history = temp.path().join("history");
         fs::create_dir(&history).unwrap();
@@ -563,7 +563,7 @@ fn admission_state(root: &Path) -> (i64, i64, i64) {
 #[test]
 fn replaced_physical_root_never_receives_old_connections_latest_admission() {
     for same_installation in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let original = temp.path().join("original");
         let replacement = temp.path().join("replacement");
         let saved = temp.path().join("saved-original");
@@ -616,7 +616,7 @@ fn replaced_physical_root_never_receives_old_connections_latest_admission() {
 
 #[test]
 fn changed_installation_in_same_root_is_rejected_before_latest_writes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let db = identity_profile(&root, "original-installation");
     let identity = RootIdentity::read(&root).unwrap();

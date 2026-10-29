@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn acquire_and_read_record() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let mut lease = WriterLease::try_acquire(dir.path()).unwrap();
         let rec = lease.read_record().unwrap();
         assert!(rec.contains("pid="), "record={rec}");
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn second_acquire_is_denied_without_disclosing_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let _holder = WriterLease::try_acquire(dir.path()).unwrap();
         let err = WriterLease::try_acquire(dir.path()).unwrap_err();
         let message = match err {
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn drop_releases_for_next_holder() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         {
             let _holder = WriterLease::try_acquire(dir.path()).unwrap();
         }

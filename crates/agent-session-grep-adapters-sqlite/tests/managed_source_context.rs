@@ -609,7 +609,7 @@ fn unknown_context_enum_and_crossed_edge_fail_closed_and_gc_does_not_hide_them()
 }
 #[test]
 fn migration_21_to_22_is_additive_and_creates_no_authority_or_dependency() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("private");
     let path = root.join("catalog.db");
     let control =
@@ -1507,7 +1507,7 @@ struct FacadeFixture {
 impl FacadeFixture {
     fn new(provider: SearchProvider) -> Self {
         use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("owned-private");
         let catalog = root.join("catalog.db");
         let surface = CanonicalLocator::from_path(temp.path()).unwrap();

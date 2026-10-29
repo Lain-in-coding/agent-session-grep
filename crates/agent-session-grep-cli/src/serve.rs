@@ -1563,7 +1563,7 @@ mod tests {
     /// and `repo` remains an independent filter, the same way MCP treats it.
     #[test]
     fn flag_named_values_are_literal_data_not_reparsed_argv() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let store = SqliteStore::open_in_memory().unwrap();
         let source = dir.path().join("flag-value.jsonl");
         std::fs::write(
@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn handoff_applies_repeated_provider_values() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let store = SqliteStore::open_in_memory().unwrap();
         let source = dir.path().join("handoff-providers.jsonl");
         std::fs::write(
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[test]
     fn resume_preview_is_read_only_and_never_acknowledges_the_first_run_marker() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let db = dir.path().join("data.db");
         let store = SqliteStore::open_for_write(db.to_str().unwrap()).expect("store");
         let source = dir.path().join("resume.jsonl");
@@ -1800,7 +1800,7 @@ mod tests {
 
     #[test]
     fn web_search_applies_provider_union_and_reports_its_capabilities() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let store = SqliteStore::open_in_memory().unwrap();
         let source = dir.path().join("grok.jsonl");
         std::fs::write(&source, r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":"needle web"},"_meta":{"promptIndex":0}}}"#).unwrap();

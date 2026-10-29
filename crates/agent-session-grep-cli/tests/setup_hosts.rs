@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 
 fn request() -> (tempfile::TempDir, SetupHostsRequest) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let launcher = PathBuf::from(env!("CARGO_BIN_EXE_agent-session-grep"));
     let catalog = root.join("empty synthetic catalog.db");

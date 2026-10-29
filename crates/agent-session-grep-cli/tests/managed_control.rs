@@ -19,7 +19,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_agent-session-grep");
 struct PrivateFixture(tempfile::TempDir);
 impl PrivateFixture {
     fn new() -> Self {
-        Self(tempfile::tempdir().unwrap())
+        Self(agent_session_grep_testkit::tempdir().unwrap())
     }
     fn path(&self) -> &Path {
         self.0.path()

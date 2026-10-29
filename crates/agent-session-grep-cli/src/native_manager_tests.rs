@@ -13,7 +13,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(kind: NativeKind) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let directory = root.join("synthetic native config");
         let location = match kind {
@@ -813,7 +813,7 @@ fn supervisor_drain_returns_held_os_guard_and_uses_original_deadline() {
     use agent_session_grep_adapters_sqlite::managed_locks::{
         ExclusiveGuard, LockKind, RootIdentity,
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let identity = RootIdentity::read(&root).unwrap();
     let held =
@@ -834,7 +834,7 @@ fn supervisor_drain_returns_held_os_guard_and_uses_original_deadline() {
 #[test]
 fn detached_supervisor_survives_parent_job_cleanup_and_does_not_hold_capture_pipes() {
     use std::process::Command;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     // Execute the unchanged production boundary in a synthetic subprocess. Its
     // jobs never attach to the parallel Cargo test process or any native job.

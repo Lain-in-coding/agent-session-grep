@@ -55,7 +55,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("private-data");
         let prefix = temp.path().join("immutable-install");
         fs::create_dir(&prefix).unwrap();
@@ -195,7 +195,7 @@ fn expected<'a>(
 
 #[test]
 fn missing_control_has_no_root_or_lock_side_effects() {
-    let empty = tempfile::tempdir().unwrap();
+    let empty = agent_session_grep_testkit::tempdir().unwrap();
     let missing = empty.path().join("missing");
     assert!(matches!(
         ControlHandleLease::try_acquire(&missing),
@@ -293,7 +293,7 @@ fn retirement_requires_caller_connections_closed_and_exact_drain_kinds() {
         intent.try_acquire(wrong),
         Err(PortError::InvalidRequest(_))
     ));
-    let other = tempfile::tempdir().unwrap();
+    let other = agent_session_grep_testkit::tempdir().unwrap();
     let wrong_root = lock(other.path(), LockKind::Supervisor);
     let mut wrong = drains.proof();
     wrong.supervisor = &wrong_root;

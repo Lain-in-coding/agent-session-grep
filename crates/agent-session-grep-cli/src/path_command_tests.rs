@@ -22,7 +22,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("managed data");
         let control = crate::retry_fixture_busy(|| {
@@ -174,7 +174,7 @@ fn strict_parser_help_and_expired_request_have_no_environment_or_state_effect() 
     ] {
         assert!(parse(&words(&bad)).is_err());
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let absent = temp.path().join("absent/catalog.db");
     assert!(matches!(
         run(
@@ -202,7 +202,7 @@ fn strict_parser_help_and_expired_request_have_no_environment_or_state_effect() 
 }
 #[test]
 fn raw_windows_path_preserves_kind_expansion_and_separator_on_remove() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let prefix = temp.path().join("Unicode 空格 prefix");
     for text in [
         "%SYNTHETIC_ROOT%\\bin;unrelated",
@@ -793,7 +793,7 @@ mod shell {
     }
     #[test]
     fn unknown_shell_and_missing_actual_profile_are_explicit_partial_prerequisites() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let shell = home.join("unknown-shell");
         fs::write(&shell, b"inert").unwrap();

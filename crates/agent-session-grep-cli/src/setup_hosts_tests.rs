@@ -5,7 +5,7 @@ fn fixture_binary() -> &'static Path {
     static BINARY: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
     &BINARY
         .get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
             let binary = dir.path().join(if cfg!(windows) {
                 "setup-fixture.exe"
             } else {
@@ -37,7 +37,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(hosts: Vec<Host>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let launcher = root.join(if cfg!(windows) {
             "local app with spaces.exe"

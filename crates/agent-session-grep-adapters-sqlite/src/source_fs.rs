@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn sqlite_capture_reads_wal_and_detects_wal_only_changes_without_writing_source() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let path = dir.path().join("live.db");
         let writer = rusqlite::Connection::open(&path).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(value); INSERT INTO t VALUES('first');").unwrap();
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn capture_and_verify_stable_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"hello stable content");
         let snap = capture(&p).unwrap();
         assert_eq!(
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn append_is_detected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"hello");
         let snap = capture(&p).unwrap();
         // 追加
@@ -664,7 +664,7 @@ mod tests {
         // verify_snapshot 必须在读取后再次核对 len+mtime 才能检出。
         // 真实竞态（stat→read 之间追加）无法在单测里确定性复现，因此直接驱动
         // 读后复检函数 post_read_verify——它必须在读取完成后捕获 len/mtime 变化。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"hello world!!!!!");
         let snap = capture(&p).unwrap();
         // 捕获后截短内容：等价于"read 已完成、源在窗口内被改写"的状态。
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn truncate_is_detected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"hello world!!!!!");
         let snap = capture(&p).unwrap();
         {
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn equal_length_content_replacement_is_detected_by_fingerprint() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"AAAAAAAAAA"); // 10 bytes
         // 捕获原始 mtime，替换后逐字节恢复，使 len 与 mtime 都与快照一致，
         // fingerprint 成为唯一能检出等长异容替换的信号。
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn snapshot_fs_read_verified_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "s.jsonl", b"payload-bytes");
         let snap = capture(&p).unwrap();
         let fs = SnapshotFs::new(vec![snap.clone()]);
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn read_verified_returns_repeatable_source() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "s.jsonl", b"line one\nline two\n");
         let (snap, source) = read_verified(&p).unwrap();
         assert_eq!(snap.len, 18);
@@ -750,7 +750,7 @@ mod tests {
         // 等长异容替换后重新 open：metadata 一致（len+mtime 相同）仍会读到替换
         // 内容——这正是 ReadOnlySource 只读视图的诚实边界；提交前 verify_snapshot
         // 用 fingerprint 兜住（等长替换检测测试已覆盖）。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let p = write_file(dir.path(), "a.jsonl", b"AAAAAAAAAA");
         let original_modified = std::fs::metadata(&p).unwrap().modified().unwrap();
         let snap = capture(&p).unwrap();
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn snapshot_fs_read_verified_rejects_oversized_source() {
         // 兼容整读路径必须诚实拒绝超过 JSON 系上限的源，而非按大文件分配。
-        let dir = tempfile::tempdir().unwrap();
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
         let big = vec![b'x'; (JSON_FAMILY_MAX_SOURCE_BYTES as usize) + 1];
         let p = write_file(dir.path(), "big.jsonl", &big);
         let snap = capture(&p).unwrap();

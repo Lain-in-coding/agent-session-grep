@@ -105,7 +105,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
         let source_root = temp.path().join("legacy");
         fs::create_dir(&source_root).unwrap();
         let source = source_root.join("catalog.db");
@@ -1036,7 +1036,7 @@ fn migration_inspector_root_epoch_and_partial_state_are_fail_closed_without_redo
     f.run().unwrap();
     let control = f.control();
     let epoch = control.status().unwrap().policy.policy_epoch;
-    let wrong = tempfile::tempdir().unwrap();
+    let wrong = agent_session_grep_testkit::tempdir().unwrap();
     assert!(
         inspect_private_artifacts(
             &f.destination,
@@ -1080,7 +1080,7 @@ fn migration_inspector_root_epoch_and_partial_state_are_fail_closed_without_redo
 
 #[test]
 fn ordinary_managed_catalog_without_migration_intent_has_no_adopted_inventory() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let root = temp.path().join("managed");
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(

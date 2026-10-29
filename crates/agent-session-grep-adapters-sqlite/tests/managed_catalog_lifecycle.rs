@@ -93,7 +93,7 @@ fn legacy_fixture(path: &Path) {
 
 #[test]
 fn additive_v20_migration_preserves_legacy_bytes_and_has_no_fabricated_evidence() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     legacy_fixture(&path);
     let before = std::fs::read(&path).unwrap();
@@ -147,7 +147,7 @@ fn additive_v20_migration_preserves_legacy_bytes_and_has_no_fabricated_evidence(
 
 #[test]
 fn failed_v20_ddl_rolls_back_columns_tables_and_version_together() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     legacy_fixture(&path);
     let conn = Connection::open(&path).unwrap();
@@ -184,7 +184,7 @@ fn failed_v20_ddl_rolls_back_columns_tables_and_version_together() {
 
 #[test]
 fn readers_writer_and_relocation_hold_shared_lifetime_until_last_close() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     let writer = SqliteStore::open_for_write(p(&path)).unwrap();
     let first = SqliteStore::open(p(&path)).unwrap();
@@ -227,7 +227,7 @@ impl Drop for CheckDropOrder {
 }
 #[test]
 fn sqlite_and_writer_lease_drop_before_catalog_handle_guard() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     let checked = Rc::new(Cell::new(false));
     let store = SqliteStore::open_for_write(p(&path)).unwrap();
@@ -243,7 +243,7 @@ fn sqlite_and_writer_lease_drop_before_catalog_handle_guard() {
 
 #[test]
 fn exclusive_gate_blocks_opens_before_catalog_or_writer_creation() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     drop(SqliteStore::open_for_write(p(&path)).unwrap());
     let gate = exclusive(temp.path()).unwrap();
@@ -275,7 +275,7 @@ impl CatalogOpenAdmission for RejectAdmission {
 }
 #[test]
 fn typed_admission_runs_under_shared_gate_before_sqlite_and_writer_lease() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     let admission = RejectAdmission {
         root: temp.path().to_owned(),
@@ -289,7 +289,7 @@ fn typed_admission_runs_under_shared_gate_before_sqlite_and_writer_lease() {
 
 #[test]
 fn missing_read_opens_create_nothing_and_reject_unknown_schema_without_migration() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let missing = temp.path().join("missing").join("catalog.db");
     assert!(SqliteStore::open(p(&missing)).is_err());
     assert!(!missing.parent().unwrap().exists());
@@ -319,7 +319,7 @@ impl CatalogOpenAdmission for ExpectedManaged {
 }
 #[test]
 fn managed_marker_blocks_every_legacy_open_even_with_control_missing() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     drop(SqliteStore::open_for_write(p(&path)).unwrap());
     {
@@ -381,7 +381,7 @@ fn separate_process_catalog_handle_blocks_exclusive_until_process_closes_store()
         io::{BufRead, BufReader, Write},
         process::{Command, Stdio},
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     drop(SqliteStore::open_for_write(p(&path)).unwrap());
     for mode in ["reader", "writer", "relocation"] {
