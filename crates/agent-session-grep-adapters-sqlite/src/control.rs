@@ -6157,12 +6157,17 @@ mod windows_private {
             .map_err(|e| private_file_io_at(e, sidecar, "handle_open"))
     }
 
-    /// SQLite creates WAL/SHM/journal sidecars itself, so they receive the
-    /// process token's default owner. For an elevated administrator that is
-    /// BUILTIN\Administrators instead of the user SID, while the inherited DACL
-    /// still grants only the current user. Only this exact well-known owner is
-    /// accepted, and only for sidecars; files ASG creates name the user owner.
-    fn administrators_owner(owner: *mut c_void) -> PortResult<bool> {
+    /// An elevated administrator's token makes BUILTIN\Administrators the
+    /// default owner of everything created without an explicit owner: SQLite
+    /// databases, sidecars and backup copies, and plain `std::fs` files such
+    /// as markers. Their DACL is still inherited from the protected private
+    /// directory and grants only the current user, which `verify_handle`
+    /// checks separately. Only a process with that alias enabled, which means
+    /// an elevated administrator or SYSTEM, can produce this owner, and both
+    /// already hold take-ownership and restore rights. Accepting it therefore
+    /// grants no one new access, while a later unelevated run can still use
+    /// what an elevated run created. Every other foreign owner is refused.
+    fn administrators_owner(owner: *mut c_void, sidecar: bool) -> PortResult<bool> {
         const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
         // SECURITY_MAX_SID_SIZE is 68 bytes; u32 storage keeps SID alignment.
         let mut buffer = [0_u32; 17];
@@ -6181,7 +6186,7 @@ mod windows_private {
             return Err(private_validation_error(
                 "security_owner_alias",
                 std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                true,
+                sidecar,
             ));
         }
         // SAFETY: owner borrows the live descriptor; buffer now holds a valid SID.
@@ -6279,8 +6284,7 @@ mod windows_private {
             return Err(private_validation_error("security_acl_missing", 0, sidecar));
         }
         // SAFETY: owner/acl borrow the live descriptor returned by Win32.
-        if unsafe { EqualSid(owner, user.sid()) } == 0 && !(sidecar && administrators_owner(owner)?)
-        {
+        if unsafe { EqualSid(owner, user.sid()) } == 0 && !administrators_owner(owner, sidecar)? {
             return Err(private_validation_error("security_owner", 0, sidecar));
         }
         // SAFETY: ACL borrows the live descriptor returned by Win32.
