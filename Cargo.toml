@@ -43,3 +43,11 @@ lto = "thin"         # cross-crate inlining across the 8 workspace crates; thin 
 codegen-units = 1    # per-crate max optimization; the workspace crates are small, so the single-unit compile cost is acceptable (hstry 1, memex 4)
 panic = "unwind"     # keep unwinding — deliberate divergence from hstry's panic="abort"
 strip = "debuginfo"  # measured 2026-08-15: same binary size as strip=true (3,817,984 B) on MSVC, but keeps symbol names so RUST_BACKTRACE=1 stays actionable; panic messages keep their compile-time file:line either way
+
+# Test builds verify real package images: setup and the supervisor SHA-256 the
+# installed application inside the same 5 s startup budget that release
+# builds use. Linux debug images embed DWARF (about 200 MiB), and unoptimized
+# SHA-256 over that alone exceeds the budget. Optimize only the digest crate;
+# product deadlines and release settings stay unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
