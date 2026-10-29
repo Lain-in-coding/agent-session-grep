@@ -841,10 +841,17 @@ mod process {
                 return Ok(());
             }
             // SAFETY: process group was created for this local probe alone.
-            if unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) } == -1
-                && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-            {
-                return Err(SetupHostsErrorCode::ProbeFailed.into());
+            if unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                // XNU skips zombies when signalling a group, so a group whose
+                // only member is the exited leader kept unreaped above reports
+                // EPERM instead of ESRCH. Accept that only once it has exited.
+                let zombie_only = cfg!(target_os = "macos")
+                    && errno == Some(libc::EPERM)
+                    && self.status()?.is_some();
+                if errno != Some(libc::ESRCH) && !zombie_only {
+                    return Err(SetupHostsErrorCode::ProbeFailed.into());
+                }
             }
             while self.status()?.is_none() {
                 if Instant::now() >= deadline {
