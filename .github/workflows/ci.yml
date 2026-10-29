@@ -105,7 +105,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        # Run every test binary so one failure cannot hide the others.
+        run: cargo test --workspace --no-fail-fast
 
       # The embedded client has no npm dependencies. Node's built-in runner
       # exercises the shipped script against delayed synthetic API responses.
