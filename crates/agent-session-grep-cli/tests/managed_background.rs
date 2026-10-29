@@ -600,7 +600,17 @@ fn held_lock_with_offline_worker_record_reports_not_running() {
     });
     f.desired(DesiredUpdates::Stopped);
     f.wait(|f| f.control().background_status().unwrap().worker.state == UpdateState::Offline);
-    assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_some());
+    // The worker records Offline before its process finishes exiting, and a
+    // loaded host can still be closing its catalog. Wait, bounded, for the
+    // exit so the drain lock below never races the departing worker's lock.
+    let exit_deadline = Instant::now() + Duration::from_secs(20);
+    while f.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < exit_deadline,
+            "stopped worker did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     f.child = None;
     let root = f.db.parent().unwrap();
     let drain = ExclusiveGuard::try_acquire(root, LockKind::Background).unwrap();
@@ -2801,12 +2811,12 @@ fn owned_purge_child_completes_before_synthetic_directory_cleanup() {
     f.wait(|f| f.has_text("purgeteardownoriginalneedle"));
     let selection = m2_selection(&f, &f.history);
     f.revoke(&selection);
+    // A poll under load can see a transient Busy read; that is "not yet",
+    // and the fixture wait still bounds the whole condition.
     f.wait(|f| {
         f.control()
             .purge_jobs()
-            .unwrap()
-            .iter()
-            .all(|job| job.state == PurgeState::Complete)
+            .is_ok_and(|jobs| jobs.iter().all(|job| job.state == PurgeState::Complete))
     });
     let end = Instant::now() + Duration::from_secs(5);
     loop {
