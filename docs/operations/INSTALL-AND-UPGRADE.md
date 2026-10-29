@@ -266,10 +266,16 @@ There is a 256-transaction inventory bound; retention/compaction is not yet
 implemented.
 
 The transaction root uses mode 0700 on Unix and a protected current-user ACL on
-Windows. New private images use mode 0600 or inherit that protected ACL. Unix
-configs with extended attributes/ACLs are refused until their preservation is
-implemented. Windows flushes image/journal files but does not claim general
-unprivileged parent-directory flush support; the receipt discloses that limit.
+Windows. New private images use mode 0600 or inherit that protected ACL. An
+edited Unix config keeps its mode and its label attributes: Linux `security.*`
+(such as an SELinux context) and `system.*` (POSIX ACLs) are copied onto the
+replacement, and a failed copy refuses the edit. macOS `com.apple.*` metadata
+is copied where the system permits a user write; values it reserves, such as
+provenance, are left to the system. Plain `user.*` attributes are not copied, a
+config with an attribute in any other namespace is refused, and macOS file ACLs
+are not preserved. Windows flushes image/journal files but does not claim
+general unprivileged parent-directory flush support; the receipt discloses that
+limit.
 An established config symlink is resolved and preserved, with retarget checks
 before and after replacement. Directory and symlink retarget checks do not
 provide perpetual protection against an adversarial same-user process.

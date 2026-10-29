@@ -687,6 +687,127 @@ fn xattr_namespace_classification_only_refuses_unknown_namespaces() {
     ));
 }
 
+/// The label each platform's test writes: a POSIX ACL that grants one more
+/// user read access on Linux, and synthetic Apple metadata on macOS. Owners
+/// may set both without privileges.
+#[cfg(target_os = "linux")]
+fn synthetic_label() -> (&'static std::ffi::CStr, Vec<u8>) {
+    // posix_acl_xattr v2: user::rw-, user:65534:r--, group::r--, mask::r--,
+    // other::---.
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (0x01u16, 6u16, u32::MAX),
+        (0x02, 4, 65534),
+        (0x04, 4, u32::MAX),
+        (0x10, 4, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    (c"system.posix_acl_access", acl)
+}
+#[cfg(target_os = "macos")]
+fn synthetic_label() -> (&'static std::ffi::CStr, Vec<u8>) {
+    (
+        c"com.apple.metadata:asg_synthetic_label",
+        b"synthetic".to_vec(),
+    )
+}
+#[cfg(target_os = "linux")]
+fn set_label(path: &std::ffi::CStr, name: &std::ffi::CStr, value: &[u8]) -> libc::c_int {
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    }
+}
+#[cfg(target_os = "macos")]
+fn set_label(path: &std::ffi::CStr, name: &std::ffi::CStr, value: &[u8]) -> libc::c_int {
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    }
+}
+#[cfg(target_os = "linux")]
+fn get_label(path: &std::ffi::CStr, name: &std::ffi::CStr, buffer: &mut [u8]) -> libc::ssize_t {
+    unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    }
+}
+#[cfg(target_os = "macos")]
+fn get_label(path: &std::ffi::CStr, name: &std::ffi::CStr, buffer: &mut [u8]) -> libc::ssize_t {
+    unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+            0,
+        )
+    }
+}
+
+/// A label attribute must survive on the replacement, not only on the
+/// displaced original.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn label_attributes_are_copied_onto_the_replacement() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    };
+
+    let f = Fixture::new(Host::Codex, Some("model = 'synthetic'\n"));
+    let path = CString::new(f.config.as_os_str().as_bytes()).unwrap();
+    let (name, value) = synthetic_label();
+    if set_label(&path, name, &value) != 0 {
+        let error = std::io::Error::last_os_error();
+        let errno = error.raw_os_error();
+        if errno == Some(libc::EOPNOTSUPP) || errno == Some(libc::ENOTSUP) {
+            eprintln!("skipped: the temp filesystem does not support {name:?}");
+            return;
+        }
+        panic!("setxattr {name:?}: {error}");
+    }
+    let before = fs::metadata(&f.config).unwrap().ino();
+
+    f.store.install(&f.registration(), None).unwrap();
+
+    assert_ne!(fs::metadata(&f.config).unwrap().ino(), before);
+    assert_eq!(
+        f.document().node(),
+        Some(f.registration().value(Host::Codex))
+    );
+    let mut read = vec![0u8; value.len() + 64];
+    let size = get_label(&path, name, &mut read);
+    let size = usize::try_from(size).unwrap_or_else(|_| {
+        panic!(
+            "replacement lost {name:?}: {}",
+            std::io::Error::last_os_error()
+        )
+    });
+    read.truncate(size);
+    assert_eq!(read, value);
+}
+
 fn m2_json_hosts() -> [Host; 3] {
     [Host::ZCode, Host::WorkBuddy, Host::Antigravity]
 }

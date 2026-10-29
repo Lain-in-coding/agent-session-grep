@@ -412,10 +412,15 @@ fn copy_zcode_servers(mut value: Value, copied: &Map<String, Value>) -> Result<V
     Ok(value)
 }
 
+/// One extended attribute (name, value) that a replacement must carry.
+type Label = (String, Vec<u8>);
+
 struct Snapshot {
     bytes: Vec<u8>,
     identity: Identity,
     permissions: fs::Permissions,
+    /// Label attributes copied onto a replacement; always empty on Windows.
+    labels: Vec<Label>,
 }
 fn snapshot(path: &Path) -> Result<Option<Snapshot>> {
     match fs::symlink_metadata(path) {
@@ -432,6 +437,7 @@ fn snapshot(path: &Path) -> Result<Option<Snapshot>> {
         return Err(ErrorCode::Malformed.into());
     }
     let identity = platform::identity(&file).map_err(io)?;
+    let labels = platform::labels(&file).map_err(io)?;
     let mut bytes = Vec::new();
     (&mut file)
         .take(MAX_BYTES + 1)
@@ -444,6 +450,7 @@ fn snapshot(path: &Path) -> Result<Option<Snapshot>> {
         bytes,
         identity,
         permissions: meta.permissions(),
+        labels,
     }))
 }
 fn content(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1553,6 +1560,7 @@ impl HostConfigStore {
             write_new(&staging, &intended)?;
             if let Some(s) = &before {
                 fs::set_permissions(&staging, s.permissions.clone()).map_err(io)?;
+                platform::apply_labels(&staging, &s.labels).map_err(io)?;
             }
             let staged_identity = snapshot(&staging)?.ok_or(ErrorCode::Conflict)?.identity;
             journal.attempts.push(Attempt {
@@ -2050,30 +2058,48 @@ mod platform {
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) mod xattr {
-        use std::{collections::BTreeMap, ffi::CString, io};
+        use std::{ffi::CString, io};
 
         use libc::{c_char, c_int, c_void, size_t, ssize_t};
 
-        // macOS xattr symbols live in libSystem rather than the libc crate's
-        // apple bindings, so they are declared directly here.
-        #[cfg_attr(target_os = "macos", link(name = "System", kind = "dylib"))]
-        unsafe extern "C" {
-            #[link_name = "flistxattr"]
-            fn flistxattr_shim(fd: c_int, list: *mut c_char, size: size_t) -> ssize_t;
-            #[link_name = "fgetxattr"]
-            fn fgetxattr_shim(
-                fd: c_int,
-                name: *const c_char,
-                value: *mut c_void,
-                size: size_t,
-            ) -> ssize_t;
-            #[link_name = "fsetxattr"]
-            fn fsetxattr_shim(
-                fd: c_int,
-                name: *const c_char,
-                value: *const c_void,
-                size: size_t,
-            ) -> c_int;
+        use super::Label;
+
+        // Linux and Darwin share these names but not their arity: Darwin adds
+        // position and options arguments, and Linux fsetxattr takes flags.
+        // The libc crate binds each platform's real prototype.
+        #[cfg(target_os = "linux")]
+        unsafe fn list(fd: c_int, buffer: *mut c_char, size: size_t) -> ssize_t {
+            unsafe { libc::flistxattr(fd, buffer, size) }
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn list(fd: c_int, buffer: *mut c_char, size: size_t) -> ssize_t {
+            unsafe { libc::flistxattr(fd, buffer, size, 0) }
+        }
+        #[cfg(target_os = "linux")]
+        unsafe fn get(
+            fd: c_int,
+            name: *const c_char,
+            buffer: *mut c_void,
+            size: size_t,
+        ) -> ssize_t {
+            unsafe { libc::fgetxattr(fd, name, buffer, size) }
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn get(
+            fd: c_int,
+            name: *const c_char,
+            buffer: *mut c_void,
+            size: size_t,
+        ) -> ssize_t {
+            unsafe { libc::fgetxattr(fd, name, buffer, size, 0, 0) }
+        }
+        #[cfg(target_os = "linux")]
+        unsafe fn set(fd: c_int, name: *const c_char, value: *const c_void, size: size_t) -> c_int {
+            unsafe { libc::fsetxattr(fd, name, value, size, 0) }
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn set(fd: c_int, name: *const c_char, value: *const c_void, size: size_t) -> c_int {
+            unsafe { libc::fsetxattr(fd, name, value, size, 0, 0) }
         }
 
         fn result(call: impl FnOnce() -> ssize_t) -> io::Result<usize> {
@@ -2084,17 +2110,15 @@ mod platform {
         }
 
         fn attrs(fd: c_int) -> io::Result<Vec<String>> {
-            let size = result(|| unsafe { flistxattr_shim(fd, std::ptr::null_mut(), 0) })?;
-            let mut names = vec![0u8; size];
-            loop {
-                let filled =
-                    result(|| unsafe { flistxattr_shim(fd, names.as_mut_ptr().cast(), size) })?;
-                if filled <= size {
-                    names.truncate(filled);
-                    break;
-                }
-                names.resize(filled, 0);
+            let size = result(|| unsafe { list(fd, std::ptr::null_mut(), 0) })?;
+            if size == 0 {
+                return Ok(Vec::new());
             }
+            let mut names = vec![0u8; size];
+            // A list that grew after the size query fails with ERANGE, which
+            // refuses the file; a partial list is never used.
+            let filled = result(|| unsafe { list(fd, names.as_mut_ptr().cast(), names.len()) })?;
+            names.truncate(filled);
             Ok(names
                 .split(|byte| *byte == 0)
                 .filter(|name| !name.is_empty())
@@ -2104,41 +2128,67 @@ mod platform {
 
         fn value(fd: c_int, name: &str) -> io::Result<Vec<u8>> {
             let target = CString::new(name).map_err(|_| unsupported_error())?;
-            let size =
-                result(|| unsafe { fgetxattr_shim(fd, target.as_ptr(), std::ptr::null_mut(), 0) })?;
+            let size = result(|| unsafe { get(fd, target.as_ptr(), std::ptr::null_mut(), 0) })?;
             let mut buffer = vec![0u8; size];
-            let filled = result(|| unsafe {
-                fgetxattr_shim(fd, target.as_ptr(), buffer.as_mut_ptr().cast(), size)
-            })?;
-            if filled > size {
-                return Err(unsupported_error());
+            if size > 0 {
+                let filled = result(|| unsafe {
+                    get(
+                        fd,
+                        target.as_ptr(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                })?;
+                buffer.truncate(filled);
             }
-            buffer.truncate(filled);
             Ok(buffer)
         }
 
-        pub(super) fn copy_labels(fd: c_int) -> io::Result<()> {
-            let names = attrs(fd)?;
-            let mut labels: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
-            for name in &names {
-                match namespace(name) {
-                    Namespace::Label => {
-                        labels.insert(name, value(fd, name)?);
-                    }
+        /// Label attributes of `fd` in name order. An attribute in an
+        /// unclassified namespace refuses the file, because a replacement
+        /// could not carry it. A macOS `com.apple.*` value that cannot be read
+        /// is left to the system that manages it.
+        pub(super) fn labels(fd: c_int) -> io::Result<Vec<Label>> {
+            let mut names = attrs(fd)?;
+            names.sort();
+            let mut labels = Vec::new();
+            for name in names {
+                match namespace(&name) {
+                    Namespace::Label => match value(fd, &name) {
+                        Ok(data) => labels.push((name, data)),
+                        Err(_) if best_effort(&name) => {}
+                        Err(error) => return Err(error),
+                    },
                     Namespace::Known => {}
                     Namespace::Unknown => return Err(unsupported_error()),
                 }
             }
+            Ok(labels)
+        }
+
+        /// Copy `labels` onto a staged replacement; values that already match
+        /// are left alone. macOS `com.apple.*` metadata such as provenance is
+        /// set by the system and may refuse a user write, and a replacement
+        /// without it is not more widely accessible. Any other failure
+        /// refuses the replacement.
+        pub(super) fn apply(fd: c_int, labels: &[Label]) -> io::Result<()> {
             for (name, data) in labels {
-                let target = CString::new(name).map_err(|_| unsupported_error())?;
-                let written = unsafe {
-                    fsetxattr_shim(fd, target.as_ptr(), data.as_ptr().cast(), data.len())
-                };
-                if written != 0 {
-                    return Err(io::Error::last_os_error());
+                if value(fd, name).is_ok_and(|current| current == *data) {
+                    continue;
+                }
+                let target = CString::new(name.as_str()).map_err(|_| unsupported_error())?;
+                if unsafe { set(fd, target.as_ptr(), data.as_ptr().cast(), data.len()) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if !best_effort(name) {
+                        return Err(error);
+                    }
                 }
             }
             Ok(())
+        }
+
+        fn best_effort(name: &str) -> bool {
+            cfg!(target_os = "macos") && name.starts_with("com.apple.")
         }
 
         pub(crate) enum Namespace {
@@ -2193,14 +2243,33 @@ mod platform {
         if !meta.is_file() || meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
             return Err(unsupported());
         }
-        // Mode-only replacement cannot promise ACL/xattr preservation. Label
-        // namespaces are copied onto the replacement when the platform
-        // permits; anything else stays a refusal.
-        #[cfg(target_os = "linux")]
-        xattr::copy_labels(file.as_raw_fd())?;
-        #[cfg(target_os = "macos")]
-        xattr::copy_labels(file.as_raw_fd())?;
+        // A replacement carries only the mode and the label attributes that
+        // apply_labels copies, so refuse a file with any other attribute.
+        labels(&file)?;
         Ok(file)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn labels(file: &File) -> std::io::Result<Vec<Label>> {
+        xattr::labels(file.as_raw_fd())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn labels(_file: &File) -> std::io::Result<Vec<Label>> {
+        Ok(Vec::new())
+    }
+    /// Copy an original's label attributes onto its staged replacement before
+    /// the exchange, so SELinux contexts and POSIX ACLs survive the edit.
+    pub(super) fn apply_labels(path: &Path, labels: &[Label]) -> std::io::Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        xattr::apply(file.as_raw_fd(), labels)?;
+        file.sync_all()
     }
     pub(super) fn create_private(path: &Path) -> std::io::Result<File> {
         OpenOptions::new()
@@ -2361,6 +2430,14 @@ mod platform {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
+    }
+    /// ReplaceFileW keeps the replaced file's security descriptor and
+    /// streams, so there are no label attributes to carry.
+    pub(super) fn labels(_file: &File) -> io::Result<Vec<Label>> {
+        Ok(Vec::new())
+    }
+    pub(super) fn apply_labels(_path: &Path, _labels: &[Label]) -> io::Result<()> {
+        Ok(())
     }
     pub(super) fn open_regular(path: &Path) -> io::Result<File> {
         let file = OpenOptions::new()
