@@ -609,17 +609,40 @@ pub fn assert_not_found<T: std::fmt::Debug>(result: PortResult<T>) {
 ///
 /// 托管私有根在生产上拒绝任何符号链接祖先，而 macOS 的系统临时目录位于
 /// `/var` → `/private/var` 符号链接之下，直接用 `tempfile::tempdir()` 的夹具在
-/// macOS 上会被判为 `ancestor_symlink`。Unix 先解析真实路径再建目录；Windows
-/// 保持系统路径原样，避免 `canonicalize` 加上 `\\?\` 前缀改变路径形态。
+/// macOS 上会被判为 `ancestor_symlink`。Unix 先解析真实路径再建目录。
+///
+/// Windows 托管 runner 的 `TEMP` 含 8.3 短名分量（形如 `RUNNER~1`），而
+/// `canonicalize` 返回长名；夹具若把规范化后的定位符与临时目录下直接拼出
+/// 的路径比较，两者就对不上。Windows 因此改用长名，并去掉 `canonicalize` 加上
+/// 的 `\\?\` 前缀以保持普通盘符路径形态；无法得到普通盘符形态时保持原样。
 pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
     #[cfg(unix)]
     {
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        tempfile::tempdir_in(windows_long_temp_dir()?)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         tempfile::tempdir()
     }
+}
+
+#[cfg(windows)]
+fn windows_long_temp_dir() -> std::io::Result<std::path::PathBuf> {
+    let temp = std::env::temp_dir();
+    let canonical = std::fs::canonicalize(&temp)?;
+    Ok(
+        match canonical
+            .to_str()
+            .and_then(|text| text.strip_prefix(r"\\?\"))
+        {
+            Some(drive) if drive.as_bytes().get(1) == Some(&b':') => drive.into(),
+            _ => temp,
+        },
+    )
 }
 
 #[cfg(test)]
