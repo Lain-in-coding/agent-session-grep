@@ -823,7 +823,8 @@ mod shell {
             .join("literal Unicode 空格 ' $(must-not-execute) &");
         let script = f.root.join("literal-fragment.sh");
         fs::write(&script, fragment(&binding).unwrap()).unwrap();
-        let bash = Path::new("/usr/bin/bash");
+        // macOS ships bash only at /bin/bash; usr-merged Linux has both.
+        let bash = Path::new("/bin/bash");
         assert!(bash.is_file());
         let output = std::process::Command::new(bash)
             .arg("--noprofile")
