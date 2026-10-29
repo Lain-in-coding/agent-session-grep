@@ -941,9 +941,11 @@ mod tests {
                     let db = catalog.to_str().unwrap().to_owned();
                     std::thread::spawn(move || {
                         start.wait();
+                        // Keep the message and details: macOS reported a bare
+                        // SourceIo once, which no code path explained.
                         prepare_setup_before(&db, Instant::now() + COMMAND_BUDGET)
                             .map(|_| ())
-                            .map_err(|error| error.0.code)
+                            .map_err(|error| format!("{:?}", error.0))
                     })
                 })
                 .collect();
