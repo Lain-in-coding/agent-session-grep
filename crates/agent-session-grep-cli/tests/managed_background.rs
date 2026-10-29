@@ -1149,17 +1149,20 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     assert!(receipt.cycle_seq >= after_delete.required_cycle_seq.get());
     let previous_cycle = receipt.cycle_seq;
     fs::write(f.history.join("new-malformed.jsonl"), b"{\"type\":").unwrap();
+    // A worker retries a failing source at once, so the newest cycle is
+    // usually already observing again. Any partial cycle after the receipt
+    // proves the malformed source was observed; a 50 ms poll of only the
+    // newest cycle can miss every one of them on a slow runner.
     f.wait(|f| {
         let c = f.control();
         let runtime = c.background_status().unwrap();
-        let cycle = c
-            .cycle(
-                agent_session_grep_ports::control::CycleSeq::new(runtime.next_cycle_seq.get() - 1)
-                    .unwrap(),
-            )
-            .unwrap();
-        cycle.token.cycle_seq.get() > previous_cycle
-            && cycle.state == agent_session_grep_ports::control::CycleState::Partial
+        (previous_cycle + 1..runtime.next_cycle_seq.get()).any(|seq| {
+            agent_session_grep_ports::control::CycleSeq::new(seq)
+                .and_then(|seq| c.cycle(seq))
+                .is_ok_and(|cycle| {
+                    cycle.state == agent_session_grep_ports::control::CycleState::Partial
+                })
+        })
     });
     let store = ManagedStore::open(&f.db, &c).unwrap();
     assert!(
