@@ -171,14 +171,21 @@ pub(crate) fn start(db: &Path, budget: Duration) -> Result<StartReport, CliError
                 latest_satisfied: false,
             });
         }
-        let worker = control.background_status().map_err(cli)?.worker;
-        let reconciled =
-            control.status().map_err(cli)?.catalog_incarnation.as_ref() == Some(&incarnation);
-        if worker.boot_id.is_some()
-            && worker.boot_id != old_boot
-            && worker.pid_hint == Some(child.id())
-            && reconciled
-        {
+        // A poll refused by contention or by the caller's runtime end is "not
+        // ready yet"; the loop's own deadline still reports startup_timeout.
+        let ready = control.background_status().and_then(|status| {
+            let worker = status.worker;
+            Ok(worker.boot_id.is_some()
+                && worker.boot_id != old_boot
+                && worker.pid_hint == Some(child.id())
+                && control.status()?.catalog_incarnation.as_ref() == Some(&incarnation))
+        });
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err(PortError::WriterBusy(_)) => false,
+            Err(error) => return Err(cli(error)),
+        };
+        if ready {
             match ExclusiveGuard::try_acquire(private, LockKind::Background) {
                 Err(PortError::WriterBusy(_)) => {
                     return Ok(StartReport {
@@ -394,14 +401,20 @@ fn quote_windows(argument: &std::ffi::OsStr, line: &mut Vec<u16>) -> PortResult<
 /// dead worker record must never report running. The lock only counts when
 /// the registered worker state is not Offline and its heartbeat is fresh.
 pub(crate) fn status(db: &Path) -> Result<StatusReport, CliError> {
-    let private = root(db).map_err(cli)?;
-    let control = SqliteControlStore::open_current_read_only(private).map_err(cli)?;
-    let current = control.status().map_err(cli)?;
-    let worker = control.background_status().map_err(cli)?.worker;
+    observe(db).map_err(cli)
+}
+
+/// Typed form of [`status`]. A caller inside a control runtime scope can retry
+/// a Busy observation within its own original end.
+pub(crate) fn observe(db: &Path) -> PortResult<StatusReport> {
+    let private = root(db)?;
+    let control = SqliteControlStore::open_current_read_only(private)?;
+    let current = control.status()?;
+    let worker = control.background_status()?.worker;
     let lock_busy = if !private
         .join("background.lock")
         .try_exists()
-        .map_err(|_| cli(unavailable()))?
+        .map_err(|_| unavailable())?
     {
         false
     } else {
@@ -411,7 +424,7 @@ pub(crate) fn status(db: &Path) -> Result<StatusReport, CliError> {
                 false
             }
             Err(PortError::WriterBusy(_)) => true,
-            Err(error) => return Err(cli(error)),
+            Err(error) => return Err(error),
         }
     };
     let running = lock_busy

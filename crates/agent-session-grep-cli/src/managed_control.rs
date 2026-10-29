@@ -182,9 +182,7 @@ pub(crate) fn start_if_selected(catalog: &Path, deadline: Instant) -> Value {
                     .iter()
                     .any(|selection| selection.enabled) =>
         {
-            control
-                .with_runtime_deadline(deadline, || Ok(start_background(catalog, deadline).1))
-                .unwrap_or_else(|_| json!({"ready":false,"reason":"control_unavailable"}))
+            start_background(catalog, &control, deadline).1
         }
         Ok(status) => {
             json!({"ready":false,"reason":if status.desired_updates == DesiredUpdates::Running {
@@ -203,9 +201,24 @@ fn desired(value: DesiredUpdates) -> &'static str {
     }
 }
 
-fn status_data(store: &SqliteControlStore, path: &Path) -> Result<Value, CliError> {
-    let status = store.status().map_err(port)?;
-    let background = crate::managed_background::status(path)?;
+/// One content-free observation inside the command's original end. Every
+/// control read retries typed Busy under that end instead of each opening a
+/// fresh default window that a slow disk can exhaust on its own.
+fn status_data(
+    store: &SqliteControlStore,
+    path: &Path,
+    deadline: Instant,
+) -> Result<Value, PortError> {
+    let (status, background, cleanup_pending) = control_read(store, deadline, || {
+        Ok((
+            store.status()?,
+            crate::managed_background::observe(path)?,
+            store
+                .purge_jobs()?
+                .iter()
+                .any(|job| job.state != PurgeState::Complete),
+        ))
+    })?;
     Ok(json!({"desired_updates":desired(status.desired_updates),
         "effective_state":background.effective_state,"running":background.running,"background":background,
         "policy_epoch":status.policy.policy_epoch.get(),"control_seq":status.policy.control_seq.get(),
@@ -213,7 +226,7 @@ fn status_data(store: &SqliteControlStore, path: &Path) -> Result<Value, CliErro
         "selected_count":status.policy.selections.iter().filter(|s|s.enabled).count(),
         "selected_count_basis":"enabled_selections_before_exclusions",
         "pending_revocations":status.policy.revocations.iter().filter(|r|r.state==RevocationState::AwaitingDrain).count(),
-        "cleanup_pending":store.purge_jobs().map_err(port)?.iter().any(|j|j.state!=PurgeState::Complete)}))
+        "cleanup_pending":cleanup_pending}))
 }
 
 const COMMAND_BUDGET: Duration = Duration::from_secs(5);
@@ -250,6 +263,27 @@ fn retry_create_busy<T>(
         }
         match operation() {
             Err(PortError::WriterBusy(_)) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Run a read-only control step inside the command's original end. A store
+/// call outside a runtime scope opens its own 250ms window, which a slow disk
+/// can exhaust while most of the command budget remains. Typed Busy retries
+/// under the same end; every other result, and expiry itself, is returned.
+fn control_read<T>(
+    control: &SqliteControlStore,
+    deadline: Instant,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    // An enclosing request end shortens this one; never retry past it.
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    loop {
+        match control.with_runtime_deadline(deadline, &mut operation) {
+            Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
             result => return result,
@@ -361,6 +395,7 @@ fn existing_source(
     control: &SqliteControlStore,
     status: &ControlStatus,
     selection: &Selection,
+    deadline: Instant,
 ) -> Result<Option<ControlId>, CliError> {
     if !selection.enabled || selection.region.kind != RootKind::Exact {
         return Ok(None);
@@ -377,16 +412,18 @@ fn existing_source(
         Err(e) => return Err(io(e)),
         Ok(_) => {}
     }
-    ManagedStore::open(path, control)
-        .map_err(port)?
-        .source_binding_for_locator(
-            control,
-            selection.region.provider,
-            &selection.region.locator,
-        )
-        .map_err(port)?
-        .map(|binding| ControlId::parse(binding.source_id.as_str()).map_err(port))
-        .transpose()
+    // A read-only open only validates, shares handles and reads admission.
+    control_read(control, deadline, || {
+        ManagedStore::open(path, control)?
+            .source_binding_for_locator(
+                control,
+                selection.region.provider,
+                &selection.region.locator,
+            )?
+            .map(|binding| ControlId::parse(binding.source_id.as_str()))
+            .transpose()
+    })
+    .map_err(port)
 }
 
 /// Describe the symbolic policy delta without enumerating files or claiming
@@ -430,7 +467,28 @@ fn selection_effect(before: &ReadPolicy, selection: &Selection) -> Value {
     })
 }
 
-fn start_background(path: &Path, deadline: Instant) -> (Outcome, Value) {
+/// Launch and verify the worker inside the command's original end, so the
+/// launcher's own control reads do not each open a fresh default window. A
+/// refused scope entry means that end has already passed.
+fn start_background(
+    path: &Path,
+    control: &SqliteControlStore,
+    deadline: Instant,
+) -> (Outcome, Value) {
+    let mut launched = None;
+    let _ = control.with_runtime_deadline(deadline, || {
+        launched = Some(launch_background(path, deadline));
+        Ok(())
+    });
+    launched.unwrap_or_else(|| {
+        (
+            Outcome::Partial,
+            json!({"ready":false,"reason":"command_deadline","latest_satisfied":false}),
+        )
+    })
+}
+
+fn launch_background(path: &Path, deadline: Instant) -> (Outcome, Value) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining < CONTROL_ATTEMPT {
         return (
@@ -443,7 +501,7 @@ fn start_background(path: &Path, deadline: Instant) -> (Outcome, Value) {
             // Lock contention alone is not proof of a registered worker.
             let verified = report.ready
                 || (report.already_running
-                    && crate::managed_background::status(path).is_ok_and(|s| {
+                    && crate::managed_background::observe(path).is_ok_and(|s| {
                         s.running
                             && s.desired_updates == "running"
                             && matches!(s.effective_state, "running" | "idle" | "busy" | "deferred")
@@ -467,7 +525,7 @@ fn start_background(path: &Path, deadline: Instant) -> (Outcome, Value) {
 }
 
 fn maybe_start(path: &Path, control: &SqliteControlStore, deadline: Instant) -> Value {
-    match control.status() {
+    match control_read(control, deadline, || control.status()) {
         Ok(s)
             if s.desired_updates == DesiredUpdates::Running
                 && s.policy
@@ -475,7 +533,7 @@ fn maybe_start(path: &Path, control: &SqliteControlStore, deadline: Instant) -> 
                     .iter()
                     .any(|selection| selection.enabled) =>
         {
-            start_background(path, deadline).1
+            start_background(path, control, deadline).1
         }
         Ok(s) => {
             json!({"ready":false,"reason":if s.desired_updates == DesiredUpdates::Running {"no_enabled_selections"} else {desired(s.desired_updates)}})
@@ -498,7 +556,14 @@ fn prepare_setup_before(db: &str, deadline: Instant) -> Result<Value, CliError> 
     retry_create_busy(deadline, || control.finish_create()).map_err(port)?;
     setup_catalog(&path, &control, deadline)?;
     let background = maybe_start(&path, &control, deadline);
-    let mut data = status_data(&control, &path)?;
+    // Catalog and control state are already durable. An observation that the
+    // original end cannot complete is unknown, not a failed setup; every other
+    // error keeps its category.
+    let mut data = match status_data(&control, &path, deadline) {
+        Ok(data) => data,
+        Err(PortError::WriterBusy(_)) => json!({"effective_state":"unknown"}),
+        Err(error) => return Err(port(error)),
+    };
     data["background_start"] = background;
     data["status"] = json!("incomplete");
     data["stages"] = json!({"catalog":"ready","history_selection":"use_sources_add","host_registration":"pending","background":"pending"});
@@ -701,9 +766,10 @@ pub(crate) fn run(
         let control = open_control_before(root, writable, deadline).map_err(port)?;
         match action {
             Action::Sources => {
-                let policy = control
-                    .read_policy(RequestIntersection::Selected)
-                    .map_err(port)?;
+                let policy = control_read(&control, deadline, || {
+                    control.read_policy(RequestIntersection::Selected)
+                })
+                .map_err(port)?;
                 let rows:Vec<_>=policy.selections.iter().map(|s|json!({"id":s.id.as_str(),"provider":s.region.provider.as_str(),"kind":if s.region.kind==RootKind::Root{"root"}else{"exact"},"enabled":s.enabled,"revision":s.revision.get()})).collect();
                 (
                     "sources.list",
@@ -742,14 +808,14 @@ pub(crate) fn run(
                     }
                 };
                 let owner = acquire(LockKind::PolicyOwner).map_err(port)?;
-                let before = control.status().map_err(port)?;
+                let before = control_read(&control, deadline, || control.status()).map_err(port)?;
                 let selected = before
                     .policy
                     .selections
                     .iter()
                     .find(|s| s.id == selection)
                     .ok_or_else(|| port(PortError::NotFound("selection".into())))?;
-                let known_source = existing_source(&path, &control, &before, selected)?;
+                let known_source = existing_source(&path, &control, &before, selected, deadline)?;
                 // The epoch guard detects another writer between the pre-read
                 // and the CAS. A committed revoke must never be retried into
                 // that guard: its own epoch increment would be reported as a
@@ -805,14 +871,14 @@ pub(crate) fn run(
             Action::Status => (
                 "background.status",
                 Outcome::Success,
-                status_data(&control, &path)?,
+                status_data(&control, &path, deadline).map_err(port)?,
             ),
             Action::Start => {
                 committed_control_mutation(&control, deadline, || {
                     control.request_background_start(control.status()?.policy.control_seq)
                 })
                 .map_err(port)?;
-                let (outcome, report) = start_background(&path, deadline);
+                let (outcome, report) = start_background(&path, &control, deadline);
                 ("background.start", outcome, report)
             }
             Action::Desired(target) => {
@@ -822,14 +888,14 @@ pub(crate) fn run(
                 .map_err(port)?;
                 let mut data = json!({"status":"intent_recorded","requested_updates":desired(target),"desired_updates":desired(target),"intent_recorded":true,"latest_satisfied":false});
                 let outcome = if target == DesiredUpdates::Running {
-                    let (outcome, report) = start_background(&path, deadline);
+                    let (outcome, report) = start_background(&path, &control, deadline);
                     data["background_start"] = report;
                     outcome
                 } else {
                     // A stop/pause intent that already matches observation is a
                     // completed transition, not pending work. Only an observed
                     // state that still differs keeps exit 10 meaningful.
-                    match status_data(&control, &path) {
+                    match status_data(&control, &path, deadline) {
                         Ok(actual)
                             if actual["desired_updates"] == json!(desired(target))
                                 && actual["running"] == json!(false) =>
@@ -840,7 +906,7 @@ pub(crate) fn run(
                     }
                 };
                 // The desired-state write is durable even when observation fails.
-                match status_data(&control, &path) {
+                match status_data(&control, &path, deadline) {
                     Ok(actual) => {
                         for (key, value) in actual.as_object().into_iter().flatten() {
                             data[key] = value.clone();
