@@ -1531,12 +1531,21 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
     // The held catalog receipt commits before the control acknowledgement
     // that records its confirmation, and a failed cycle clears that pending
     // confirmation; wait for both rather than reading once in between.
+    // A cycle in which no overlapping root completes a consistent discovery
+    // (a child enumeration that fails or races the rewrite under load) starts
+    // the clock on the historical binding root, the parent. Here the parent
+    // stays incomplete, so that clock never publishes, and the next cycle with
+    // a complete child restarts the clock on the child. Wait for the child
+    // clock instead of judging the first confirmation read.
     let confirmation = || {
         f.control()
             .bounded(|c| c.source_progress(&source_id))
             .and_then(|progress| progress.confirmation)
     };
-    f.wait(|f| f.has_held_receipt() && confirmation().is_some());
+    f.wait(|f| {
+        f.has_held_receipt()
+            && confirmation().is_some_and(|pending| pending.root_identity == child_root)
+    });
     assert!(f.has_text("childbeforexneedle"));
     let confirmation = confirmation().unwrap();
     assert_eq!(confirmation.root_identity, child_root);
