@@ -492,65 +492,151 @@ fn prepare_setup_before(db: &str, deadline: Instant) -> Result<Value, CliError> 
     let path = absolute(Path::new(db))?;
     validate_catalog_path(&path).map_err(port)?;
     let root = path.parent().ok_or_else(|| io("missing data root"))?;
-    let control_path = SqliteControlStore::path(root);
-    let control = match std::fs::symlink_metadata(&control_path) {
-        Ok(_) => open_control_before(root, true, deadline).map_err(port)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if path.exists() {
-                return Err(ProtocolError::new(CanonicalCode::SchemaIncompatible,
-                    "setup requires a new managed catalog path; existing catalogs need explicit migration").into());
-            }
-            if let Some(parent) = root.parent() {
-                std::fs::create_dir_all(parent).map_err(io)?;
-            }
-            let root_exists = match std::fs::symlink_metadata(root) {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(io(error)),
-            };
-            if root_exists {
-                // Resume only the exact durable intent. A fresh random identity
-                // here would strand the recorded installation forever.
-                match SqliteControlStore::read_create_intent(root).map_err(port)? {
-                    Some((installation, desired)) => retry_create_busy(deadline, || {
-                        SqliteControlStore::recover_create(root, &installation, desired)
-                    })
-                    .map_err(port)?,
-                    None => {
-                        let installation = random_id("installation")?;
-                        retry_create_busy(deadline, || {
-                            SqliteControlStore::create(root, &installation, DesiredUpdates::Running)
-                        })
-                        .map_err(port)?
-                    }
-                }
-            } else {
-                let installation = random_id("installation")?;
-                retry_create_busy(deadline, || {
-                    SqliteControlStore::create(root, &installation, DesiredUpdates::Running)
-                })
-                .map_err(port)?
-            }
-        }
-        Err(e) => return Err(io(e)),
-    };
+    let control = setup_control(&path, root, deadline)?;
     // Retire matching creation records before the catalog can exist; a later
     // retry must never mistake stale records for recoverable policy.
     retry_create_busy(deadline, || control.finish_create()).map_err(port)?;
-    if path.exists() {
-        drop(ManagedStore::open(&path, &control).map_err(port)?);
-    } else {
-        drop(
-            ManagedStore::create(&path, &control, random_id("catalog")?, app_clock_ms())
-                .map_err(port)?,
-        );
-    }
+    setup_catalog(&path, &control, deadline)?;
     let background = maybe_start(&path, &control, deadline);
     let mut data = status_data(&control, &path)?;
     data["background_start"] = background;
     data["status"] = json!("incomplete");
     data["stages"] = json!({"catalog":"ready","history_selection":"use_sources_add","host_registration":"pending","background":"pending"});
     Ok(data)
+}
+
+/// Open or create the control database for setup. Another first setup on the
+/// same data root can hold ControlCreate, record the intent or publish first;
+/// each attempt observes the current state again, so a loser waits, resumes
+/// that exact intent, or opens the published database. Every refusal that no
+/// concurrent setup explains (existing legacy catalog, orphan stage, unproven
+/// marker) returns unchanged.
+fn setup_control(
+    path: &Path,
+    root: &Path,
+    deadline: Instant,
+) -> Result<SqliteControlStore, CliError> {
+    let control_path = SqliteControlStore::path(root);
+    let fresh_installation = random_id("installation")?;
+    // One extra pass when our fresh create met another setup's newly recorded
+    // intent. That pass resumes the intent; without one it stays terminal.
+    let mut intent_recheck = true;
+    loop {
+        match std::fs::symlink_metadata(&control_path) {
+            Ok(_) => return open_control_before(root, true, deadline).map_err(port),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(e)),
+        }
+        if path.exists() {
+            // A concurrent setup can publish control and create the catalog
+            // between the two lookups; only an absent control is legacy.
+            if std::fs::symlink_metadata(&control_path).is_ok() {
+                continue;
+            }
+            return Err(ProtocolError::new(CanonicalCode::SchemaIncompatible,
+                "setup requires a new managed catalog path; existing catalogs need explicit migration").into());
+        }
+        if deadline.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(port(PortError::WriterBusy(
+                "control deadline reached".into(),
+            )));
+        }
+        if let Some(parent) = root.parent() {
+            std::fs::create_dir_all(parent).map_err(io)?;
+        }
+        let root_exists = match std::fs::symlink_metadata(root) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(io(error)),
+        };
+        // Resume only the exact durable intent. A fresh random identity here
+        // would strand the recorded installation forever.
+        let intent = if root_exists {
+            SqliteControlStore::read_create_intent(root)
+        } else {
+            Ok(None)
+        };
+        let fresh = matches!(intent, Ok(None));
+        let attempt = intent.and_then(|intent| match intent {
+            Some((installation, desired)) => SqliteControlStore::recover_create_with_deadline(
+                root,
+                &installation,
+                desired,
+                deadline,
+            ),
+            None => SqliteControlStore::create_with_deadline(
+                root,
+                &fresh_installation,
+                DesiredUpdates::Running,
+                deadline,
+            ),
+        });
+        match attempt {
+            Ok(control) => return Ok(control),
+            // A concurrent setup holds ControlCreate or a handle lock.
+            Err(PortError::WriterBusy(_)) => std::thread::sleep(Duration::from_millis(5)),
+            // A concurrent setup published first: the next pass opens it.
+            Err(_) if std::fs::symlink_metadata(&control_path).is_ok() => {}
+            // It recorded its intent after our read and stopped before
+            // publishing: resume that exact intent on the next pass.
+            Err(PortError::GenerationMismatch(_)) if fresh && intent_recheck => {
+                intent_recheck = false;
+            }
+            Err(error) => return Err(port(error)),
+        }
+    }
+}
+
+/// Open or create the managed catalog for setup. Creation is serialized by
+/// the writer lease, so a concurrent first setup's catalog is waited out and
+/// then opened; an existing catalog that cannot be opened is retried through
+/// create, which resumes only a reserved, never-activated (pristine) catalog.
+/// Like the original single create, the first attempt is not gated by the
+/// remaining budget; only retries after Busy are.
+fn setup_catalog(
+    path: &Path,
+    control: &SqliteControlStore,
+    deadline: Instant,
+) -> Result<(), CliError> {
+    let incarnation = random_id("catalog")?;
+    let mut first_attempt = true;
+    loop {
+        let opened = if path.exists() {
+            match ManagedStore::open(path, control) {
+                Ok(store) => {
+                    drop(store);
+                    return Ok(());
+                }
+                Err(PortError::WriterBusy(_)) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if !first_attempt && deadline.saturating_duration_since(Instant::now()) < CONTROL_ATTEMPT {
+            return Err(port(opened.unwrap_or_else(|| {
+                PortError::WriterBusy("control deadline reached".into())
+            })));
+        }
+        first_attempt = false;
+        match ManagedStore::create(path, control, incarnation.clone(), app_clock_ms()) {
+            Ok(store) => {
+                drop(store);
+                return Ok(());
+            }
+            // The writer lease is held, typically by a concurrent creator.
+            Err(PortError::WriterBusy(_)) => std::thread::sleep(Duration::from_millis(5)),
+            // Create inspected a completed catalog of another incarnation
+            // under the writer lease: a concurrent setup won. Open it, waiting
+            // out only transient Busy (for example a vanishing sidecar).
+            Err(PortError::GenerationMismatch(_)) => {
+                return retry_create_busy(deadline, || ManagedStore::open(path, control))
+                    .map(drop)
+                    .map_err(port);
+            }
+            Err(error) => return Err(port(opened.unwrap_or(error))),
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -837,6 +923,72 @@ mod tests {
         assert!(!root.join("control.db.creating.intent").exists());
         assert!(!root.join("control.db.creating.publish").exists());
         assert!(!root.join("control.db.creating").exists());
+    }
+
+    #[test]
+    fn concurrent_first_setups_share_one_installation_and_catalog() {
+        // Two terminals, or an installer and a user, can run first setup on the
+        // same data root together. Every participant must adopt the winner's
+        // control and catalog instead of reporting a lock or "invalid" error.
+        for _ in 0..6 {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let root = temp.path().join("private");
+            let catalog = root.join("catalog.db");
+            let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let start = start.clone();
+                    let db = catalog.to_str().unwrap().to_owned();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        prepare_setup_before(&db, Instant::now() + COMMAND_BUDGET)
+                            .map(|_| ())
+                            .map_err(|error| error.0.code)
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+            let control =
+                open_control_before(&root, false, Instant::now() + COMMAND_BUDGET).unwrap();
+            drop(ManagedStore::open(&catalog, &control).unwrap());
+            for leftover in [
+                "control.db.creating",
+                "control.db.creating.intent",
+                "control.db.creating.publish",
+            ] {
+                assert!(!root.join(leftover).exists(), "{leftover}");
+            }
+        }
+    }
+
+    #[test]
+    fn setup_resumes_an_intent_recorded_after_its_first_read() {
+        // Another setup recorded its intent after our read found none (no
+        // rendezvous file yet), then stopped before publishing. Our fresh
+        // create meets that pending intent; one recheck resumes it exactly
+        // instead of failing the run.
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let installation = ControlId::parse("installation_late_intent").unwrap();
+        crate::native_autostart::platform::create_private_directory(&root).unwrap();
+        let bytes = creation_intent_bytes(&root, installation.as_str(), "paused");
+        write_creation_record(&root, "control.db.creating.intent", &bytes);
+        assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
+        let data = prepare_setup_before(catalog.to_str().unwrap(), Instant::now() + COMMAND_BUDGET)
+            .unwrap();
+        assert_eq!(data["desired_updates"], "paused");
+        let control = SqliteControlStore::open_existing_writable(&root, &installation).unwrap();
+        assert_eq!(
+            control.status().unwrap().policy.installation_id,
+            installation
+        );
+        assert!(catalog.exists());
+        assert!(!root.join("control.db.creating.intent").exists());
     }
 
     #[test]

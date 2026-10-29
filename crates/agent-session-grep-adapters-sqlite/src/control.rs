@@ -3433,17 +3433,21 @@ fn private_directory(path: &Path, create: bool) -> PortResult<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 reject_links(path.parent().ok_or_else(invalid)?)?;
                 #[cfg(unix)]
-                {
+                let created = {
                     use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(path)
-                        .map_err(io_error)?;
-                }
+                    fs::DirBuilder::new().mode(0o700).create(path)
+                };
                 #[cfg(windows)]
-                windows_private::create_directory(path)?;
+                let created = windows_private::create_directory(path);
                 #[cfg(not(any(unix, windows)))]
-                return Err(io_error(()));
+                let created: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+                match created {
+                    Ok(()) => {}
+                    // A concurrent first setup created it after our lookup.
+                    // Adopt it only through the same private validation below.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(io_error(error)),
+                }
             }
             Err(error) => return Err(io_error(error)),
         }
@@ -5990,17 +5994,20 @@ mod windows_private {
         value.push(0);
         Ok(value)
     }
-    pub(super) fn create_directory(path: &Path) -> PortResult<()> {
-        let descriptor = descriptor()?;
+    /// Returns the OS error so a concurrent creator's AlreadyExists stays
+    /// distinguishable; every other failure is still refused by the caller.
+    pub(super) fn create_directory(path: &Path) -> std::io::Result<()> {
+        let descriptor = descriptor().map_err(|_| std::io::Error::other("security descriptor"))?;
         let attributes = SecurityAttributes {
             length: std::mem::size_of::<SecurityAttributes>() as u32,
             descriptor: descriptor.0,
             inherit: 0,
         };
-        let name = wide(path)?;
+        let name =
+            wide(path).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         // SAFETY: both structures live through this call; DACL is installed at creation.
         if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
-            return Err(io_error(()));
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
