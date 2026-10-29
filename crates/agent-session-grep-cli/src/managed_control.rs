@@ -36,6 +36,8 @@ pub(crate) fn is_control(command: &str) -> bool {
 }
 
 fn port(error: PortError) -> CliError {
+    #[cfg(test)]
+    tests::LAST_PORT_ERROR.with(|slot| *slot.borrow_mut() = Some(format!("{error:?}")));
     let code = match error {
         PortError::InvalidRequest(_) => CanonicalCode::InvalidRequest,
         PortError::NotFound(_) => CanonicalCode::NotFound,
@@ -940,6 +942,13 @@ pub(crate) fn run(
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// The typed cause behind the last fixed-text `port` error on this
+        /// thread. Production output keeps only the canonical code.
+        pub(super) static LAST_PORT_ERROR: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     fn creation_intent_bytes(root: &Path, installation: &str, desired: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "schema": "asg.control-create-intent/v2",
@@ -1007,11 +1016,14 @@ mod tests {
                     let db = catalog.to_str().unwrap().to_owned();
                     std::thread::spawn(move || {
                         start.wait();
-                        // Keep the message and details: macOS reported a bare
-                        // SourceIo once, which no code path explained.
+                        // Keep the typed cause: macOS reports a bare SourceIo
+                        // that the fixed public message cannot explain.
                         prepare_setup_before(&db, Instant::now() + COMMAND_BUDGET)
                             .map(|_| ())
-                            .map_err(|error| format!("{:?}", error.0))
+                            .map_err(|error| {
+                                let cause = LAST_PORT_ERROR.with(|slot| slot.borrow_mut().take());
+                                format!("{:?} cause={cause:?}", error.0)
+                            })
                     })
                 })
                 .collect();
