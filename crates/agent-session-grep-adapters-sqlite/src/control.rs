@@ -5834,7 +5834,7 @@ fn write_source(conn: &Connection, p: &SourceProgress) -> PortResult<()> {
 mod windows_private {
     use super::{
         PortResult, io_error, private_file_io, private_file_io_at, private_validation_error,
-        private_validation_io,
+        private_validation_io, validation_changed,
     };
     use std::{
         ffi::c_void,
@@ -6149,12 +6149,33 @@ mod windows_private {
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
         };
-        OpenOptions::new()
-            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(|e| private_file_io_at(e, sidecar, "handle_open"))
+        let open = |access: u32| {
+            OpenOptions::new()
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        };
+        open(READ_CONTROL | FILE_READ_ATTRIBUTES).map_err(|error| {
+            // A name whose delete is pending (SQLite deleting a WAL/SHM on its
+            // last close while another handle remains) refuses every new open
+            // with ERROR_ACCESS_DENIED, even one that requests no access. An
+            // ACL refusal still admits that zero-access open. Only the former
+            // is a transient change; any other refusal stays a hard failure.
+            if error.raw_os_error() == Some(5) {
+                match open(0) {
+                    Err(again) if again.raw_os_error() == Some(5) => {
+                        return validation_changed("handle_delete_pending", sidecar, 303);
+                    }
+                    // The pending delete completed between the two opens.
+                    Err(again) if again.kind() == std::io::ErrorKind::NotFound => {
+                        return private_file_io_at(again, sidecar, "handle_open");
+                    }
+                    _ => {}
+                }
+            }
+            private_file_io_at(error, sidecar, "handle_open")
+        })
     }
 
     /// An elevated administrator's token makes BUILTIN\Administrators the
@@ -6382,11 +6403,22 @@ mod windows_private {
         }
 
         fn allow_everyone(path: &Path) {
+            set_protected_dacl(path, "D:P(A;;FA;;;WD)");
+        }
+
+        /// Deny READ_CONTROL to the owner through an OWNER RIGHTS entry while
+        /// the user keeps every other right, so only that refusal applies.
+        fn deny_owner_read_control(path: &Path) {
+            let sid = User::current().unwrap().sid_text().unwrap();
+            set_protected_dacl(path, &format!("D:P(D;;RC;;;OW)(A;;FA;;;{sid})"));
+        }
+
+        fn set_protected_dacl(path: &Path, sddl: &str) {
             #[link(name = "advapi32")]
             unsafe extern "system" {
                 fn SetFileSecurityW(path: *const u16, info: u32, descriptor: *mut c_void) -> i32;
             }
-            let sddl: Vec<_> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
+            let sddl: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
             let mut descriptor = ptr::null_mut();
             // SAFETY: terminated synthetic SDDL and writable output pointer.
             assert_ne!(
@@ -6407,6 +6439,53 @@ mod windows_private {
             assert_ne!(
                 unsafe { SetFileSecurityW(path.as_ptr(), 0x80000004, descriptor.0) },
                 0
+            );
+        }
+
+        /// SQLite deletes WAL/SHM on its last close. While another handle
+        /// remains, that name refuses every new open with access denied; it is
+        /// a retryable change and validates again once the delete completes.
+        /// A real ACL refusal of the same open stays a hard failure.
+        #[test]
+        fn delete_pending_sidecar_name_is_retryable_and_acl_denial_is_not() {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+            let (_temp, _root, db) = setup();
+            let wal = sidecar(&db, "-wal");
+            drop(create_file(&wal).unwrap());
+            let held = OpenOptions::new()
+                .access_mode(DELETE | 0x20000 | 0x80)
+                .share_mode(7)
+                .custom_flags(0x00200000)
+                .open(&wal)
+                .unwrap();
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: valid owned disposable handle with DELETE access and
+            // matching FILE_DISPOSITION_INFO payload/class.
+            assert_ne!(
+                unsafe {
+                    SetFileInformationByHandle(
+                        held.as_raw_handle(),
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                },
+                0
+            );
+            assert!(
+                matches!(verify_sidecars(&db), Err(PortError::WriterBusy(ref detail))
+                if detail == "private storage changed during validation (stage=handle_delete_pending, sidecar=1, code=303)")
+            );
+            drop(held);
+            verify_sidecars(&db).unwrap();
+
+            drop(create_file(&wal).unwrap());
+            deny_owner_read_control(&wal);
+            assert!(
+                matches!(verify_sidecars(&db), Err(PortError::Backend(ref detail))
+                if detail == "private storage validation failed (stage=handle_open, sidecar=1, code=5)")
             );
         }
 
