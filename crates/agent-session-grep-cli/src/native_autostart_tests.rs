@@ -445,7 +445,13 @@ fn linked_config_and_retargeted_parent_are_refused_without_following() {
         })
         .err()
         .unwrap();
-    assert!(matches!(error.code, ErrorCode::Conflict | ErrorCode::Io));
+    // As in production (`.asg-<installation>`), the private journal lives in
+    // the retargeted directory, so recording the refusal can itself require
+    // recovery. Either way nothing follows the new directory.
+    assert!(matches!(
+        error.code,
+        ErrorCode::Conflict | ErrorCode::Io | ErrorCode::RecoveryRequired
+    ));
     assert!(moved.join(f.store.entry_name()).exists());
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
 }

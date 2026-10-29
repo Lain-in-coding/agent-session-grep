@@ -259,8 +259,18 @@ impl PackageFixture {
                 ),
             );
         }
-        for (name, (bytes, _)) in &members {
+        for (name, (bytes, mode)) in &members {
             private_file(&prefix.join(name), bytes);
+            // Match the installed package mode: the verifier requires every
+            // execute bit, and the launcher refuses a non-executable app
+            // before cleanup ever reads the package plan.
+            #[cfg(unix)]
+            if mode == "0755" {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(prefix.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
         }
         let fields = [
             ("version", version.into()),
@@ -416,20 +426,32 @@ fn immutable_helper_seal_is_manifest_bound_and_private_copy_is_exact() {
         seal.runner.digest,
         journal.state.after_exit.as_ref().unwrap().runner.digest
     );
+    let runner = if cfg!(windows) {
+        "helper/runner.exe"
+    } else {
+        "helper/runner"
+    };
     assert_eq!(
-        fs::read(journal.root.join("helper/runner.exe")).unwrap(),
+        fs::read(journal.root.join(runner)).unwrap(),
         b"inert synthetic native application, never executed"
     );
-    assert_eq!(
-        fs::read(journal.root.join("helper/tail-source.ps1")).unwrap(),
-        include_bytes!("../../../scripts/install/package-uninstall.ps1")
-    );
+    if cfg!(windows) {
+        assert_eq!(
+            fs::read(journal.root.join("helper/tail-source.ps1")).unwrap(),
+            include_bytes!("../../../scripts/install/package-uninstall.ps1")
+        );
+    } else {
+        // Only Windows needs a PowerShell tail; a Unix runner finishes in-process.
+        assert!(seal.tail.is_none() && seal.tail_source.is_none());
+        assert!(!journal.root.join("helper/tail-source.ps1").exists());
+    }
     private_file(
         &journal.root.join("helper/unknown.log"),
         b"unknown retained",
     );
     assert!(!account_package(&journal, &seal, deadline()).unwrap());
 }
+#[cfg(windows)]
 #[test]
 fn historical_package_without_tail_remains_explicitly_pending_with_recovery_image() {
     let fixture = PackageFixture::new(false);
@@ -450,6 +472,35 @@ fn historical_package_without_tail_remains_explicitly_pending_with_recovery_imag
             .exists()
     );
     assert!(journal.root.join("helper/runner.exe").exists());
+    assert!(fixture.catalog.exists() && SqliteControlStore::path(&fixture.root).exists());
+}
+#[cfg(unix)]
+#[test]
+fn unix_package_cleanup_completes_in_process_without_a_tail_helper() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let installation =
+        update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+    let result = finalize(&mut journal, &seal, &installation, deadline());
+    assert!(
+        result.is_ok(),
+        "actual result {result:?}; report {}",
+        serde_json::to_string(&journal.state.report).unwrap()
+    );
+    assert_eq!(
+        journal.state.report.status,
+        "complete_with_retained_private_markers"
+    );
+    assert!(!journal.state.report.cleanup_pending);
+    assert!(
+        !fixture
+            .prefix
+            .join(agent_session_grep_launcher::metadata::APP_NAME)
+            .exists()
+    );
+    assert!(!journal.root.join("helper/runner").exists());
+    // Keep-data cleanup removes package bytes only.
     assert!(fixture.catalog.exists() && SqliteControlStore::path(&fixture.root).exists());
 }
 

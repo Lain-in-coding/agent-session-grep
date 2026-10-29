@@ -488,7 +488,14 @@ impl Fixture {
     fn stage(&self) -> (TempDir, PathBuf) {
         let directory = agent_session_grep_testkit::tempdir().expect("stage tempdir");
         #[cfg(unix)]
-        let path = directory.path().canonicalize().expect("canonical stage");
+        let path = {
+            use std::os::unix::fs::PermissionsExt;
+            // Production stages come from create_private_directory (0700);
+            // tempfile applies the umask, which normally leaves 0755.
+            let path = directory.path().canonicalize().expect("canonical stage");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("private stage");
+            path
+        };
         #[cfg(windows)]
         let path = directory.path().to_path_buf();
         (directory, path)
