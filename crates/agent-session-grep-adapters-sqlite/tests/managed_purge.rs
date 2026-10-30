@@ -1,7 +1,7 @@
 //! Synthetic file-backed SQLite/WAL fixtures only. No real histories or profiles.
 use agent_session_grep_adapters_sqlite::{
     SourceBatch, SqliteControlStore,
-    control::{BackupPurpose, BackupState, PurgeCheckpoint, PurgeFailure},
+    control::{BackupPurpose, BackupRegistration, BackupState, PurgeCheckpoint, PurgeFailure},
     managed_cache::{
         CacheBinding, CacheCandidate, CacheInsert, CachePageRequest, InsertOutcome, ManagedCache,
     },
@@ -846,6 +846,141 @@ fn legacy_digestless_quarantine_does_not_block_remaining_backups_or_job_completi
         .unwrap();
     assert_eq!(record.state, BackupState::Quarantined);
     assert_eq!(record.digest, None);
+}
+
+#[test]
+fn incomplete_registered_backup_stays_pending_without_blocking_later_cleanup() {
+    for leave_partial_file in [false, true] {
+        let f = Fixture::new();
+        let prefix = verified_prefix(&f);
+        let install_lock = acquire(
+            &prefix,
+            LockKind::MaintenanceJob(
+                agent_session_grep_adapters_sqlite::managed_locks::JobLockKey::parse(
+                    "installation-update",
+                )
+                .unwrap(),
+            ),
+        );
+        let installation = f.control.bind_installation(&prefix, &install_lock).unwrap();
+        let BackupOutcome::Created(verified) = create_backup(&f, &installation, "zzz-safe") else {
+            panic!("backup fixture was not created")
+        };
+        let registration = BackupRegistration {
+            backup_id: id("aaa-registered"),
+            purpose: BackupPurpose::BetaRollback,
+            relative_locator: "backups/aaa-registered/catalog.db".into(),
+            catalog_incarnation: verified.catalog_incarnation,
+            catalog_generation: verified.catalog_generation,
+            schema_version: verified.schema_version,
+            source_ids: verified.source_ids,
+        };
+        {
+            let guard = acquire(&f.root, LockKind::PolicyOwner);
+            let bound = f.control.bind_control_root(&guard).unwrap();
+            f.control
+                .begin_maintenance(
+                    current(&f.control),
+                    &id("registered-owner"),
+                    &bound,
+                    &installation,
+                    MaintenanceFence {
+                        state: MaintenanceState::Updating,
+                        owner: Some(id("registered-owner")),
+                        phase: Some(MaintenancePhase::BackedUp),
+                    },
+                )
+                .unwrap();
+        }
+        let registered_dir = f.root.join("backups/aaa-registered");
+        fs::create_dir_all(&registered_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&registered_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let registered_path = registered_dir.join("catalog.db");
+        if leave_partial_file {
+            fs::write(&registered_path, b"synthetic partial backup").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&registered_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        {
+            let guard = acquire(&f.root, LockKind::PolicyOwner);
+            let bound = f.control.bind_control_root(&guard).unwrap();
+            f.control
+                .register_backup(
+                    current(&f.control),
+                    &id("registered-owner"),
+                    &bound,
+                    &installation,
+                    &registration,
+                    30,
+                )
+                .unwrap();
+            f.control
+                .clear_maintenance(
+                    current(&f.control),
+                    &id("registered-owner"),
+                    &bound,
+                    &installation,
+                )
+                .unwrap();
+        }
+        let job = f.revoke();
+
+        for nonce in ["registered-first", "registered-second"] {
+            let guard = acquire(&f.root, purge_lock_kind().unwrap());
+            let owner = f.control.bind_purge_owner(&guard, id(nonce)).unwrap();
+            let report = run(
+                &f.control,
+                &f.catalog,
+                &owner,
+                Some(&installation),
+                40,
+                deadline(),
+            )
+            .unwrap();
+            assert!(!report.complete(), "{report:?}");
+            assert_eq!(
+                report.backups,
+                PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact)
+            );
+
+            let records = f.control.backup_records().unwrap();
+            let registered = records
+                .iter()
+                .find(|backup| backup.backup_id == id("aaa-registered"))
+                .unwrap();
+            assert_eq!(registered.state, BackupState::Registered);
+            assert_eq!(registered.digest, None);
+            assert_eq!(registered.source_ids, registration.source_ids);
+            assert_eq!(
+                records
+                    .iter()
+                    .find(|backup| backup.backup_id == id("zzz-safe"))
+                    .unwrap()
+                    .state,
+                BackupState::PurgedByPolicy
+            );
+            assert!(!f.root.join("backups/zzz-safe/catalog.db").exists());
+            if leave_partial_file {
+                assert_eq!(
+                    fs::read(&registered_path).unwrap(),
+                    b"synthetic partial backup"
+                );
+            } else {
+                assert!(!registered_path.exists());
+            }
+            assert_ne!(
+                f.control.purge_job_status(&job).unwrap().job.state,
+                PurgeState::Complete
+            );
+        }
+    }
 }
 
 #[test]

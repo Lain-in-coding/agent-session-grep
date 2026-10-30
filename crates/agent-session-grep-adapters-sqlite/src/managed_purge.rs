@@ -1195,11 +1195,19 @@ fn purge_backups(
     if !backup_directory_is_accounted(control, deadline)? {
         return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
     }
+    let mut unclassified_registered = false;
     for backup in control.backup_records()? {
         check(deadline)?;
         if backup.state == BackupState::PurgedByPolicy
             && backup_artifact_absent(control, &backup.relative_locator)?
         {
+            continue;
+        }
+        if backup.state == BackupState::Registered && backup.digest.is_none() {
+            // Registration proves ownership, not that any bytes match a
+            // verified backup. Preserve this intent and continue cleaning
+            // other independently verified backups in the same slice.
+            unclassified_registered = true;
             continue;
         }
         let needs_purge = match backup.state {
@@ -1249,7 +1257,11 @@ fn purge_backups(
             }
         }
     }
-    Ok(PurgeStage::Complete)
+    if unclassified_registered {
+        Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact))
+    } else {
+        Ok(PurgeStage::Complete)
+    }
 }
 
 fn quarantine_unclassified_before(
