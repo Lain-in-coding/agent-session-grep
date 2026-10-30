@@ -420,11 +420,14 @@ fn path_removal_runs_only_after_the_uninstalling_fence() {
 fn keep_data_keeps_catalog_policy_and_denies_without_clearing_pause() {
     let fixture = Fixture::new();
     let policy = control_status(&fixture.control).policy;
-    let report = fixture.execute(true, deadline());
+    // This is a complete keep-data operation, not a shortened-deadline test.
+    let report = fixture.execute(true, Instant::now() + BUDGET);
     assert!(
         !report.corpus_removed
             && report.catalog_and_policy_retained
-            && report.continuation_cache_cleared
+            && report.continuation_cache_cleared,
+        "actual stages: {}",
+        serde_json::to_string(&report).unwrap()
     );
     assert!(!report.control_cleanup_pending && report.package_cleanup_pending);
     assert!(fixture.catalog.exists());

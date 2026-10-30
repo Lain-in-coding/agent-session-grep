@@ -678,8 +678,11 @@ fn tail_failed_runner_delete_preserves_recovery_and_rejects_forged_completion() 
     let (mut journal, seal) = tail_handoff(&mut fixture, false);
     let plan = journal.state.after_exit.clone().unwrap();
     let runner = package_installation::pinned(&journal.root.join(&plan.runner.relative)).unwrap();
+    // The pinned runner is the failure injection. Keep the real tail budget
+    // so PowerShell startup and Add-Type cannot consume a shortened deadline
+    // before the script removes itself and reaches the locked runner.
     journal.state.after_exit.as_mut().unwrap().deadline_tick =
-        Some(deadline_tick(Instant::now() + Duration::from_secs(4)).unwrap());
+        Some(deadline_tick(Instant::now() + BUDGET).unwrap());
     journal
         .state
         .after_exit
@@ -692,6 +695,10 @@ fn tail_failed_runner_delete_preserves_recovery_and_rejects_forged_completion() 
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
     assert!(journal.root.join(&plan.runner.relative).exists());
     assert!(journal.root.join("helper/tail-source.ps1").exists());
+    assert!(
+        !journal.root.join("helper/tail.ps1").exists(),
+        "tail must reach runner deletion before the injected lock exhausts its budget"
+    );
     assert!(!consume_tail_result(&mut journal, &seal, deadline()).unwrap());
     assert!(
         journal.state.report.after_exit_cleanup_pending
