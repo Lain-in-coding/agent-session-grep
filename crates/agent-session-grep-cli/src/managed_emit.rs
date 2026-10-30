@@ -31,8 +31,14 @@ const CONTROL_MAGIC: &[u8; 8] = b"ASGCTL01";
 const CONTROL_HEADER_BYTES: usize = 12;
 const HEADER_BYTES: usize = 50;
 const WRITE_READY: u8 = 1;
+/// Sent after the frame write and flush complete (or the consumer closed its
+/// pipe), before the helper releases anything.
+const WRITE_DONE: u8 = 2;
 const WRITE_WINDOW: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(1);
+/// Transient control contention a helper absorbs before reporting `Blocked`.
+/// It never extends the parent's own cancellation deadline.
+const CONTROL_READ_BUDGET: Duration = Duration::from_secs(1);
 const EXIT_POLICY: i32 = 7;
 const EXIT_BLOCKED: i32 = 10;
 
@@ -58,10 +64,21 @@ pub enum EmissionFailureKind {
 pub struct EmissionFailure {
     kind: EmissionFailureKind,
     pending: Option<Box<PendingEmission>>,
+    untouched: bool,
 }
 impl EmissionFailure {
     pub fn kind(&self) -> EmissionFailureKind {
         self.kind
+    }
+    /// True only when no byte of this frame can have reached the transport:
+    /// the failure happened before a helper received the frame, or the helper
+    /// exited, or its confirmed termination ended the status pipe, without
+    /// ever signalling that it was about to write. A zero exit without the
+    /// completion marker is an anomaly and never qualifies. The caller may
+    /// then answer the same request with a content-free error and keep the
+    /// transport.
+    pub fn output_untouched(&self) -> bool {
+        self.untouched
     }
     /// A caller receiving this capability MUST close/disable this transport and
     /// retain scope_revoking for evidence until termination is confirmed. A dropped
@@ -87,6 +104,7 @@ fn failure(kind: EmissionFailureKind) -> EmissionFailure {
     EmissionFailure {
         kind,
         pending: None,
+        untouched: true,
     }
 }
 
@@ -100,8 +118,11 @@ struct RootFile {
 pub struct PendingEmission {
     child: Child,
     feeder: Option<JoinHandle<io::Result<()>>>,
-    status_reader: Option<JoinHandle<()>>,
+    status_reader: Option<JoinHandle<bool>>,
     exit: Option<ExitStatus>,
+    /// Set by confirmed termination: whether the status task proved a clean
+    /// marker protocol. Absence of proof is never an untouched proof.
+    status_clean: bool,
     _root: Option<RootFile>,
 }
 impl fmt::Debug for PendingEmission {
@@ -123,19 +144,20 @@ impl PendingEmission {
                 .as_ref()
                 .is_none_or(JoinHandle::is_finished)
     }
-    fn join_finished(&mut self) -> bool {
+    /// Joins finished tasks: (stdin feeder succeeded, status protocol clean).
+    fn join_status(&mut self) -> Option<(bool, bool)> {
         if !self.tasks_finished() {
-            return false;
+            return None;
         }
         let feeder_ok = self
             .feeder
             .take()
             .is_none_or(|task| matches!(task.join(), Ok(Ok(()))));
-        let reader_ok = self
+        let status_clean = self
             .status_reader
             .take()
-            .is_none_or(|task| task.join().is_ok());
-        feeder_ok && reader_ok
+            .is_none_or(|task| matches!(task.join(), Ok(true)));
+        Some((feeder_ok, status_clean))
     }
     /// Retrying termination is explicit and uses the supplied absolute deadline;
     /// no PID/host lookup, process tree kill or lock expiry is ever used.
@@ -146,8 +168,11 @@ impl PendingEmission {
             let _ = self.child.kill();
         }
         loop {
-            if self.poll_exit().unwrap_or(false) && self.tasks_finished() {
-                let _ = self.join_finished();
+            if self.poll_exit().unwrap_or(false)
+                && self.tasks_finished()
+                && let Some((_, status_clean)) = self.join_status()
+            {
+                self.status_clean = status_clean;
                 return true;
             }
             if Instant::now() >= deadline {
@@ -374,25 +399,45 @@ fn emit_packet_using(
         feeder: None,
         status_reader: None,
         exit: None,
+        status_clean: false,
         _root: packet.root,
     };
     let Some(mut input) = process.child.stdin.take() else {
-        return cancel(process, deadline, EmissionFailureKind::StorageOrIo);
+        return cancel(process, None, deadline, EmissionFailureKind::StorageOrIo);
     };
     let Some(mut status) = process.child.stderr.take() else {
-        return cancel(process, deadline, EmissionFailureKind::StorageOrIo);
+        return cancel(process, None, deadline, EmissionFailureKind::StorageOrIo);
     };
-    let (sender, ready) = mpsc::sync_channel(1);
+    // At most two markers are ever sent, so the sender never blocks.
+    let (sender, markers) = mpsc::sync_channel(2);
     process.status_reader =
         match thread::Builder::new()
             .name("asg-emit-status".into())
             .spawn(move || {
-                let mut byte = [0];
-                let started = status.read_exact(&mut byte).is_ok() && byte[0] == WRITE_READY;
-                let _ = sender.send(started);
+                // A no-write proof requires clean EOF before READY. Status I/O
+                // errors, malformed bytes, or another marker sequence never
+                // authorize treating stdout as untouched.
+                let mut seen = 0;
+                loop {
+                    let mut byte = [0];
+                    match status.read(&mut byte) {
+                        Ok(0) => return seen != 1,
+                        Ok(1) if seen == 0 && byte[0] == WRITE_READY => {}
+                        Ok(1) if seen == 1 && byte[0] == WRITE_DONE => {}
+                        _ => return false,
+                    }
+                    seen += 1;
+                    if sender.send(byte[0]).is_err() {
+                        return false;
+                    }
+                    if seen == 2 {
+                        // A successful frame ends the status protocol here.
+                        return true;
+                    }
+                }
             }) {
             Ok(task) => Some(task),
-            Err(_) => return cancel(process, deadline, EmissionFailureKind::StorageOrIo),
+            Err(_) => return cancel(process, None, deadline, EmissionFailureKind::StorageOrIo),
         };
     process.feeder = match thread::Builder::new()
         .name("asg-emit-input".into())
@@ -405,54 +450,129 @@ fn emit_packet_using(
             Ok(())
         }) {
         Ok(task) => Some(task),
-        Err(_) => return cancel(process, deadline, EmissionFailureKind::StorageOrIo),
+        Err(_) => return cancel(process, None, deadline, EmissionFailureKind::StorageOrIo),
     };
-    supervise(process, ready, stop_at, deadline)
+    supervise(process, markers, stop_at, deadline)
+}
+
+/// Status markers observed from one helper.
+#[derive(Default)]
+struct Markers {
+    ready: bool,
+    done: bool,
+}
+impl Markers {
+    fn drain(&mut self, markers: &Receiver<u8>) {
+        while let Ok(marker) = markers.try_recv() {
+            match marker {
+                WRITE_READY => self.ready = true,
+                WRITE_DONE => self.done = true,
+                _ => {}
+            }
+        }
+    }
 }
 
 fn supervise(
     mut process: PendingEmission,
-    ready: Receiver<bool>,
+    markers: Receiver<u8>,
     stop_at: Instant,
     deadline: Instant,
 ) -> Result<EmissionOutcome, EmissionFailure> {
-    let mut cancel_at = stop_at;
+    let mut seen = Markers::default();
+    let mut write_end = None;
     loop {
-        if let Ok(true) = ready.try_recv() {
-            cancel_at = cancel_at.min(Instant::now() + WRITE_WINDOW);
+        seen.drain(&markers);
+        if seen.ready && write_end.is_none() {
+            write_end = Some(Instant::now() + WRITE_WINDOW);
         }
+        // The write window bounds only output. Once the OS accepted the
+        // complete frame, helper teardown is never a failed emission.
+        let cancel_at = match write_end {
+            Some(end) if !seen.done => stop_at.min(end),
+            _ => stop_at,
+        };
         match process.poll_exit() {
             Ok(true) if process.tasks_finished() => {
+                // The status pipe is closed: every marker has been forwarded.
+                seen.drain(&markers);
                 let code = process.exit.and_then(|s| s.code());
-                let tasks_ok = process.join_finished();
-                return match code {
-                    Some(0) if tasks_ok => Ok(EmissionOutcome::Completed),
-                    Some(EXIT_POLICY) => Err(failure(EmissionFailureKind::PolicyChanged)),
-                    Some(EXIT_BLOCKED) => Err(failure(EmissionFailureKind::Blocked)),
-                    Some(2) => Err(failure(EmissionFailureKind::InvalidFrame)),
-                    _ => Err(failure(EmissionFailureKind::StorageOrIo)),
+                let (feeder_ok, status_clean) = process.join_status().unwrap_or((false, false));
+                // Only DONE proves the OS accepted the complete frame. A zero
+                // exit without it is a protocol anomaly, never a completion.
+                if seen.done {
+                    return Ok(EmissionOutcome::Completed);
+                }
+                let kind = match code {
+                    Some(EXIT_POLICY) => EmissionFailureKind::PolicyChanged,
+                    Some(EXIT_BLOCKED) => EmissionFailureKind::Blocked,
+                    Some(2) => EmissionFailureKind::InvalidFrame,
+                    _ => EmissionFailureKind::StorageOrIo,
                 };
+                return Err(EmissionFailure {
+                    kind,
+                    pending: None,
+                    untouched: !seen.ready && status_clean && feeder_ok && code != Some(0),
+                });
             }
-            Err(_) => return cancel(process, deadline, EmissionFailureKind::StorageOrIo),
+            Ok(true) if Instant::now() < deadline => {
+                // An exited helper releases nothing further; its stdin and
+                // status tasks finish with the closed pipes.
+                pause_until(deadline);
+                continue;
+            }
+            Err(_) => {
+                return cancel(
+                    process,
+                    Some((&markers, seen)),
+                    deadline,
+                    EmissionFailureKind::StorageOrIo,
+                );
+            }
             _ => {}
         }
         if Instant::now() >= cancel_at {
-            return cancel(process, deadline, EmissionFailureKind::Deadline);
+            return cancel(
+                process,
+                Some((&markers, seen)),
+                deadline,
+                EmissionFailureKind::Deadline,
+            );
         }
         pause_until(cancel_at);
     }
 }
+/// Terminates the helper within the original deadline. A frame the helper
+/// reported fully written is complete even if its teardown had to be killed.
 fn cancel(
     mut process: PendingEmission,
+    markers: Option<(&Receiver<u8>, Markers)>,
     deadline: Instant,
     reason: EmissionFailureKind,
 ) -> Result<EmissionOutcome, EmissionFailure> {
     if process.confirm_termination(deadline) {
-        Err(failure(reason))
+        // Termination closed the status pipe, so the markers are final. A
+        // helper given no frame (no receiver yet) cannot have written one.
+        let given_frame = markers.is_some();
+        let seen = markers.map_or_else(Markers::default, |(receiver, mut seen)| {
+            seen.drain(receiver);
+            seen
+        });
+        if seen.done {
+            return Ok(EmissionOutcome::Completed);
+        }
+        let exited_zero = process.exit.and_then(|s| s.code()) == Some(0);
+        let status_clean = process.status_clean;
+        Err(EmissionFailure {
+            kind: reason,
+            pending: None,
+            untouched: !seen.ready && (!given_frame || (status_clean && !exited_zero)),
+        })
     } else {
         Err(EmissionFailure {
             kind: EmissionFailureKind::TerminationUnconfirmed,
             pending: Some(Box::new(process)),
+            untouched: false,
         })
     }
 }
@@ -504,13 +624,24 @@ fn helper() -> i32 {
     if RootIdentity::read(&request.root).ok() != Some(gate.root_identity()) {
         return EXIT_POLICY;
     }
-    let control = match SqliteControlStore::open_current_read_only(&request.root) {
-        Ok(store) => store,
-        Err(_) => return EXIT_POLICY,
-    };
-    let policy = match control.read_policy(RequestIntersection::Selected) {
-        Ok(policy) => policy,
-        Err(_) => return EXIT_POLICY,
+    // A transient refusal (another handle's checkpoint, or a sidecar whose
+    // delete is pending) is not a policy change. Retry it briefly; if it
+    // persists, report Blocked, which callers treat as retryable. Every other
+    // failure still withholds the frame as a policy change.
+    let budget_end = Instant::now() + CONTROL_READ_BUDGET;
+    let (control, policy) = loop {
+        let attempt = SqliteControlStore::open_current_read_only(&request.root).and_then(|store| {
+            let policy = store.read_policy(RequestIntersection::Selected)?;
+            Ok((store, policy))
+        });
+        match attempt {
+            Ok(opened) => break opened,
+            Err(PortError::WriterBusy(_)) if Instant::now() < budget_end => thread::sleep(
+                Duration::from_millis(5).min(budget_end.saturating_duration_since(Instant::now())),
+            ),
+            Err(PortError::WriterBusy(_)) => return EXIT_BLOCKED,
+            Err(_) => return EXIT_POLICY,
+        }
     };
     if policy.policy_epoch != request.epoch || policy.installation_id != request.installation {
         return EXIT_POLICY;
@@ -535,8 +666,9 @@ fn helper() -> i32 {
 }
 
 fn write_frame(frame: &[u8]) -> i32 {
-    // Exactly one content-free status byte, on a separate private pipe. The
-    // parent caps the following synchronous write window and owns cancellation.
+    // Content-free status bytes on a separate private pipe: READY before the
+    // write and DONE after it completed. The parent caps only the span between
+    // them and owns cancellation.
     if io::stderr().lock().write_all(&[WRITE_READY]).is_err() {
         return 5;
     }
@@ -544,11 +676,16 @@ fn write_frame(frame: &[u8]) -> i32 {
     let mut sink = stdout.lock();
     let result = sink.write_all(frame).and_then(|()| sink.flush());
     drop(sink);
-    match result {
+    let code = match result {
         Ok(()) => 0,
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 0,
         Err(_) => 5,
+    };
+    if code == 0 {
+        // A parent that already stopped reading status loses only this marker.
+        let _ = io::stderr().lock().write_all(&[WRITE_DONE]);
     }
+    code
 }
 
 fn encode_control_packet(frame: &[u8]) -> Vec<u8> {

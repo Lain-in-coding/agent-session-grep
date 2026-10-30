@@ -292,6 +292,29 @@ impl ManagedBackend {
         match result {
             Ok(_) => true,
             Err(error) => {
+                if error.output_untouched()
+                    && Instant::now() < deadline
+                    && let Some(call) = self.call.borrow().as_ref()
+                {
+                    // The helper exited or was confirmed dead before READY,
+                    // so no evidence byte can be on stdout. Answer this RPC
+                    // with a content-free classified error and keep its session.
+                    let classified = managed_read::withheld_emission_error(error.kind());
+                    let mut frame =
+                        mcp::business_error_frame(call.id.clone(), &classified).into_bytes();
+                    frame.push(b'\n');
+                    match managed_emit::emit_control_frame(&frame, deadline) {
+                        Ok(_) => return true,
+                        Err(fallback) => {
+                            if let Some(mut pending) = fallback.into_pending()
+                                && !pending.confirm_termination(deadline)
+                            {
+                                std::mem::forget(pending);
+                            }
+                            return false;
+                        }
+                    }
+                }
                 if let Some(mut pending) = error.into_pending()
                     && !pending.confirm_termination(deadline)
                 {

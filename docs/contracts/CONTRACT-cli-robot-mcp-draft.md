@@ -440,11 +440,21 @@ fit the final budget. The consumer must not modify the returned payload.
 
 The complete prepared frame is passed to the ASG-owned emission helper with the
 captured physical root identity, installation and policy epoch. The helper checks
-current control under the shared emission gate. Deadline/I/O/unconfirmed-helper
-termination stops this stdout transport; no normal error envelope is appended
-to a possibly partial evidence frame. A pending helper never becomes a false
-revocation acknowledgement. This composition contract does not certify all
-MCP/TUI/Web routing, native cross-platform cancellation or full Beta acceptance.
+current control under the shared emission gate. On a private status pipe it
+reports one byte before writing and a second byte after the write and flush
+complete; the 100 ms write window bounds only that span, so helper teardown
+after the second byte is never a failed emission. Only that completion byte
+proves a delivered frame. Deadline/I/O/unconfirmed-helper termination after the
+first byte stops this stdout transport; no normal error envelope is appended to
+a possibly partial evidence frame. When the helper exits, or its confirmed
+termination ends a clean status pipe, without the first byte, no output byte
+exists. That request then receives one content-free classified error
+(`writer_busy` for contention, `schema_incompatible` for a changed policy) and
+the transport stays open. Transient control contention seen by the helper is
+retried for at most one second and then reported as busy, never as a policy
+change. A pending helper never becomes a false revocation acknowledgement. This
+composition contract does not certify all MCP/TUI/Web routing, native
+cross-platform cancellation or full Beta acceptance.
 For `doctor --db`, a sibling `control.db` selects this managed read path instead
 of the legacy store reader. The managed response reports `managed: true`, a
 bounded catalog check and its control-authorized snapshot, while

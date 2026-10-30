@@ -1310,6 +1310,12 @@ fn business_error_result(error: &ProtocolError) -> Value {
     })
 }
 
+/// A content-free business-error result for one RPC id. Managed callers use it
+/// only after proving that no byte of the withheld frame reached stdout.
+pub(crate) fn business_error_frame(id: Value, error: &ProtocolError) -> String {
+    result_frame(id, business_error_result(error))
+}
+
 fn business(error: impl Into<ProtocolError>) -> ToolError {
     ToolError::Business(error.into())
 }

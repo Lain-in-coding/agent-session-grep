@@ -116,7 +116,8 @@ fn actual_helper_writes_exact_frame_and_normal_exit() {
     let output = complete_helper(packet);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, frame);
-    assert_eq!(output.stderr, [1]); // fixed private handshake, no path/content
+    // Fixed private markers (about to write, write complete), no path/content.
+    assert_eq!(output.stderr, [1, 2]);
     drop(acquire(&root, LockKind::PolicyEmission));
 }
 
@@ -351,6 +352,8 @@ fn parent_supervisor_cancels_stalled_output_with_original_deadline() {
     .unwrap_err();
     assert_eq!(failure.kind(), EmissionFailureKind::Deadline);
     assert!(Instant::now() < deadline);
+    // The helper had signalled its write, so stdout may hold a partial frame.
+    assert!(!failure.output_untouched());
     assert!(failure.into_pending().is_none());
     drop(acquire(&root, LockKind::PolicyEmission));
 }
@@ -388,6 +391,8 @@ fn parent_exact_output_error_mapping_and_rejected_frame_have_no_content() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), EmissionFailureKind::PolicyChanged);
+    // The helper refused before its write marker: no byte can be on stdout.
+    assert!(error.output_untouched());
     assert!(std::fs::read(&output_path).unwrap().is_empty());
     let error = managed_emit::emit_using(
         binary(),
@@ -400,22 +405,53 @@ fn parent_exact_output_error_mapping_and_rejected_frame_have_no_content() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), EmissionFailureKind::InvalidFrame);
+    assert!(error.output_untouched());
     // Expired calls fail before spawning, so using this test process as the
     // current executable cannot accidentally dispatch an unrecognized helper.
-    assert_eq!(
-        managed_emit::emit_frame(
-            &root,
-            agent_session_grep_adapters_sqlite::managed_locks::RootIdentity::read(&root).unwrap(),
-            &policy.installation_id,
-            policy.policy_epoch,
-            b"",
-            Instant::now()
-        )
-        .unwrap_err()
-        .kind(),
-        EmissionFailureKind::Deadline
-    );
+    let expired = managed_emit::emit_frame(
+        &root,
+        agent_session_grep_adapters_sqlite::managed_locks::RootIdentity::read(&root).unwrap(),
+        &policy.installation_id,
+        policy.policy_epoch,
+        b"",
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert_eq!(expired.kind(), EmissionFailureKind::Deadline);
+    assert!(expired.output_untouched());
     assert!(managed_emit::intercept(&["ordinary".into()]).is_none());
+}
+
+#[test]
+fn persistent_control_contention_is_blocked_not_a_policy_change() {
+    let (temp, root, store) = setup();
+    let policy = store.status().unwrap().policy;
+    // The store's own shared lease would not conflict; release it so only the
+    // exclusive holder below refuses the helper's control admission.
+    drop(store);
+    let held = acquire(&root, LockKind::ControlHandles);
+    let output_path = temp.path().join("output");
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let error = managed_emit::emit_using(
+        binary(),
+        &root,
+        &policy.installation_id,
+        policy.policy_epoch,
+        b"must not appear\n",
+        deadline,
+        Stdio::from(std::fs::File::create(&output_path).unwrap()),
+    )
+    .unwrap_err();
+    // Contention outlasting the helper's bounded retry is retryable Busy, and
+    // it was refused before the write marker, so the transport may continue.
+    assert_eq!(error.kind(), EmissionFailureKind::Blocked);
+    assert!(error.output_untouched());
+    assert!(Instant::now() < deadline);
+    assert!(error.into_pending().is_none());
+    assert!(std::fs::read(&output_path).unwrap().is_empty());
+    drop(held);
+    drop(acquire(&root, LockKind::PolicyEmission));
 }
 
 #[test]
@@ -557,7 +593,7 @@ fn control_frame_has_exact_bytes_and_needs_no_catalog_or_control_root() {
     );
     assert_eq!(direct.status.code(), Some(0));
     assert_eq!(direct.stdout, frame);
-    assert_eq!(direct.stderr, [1]);
+    assert_eq!(direct.stderr, [1, 2]);
 }
 
 #[test]
@@ -606,7 +642,7 @@ fn control_frames_survive_maintenance_pending_deny_and_exclusive_evidence_gate()
     );
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, frame);
-    assert_eq!(output.stderr, [1]);
+    assert_eq!(output.stderr, [1, 2]);
     assert_eq!(store.status().unwrap(), before);
     let evidence = complete_helper(managed_emit::packet_for_test(
         &root,
@@ -725,6 +761,7 @@ fn control_parent_cancels_blocked_pipe_and_confirms_owned_helper_exit() {
     .unwrap_err();
     assert_eq!(error.kind(), EmissionFailureKind::Deadline);
     assert!(Instant::now() < deadline);
+    assert!(!error.output_untouched());
     // supervise/cancel can remove PendingEmission only after try_wait and both
     // input/status tasks complete. A cancellation request alone is insufficient.
     assert!(error.into_pending().is_none());

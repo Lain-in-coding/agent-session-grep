@@ -80,6 +80,31 @@ fn boundary_error() -> CliError {
     ))
 }
 
+/// Content-free classification for an evidence frame proven withheld before
+/// any output byte. Only contention is retryable; a changed policy or a broken
+/// helper keeps its own category so clients do not retry permanent failures.
+pub(crate) fn withheld_emission_error(kind: managed_emit::EmissionFailureKind) -> ProtocolError {
+    use managed_emit::EmissionFailureKind as Kind;
+    match kind {
+        Kind::Blocked | Kind::Deadline => ProtocolError::new(
+            CanonicalCode::WriterBusy,
+            "managed response was withheld before output; retry the request",
+        ),
+        Kind::PolicyChanged => ProtocolError::new(
+            CanonicalCode::SchemaIncompatible,
+            "managed policy changed before output; send a new request",
+        ),
+        Kind::StorageOrIo => ProtocolError::new(
+            CanonicalCode::SourceIo,
+            "managed response could not be emitted",
+        ),
+        Kind::InvalidFrame | Kind::TerminationUnconfirmed => ProtocolError::new(
+            CanonicalCode::Internal,
+            "managed response could not be emitted",
+        ),
+    }
+}
+
 struct Request {
     command: &'static str,
     operation: Operation,
@@ -800,6 +825,11 @@ fn emit_cli_request(
     ) {
         Ok(_) => Ok(result.outcome),
         Err(error) => {
+            // No helper byte reached stdout, so the ordinary single error
+            // envelope is the complete response. Writing it holds no gate.
+            if error.output_untouched() {
+                return Err(CliError(withheld_emission_error(error.kind())));
+            }
             // A possibly partial evidence frame permanently closes this transport.
             if let Some(mut pending) = error.into_pending()
                 && !pending.confirm_termination(authority.deadline)
