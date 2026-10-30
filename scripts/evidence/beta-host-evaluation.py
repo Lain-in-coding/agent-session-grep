@@ -424,11 +424,16 @@ class ProcessTree:
         if os.name == "nt":
             return self._stop_windows(deadline)
         else:
+            # Darwin reports EPERM for a group whose remaining members are
+            # zombies awaiting reaping. EPERM never proves the group is gone,
+            # so only ESRCH completes cleanup; otherwise the deadline decides.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 self.cleanup = "complete"
                 return self.cleanup
+            except PermissionError:
+                pass
             while time.monotonic() < deadline:
                 process.poll()
                 try:
@@ -436,10 +441,12 @@ class ProcessTree:
                 except ProcessLookupError:
                     self.cleanup = "complete"
                     return self.cleanup
+                except PermissionError:
+                    pass
                 if time.monotonic() + 0.1 >= deadline:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
                 time.sleep(POLL)
         process.poll()

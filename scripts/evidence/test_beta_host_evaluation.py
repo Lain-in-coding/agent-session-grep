@@ -427,6 +427,37 @@ print(json.dumps({"type":"turn.completed"}),flush=True)
         self.assertEqual(tree.stop(0.2), "incomplete")
         self.assertEqual(tree.kernel.mock_calls, [])
 
+    def posix_tree(self, killpg) -> tuple[object, object]:
+        tree = RUNNER.ProcessTree.__new__(RUNNER.ProcessTree)
+        tree.process = SimpleNamespace(pid=4321, poll=lambda: 0)
+        tree.cleanup = "running"
+        return tree, patch.object(RUNNER, "os", SimpleNamespace(name="posix", killpg=killpg))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group signals.")
+    def test_posix_cleanup_waits_through_zombie_eperm_until_esrch(self) -> None:
+        probes = []
+
+        def killpg(pid, sig):
+            if sig == 0:
+                probes.append(pid)
+                if len(probes) <= 3:
+                    raise PermissionError(1, "Operation not permitted")
+                raise ProcessLookupError(3, "No such process")
+
+        tree, posix = self.posix_tree(killpg)
+        with posix:
+            self.assertEqual(tree.stop(1.0), "complete")
+        self.assertEqual(len(probes), 4)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group signals.")
+    def test_posix_cleanup_never_treats_eperm_as_exit(self) -> None:
+        def killpg(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+
+        tree, posix = self.posix_tree(killpg)
+        with posix:
+            self.assertEqual(tree.stop(0.2), "incomplete")
+
     @unittest.skipUnless(os.name == "nt", "Native Windows membership proof.")
     def test_windows_cleanup_refuses_unverified_members(self) -> None:
         for failure in ("snapshot", "open", "membership", "wait"):
