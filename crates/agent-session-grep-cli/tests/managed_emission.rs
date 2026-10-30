@@ -505,13 +505,22 @@ fn captured_root_mismatch_rejects_parent_before_spawn() {
 
 #[test]
 fn maximum_frame_survives_input_transfer_and_complete_output() {
-    let (temp, root, store) = setup();
+    let (_temp, root, store) = setup();
     let policy = store.status().unwrap().policy;
-    let path = temp.path().join("maximum-frame");
-    let output = std::fs::File::create(&path).unwrap();
     let frame = (0..MAX_FRAME_BYTES)
         .map(|n| (n % 251) as u8)
         .collect::<Vec<_>>();
+    // Maximum-frame correctness does not measure disk write latency inside
+    // the production helper's bounded synchronous-write window.
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let (ready, waiting) = mpsc::sync_channel(1);
+    let collected = thread::spawn(move || {
+        let mut output = Vec::with_capacity(MAX_FRAME_BYTES);
+        ready.send(()).unwrap();
+        reader.read_to_end(&mut output).unwrap();
+        output
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
     let result = managed_emit::emit_using(
         binary(),
         &root,
@@ -519,11 +528,11 @@ fn maximum_frame_survives_input_transfer_and_complete_output() {
         policy.policy_epoch,
         &frame,
         Instant::now() + Duration::from_secs(5),
-        Stdio::from(output),
+        Stdio::from(writer),
     )
     .unwrap();
     assert_eq!(result, EmissionOutcome::Completed);
-    assert_eq!(std::fs::read(path).unwrap(), frame);
+    assert_eq!(collected.join().unwrap(), frame);
     drop(acquire(&root, LockKind::PolicyEmission));
 }
 

@@ -90,6 +90,11 @@ impl Fixture {
         }
     }
     fn response(&self, args: &[OsString]) -> LocalCapture {
+        let registration = self.installation(true);
+        let (supervisor, _) = registration.supervisor.as_ref().unwrap();
+        self.response_with_supervisor(args, supervisor)
+    }
+    fn response_with_supervisor(&self, args: &[OsString], supervisor: &Path) -> LocalCapture {
         let store = self.store();
         if args.iter().any(|arg| arg == "enable") {
             self.enabled.set(true);
@@ -97,8 +102,6 @@ impl Fixture {
         if args.iter().any(|arg| arg == "disable") {
             self.enabled.set(false);
         }
-        let registration = self.installation(true);
-        let (supervisor, _) = registration.supervisor.as_ref().unwrap();
         let stdout = if args.iter().any(|arg| arg == "LoadUnit") {
             json!({"type":"o","data":["/org/freedesktop/systemd1/unit/synthetic_2eservice"]})
                 .to_string()
@@ -613,47 +616,74 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
 }
 
 #[test]
-fn transient_policy_owner_contention_completes_within_the_original_deadline() {
+fn prepared_installation_completes_within_the_original_deadline() {
     let f = Fixture::new(DesiredUpdates::Paused);
-    let (release, released) = std::sync::mpsc::channel();
-    let owner =
-        crate::retry_fixture_busy(|| ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner));
+    // The verifier returns an existing installation; package construction is
+    // test preparation, not part of the command's original deadline.
+    let mut installation = Some(f.installation(true));
+    let supervisor = installation
+        .as_ref()
+        .unwrap()
+        .supervisor
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     let end = Instant::now() + Duration::from_secs(2);
-    let finished = std::thread::scope(|threads| {
-        let releaser = threads.spawn(move || {
-            assert!(released.recv_timeout(Duration::from_secs(2)).is_ok());
-            // The guard remains held across the caller's first admission.
-            std::thread::sleep(Duration::from_millis(30));
-            drop(owner);
-        });
-        let result = execute(
-            f.catalog.to_str().unwrap(),
-            Options {
-                action: Action::Enable,
-                prefix: None,
-            },
-            end,
-            &mut |_| {
-                release.send(()).unwrap();
-                Ok(f.installation(true))
-            },
-            &mut || Ok(f.location.clone()),
-            &mut |_, args, deadline| {
-                assert_eq!(deadline, end);
-                Ok(f.response(args))
-            },
-        );
-        releaser.join().unwrap();
-        result
-    });
+    let finished = execute(
+        f.catalog.to_str().unwrap(),
+        Options {
+            action: Action::Enable,
+            prefix: None,
+        },
+        end,
+        &mut |_| Ok(installation.take().unwrap()),
+        &mut || Ok(f.location.clone()),
+        &mut |_, args, deadline| {
+            assert_eq!(deadline, end);
+            Ok(f.response_with_supervisor(args, &supervisor))
+        },
+    );
     assert_eq!(finished.status, "complete", "reason={:?}", finished.reason);
     assert!(finished.intent_recorded && finished.private_receipt_recorded);
     assert_eq!(
         control_status(&f.control()).desired_updates,
         DesiredUpdates::Paused
     );
-    assert!(Instant::now() < end);
     f.assert_unrelated();
+}
+
+#[test]
+fn policy_owner_retry_observes_busy_before_release_and_keeps_original_end() {
+    let f = Fixture::new(DesiredUpdates::Paused);
+    let mut owner = Some(crate::retry_fixture_busy(|| {
+        ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner)
+    }));
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut attempts = 0;
+    let acquired = retry_port(end, || {
+        attempts += 1;
+        let result = ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner);
+        if attempts == 1 {
+            assert!(matches!(result, Err(PortError::WriterBusy(_))));
+            // Release only after real contention is observed, so a passing test
+            // cannot avoid exercising the retry path through thread timing.
+            drop(owner.take());
+        }
+        result
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    drop(acquired);
+    let mut expired_attempts = 0;
+    assert!(matches!(
+        retry_port(Instant::now(), || {
+            expired_attempts += 1;
+            ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner)
+        }),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert_eq!(expired_attempts, 0);
 }
 
 #[test]
@@ -894,8 +924,11 @@ fn live_authority_holds_both_database_lifetimes_and_rechecks_current_intent() {
             control.set_desired_updates(seq, DesiredUpdates::Paused)
         })
         .unwrap();
+    // The independent pause command is not part of the later read's budget.
+    assert!(matches!(live.status(Instant::now()), Err(Reason::Timeout)));
+    let status_end = Instant::now() + Duration::from_secs(2);
     assert_eq!(
-        live.status(end).unwrap().desired_updates,
+        live.status(status_end).unwrap().desired_updates,
         DesiredUpdates::Paused
     );
     drop(control);

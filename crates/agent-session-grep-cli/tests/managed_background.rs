@@ -163,17 +163,31 @@ impl Fixture {
         }
     }
     fn control(&self) -> SqliteControlStore {
+        self.control_before(Instant::now() + Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("synthetic fixture control admission failed: {error:?}"))
+    }
+    fn control_before(&self, end: Instant) -> PortResult<SqliteControlStore> {
+        if Instant::now() >= end {
+            return Err(PortError::WriterBusy(
+                "synthetic control admission deadline reached".into(),
+            ));
+        }
         let root = self.db.parent().unwrap();
-        let physical = RootIdentity::read(root).unwrap();
-        let end = Instant::now() + Duration::from_secs(5);
+        let physical = RootIdentity::read(root)?;
         loop {
-            assert_eq!(RootIdentity::read(root).unwrap(), physical);
+            if Instant::now() >= end {
+                return Err(PortError::WriterBusy(
+                    "synthetic control admission deadline reached".into(),
+                ));
+            }
+            assert_eq!(RootIdentity::read(root)?, physical);
             match SqliteControlStore::open_current_read_only_with_deadline(root, end) {
-                Ok(control) => return control,
                 Err(PortError::WriterBusy(_)) if Instant::now() < end => {
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(
+                        Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+                    );
                 }
-                Err(error) => panic!("synthetic fixture control admission failed: {error:?}"),
+                result => return result,
             }
         }
     }
@@ -335,25 +349,27 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    #[track_caller]
     fn has_text(&self, text: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let control = self.control();
-            let opened = ManagedStore::open(&self.db, &control);
+            let mut phase = "control admission";
             // Windows briefly denies sidecar handles while the child worker
             // checkpoints; retry within this bounded read budget instead of
             // treating a transient open as terminal validation failure.
-            let result = match opened {
-                Ok(store) => {
+            let result = (|| {
+                let control = self.control_before(deadline)?;
+                // Catalog admission also reads control; an unscoped open would
+                // use fresh 250ms windows instead of this read's original end.
+                phase = "catalog admission";
+                control.with_runtime_deadline(deadline, || {
+                    let store = ManagedStore::open(&self.db, &control)?;
+                    phase = "lexical query";
                     store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
                         read.query_lexical(text, &ProjectionQuery::default(), 16)
                     })
-                }
-                Err(PortError::Backend(reason)) if !reason.contains("code=5") => {
-                    panic!("managed catalog private-file validation failed: {reason}")
-                }
-                Err(error) => Err(error),
-            };
+                })
+            })();
             if let Err(PortError::Backend(reason)) = &result
                 && !reason.contains("code=5")
             {
@@ -372,8 +388,8 @@ impl Fixture {
                 Err(PortError::Backend(_)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                Err(PortError::WriterBusy(_)) => {
-                    panic!("managed source query timed out while busy")
+                Err(error @ PortError::WriterBusy(_)) => {
+                    panic!("managed source query timed out during {phase}: {error:?}")
                 }
                 Err(PortError::SnapshotChanged(_)) => {
                     panic!("managed source query snapshot changed")
@@ -1851,6 +1867,7 @@ fn m2_receipt_current(f: &Fixture, path: &Path) -> bool {
         })
         .unwrap_or(false)
 }
+#[track_caller]
 fn m2_assert_no_metadata_enrichment(f: &Fixture, text: &str) {
     let hits = m2_hits(f, text);
     assert!(!hits.is_empty());

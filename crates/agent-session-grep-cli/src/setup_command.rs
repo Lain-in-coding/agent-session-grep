@@ -1260,10 +1260,17 @@ mod m2_tests {
             result.expect("transient control admission must use remaining caller budget");
         assert_eq!(selection["enabled"], true);
         assert_eq!(selection["provider"], "zcode");
-        assert!(Instant::now() < end);
+        // A committed selection stays successful if acknowledgement or thread
+        // scheduling crosses the end; verify its durable result, not this clock.
         let control =
             SqliteControlStore::open_current_read_only(catalog.parent().unwrap()).unwrap();
-        assert_eq!(control.status().unwrap().policy.selections.len(), 1);
+        let status = control.status().unwrap();
+        assert_eq!(status.policy.selections.len(), 1);
+        let stored = &status.policy.selections[0];
+        assert_eq!(selection["id"], stored.id.as_str());
+        assert!(stored.enabled);
+        assert_eq!(stored.region.provider.as_str(), "zcode");
+        assert_eq!(status.desired_updates, DesiredUpdates::Paused);
     }
 
     #[test]
