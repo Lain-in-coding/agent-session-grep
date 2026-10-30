@@ -660,6 +660,263 @@ fn claude_canonical_parser_preserves_session_parent_usage_and_activity() {
         "synthetic-assistant"
     );
 }
+
+fn claude_runtime_metadata() -> [Value; 2] {
+    // Synthetic values from the observed field structure, never a native transcript.
+    [
+        json!({"type":"atis-latch","atis":"synthetic latch","sessionId":"synthetic-session"}),
+        json!({
+            "type":"cost-state","sessionId":"synthetic-session","totalCostUSD":0.25,
+            "totalAPIDuration":23,"totalAPIDurationWithoutRetries":19,
+            "totalToolDuration":4,"totalLinesAdded":3,"totalLinesRemoved":1,
+            "totalDuration":29,"startTime":1_700_000_000_000_u64,
+            "modelUsage":{"synthetic-model":{
+                "inputTokens":700,"outputTokens":300,"cacheReadInputTokens":200,
+                "cacheCreationInputTokens":100,"webSearchRequests":0,"costUSD":0.25,
+                "thinkingTokens":100
+            }},
+            "hasUnknownModelCost":false
+        }),
+    ]
+}
+
+#[test]
+fn claude_runtime_metadata_keeps_complete_originals_spans_and_message_usage() {
+    let originals = claude_rows();
+    let baseline_bytes = rows(&originals);
+    let baseline = stage("claude-code", &SliceSource::new(&baseline_bytes), end()).unwrap();
+    let [atis, cost] = claude_runtime_metadata();
+    let mut optional_cost = cost.clone();
+    optional_cost
+        .as_object_mut()
+        .unwrap()
+        .remove("hasUnknownModelCost");
+    optional_cost["modelUsage"]["synthetic-model"]
+        .as_object_mut()
+        .unwrap()
+        .remove("thinkingTokens");
+    let mut empty_cost = optional_cost.clone();
+    empty_cost["modelUsage"] = json!({});
+    for metadata in [
+        vec![atis.clone()],
+        vec![cost.clone()],
+        vec![atis.clone(), cost.clone()],
+        vec![atis.clone(), cost.clone(), atis, cost],
+        vec![optional_cost],
+        vec![empty_cost],
+    ] {
+        let mut records = vec![metadata[0].clone(), originals[0].clone()];
+        records.extend(metadata.iter().skip(1).cloned());
+        records.push(originals[1].clone());
+        let bytes = rows(&records);
+        let before = bytes.clone();
+        let source = CountSource::new(&bytes);
+        let parsed = stage("claude-code", &source, end()).unwrap();
+        assert!(parsed.completeness.is_complete());
+        assert_eq!(parsed.completeness.source_bytes(), bytes.len() as u64);
+        assert_eq!(parsed.staged.report, baseline.staged.report);
+        assert_eq!(parsed.staged.messages.len(), 2);
+        assert_eq!(parsed.staged.activities, baseline.staged.activities);
+        assert_eq!(parsed.staged.usage_events, baseline.staged.usage_events);
+        for (actual, expected) in parsed.staged.messages.iter().zip(&baseline.staged.messages) {
+            let (start, finish) = actual.span.unwrap();
+            let original: Value =
+                serde_json::from_slice(&bytes[start as usize..finish as usize]).unwrap();
+            assert_eq!(original["uuid"], actual.native_id);
+            assert_eq!(original["sessionId"], "synthetic-session");
+            let mut without_span = actual.clone();
+            without_span.span = expected.span;
+            assert_eq!(&without_span, expected);
+        }
+        assert_eq!(source.opens.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            source.bytes_read.load(AtomicOrdering::Relaxed),
+            bytes.len() * 2
+        );
+        assert_eq!(bytes, before);
+    }
+}
+
+fn assert_claude_metadata_incomplete(metadata: Value) {
+    let mut records = claude_rows();
+    // Keep the malformed row past the provider probe sample to exercise the gate.
+    records.extend((0..65).map(|_| json!({"type":"summary","summary":"synthetic metadata"})));
+    records.push(metadata);
+    let bytes = rows(&records);
+    let parsed = stage("claude-code", &SliceSource::new(&bytes), end()).unwrap();
+    assert!(!parsed.completeness.is_complete());
+    assert_eq!(
+        parsed.completeness.incomplete_reason(),
+        Some(IncompleteReason::UnsupportedRecord)
+    );
+    assert_eq!(parsed.staged.messages.len(), 2);
+    assert_eq!(parsed.staged.usage_events.len(), 1);
+    assert_eq!(parsed.staged.usage_events[0].usage.input_tokens, 7);
+}
+
+#[test]
+fn claude_runtime_metadata_rejects_missing_malformed_and_future_shapes() {
+    let [atis, cost] = claude_runtime_metadata();
+    for record in [&atis, &cost] {
+        for (key, value) in record.as_object().unwrap() {
+            if key != "hasUnknownModelCost" {
+                let mut missing = record.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert_claude_metadata_incomplete(missing);
+            }
+            let mut invalid = record.clone();
+            invalid[key] = match value {
+                Value::String(_) => json!({}),
+                Value::Number(_) => json!(-1),
+                Value::Object(_) => json!([]),
+                Value::Bool(_) => Value::Null,
+                _ => panic!("unsupported synthetic metadata value"),
+            };
+            assert_claude_metadata_incomplete(invalid);
+        }
+        for identity in [json!(""), json!(" "), json!(0), Value::Null] {
+            let mut invalid = record.clone();
+            invalid["sessionId"] = identity;
+            assert_claude_metadata_incomplete(invalid);
+        }
+        let mut future = record.clone();
+        future["type"] = json!("future-runtime-metadata");
+        assert_claude_metadata_incomplete(future);
+    }
+    for value in [
+        Value::Null,
+        json!(false),
+        json!("counter"),
+        json!({}),
+        json!([]),
+    ] {
+        let mut invalid = cost.clone();
+        invalid["totalCostUSD"] = value;
+        assert_claude_metadata_incomplete(invalid);
+    }
+    for key in cost["modelUsage"]["synthetic-model"]
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        let mut invalid = cost.clone();
+        invalid["modelUsage"]["synthetic-model"][key] = json!("not a counter");
+        assert_claude_metadata_incomplete(invalid);
+        if key != "thinkingTokens" {
+            let mut missing = cost.clone();
+            missing["modelUsage"]["synthetic-model"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert_claude_metadata_incomplete(missing);
+        }
+    }
+}
+
+#[test]
+fn claude_runtime_metadata_cannot_hide_conversation_bodies() {
+    for record in claude_runtime_metadata() {
+        for key in ["message", "content", "payload", "body", "futureField"] {
+            for body in [
+                Value::Null,
+                json!({"role":"assistant","content":"synthetic concealed original"}),
+            ] {
+                let mut invalid = record.clone();
+                invalid[key] = body;
+                assert_claude_metadata_incomplete(invalid);
+            }
+        }
+    }
+    let mut nested = claude_runtime_metadata()[1].clone();
+    nested["modelUsage"]["synthetic-model"]["message"] =
+        json!({"content":"synthetic concealed original"});
+    assert_claude_metadata_incomplete(nested);
+    let mut disguised = claude_runtime_metadata()[1].clone();
+    disguised["modelUsage"]["synthetic-model"] =
+        json!({"type":"assistant","message":{"content":"synthetic concealed original"}});
+    assert_claude_metadata_incomplete(disguised);
+    for result_only in ["contextWindow", "maxOutputTokens"] {
+        let mut invalid = claude_runtime_metadata()[1].clone();
+        invalid["modelUsage"]["synthetic-model"][result_only] = json!(4096);
+        assert_claude_metadata_incomplete(invalid);
+    }
+}
+
+#[test]
+fn claude_runtime_metadata_rejects_raw_duplicate_fields_and_concealed_models() {
+    let [atis, cost] = claude_runtime_metadata();
+    let mut malformed = Vec::new();
+    for (record, fields) in [
+        (&atis, &["atis", "sessionId"][..]),
+        (
+            &cost,
+            &["totalCostUSD", "hasUnknownModelCost", "modelUsage"][..],
+        ),
+    ] {
+        for field in fields {
+            let mut raw = record.to_string();
+            raw.pop();
+            raw.push_str(&format!(",\"{field}\":{}}}", record[*field]));
+            malformed.push(raw);
+        }
+    }
+    let counters = cost["modelUsage"]["synthetic-model"].to_string();
+    let model_entry = format!("\"synthetic-model\":{counters}");
+    let model_map = format!("{{{model_entry}}}");
+    for field in ["inputTokens", "thinkingTokens"] {
+        let mut duplicate = counters.clone();
+        duplicate.pop();
+        duplicate.push_str(&format!(",\"{field}\":0}}"));
+        malformed.push(cost.to_string().replacen(
+            &model_map,
+            &format!("{{\"synthetic-model\":{duplicate}}}"),
+            1,
+        ));
+    }
+    let mut hidden = cost["modelUsage"]["synthetic-model"].clone();
+    hidden["message"] = json!({"content":"synthetic concealed original"});
+    let hidden_entry = format!("\"synthetic-model\":{hidden}");
+    for entries in [
+        format!("{{{hidden_entry},{model_entry}}}"),
+        format!("{{{model_entry},{hidden_entry}}}"),
+    ] {
+        malformed.push(cost.to_string().replacen(&model_map, &entries, 1));
+    }
+    let mut records = claude_rows();
+    records.extend((0..65).map(|_| json!({"type":"summary","summary":"synthetic metadata"})));
+    let prefix = rows(&records);
+    for raw in malformed {
+        // Do not round-trip through Value: it would discard the duplicate keys.
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(raw.as_bytes());
+        bytes.push(b'\n');
+        let parsed = stage("claude-code", &SliceSource::new(&bytes), end()).unwrap();
+        assert_eq!(
+            parsed.completeness.incomplete_reason(),
+            Some(IncompleteReason::UnsupportedRecord)
+        );
+        assert_eq!(parsed.staged.messages.len(), 2);
+        assert_eq!(parsed.staged.usage_events.len(), 1);
+        assert_eq!(parsed.staged.usage_events[0].usage.input_tokens, 7);
+    }
+}
+
+#[test]
+fn claude_runtime_metadata_alone_never_grants_format_or_originals() {
+    for metadata in claude_runtime_metadata() {
+        let bytes = rows(&[metadata]);
+        let parsed = stage("claude-code", &SliceSource::new(&bytes), end()).unwrap();
+        assert!(!parsed.completeness.is_complete());
+        assert_eq!(
+            parsed.completeness.incomplete_reason(),
+            Some(IncompleteReason::InsufficientFormatEvidence)
+        );
+        assert!(parsed.staged.messages.is_empty());
+        assert!(parsed.staged.activities.is_empty());
+        assert!(parsed.staged.usage_events.is_empty());
+    }
+}
+
 #[test]
 fn codex_canonical_parser_retains_exact_original_session_and_usage() {
     let bytes = rows(&codex_rows());

@@ -877,6 +877,149 @@ fn content_supported(
     )
     .unwrap_or(false)
 }
+
+#[derive(Clone, Copy)]
+enum ClaudeMetadataShape {
+    Atis,
+    Cost,
+    Models,
+    ModelCounters,
+}
+
+struct ClaudeMetadataSeed {
+    shape: ClaudeMetadataShape,
+    deadline: Deadline,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ClaudeMetadataSeed {
+    type Value = bool;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ClaudeMetadataSeed {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("known Claude runtime metadata")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        use ClaudeMetadataShape::{Atis, Cost, ModelCounters, Models};
+        let fields: &[&str] = match self.shape {
+            Atis => &["type", "sessionId", "atis"],
+            Cost => &[
+                "type",
+                "sessionId",
+                "totalCostUSD",
+                "totalAPIDuration",
+                "totalAPIDurationWithoutRetries",
+                "totalToolDuration",
+                "totalLinesAdded",
+                "totalLinesRemoved",
+                "totalDuration",
+                "startTime",
+                "modelUsage",
+                "hasUnknownModelCost",
+            ],
+            Models => &[],
+            ModelCounters => &[
+                "inputTokens",
+                "outputTokens",
+                "cacheReadInputTokens",
+                "cacheCreationInputTokens",
+                "webSearchRequests",
+                "costUSD",
+                "thinkingTokens",
+            ],
+        };
+        let required = if matches!(self.shape, Cost | ModelCounters) {
+            // hasUnknownModelCost and thinkingTokens are optional, but never null.
+            fields.len() - 1
+        } else {
+            fields.len()
+        };
+        let mut seen = 0_u16;
+        loop {
+            self.deadline.check().map_err(serde::de::Error::custom)?;
+            let Some(key) = map.next_key::<String>()? else {
+                break;
+            };
+            if matches!(self.shape, Models) {
+                // Validate one model at a time; never retain the counter map.
+                if key.trim().is_empty()
+                    || !map.next_value_seed(ClaudeMetadataSeed {
+                        shape: ModelCounters,
+                        deadline: self.deadline,
+                    })?
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let Some(index) = fields.iter().position(|field| *field == key) else {
+                return Ok(false);
+            };
+            let bit = 1 << index;
+            if seen & bit != 0 {
+                return Ok(false);
+            }
+            seen |= bit;
+            let valid = match key.as_str() {
+                "type" => {
+                    map.next_value::<String>()?
+                        == if matches!(self.shape, Atis) {
+                            "atis-latch"
+                        } else {
+                            "cost-state"
+                        }
+                }
+                "sessionId" => !map.next_value::<String>()?.trim().is_empty(),
+                "atis" => {
+                    map.next_value::<String>()?;
+                    true
+                }
+                "hasUnknownModelCost" => {
+                    map.next_value::<bool>()?;
+                    true
+                }
+                "modelUsage" => map.next_value_seed(ClaudeMetadataSeed {
+                    shape: Models,
+                    deadline: self.deadline,
+                })?,
+                _ => {
+                    let value = map.next_value::<f64>()?;
+                    value.is_finite() && value >= 0.0
+                }
+            };
+            if !valid {
+                return Ok(false);
+            }
+        }
+        let required_mask = (1 << required) - 1;
+        Ok(seen & required_mask == required_mask)
+    }
+}
+
+fn claude_metadata_supported(line: &[u8], kind: &str, deadline: Deadline) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    serde::de::DeserializeSeed::deserialize(
+        ClaudeMetadataSeed {
+            shape: if kind == "atis-latch" {
+                ClaudeMetadataShape::Atis
+            } else {
+                ClaudeMetadataShape::Cost
+            },
+            deadline,
+        },
+        &mut deserializer,
+    )
+    .unwrap_or(false)
+        && deserializer.end().is_ok()
+}
+
 impl RecordScan {
     fn new(provider: &'static str) -> Self {
         Self {
@@ -927,6 +1070,10 @@ impl RecordScan {
                     return false;
                 };
                 match self.provider {
+                    "claude-code" if matches!(kind, "atis-latch" | "cost-state") => {
+                        // Last-wins runtime state is not a message or a usage delta.
+                        claude_metadata_supported(line, kind, deadline)
+                    }
                     "claude-code" => {
                         matches!(
                             kind,
