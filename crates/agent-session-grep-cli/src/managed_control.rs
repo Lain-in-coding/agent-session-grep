@@ -343,7 +343,7 @@ fn committed_control_mutation_with<T>(
 /// Keep the first physical root and installation through typed-Busy retries.
 /// Opening control state is part of the existing command budget; it must not
 /// fail at an unrelated 250ms default before that budget has been consumed.
-fn open_control_before(
+pub(crate) fn open_control_before(
     root: &Path,
     writable: bool,
     deadline: Instant,

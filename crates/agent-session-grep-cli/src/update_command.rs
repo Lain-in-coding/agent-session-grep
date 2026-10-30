@@ -254,7 +254,7 @@ use crate::{
 use agent_session_grep_adapters_sqlite::{
     SqliteControlStore,
     control::{BackupPurpose, InstallationLockAuthority},
-    managed_locks::{ExclusiveGuard, LockKind},
+    managed_locks::{ExclusiveGuard, LockKind, RootIdentity},
     managed_maintenance::{BackupOutcome, MaintenanceCatalog, RestoreOutcome},
 };
 use agent_session_grep_ports::{
@@ -361,12 +361,38 @@ fn with_update_deadline<T>(
         .with_runtime_deadline(end, || Ok(operation()))
         .map_err(port)?
 }
+/// Repeat a read-only or idempotent admission while it reports typed Busy. A
+/// worker heartbeat or cycle commit between two policy snapshots is an
+/// ordinary race, not a refusal: read again under the same original end.
+/// Every other result, and Busy at or after that end, is returned unchanged.
+/// Never replay journal, fence, catalog or program mutations through this helper.
+fn retry_busy<T>(
+    end: Instant,
+    mut step: impl FnMut() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    loop {
+        require_time(end)?;
+        match step() {
+            Err(error) if error.0.code == CanonicalCode::WriterBusy && Instant::now() < end => {
+                std::thread::sleep(
+                    Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
+}
 fn control_lock(root: &Path, end: Instant) -> Result<ExclusiveGuard, CliError> {
+    // A nested caller may hold an earlier request end; never wait past it.
+    let end = SqliteControlStore::effective_runtime_deadline(end);
     loop {
         require_time(end)?;
         match ExclusiveGuard::try_acquire(root, LockKind::PolicyOwner) {
             Ok(lock) => return Ok(lock),
-            Err(PortError::WriterBusy(_)) => std::thread::sleep(Duration::from_millis(5)),
+            Err(PortError::WriterBusy(_)) => std::thread::sleep(
+                Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+            ),
             Err(e) => return Err(port(e)),
         }
     }
@@ -383,24 +409,28 @@ fn set_fence(
     loop {
         require_time(end)?;
         let lock = control_lock(root, end)?;
-        let bound = control.bind_control_root(&lock).map_err(port)?;
-        let status = control.status().map_err(port)?;
-        let fence = MaintenanceFence {
-            state: if recovering {
-                MaintenanceState::Recovering
-            } else {
-                MaintenanceState::Updating
-            },
-            owner: Some(owner.clone()),
-            phase: Some(phase),
-        };
-        match control.begin_maintenance(
-            status.policy.control_seq,
-            owner,
-            &bound,
-            installation,
-            fence,
-        ) {
+        // Binding and reading the expected sequence are part of the same
+        // attempt as the CAS: their contention retries instead of aborting.
+        let attempt = control.bind_control_root(&lock).and_then(|bound| {
+            let status = control.status()?;
+            let fence = MaintenanceFence {
+                state: if recovering {
+                    MaintenanceState::Recovering
+                } else {
+                    MaintenanceState::Updating
+                },
+                owner: Some(owner.clone()),
+                phase: Some(phase),
+            };
+            control.begin_maintenance(
+                status.policy.control_seq,
+                owner,
+                &bound,
+                installation,
+                fence,
+            )
+        });
+        match attempt {
             Ok(_) => return Ok(()),
             Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {}
             Err(e) => return Err(port(e)),
@@ -418,13 +448,17 @@ fn clear_fence(
     loop {
         require_time(end)?;
         let lock = control_lock(root, end)?;
-        let bound = control.bind_control_root(&lock).map_err(port)?;
-        let status = control.status().map_err(port)?;
-        if status.policy.maintenance.state == MaintenanceState::Idle {
-            return Ok(());
-        }
-        match control.clear_maintenance(status.policy.control_seq, owner, &bound, installation) {
-            Ok(_) => return Ok(()),
+        let attempt = control.bind_control_root(&lock).and_then(|bound| {
+            let status = control.status()?;
+            if status.policy.maintenance.state == MaintenanceState::Idle {
+                return Ok(());
+            }
+            control
+                .clear_maintenance(status.policy.control_seq, owner, &bound, installation)
+                .map(|_| ())
+        });
+        match attempt {
+            Ok(()) => return Ok(()),
             Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {}
             Err(e) => return Err(port(e)),
         }
@@ -868,57 +902,31 @@ fn apply(
             "program update requires both packages to use current catalog and control schemas; installation retained",
         ));
     }
-    let control_read =
-        SqliteControlStore::open_current_read_only_with_deadline(root, end).map_err(port)?;
-    let installation_id = control_read
-        .with_runtime_deadline(end, || control_read.status())
-        .map_err(port)?
-        .policy
-        .installation_id;
-    let control =
-        SqliteControlStore::open_existing_writable_with_deadline(root, &installation_id, end)
-            .map_err(port)?;
-    drop(control_read);
+    // Retain the first physical root and witnessed installation through Busy
+    // retries. Writable admission checks that identity before runtime migration.
+    let control = crate::managed_control::open_control_before(root, true, end).map_err(port)?;
     with_update_deadline(&control, end, || {
-        let status = control.status().map_err(port)?;
-        if status.policy.maintenance.state != MaintenanceState::Idle {
-            return Err(problem(
-                CanonicalCode::UpdateRecoveryRequired,
-                "unmatched maintenance fence; recover the recorded update first",
-            ));
-        }
-        if installed.prefix != prefix
-            || !package_installation::hex(&installed.archive_sha256, 64)
-            || !package_installation::hex(&installed.manifest_sha256, 64)
-            || !package_installation::hex(&installed.package_files_sha256, 64)
-        {
-            return Err(package_installation::invalid_install(
-                "old package identity",
-            ));
-        }
-        let old_version =
-            semver::Version::parse(&old.version).map_err(package_installation::invalid_install)?;
-        let new_version =
-            semver::Version::parse(&new.version).map_err(package_installation::invalid_install)?;
-        if new_version.cmp_precedence(&old_version) != std::cmp::Ordering::Greater {
-            return Err(CliError::usage(
-                "apply requires a newer SemVer candidate; recover handles an interrupted same candidate",
-            ));
-        }
-        let catalog =
-            agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
-                &control, &db, end,
-            )
-            .map_err(port)?;
-        if catalog.schema != old.catalog_schema
-            || catalog.installation != status.policy.installation_id
-            || status.catalog_incarnation.as_ref() != Some(&catalog.incarnation)
-        {
-            return Err(problem(
-                CanonicalCode::SchemaIncompatible,
-                "catalog identity does not match the installed update baseline",
-            ));
-        }
+        let (status, catalog) = admit_update(&control, &db, old.catalog_schema, end, || {
+            if installed.prefix != prefix
+                || !package_installation::hex(&installed.archive_sha256, 64)
+                || !package_installation::hex(&installed.manifest_sha256, 64)
+                || !package_installation::hex(&installed.package_files_sha256, 64)
+            {
+                return Err(package_installation::invalid_install(
+                    "old package identity",
+                ));
+            }
+            let old_version = semver::Version::parse(&old.version)
+                .map_err(package_installation::invalid_install)?;
+            let new_version = semver::Version::parse(&new.version)
+                .map_err(package_installation::invalid_install)?;
+            if new_version.cmp_precedence(&old_version) != std::cmp::Ordering::Greater {
+                return Err(CliError::usage(
+                    "apply requires a newer SemVer candidate; recover handles an interrupted same candidate",
+                ));
+            }
+            Ok(())
+        })?;
         let generation = catalog.generation;
         let incarnation = catalog.incarnation.as_str().to_owned();
         let checkpoint = Checkpoint {
@@ -1005,6 +1013,48 @@ fn apply(
         }
         drop(installed);
         finish_update(&control, &installation, &owner, root, &mut journal, end)
+    })
+}
+/// Read-only apply admission. The fence, candidate and catalog identity checks
+/// keep their order; a Busy observation repeats all of them from a fresh
+/// status under the original end. No journal, fence or binding exists yet.
+fn admit_update(
+    control: &SqliteControlStore,
+    db: &Path,
+    old_catalog_schema: u32,
+    end: Instant,
+    mut candidate: impl FnMut() -> Result<(), CliError>,
+) -> Result<
+    (
+        agent_session_grep_ports::control::ControlStatus,
+        agent_session_grep_adapters_sqlite::managed_maintenance::CatalogIdentity,
+    ),
+    CliError,
+> {
+    retry_busy(end, || {
+        let status = control.status().map_err(port)?;
+        if status.policy.maintenance.state != MaintenanceState::Idle {
+            return Err(problem(
+                CanonicalCode::UpdateRecoveryRequired,
+                "unmatched maintenance fence; recover the recorded update first",
+            ));
+        }
+        candidate()?;
+        let catalog =
+            agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
+                control, db, end,
+            )
+            .map_err(port)?;
+        if catalog.schema != old_catalog_schema
+            || catalog.installation != status.policy.installation_id
+            || status.catalog_incarnation.as_ref() != Some(&catalog.incarnation)
+        {
+            return Err(problem(
+                CanonicalCode::SchemaIncompatible,
+                "catalog identity does not match the installed update baseline",
+            ));
+        }
+        Ok((status, catalog))
     })
 }
 fn quiesced_checkpoint(
@@ -1579,48 +1629,52 @@ fn verify_catalog_program_pair(
     end: Instant,
 ) -> Result<(), CliError> {
     with_update_deadline(control, end, || {
-        require_time(end)?;
-        let before = control.status().map_err(port)?;
-        // Completion still owns the installation lock and durable fence. The
-        // idle admission inspector is reserved for preflight/terminal replay;
-        // an active fence requires the existing exclusive maintenance gates.
-        let owned_catalog = if before.policy.maintenance.state == MaintenanceState::Idle {
-            None
-        } else {
-            Some(
-                MaintenanceCatalog::open_authorized(control, installation, owner, catalog, end)
-                    .map_err(port)?,
-            )
-        };
-        let identity = match owned_catalog.as_ref() {
-            Some(catalog) => catalog.identity().clone(),
-            None => {
-                agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
-                    control, catalog, end,
+        // A heartbeat or cycle commit between the two status reads is read
+        // again under the same end; an identity mismatch is final.
+        retry_busy(end, || {
+            require_time(end)?;
+            let before = control.status().map_err(port)?;
+            // Completion still owns the installation lock and durable fence.
+            // The idle admission inspector is reserved for preflight/terminal
+            // replay; an active fence requires the exclusive maintenance gates.
+            let owned_catalog = if before.policy.maintenance.state == MaintenanceState::Idle {
+                None
+            } else {
+                Some(
+                    MaintenanceCatalog::open_authorized(control, installation, owner, catalog, end)
+                        .map_err(port)?,
                 )
-                .map_err(port)?
+            };
+            let identity = match owned_catalog.as_ref() {
+                Some(catalog) => catalog.identity().clone(),
+                None => {
+                    agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
+                        control, catalog, end,
+                    )
+                    .map_err(port)?
+                }
+            };
+            let status = control.status().map_err(port)?;
+            if status.policy != before.policy
+                || status.catalog_incarnation != before.catalog_incarnation
+                || status.desired_updates != before.desired_updates
+            {
+                return Err(problem(
+                    CanonicalCode::WriterBusy,
+                    "catalog completion policy changed during identity verification",
+                ));
             }
-        };
-        let status = control.status().map_err(port)?;
-        if status.policy != before.policy
-            || status.catalog_incarnation != before.catalog_incarnation
-            || status.desired_updates != before.desired_updates
-        {
-            return Err(problem(
-                CanonicalCode::WriterBusy,
-                "catalog completion policy changed during identity verification",
-            ));
-        }
-        if !recovered_catalog_matches_program(&identity, expected, checkpoint)
-            || status.policy.installation_id != identity.installation
-            || status.catalog_incarnation.as_ref() != Some(&identity.incarnation)
-        {
-            return Err(problem(
-                CanonicalCode::UpdateRecoveryRequired,
-                "catalog identity does not match the verified active program; retain the maintenance fence",
-            ));
-        }
-        require_time(end)
+            if !recovered_catalog_matches_program(&identity, expected, checkpoint)
+                || status.policy.installation_id != identity.installation
+                || status.catalog_incarnation.as_ref() != Some(&identity.incarnation)
+            {
+                return Err(problem(
+                    CanonicalCode::UpdateRecoveryRequired,
+                    "catalog identity does not match the verified active program; retain the maintenance fence",
+                ));
+            }
+            require_time(end)
+        })
     })
 }
 
@@ -1648,9 +1702,27 @@ fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<(Outcome, V
     }
     let expected_installation =
         ControlId::parse(&journal.state.checkpoint.installation_id).map_err(port)?;
-    let control =
-        SqliteControlStore::open_existing_writable_with_deadline(root, &expected_installation, end)
-            .map_err(port)?;
+    // An installation mismatch is refused before migration and is not Busy.
+    let physical_root = RootIdentity::read(root).map_err(port)?;
+    let control = retry_busy(end, || {
+        if RootIdentity::read(root).map_err(port)? != physical_root {
+            return Err(port(PortError::SnapshotChanged(
+                "update control root changed".into(),
+            )));
+        }
+        let control = SqliteControlStore::open_existing_writable_with_deadline(
+            root,
+            &expected_installation,
+            end,
+        )
+        .map_err(port)?;
+        if RootIdentity::read(root).map_err(port)? != physical_root {
+            return Err(port(PortError::SnapshotChanged(
+                "update control root changed".into(),
+            )));
+        }
+        Ok(control)
+    })?;
     with_update_deadline(&control, end, || {
         if control
             .status()

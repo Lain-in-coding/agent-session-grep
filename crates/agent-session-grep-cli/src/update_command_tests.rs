@@ -714,3 +714,210 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
         DesiredUpdates::Paused
     );
 }
+
+/// Idle, paused installation with one registered worker and a reconciled
+/// catalog: the real inputs that apply admission and terminal replay inspect.
+fn with_idle_admission(
+    test: impl FnOnce(&SqliteControlStore, &InstallationLockAuthority<'_>, &Path, &Path),
+) {
+    use agent_session_grep_adapters_sqlite::{
+        managed_locks::{ExclusiveGuard, JobLockKey, LockKind},
+        managed_store::ManagedStore,
+    };
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().join("private");
+    let prefix = temp.path().join("installation");
+    std::fs::create_dir(&prefix).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    let control = crate::retry_fixture_busy(|| {
+        SqliteControlStore::create(
+            &root,
+            &ControlId::parse("install").unwrap(),
+            DesiredUpdates::Paused,
+        )
+    });
+    let db = root.join("catalog.db");
+    let store =
+        ManagedStore::create(&db, &control, ControlId::parse("catalog").unwrap(), 1).unwrap();
+    {
+        let worker_lock =
+            crate::retry_fixture_busy(|| ExclusiveGuard::try_acquire(&root, LockKind::Background));
+        let worker = control
+            .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
+            .unwrap();
+        control
+            .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
+            .unwrap();
+        store.reconcile_progress(&control, &worker).unwrap();
+    }
+    drop(store);
+    let lock = crate::retry_fixture_busy(|| {
+        ExclusiveGuard::try_acquire(
+            &prefix,
+            LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+        )
+    });
+    {
+        let guard = control_lock(&root, end).unwrap();
+        let bound = control.bind_control_root(&guard).unwrap();
+        control
+            .record_verified_installation_prefix(&prefix, &lock, &bound, end)
+            .unwrap();
+    }
+    let installation = control.bind_installation(&prefix, &lock).unwrap();
+    test(&control, &installation, &root, &db);
+}
+
+/// Hold the real catalog handle gate, then commit one real worker heartbeat
+/// before releasing it. An admission that read its first policy snapshot
+/// while the gate was held sees a changed control sequence afterwards.
+fn heartbeat_while_gated(
+    root: &Path,
+    hold: Duration,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+    use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
+    use agent_session_grep_ports::control::{BackgroundFailure, UpdateState};
+    let root = root.to_path_buf();
+    let (ready, gated) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let control = crate::retry_fixture_busy(|| {
+            SqliteControlStore::open_existing_writable_with_deadline(
+                &root,
+                &ControlId::parse("install").unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+        });
+        let worker_lock =
+            crate::retry_fixture_busy(|| ExclusiveGuard::try_acquire(&root, LockKind::Background));
+        let worker = control
+            .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
+            .unwrap();
+        let handles = crate::retry_fixture_busy(|| {
+            ExclusiveGuard::try_acquire(&root, LockKind::CatalogHandles)
+        });
+        ready.send(()).unwrap();
+        std::thread::sleep(hold);
+        crate::retry_fixture_busy(|| {
+            let seq = control.status()?.policy.control_seq;
+            control.heartbeat_worker(
+                seq,
+                &worker,
+                UpdateState::Paused,
+                Some(BackgroundFailure::Paused),
+                2,
+            )
+        });
+        drop(handles);
+    });
+    (contender, gated)
+}
+
+#[test]
+fn terminal_pair_check_rereads_after_a_heartbeat_between_policy_snapshots() {
+    use agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity;
+    with_idle_admission(|control, installation, root, db| {
+        let end = Instant::now() + Duration::from_secs(10);
+        let initial = inspect_catalog_identity(control, db, end).unwrap();
+        let before = control.status().unwrap();
+        let checkpoint = Checkpoint {
+            installation_id: initial.installation.as_str().to_owned(),
+            policy_epoch: before.policy.policy_epoch.get() as u64,
+            control_seq: before.policy.control_seq.get() as u64,
+            desired_updates: "paused".into(),
+            catalog_incarnation: initial.incarnation.as_str().to_owned(),
+            catalog_generation: initial.generation,
+            catalog_schema: initial.schema,
+        };
+        let hold = Duration::from_millis(250);
+        let started = Instant::now();
+        let (contender, gated) = heartbeat_while_gated(root, hold);
+        gated.recv().unwrap();
+        verify_catalog_program_pair(
+            control,
+            installation,
+            &ControlId::parse("owner").unwrap(),
+            db,
+            &build_identity(),
+            &checkpoint,
+            end,
+        )
+        .unwrap();
+        assert!(started.elapsed() >= hold);
+        contender.join().unwrap();
+        let after = control.status().unwrap();
+        assert_eq!(
+            after.policy.control_seq.get(),
+            before.policy.control_seq.get() + 1
+        );
+        assert_eq!(after.policy.policy_epoch, before.policy.policy_epoch);
+        assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
+        assert_eq!(after.desired_updates, DesiredUpdates::Paused);
+    });
+}
+
+#[test]
+fn apply_admission_rereads_status_after_a_heartbeat_between_policy_snapshots() {
+    with_idle_admission(|control, _installation, root, db| {
+        let end = Instant::now() + Duration::from_secs(10);
+        let before = control.status().unwrap();
+        let (contender, gated) = heartbeat_while_gated(root, Duration::from_millis(250));
+        gated.recv().unwrap();
+        let mut candidates = 0;
+        let (status, catalog) = with_update_deadline(control, end, || {
+            admit_update(control, db, current_catalog_schema(), end, || {
+                candidates += 1;
+                Ok(())
+            })
+        })
+        .unwrap();
+        contender.join().unwrap();
+        // The first attempt saw the pre-heartbeat sequence; admission returns
+        // the status of the attempt that actually matched the catalog.
+        assert!(candidates >= 2);
+        assert_eq!(
+            status.policy.control_seq.get(),
+            before.policy.control_seq.get() + 1
+        );
+        assert_eq!(status, control.status().unwrap());
+        assert_eq!(catalog.installation, status.policy.installation_id);
+        assert_eq!(
+            status.catalog_incarnation.as_ref(),
+            Some(&catalog.incarnation)
+        );
+    });
+}
+
+#[test]
+fn busy_admission_retries_never_outlive_the_original_request_end() {
+    with_idle_admission(|control, _installation, root, db| {
+        let before = control.status().unwrap();
+        let hold = Duration::from_millis(1500);
+        let (contender, gated) = heartbeat_while_gated(root, hold);
+        gated.recv().unwrap();
+        let asked = Instant::now();
+        let end = asked + Duration::from_millis(300);
+        let error = with_update_deadline(control, end, || {
+            // Even a longer nested end cannot extend the outer request while
+            // the actual CatalogHandles lock is held.
+            admit_update(
+                control,
+                db,
+                current_catalog_schema(),
+                asked + Duration::from_secs(10),
+                || Ok(()),
+            )
+        })
+        .unwrap_err();
+        let waited = asked.elapsed();
+        assert_eq!(error.0.code, CanonicalCode::WriterBusy);
+        // Returned at the original end while the gate was still held.
+        assert!(waited < Duration::from_millis(1200), "{waited:?}");
+        contender.join().unwrap();
+        let after = control.status().unwrap();
+        assert_eq!(
+            after.policy.control_seq.get(),
+            before.policy.control_seq.get() + 1
+        );
+        assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
+    });
+}

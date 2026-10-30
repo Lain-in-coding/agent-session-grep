@@ -2345,6 +2345,7 @@ pub fn inspect_catalog_identity(
     catalog: &Path,
     deadline: Instant,
 ) -> PortResult<CatalogIdentity> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
     control.with_runtime_deadline(deadline, || {
         check_deadline(deadline)?;
         control.validate_live_root()?;
@@ -2364,7 +2365,10 @@ pub fn inspect_catalog_identity(
             check_deadline(deadline)?;
             match SharedGuard::try_acquire(parent, LockKind::CatalogHandles) {
                 Ok(guard) => break guard,
-                Err(PortError::WriterBusy(_)) => std::thread::sleep(Duration::from_millis(1)),
+                Err(PortError::WriterBusy(_)) => std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
                 Err(error) => return Err(error),
             }
         };
