@@ -78,7 +78,8 @@ for event in [
  {"type":"system","subtype":"init","session_id":"synthetic-session","model":"synthetic-model","claude_code_version":"synthetic-v1"},
  {"type":"assistant","message":{"usage":{"input_tokens":999},"content":[{"type":"tool_use","id":"call1","name":"mcp__agent-session-grep__search_sessions","input":{"query":"合成"}}]}},
  {"type":"result","subtype":"success","is_error":False,"result":"done synthetic","usage":{"input_tokens":41,"output_tokens":7,"cache_read_input_tokens":13,"cache_creation_input_tokens":0},"permission_denials":[]}]:
- print(json.dumps(event,ensure_ascii=False),flush=True)
+ sys.stdout.buffer.write(json.dumps(event,ensure_ascii=False).encode()+b"\\n")
+ sys.stdout.buffer.flush()
 """)
         self.assertEqual(result["native_status"], "success")
         self.assertTrue(result["capture_complete"])
