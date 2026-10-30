@@ -137,7 +137,7 @@ impl Fixture {
                 action,
                 prefix: None,
             },
-            Instant::now() + Duration::from_secs(3),
+            Instant::now() + BUDGET,
             &mut |_| Ok(self.installation(true)),
             &mut || Ok(self.location.clone()),
             &mut |_, args, _| Ok(self.response(args)),
