@@ -237,6 +237,12 @@ class ProcessTree:
             kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
             kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
             kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+            kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
             kernel.CloseHandle.argtypes = [wintypes.HANDLE]
 
             class BasicLimit(ctypes.Structure):
@@ -329,19 +335,83 @@ class ProcessTree:
         if resumed != 1:
             raise CaptureError("suspended_launch_resume_failed")
 
-    def _active_windows(self) -> int | None:
+    def _windows_pids(self, deadline: float) -> list[int] | None:
         from ctypes import wintypes
 
-        class Accounting(ctypes.Structure):
-            _fields_ = [("total_user", ctypes.c_int64), ("total_kernel", ctypes.c_int64),
-                        ("period_user", ctypes.c_int64), ("period_kernel", ctypes.c_int64),
-                        ("faults", wintypes.DWORD), ("total", wintypes.DWORD),
-                        ("active", wintypes.DWORD), ("terminated", wintypes.DWORD)]
+        capacity = 64
+        while capacity <= 65536 and time.monotonic() < deadline:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [("assigned", wintypes.DWORD), ("listed", wintypes.DWORD),
+                            ("pids", ctypes.c_size_t * capacity)]
 
-        data = Accounting()
-        if self.kernel.QueryInformationJobObject(self.job, 1, ctypes.byref(data), ctypes.sizeof(data), None):
-            return int(data.active)
+            data = ProcessIds()
+            ok = self.kernel.QueryInformationJobObject(self.job, 3, ctypes.byref(data), ctypes.sizeof(data), None)
+            if ok and data.assigned == data.listed and data.listed <= capacity:
+                return list(data.pids[:data.listed])
+            if not ok and ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
+                return None
+            capacity = max(capacity * 2, int(data.assigned))
         return None
+
+    def _stop_windows(self, deadline: float) -> str:
+        from ctypes import wintypes
+
+        process = self.process
+        assert process is not None
+        self.cleanup = "incomplete"
+        # NULL queries the caller's job, not this launch's already-closed job.
+        if self.job is None:
+            return self.cleanup
+        held = {process.pid: int(process._handle)}
+        owned = []
+        try:
+            while time.monotonic() < deadline:
+                pids = self._windows_pids(deadline)
+                if pids is None:
+                    break
+                for pid in pids:
+                    if pid in held:
+                        continue
+                    if time.monotonic() >= deadline:
+                        return self.cleanup
+                    handle = self.kernel.OpenProcess(0x00100000 | 0x0001 | 0x1000, False, pid)
+                    if not handle:
+                        if ctypes.get_last_error() == 87:  # Process already destroyed.
+                            continue
+                        return self.cleanup
+                    owned.append(handle)
+                    member = wintypes.BOOL()
+                    if not self.kernel.IsProcessInJob(handle, self.job, ctypes.byref(member)) or not member.value:
+                        return self.cleanup
+                    held[pid] = handle
+                # TerminateJobObject can remove members from accounting before
+                # their inherited files close. Retain identity-checked handles,
+                # stop members individually, then discover any racing children.
+                for handle in held.values():
+                    state = self.kernel.WaitForSingleObject(handle, 0)
+                    if state == 0:
+                        continue
+                    if state != 258:
+                        return self.cleanup
+                    # An exiting process can deny termination before signaling.
+                    # Even then, the bounded handle wait below is mandatory.
+                    if not self.kernel.TerminateProcess(handle, 1) and ctypes.get_last_error() != 5:
+                        return self.cleanup
+                for handle in held.values():
+                    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                    if self.kernel.WaitForSingleObject(handle, remaining_ms) != 0:
+                        return self.cleanup
+                if not pids and process.poll() is not None and time.monotonic() < deadline:
+                    self.cleanup = "complete"
+                    return self.cleanup
+                time.sleep(min(POLL, max(0, deadline - time.monotonic())))
+        finally:
+            if self.cleanup != "complete":
+                # Best-effort containment on failure is not completion evidence.
+                self.kernel.TerminateJobObject(self.job, 1)
+            for handle in owned:
+                self.kernel.CloseHandle(handle)
+        return self.cleanup
 
     def stop(self, grace: float) -> str:
         process = self.process
@@ -349,17 +419,7 @@ class ProcessTree:
             return self.cleanup
         deadline = time.monotonic() + grace
         if os.name == "nt":
-            if not self.kernel.TerminateJobObject(self.job, 1):
-                self.cleanup = "incomplete"
-                return self.cleanup
-            while time.monotonic() < deadline:
-                native_exit = process.poll()
-                # Job accounting may reach zero before the process handle is
-                # signaled and its inherited files have finished closing.
-                if self._active_windows() == 0 and native_exit is not None:
-                    self.cleanup = "complete"
-                    return self.cleanup
-                time.sleep(POLL)
+            return self._stop_windows(deadline)
         else:
             try:
                 os.killpg(process.pid, signal.SIGTERM)

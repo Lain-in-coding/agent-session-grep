@@ -14,7 +14,8 @@ import time
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 MODULE_PATH = Path(__file__).with_name("beta-host-evaluation.py")
 SPEC = importlib.util.spec_from_file_location("beta_host_evaluation", MODULE_PATH)
@@ -175,7 +176,151 @@ print(json.dumps({"type":"turn.completed"}),flush=True)
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["native_returncode_before_cleanup"], 0)
         self.assertIsNotNone(result["native_status"])
-        self.assertIn(result["cleanup"], ("complete", "incomplete"))
+        if os.name == "nt":
+            self.assertEqual(result["cleanup"], "complete")
+        else:
+            self.assertIn(result["cleanup"], ("complete", "incomplete"))
+        for member in ("prompt.private.bin", "stdout.private.jsonl", "stderr.private.bin"):
+            (self.out / "run" / member).unlink()
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows process-handle semantics.")
+    def test_windows_cleanup_waits_for_disappearing_descendant_handles(self) -> None:
+        cases = ((0.1, False, "complete"), (1.0, False, "incomplete"),
+                 (0.1, True, "complete"), (1.0, True, "incomplete"))
+        for exit_delay, already_exiting, expected in cases:
+            with self.subTest(exit_delay=exit_delay, already_exiting=already_exiting):
+                class Kernel:
+                    now = 0.0
+                    terminating = False
+                    waits = 0
+                    closed = []
+
+                    def QueryInformationJobObject(self, job, kind, data, size, returned):
+                        if kind == 1:
+                            data._obj.active = 0
+                        elif kind == 3:
+                            data._obj.assigned = data._obj.listed = 0 if self.terminating else 1
+                            if not self.terminating:
+                                data._obj.pids[0] = 2
+                        else:
+                            raise AssertionError("Unexpected job query")
+                        return 1
+
+                    def OpenProcess(self, access, inherit, pid):
+                        return pid
+
+                    def IsProcessInJob(self, handle, job, member):
+                        member._obj.value = True
+                        return 1
+
+                    def TerminateProcess(self, handle, code):
+                        self.terminating = True
+                        if already_exiting:
+                            RUNNER.ctypes.set_last_error(5)
+                            return 0
+                        return 1
+
+                    def TerminateJobObject(self, job, code):
+                        self.terminating = True
+                        return 1
+
+                    def WaitForSingleObject(self, handle, milliseconds):
+                        if handle == 1:
+                            return 0
+                        self.waits += 1
+                        self.now += min(milliseconds / 1000, max(0, exit_delay - self.now))
+                        return 0 if self.terminating and self.now >= exit_delay else 258
+
+                    def CloseHandle(self, handle):
+                        self.closed.append(handle)
+                        return 1
+
+                    def sleep(self, seconds):
+                        self.now += seconds
+
+                kernel = Kernel()
+                tree = RUNNER.ProcessTree.__new__(RUNNER.ProcessTree)
+                tree.job, tree.kernel = 99, kernel
+                tree.process = SimpleNamespace(pid=1, _handle=1, poll=lambda: 0)
+                tree.cleanup = "running"
+                with patch.object(RUNNER.time, "monotonic", side_effect=lambda: kernel.now), \
+                     patch.object(RUNNER.time, "sleep", side_effect=kernel.sleep):
+                    result = tree.stop(0.2)
+                self.assertEqual(result, expected)
+                self.assertGreater(kernel.waits, 0)
+                self.assertEqual(kernel.closed, [2])
+                self.assertLessEqual(kernel.now, 0.201)
+                if expected == "complete":
+                    self.assertGreaterEqual(kernel.now, exit_delay)
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows membership proof.")
+    def test_windows_cleanup_never_queries_a_closed_job(self) -> None:
+        tree = RUNNER.ProcessTree.__new__(RUNNER.ProcessTree)
+        tree.job, tree.kernel = None, Mock()
+        tree.process = SimpleNamespace(pid=1, _handle=1, poll=lambda: 0)
+        tree.cleanup = "running"
+        self.assertEqual(tree.stop(0.2), "incomplete")
+        self.assertEqual(tree.kernel.mock_calls, [])
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows membership proof.")
+    def test_windows_cleanup_refuses_unverified_members(self) -> None:
+        for failure in ("snapshot", "open", "membership", "wait"):
+            with self.subTest(failure=failure):
+                def membership(handle, job, member):
+                    member._obj.value = failure != "membership"
+                    return 1
+
+                RUNNER.ctypes.set_last_error(5)
+                kernel = SimpleNamespace(
+                    OpenProcess=Mock(return_value=0 if failure == "open" else 2),
+                    IsProcessInJob=membership,
+                    WaitForSingleObject=Mock(side_effect=lambda handle, ms: 0 if handle == 1 else 0xFFFFFFFF),
+                    TerminateProcess=Mock(return_value=1),
+                    TerminateJobObject=Mock(return_value=1),
+                    CloseHandle=Mock(return_value=1),
+                )
+                tree = RUNNER.ProcessTree.__new__(RUNNER.ProcessTree)
+                tree.job, tree.kernel = 99, kernel
+                tree.process = SimpleNamespace(pid=1, _handle=1, poll=lambda: 0)
+                tree.cleanup = "running"
+                tree._windows_pids = Mock(return_value=None if failure == "snapshot" else [2])
+                self.assertEqual(tree.stop(0.2), "incomplete")
+                kernel.TerminateProcess.assert_not_called()
+                kernel.TerminateJobObject.assert_called_once_with(99, 1)
+                if failure in ("membership", "wait"):
+                    kernel.CloseHandle.assert_called_once_with(2)
+                else:
+                    kernel.CloseHandle.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows job query layout.")
+    def test_windows_membership_query_requires_a_complete_bounded_snapshot(self) -> None:
+        capacities = []
+
+        def query(job, kind, data, size, returned):
+            self.assertEqual(kind, 3)
+            capacity = len(data._obj.pids)
+            capacities.append(capacity)
+            data._obj.assigned = 65
+            data._obj.listed = min(capacity, 65)
+            for index in range(data._obj.listed):
+                data._obj.pids[index] = index + 1
+            if capacity < 65:
+                RUNNER.ctypes.set_last_error(234)
+                return 0
+            return 1
+
+        tree = RUNNER.ProcessTree.__new__(RUNNER.ProcessTree)
+        tree.job = 99
+        tree.kernel = SimpleNamespace(QueryInformationJobObject=query)
+        self.assertEqual(tree._windows_pids(time.monotonic() + 1), list(range(1, 66)))
+        self.assertEqual(capacities, [64, 128])
+        RUNNER.ctypes.set_last_error(6)
+        tree.kernel.QueryInformationJobObject = Mock(return_value=0)
+        self.assertIsNone(tree._windows_pids(time.monotonic() + 1))
+        tree.kernel.QueryInformationJobObject.assert_called_once()
+        tree.kernel.QueryInformationJobObject.reset_mock()
+        self.assertIsNone(tree._windows_pids(time.monotonic()))
+        tree.kernel.QueryInformationJobObject.assert_not_called()
 
     def test_no_trace_does_not_claim_zero_asg_calls(self) -> None:
         result = self.host("codex", """import json
