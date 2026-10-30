@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-These changes form the `0.2.0-beta.6` Managed Beta candidate. That version
+These changes form the `0.2.0-beta.7` Managed Beta candidate. That version
 names the current build under acceptance; no tag or release is implied, and
 the open six-host, native-package, measurement, owner, and publication gates
 remain unfulfilled. Historical `0.1.0` release notes and evidence below remain

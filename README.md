@@ -8,7 +8,7 @@ message graphs, then serves full-text retrieval, resume, and handoff through
 CLI, MCP, Robot, TUI, and loopback Web UI surfaces — all sharing one
 Application ADT.
 
-**Release status:** `0.2.0-beta.6` is the Cargo workspace version for the
+**Release status:** `0.2.0-beta.7` is the Cargo workspace version for the
 in-progress Managed Beta candidate; it is not yet a published release or a
 maturity certification. The canonical public release remains the
 [v0.1.0 Release](https://github.com/Lain-in-coding/agent-session-grep/releases/tag/v0.1.0),

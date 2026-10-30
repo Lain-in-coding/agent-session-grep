@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-session-grep-adapters-sqlite"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-application",
  "agent-session-grep-domain",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-application"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-cli"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-adapters-sqlite",
  "agent-session-grep-application",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-domain"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "blake3",
  "serde",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-launcher"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "libc",
  "semver",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-ports"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "serde",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-aider"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-antigravity"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-claude"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-cline"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-codebuddy"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-codex"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-cursor"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-dsh"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-grok"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-hermes"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-ports",
  "agent-session-grep-testkit",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-kimi"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-openclaw"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-opencode"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-pi"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-qoder"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-workbuddy"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-provider-zcode"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session-grep-testkit"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.7"
 dependencies = [
  "agent-session-grep-domain",
  "agent-session-grep-ports",
