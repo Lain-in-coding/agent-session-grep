@@ -79,7 +79,7 @@ for event in [
  {"type":"system","subtype":"init","session_id":"synthetic-session","model":"synthetic-model","claude_code_version":"synthetic-v1"},
  {"type":"assistant","message":{"usage":{"input_tokens":999},"content":[{"type":"tool_use","id":"call1","name":"mcp__agent-session-grep__search_sessions","input":{"query":"合成"}}]}},
  {"type":"result","subtype":"success","is_error":False,"result":"done synthetic","usage":{"input_tokens":41,"output_tokens":7,"cache_read_input_tokens":13,"cache_creation_input_tokens":0},"permission_denials":[]}]:
- sys.stdout.buffer.write(json.dumps(event,ensure_ascii=False).encode()+b"\\n")
+ sys.stdout.buffer.write(json.dumps(event,ensure_ascii=False).encode("utf-8")+b"\\n")
  sys.stdout.buffer.flush()
 """)
         self.assertEqual(result["native_status"], "success")
@@ -96,6 +96,7 @@ for event in [
         self.assertEqual(received["prompt_sha"], result["prompt_sha256"])
         self.assertNotIn(str(self.profile), json.dumps(result))
         self.assertNotIn("合成", json.dumps(result, ensure_ascii=False))
+        self.assertIn("合成".encode("utf-8"), (self.out / "run" / "stdout.private.jsonl").read_bytes())
 
     def test_codex_usage_and_start_complete_dedup(self) -> None:
         result = self.host("codex", """import sys,json,os
@@ -166,6 +167,60 @@ time.sleep(30)
         self.assertEqual(result["native_status"], "turn.completed")
         self.assertIsNone(result["native_returncode_before_cleanup"])
         self.assertEqual(result["measurements"]["tokens"]["model_input_tokens"]["coverage"], "partial-episode")
+
+    def test_default_completion_grace_does_not_extend_hard_timeout(self) -> None:
+        result = self.host("codex", """import json,time
+print(json.dumps({"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"done"}}),flush=True)
+print(json.dumps({"type":"turn.completed"}),flush=True)
+time.sleep(30)
+""", timeout_seconds=1)
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["completed_but_stalled"])
+        self.assertEqual(result["stop_reason"], "time_budget")
+        self.assertEqual(result["native_status"], "turn.completed")
+        self.assertFalse(result["capture_complete"])
+        self.assertEqual(result["measurements"]["latency"]["end_to_end"]["coverage"], "partial-episode")
+        self.assertLess(result["measurements"]["latency"]["end_to_end"]["end_monotonic_ns"],
+                        result["stopped_monotonic_ns"])
+
+    def late_observed_exit(self, **kwargs) -> dict:
+        class CompletedProcess:
+            first_poll = True
+
+            def poll(self):
+                if self.first_poll:
+                    self.first_poll = False
+                    time.sleep(0.25)
+                return 0
+
+        def spawn(argv, **kwargs):
+            for event in (
+                {"type": "item.completed", "item": {"id": "answer", "type": "agent_message", "text": "done"}},
+                {"type": "turn.completed"},
+            ):
+                kwargs["stdout"].write(jsonl(event))
+            return CompletedProcess()
+
+        with patch.object(RUNNER.ProcessTree, "spawn", side_effect=spawn), \
+             patch.object(RUNNER.ProcessTree, "stop", return_value="complete"):
+            return self.host("codex", "raise SystemExit(0)\n", **kwargs)
+
+    def test_host_exit_observed_after_hard_deadline_stays_incomplete(self) -> None:
+        result = self.late_observed_exit(timeout_seconds=0.2)
+        self.assertEqual(result["native_returncode_before_cleanup"], 0)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["stop_reason"], "time_budget")
+        self.assertFalse(result["capture_complete"])
+        self.assertEqual(result["execution_state"], "failed")
+
+    def test_host_exit_observed_after_completion_grace_stays_incomplete(self) -> None:
+        result = self.late_observed_exit(timeout_seconds=3, completion_grace_seconds=0.1)
+        self.assertEqual(result["native_returncode_before_cleanup"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertTrue(result["completed_but_stalled"])
+        self.assertEqual(result["stop_reason"], "terminal_event_process_stalled")
+        self.assertFalse(result["capture_complete"])
+        self.assertEqual(result["measurements"]["latency"]["end_to_end"]["coverage"], "partial-episode")
 
     def test_descendant_regular_file_handle_never_waits_for_pipe_eof(self) -> None:
         result = self.host("codex", """import subprocess,sys,json
@@ -761,6 +816,36 @@ time.sleep(30)
         self.assertNotIn("input_tokens", rendered)
         self.assertNotIn("123", rendered)
         self.assertEqual(json.loads(stdout.getvalue())["acceptance"], "open")
+
+    def test_run_cli_default_grace_allows_delayed_clean_codex_exit(self) -> None:
+        script = self.work / "fake-delayed-cli.py"
+        script.write_text("""import json,sys,time
+for event in [
+    {"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"done"}},
+    {"type":"turn.completed"},
+]:
+    sys.stdout.buffer.write(json.dumps(event).encode("utf-8") + b"\\n")
+    sys.stdout.buffer.flush()
+time.sleep(1.5)
+""", encoding="utf-8")
+        prompt_file = self.work / "prompt.bin"
+        prompt_file.write_bytes(b"synthetic prompt")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        original = RUNNER.host_argv
+        def fake_host_argv(host, command, workdir, **kwargs):
+            return [*command, "-u", str(script), *original(host, command, workdir, **kwargs)[1:]]
+        with patch.object(RUNNER, "host_argv", side_effect=fake_host_argv), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = RUNNER.main(["run", "--host", "codex", "--executable", str(self.executable),
+                                "--profile-dir", str(self.profile), "--working-dir", str(self.work),
+                                "--prompt-file", str(prompt_file), "--output-root", str(self.out),
+                                "--run-id", "delayed-cli-fixture", "--timeout-seconds", "8"])
+        summary = json.loads((self.out / "delayed-cli-fixture" / "capture-summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["stop_reason"], "native_exit")
+        self.assertFalse(summary["completed_but_stalled"])
+        self.assertTrue(summary["capture_complete"])
+        self.assertEqual(summary["native_returncode_before_cleanup"], 0)
+        self.assertEqual(summary["execution_state"], "completed")
+        self.assertEqual(code, 0)
 
 
     def test_echoed_request_is_not_invented_rpc_response(self) -> None:

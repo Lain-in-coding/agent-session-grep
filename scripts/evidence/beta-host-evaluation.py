@@ -38,6 +38,9 @@ SCHEMA = "agent-session-grep.beta-host-evaluation/v1"
 CHUNK = 65536
 MAX_FRAME = 16 * 1024 * 1024
 POLL = 0.025
+# Measured clean Codex exit took about 3.45 s after its terminal event.
+# Grace applies only after a terminal event; the hard timeout still bounds the run.
+DEFAULT_COMPLETION_GRACE_SECONDS = 10.0
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = {
     "search_sessions": "search", "get_message": "direct-read",
@@ -1001,7 +1004,7 @@ def run_host(host: str, command: Sequence[str], *, profile_dir: Path, workdir: P
              config_profile: str | None = None, model: str | None = None,
              max_turns: int | None = None, asg_server: str = "agent-session-grep",
              environment: Mapping[str, str] | None = None,
-             completion_grace_seconds: float = 0.5, cleanup_seconds: float = 1.0,
+             completion_grace_seconds: float = DEFAULT_COMPLETION_GRACE_SECONDS, cleanup_seconds: float = 1.0,
              max_log_bytes: int = 256 * 1024 * 1024) -> dict:
     if not isinstance(prompt, bytes) or len(prompt) > MAX_FRAME:
         raise CaptureError("invalid_prompt_bytes")
@@ -1045,10 +1048,9 @@ def run_host(host: str, command: Sequence[str], *, profile_dir: Path, workdir: P
             deadline = started + int(timeout_seconds * 1_000_000_000)
             while True:
                 tail.poll()
-                current = time.monotonic_ns()
                 returncode_at_stop = process.poll()
-                if returncode_at_stop is not None:
-                    break
+                current = time.monotonic_ns()
+                # Observation shares the original budget, even for a zero exit.
                 if current >= deadline:
                     timed_out = True
                     reason = "time_budget"
@@ -1056,6 +1058,8 @@ def run_host(host: str, command: Sequence[str], *, profile_dir: Path, workdir: P
                 if native.terminal_at_ns is not None and current - native.terminal_at_ns >= int(completion_grace_seconds * 1_000_000_000):
                     stalled = True
                     reason = "terminal_event_process_stalled"
+                    break
+                if returncode_at_stop is not None:
                     break
                 if sum((output / member).stat().st_size for member in ("stdout.private.jsonl", "stderr.private.bin")) > max_log_bytes:
                     error_code = "native_log_budget_exceeded"
@@ -1234,7 +1238,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--model", help="Explicit model identifier; omitted means the supplied profile decides.")
     run.add_argument("--max-turns", type=int, help="Claude native turn limit; max-turns errors remain errors.")
     run.add_argument("--asg-server", default="agent-session-grep", help="Exact registered ASG server name for native trace recognition.")
-    run.add_argument("--completion-grace-seconds", type=float, default=0.5)
+    run.add_argument("--completion-grace-seconds", type=float, default=DEFAULT_COMPLETION_GRACE_SECONDS)
     run.add_argument("--max-log-bytes", type=int, default=256 * 1024 * 1024)
     run.add_argument("--pack", type=Path, help="Original frozen pack, read-only.")
     run.add_argument("--observation-metadata", type=Path, help="Parent-supplied sanitized case/repeat/variant and digest JSON.")
