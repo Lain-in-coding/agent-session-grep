@@ -32,6 +32,10 @@ HOST_RUNTIME_CACHES = (
     "appdata/local/microsoft/powershell",
     "appdata/local/microsoft/windows/powershell",
 )
+# Verify-Programs executes six independently bounded 30-second probes.
+# Both invocation helpers need that total plus startup/flush time, including
+# the inert synthetic setup/path commands used by the forwarding cases.
+POWERSHELL_INSTALL_TIMEOUT = 6 * 30 + 30
 
 
 class BuildManifestTests(unittest.TestCase):
@@ -459,7 +463,8 @@ class BuildManifestTests(unittest.TestCase):
         if prefix is not None:
             command += ["-Prefix", str(prefix)]
         command += list(extra_args)
-        return subprocess.run(command, capture_output=True, text=True, errors="backslashreplace", env=env, timeout=55)
+        return subprocess.run(command, capture_output=True, text=True, errors="backslashreplace",
+                              env=env, timeout=POWERSHELL_INSTALL_TIMEOUT)
 
     def run_ps_install_options(self, root: Path, manifest: Path, checksums: Path,
                                prefix: Path, options: dict, env: dict,
@@ -477,7 +482,8 @@ class BuildManifestTests(unittest.TestCase):
             [shutil.which(engine), "-NoProfile", "-NonInteractive", "-Command", runner],
             env={**env, "ASG_TEST_INSTALL_OPTIONS": json.dumps(bindings),
                  "ASG_TEST_INSTALL_SCRIPT": str(root / "package-install.ps1")},
-            capture_output=True, text=True, errors="backslashreplace", timeout=55,
+            capture_output=True, text=True, errors="backslashreplace",
+            timeout=POWERSHELL_INSTALL_TIMEOUT,
         )
 
     @staticmethod
