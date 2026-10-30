@@ -14,7 +14,8 @@ use crate::{
     SCHEMA_VERSION, SqliteControlStore, SqliteStore, WriterLease,
     control::{
         BackupPurpose, BackupRegistration, BackupState, CoveredSource, InstallationLockAuthority,
-        StoredBackup, catalog_backup_locator, ensure_private_directory, validate_private_directory,
+        StoredBackup, catalog_backup_locator, ensure_private_directory, retry_seq_race_before,
+        validate_private_directory,
     },
     managed_locks::{ExclusiveGuard, LockKind, RootIdentity, SharedGuard},
     managed_store::{APPLICATION_ID, validate_catalog_path},
@@ -653,6 +654,23 @@ fn backup_record(control: &SqliteControlStore, backup_id: &ControlId) -> PortRes
         .into_iter()
         .find(|backup| backup.backup_id == *backup_id)
         .ok_or_else(|| PortError::NotFound("backup is not registered".into()))
+}
+
+/// Losing control_seq may be retried only against the same accounted backup,
+/// or the exact idempotent result of this transition. In particular, a changed
+/// digest, size, locator or coverage never becomes a retryable sequence race.
+pub(crate) fn backup_retry_is_current(
+    control: &SqliteControlStore,
+    before: &StoredBackup,
+    terminal: BackupState,
+) -> PortResult<bool> {
+    let current = backup_record(control, &before.backup_id)?;
+    let mut settled = before.clone();
+    settled.state = terminal;
+    if terminal == BackupState::PurgedByPolicy {
+        settled.source_ids.clear();
+    }
+    Ok(current == *before || current == settled)
 }
 
 fn verify_record(
@@ -2200,6 +2218,19 @@ pub fn purge_backup(
     now_ms: i64,
     deadline: Instant,
 ) -> PortResult<PurgeOutcome> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    control.with_runtime_deadline(deadline, || {
+        purge_backup_in_scope(control, installation, backup_id, now_ms, deadline)
+    })
+}
+
+fn purge_backup_in_scope(
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    backup_id: &ControlId,
+    now_ms: i64,
+    deadline: Instant,
+) -> PortResult<PurgeOutcome> {
     installation.validate(control)?;
     check_deadline(deadline)?;
     let record = backup_record(control, backup_id)?;
@@ -2218,11 +2249,11 @@ pub fn purge_backup(
             artifact_removed: removed,
         });
     }
-    let (metadata, coverage) = if record.state == BackupState::Quarantined {
+    let (metadata, quarantined) = if record.state == BackupState::Quarantined {
         // A previous attempt may already have removed the sidecar or database.
         // Its durable coverage/digest remain the cleanup authority after
         // reallow. Do not require a now-impossible complete-image verification.
-        (metadata, record.source_ids.clone())
+        (metadata, record)
     } else {
         let verified = match verify_record(control, &record, deadline) {
             Ok(verified) => verified,
@@ -2231,45 +2262,61 @@ pub fn purge_backup(
             }
             Err(error) => return Err(error),
         };
-        let changed = {
-            let guard = acquire_exclusive(control.private_root(), LockKind::PolicyOwner, deadline)?;
-            let bound = control.bind_control_root(&guard)?;
-            let policy = control.read_policy(RequestIntersection::Selected)?;
-            if !withdrawn(&policy, verified.coverage()) {
-                return Ok(PurgeOutcome::NotWithdrawn);
-            }
-            control.quarantine_backup(
-                policy.control_seq,
-                &bound,
-                installation,
-                backup_id,
-                verified.coverage(),
-                &verified.metadata.digest,
-                verified.metadata.size_bytes,
-                now_ms,
-            )?
+        let changed = retry_seq_race_before(
+            deadline,
+            || {
+                let guard =
+                    acquire_exclusive(control.private_root(), LockKind::PolicyOwner, deadline)?;
+                let bound = control.bind_control_root(&guard)?;
+                let policy = control.read_policy(RequestIntersection::Selected)?;
+                // Reallow during a sequence race must still prevent a new
+                // withdrawal. A prior durable quarantine remains authoritative.
+                if !withdrawn(&policy, verified.coverage()) {
+                    return Ok(None);
+                }
+                control
+                    .quarantine_backup(
+                        policy.control_seq,
+                        &bound,
+                        installation,
+                        backup_id,
+                        verified.coverage(),
+                        &verified.metadata.digest,
+                        verified.metadata.size_bytes,
+                        now_ms,
+                    )
+                    .map(Some)
+            },
+            || backup_retry_is_current(control, &record, BackupState::Quarantined),
+        )?;
+        let Some(changed) = changed else {
+            return Ok(PurgeOutcome::NotWithdrawn);
         };
         (
             metadata_from(&changed.value, installation.installation_id())?,
-            changed.value.source_ids,
+            changed.value,
         )
     };
     // PolicyOwner is not held while validating, hashing or unlinking files.
     if !remove_artifact(control, &metadata, deadline)? {
         return Ok(PurgeOutcome::PendingCleanup { metadata });
     }
-    let finalized = {
-        let guard = acquire_exclusive(control.private_root(), LockKind::PolicyOwner, deadline)?;
-        let bound = control.bind_control_root(&guard)?;
-        control.finalize_backup_purge(
-            control.status()?.policy.control_seq,
-            &bound,
-            installation,
-            backup_id,
-            &coverage,
-            now_ms,
-        )?
-    };
+    let finalized = retry_seq_race_before(
+        deadline,
+        || {
+            let guard = acquire_exclusive(control.private_root(), LockKind::PolicyOwner, deadline)?;
+            let bound = control.bind_control_root(&guard)?;
+            control.finalize_backup_purge(
+                control.status()?.policy.control_seq,
+                &bound,
+                installation,
+                backup_id,
+                &quarantined.source_ids,
+                now_ms,
+            )
+        },
+        || backup_retry_is_current(control, &quarantined, BackupState::PurgedByPolicy),
+    )?;
     Ok(PurgeOutcome::Purged {
         metadata: metadata_from(&finalized.value, installation.installation_id())?,
         artifact_removed: true,

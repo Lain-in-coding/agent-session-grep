@@ -8,14 +8,15 @@ use crate::{
     SqliteControlStore, WriterLease,
     control::{
         BackupState, InstallationLockAuthority, PURGE_LOCK_KEY, PurgeCheckpoint, PurgeFailure,
-        PurgeOwner, PurgeTransition, validate_private_directory,
+        PurgeOwner, PurgeTransition, StoredBackup, retry_seq_race_before,
+        validate_private_directory,
     },
     managed_cache::ManagedCache,
     managed_locks::{ExclusiveGuard, JobLockKey, LockKind, RootIdentity},
     managed_maintenance::{
-        PurgeOutcome, catalog_coverage_is_classified, catalog_journal_is_content_free,
-        purge_backup, set_sql_deadline, source_binding_is_retired, validate_identity,
-        verify_backup_until, verify_derived_integrity,
+        PurgeOutcome, backup_retry_is_current, catalog_coverage_is_classified,
+        catalog_journal_is_content_free, purge_backup, set_sql_deadline, source_binding_is_retired,
+        validate_identity, verify_backup_until, verify_derived_integrity,
     },
     managed_store::validate_catalog_path,
 };
@@ -393,56 +394,6 @@ fn failure(error: &PortError, deadline: Instant) -> PurgeFailure {
         _ => PurgeFailure::Storage,
     }
 }
-/// The control scope deliberately has a 1ms SQLite busy allowance. Brief
-/// contention may refuse a transaction, so retry only that typed class within
-/// the original slice. Every closure releases PolicyOwner before the wait.
-fn retry_control_before<T>(
-    deadline: Instant,
-    mut operation: impl FnMut() -> PortResult<T>,
-) -> PortResult<T> {
-    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
-    loop {
-        check(deadline)?;
-        match operation() {
-            Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
-                std::thread::sleep(
-                    Duration::from_millis(1)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            result => return result,
-        }
-    }
-}
-
-/// Every control CAS expects the control_seq read just before it, and a live
-/// worker advances that sequence on each heartbeat without changing policy.
-/// Losing that race is not policy drift: retry within the same slice while
-/// `unchanged` still reads this owner's policy and job. Any real change keeps
-/// the original GenerationMismatch; Busy keeps its existing slice retry.
-fn retry_seq_race_before<T>(
-    deadline: Instant,
-    mut operation: impl FnMut() -> PortResult<T>,
-    mut unchanged: impl FnMut() -> PortResult<bool>,
-) -> PortResult<T> {
-    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
-    loop {
-        match retry_control_before(deadline, &mut operation) {
-            Err(error @ PortError::GenerationMismatch(_)) => {
-                if !retry_control_before(deadline, &mut unchanged)? {
-                    return Err(error);
-                }
-                check(deadline)?;
-                std::thread::sleep(
-                    Duration::from_millis(1)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            result => return result,
-        }
-    }
-}
-
 /// The job still belongs to this runner and, when given, to this exact epoch.
 fn still_owned(
     control: &SqliteControlStore,
@@ -1263,15 +1214,7 @@ fn purge_backups(
                 Err(error @ PortError::WriterBusy(_)) => return Err(error),
                 Err(error) if !backup_classification_is_terminal(&error) => return Err(error),
                 Err(_) => {
-                    let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-                    let bound = control.bind_control_root(&lock)?;
-                    control.quarantine_unclassified_backup(
-                        control.status()?.policy.control_seq,
-                        owner,
-                        &bound,
-                        &backup.backup_id,
-                        backup.digest.as_deref().zip(Some(backup.size_bytes)),
-                    )?;
+                    quarantine_unclassified_before(control, owner, &backup, deadline)?;
                     return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
                 }
             },
@@ -1301,20 +1244,41 @@ fn purge_backups(
                 return Ok(PurgeStage::Pending(PurgeFailure::ArtifactPending));
             }
             PurgeOutcome::Attention(_) => {
-                let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
-                let bound = control.bind_control_root(&lock)?;
-                control.quarantine_unclassified_backup(
-                    control.status()?.policy.control_seq,
-                    owner,
-                    &bound,
-                    &backup.backup_id,
-                    backup.digest.as_deref().zip(Some(backup.size_bytes)),
-                )?;
+                quarantine_unclassified_before(control, owner, &backup, deadline)?;
                 return Ok(PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact));
             }
         }
     }
     Ok(PurgeStage::Complete)
+}
+
+fn quarantine_unclassified_before(
+    control: &SqliteControlStore,
+    owner: &PurgeOwner<'_>,
+    backup: &StoredBackup,
+    deadline: Instant,
+) -> PortResult<()> {
+    retry_seq_race_before(
+        deadline,
+        || {
+            let lock = acquire(control.private_root(), LockKind::PolicyOwner, deadline)?;
+            let bound = control.bind_control_root(&lock)?;
+            control
+                .quarantine_unclassified_backup(
+                    control.status()?.policy.control_seq,
+                    owner,
+                    &bound,
+                    &backup.backup_id,
+                    backup.digest.as_deref().zip(Some(backup.size_bytes)),
+                )
+                .map(|_| ())
+        },
+        || {
+            // A missing digest is a deterministic refusal, not a seq race.
+            Ok(backup.digest.is_some()
+                && backup_retry_is_current(control, backup, BackupState::Quarantined)?)
+        },
+    )
 }
 
 fn backup_artifact_absent(control: &SqliteControlStore, locator: &str) -> PortResult<bool> {

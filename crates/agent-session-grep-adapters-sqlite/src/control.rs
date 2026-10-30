@@ -111,6 +111,59 @@ fn runtime_tick() -> PortResult<()> {
     }
     Ok(())
 }
+
+/// Retry only typed contention within the earliest caller-owned end. Each
+/// attempt must release its PolicyOwner guard before returning; a successful
+/// mutation is returned immediately and never replayed.
+pub(crate) fn retry_control_before<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> PortResult<T>,
+) -> PortResult<T> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(PortError::WriterBusy(
+                "control retry deadline reached".into(),
+            ));
+        }
+        match operation() {
+            Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
+/// A worker heartbeat advances control_seq without changing the authority
+/// behind another CAS. Retry a lost sequence race only while the caller's
+/// exact owner/policy or backup receipt still matches. All other errors keep
+/// their original classification; this grants no mutation authority.
+pub(crate) fn retry_seq_race_before<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> PortResult<T>,
+    mut unchanged: impl FnMut() -> PortResult<bool>,
+) -> PortResult<T> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    loop {
+        match retry_control_before(deadline, &mut operation) {
+            Err(error @ PortError::GenerationMismatch(_)) => {
+                if !retry_control_before(deadline, &mut unchanged)? {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
 fn runtime_capacity() -> PortError {
     PortError::Backend("control runtime dependency capacity exceeded".into())
 }

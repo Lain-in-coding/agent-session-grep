@@ -1090,6 +1090,73 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
     assert_eq!(f.control.status().unwrap(), after);
 }
 
+fn backup_sequence_contender(root: &Path) -> std::thread::JoinHandle<()> {
+    let root = root.to_path_buf();
+    let (ready, held) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(SqliteControlStore::path(&root)).unwrap();
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE control_meta SET control_seq=control_seq+1 WHERE singleton=1",
+        )
+        .unwrap();
+        ready.send(()).unwrap();
+        // The first CAS exhausts the default 250ms allowance. A later attempt
+        // reads the old sequence while this commit is still held, then loses
+        // that CAS when the transaction is released.
+        std::thread::sleep(Duration::from_millis(400));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    held.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread
+}
+
+#[test]
+fn backup_quarantine_retries_busy_and_sequence_race_in_the_same_request() {
+    let f = Fixture::new();
+    let selected = select(&f, "selected", RootKind::Root);
+    bind_source(&f, "source_a", "selected/source");
+    f.fence("owner");
+    let metadata = f.backup();
+    let installation =
+        retry_expected_success(|| f.control.bind_installation(&f.prefix, &f.installation_lock))
+            .unwrap();
+    retry_expected_success(|| {
+        f.control.revoke_selection(
+            f.control.status()?.policy.control_seq,
+            &selected.id,
+            None,
+            6,
+        )
+    })
+    .unwrap();
+    let before = f.control.status().unwrap();
+    let contender = backup_sequence_contender(&f.root);
+    let outcome = purge_backup(&f.control, &installation, &id("backup"), 7, end());
+    contender.join().unwrap();
+    assert!(matches!(
+        outcome.unwrap(),
+        PurgeOutcome::Purged {
+            artifact_removed: true,
+            ..
+        }
+    ));
+    assert!(!f.root.join(&metadata.relative_locator).exists());
+    let terminal = f.control.backup_records().unwrap().pop().unwrap();
+    assert_eq!(terminal.state, BackupState::PurgedByPolicy);
+    assert_eq!(terminal.digest.as_deref(), Some(metadata.digest.as_str()));
+    assert_eq!(terminal.size_bytes, metadata.size_bytes);
+    assert!(terminal.source_ids.is_empty());
+    let after = f.control.status().unwrap();
+    // Exactly one competing sequence write, one quarantine and one finalize.
+    assert_eq!(
+        after.policy.control_seq.get(),
+        before.policy.control_seq.get() + 3
+    );
+    assert_eq!(after.policy.policy_epoch, before.policy.policy_epoch);
+    assert_eq!(after.policy.exclusions, before.policy.exclusions);
+    assert_eq!(after.desired_updates, before.desired_updates);
+}
+
 #[cfg(windows)]
 #[test]
 fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
@@ -1143,8 +1210,12 @@ fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
     }
     assert!(verify_backup(&f.control, &id("backup")).is_err());
     drop(pinned);
+    let before_finalize = f.control.status().unwrap();
+    let contender = backup_sequence_contender(&f.root);
+    let finalized = purge_backup(&f.control, &installation, &id("backup"), 9, end());
+    contender.join().unwrap();
     assert!(matches!(
-        purge_backup(&f.control, &installation, &id("backup"), 9, end()).unwrap(),
+        finalized.unwrap(),
         PurgeOutcome::Purged {
             artifact_removed: true,
             ..
@@ -1157,6 +1228,11 @@ fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
         .unwrap();
     assert_eq!(terminal.state, BackupState::PurgedByPolicy);
     assert!(terminal.source_ids.is_empty());
+    assert_eq!(
+        f.control.status().unwrap().policy.control_seq.get(),
+        before_finalize.policy.control_seq.get() + 2,
+        "one writer and one finalization; cleanup must not quarantine again"
+    );
     assert!(matches!(
         purge_backup(&f.control, &installation, &id("backup"), 10, end()).unwrap(),
         PurgeOutcome::Purged {

@@ -719,6 +719,83 @@ fn corrupted_registered_backup_is_quarantined_with_accounting_and_never_silently
 }
 
 #[test]
+fn unclassified_backup_quarantine_retries_inside_the_original_purge_slice() {
+    let f = Fixture::new();
+    let prefix = verified_prefix(&f);
+    let install_lock = acquire(
+        &prefix,
+        LockKind::MaintenanceJob(
+            agent_session_grep_adapters_sqlite::managed_locks::JobLockKey::parse(
+                "installation-update",
+            )
+            .unwrap(),
+        ),
+    );
+    let installation = f.control.bind_installation(&prefix, &install_lock).unwrap();
+    let BackupOutcome::Created(metadata) = create_backup(&f, &installation, "contended") else {
+        panic!("backup fixture was not created")
+    };
+    let path = f.root.join(&metadata.relative_locator);
+    fs::write(&path, b"synthetic unclassified replacement bytes").unwrap();
+    let original_a = fs::read(&f.source_a).unwrap();
+    let original_b = fs::read(&f.source_b).unwrap();
+    let guard = acquire(&f.root, purge_lock_kind().unwrap());
+    let owner = f
+        .control
+        .bind_purge_owner(&guard, id("backup-race"))
+        .unwrap();
+    let before = f.control.status().unwrap();
+    let root = f.root.clone();
+    let (ready, held) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let conn = Connection::open(SqliteControlStore::path(&root)).unwrap();
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE control_meta SET control_seq=control_seq+1 WHERE singleton=1",
+        )
+        .unwrap();
+        ready.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    held.recv_timeout(Duration::from_secs(5)).unwrap();
+    // No revoke job exists: the first control write in this slice is the
+    // unclassified-backup quarantine, after catalog/cache cleanup.
+    let report = run(
+        &f.control,
+        &f.catalog,
+        &owner,
+        Some(&installation),
+        20,
+        deadline(),
+    );
+    contender.join().unwrap();
+    let report = report.unwrap();
+    assert_eq!(report.catalog, PurgeStage::Complete);
+    assert_eq!(report.cache, PurgeStage::Complete);
+    assert_eq!(
+        report.backups,
+        PurgeStage::Pending(PurgeFailure::UnclassifiedArtifact)
+    );
+    let record = f.control.backup_records().unwrap().remove(0);
+    assert_eq!(record.state, BackupState::Quarantined);
+    assert_eq!(record.digest.as_deref(), Some(metadata.digest.as_str()));
+    assert_eq!(record.size_bytes, metadata.size_bytes);
+    assert_eq!(record.source_ids, metadata.source_ids);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"synthetic unclassified replacement bytes"
+    );
+    assert_eq!(fs::read(&f.source_a).unwrap(), original_a);
+    assert_eq!(fs::read(&f.source_b).unwrap(), original_b);
+    let after = f.control.status().unwrap();
+    assert_eq!(
+        after.policy.control_seq.get(),
+        before.policy.control_seq.get() + 2
+    );
+    assert_eq!(after.policy.policy_epoch, before.policy.policy_epoch);
+}
+
+#[test]
 fn legacy_digestless_quarantine_does_not_block_remaining_backups_or_job_completion() {
     let f = Fixture::new();
     let prefix = verified_prefix(&f);
