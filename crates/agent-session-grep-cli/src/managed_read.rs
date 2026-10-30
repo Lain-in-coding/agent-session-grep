@@ -850,6 +850,38 @@ fn check_deadline(deadline: Instant) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Retry one idempotent control/catalog SQL read while a SQLite busy episode
+/// outlasts its 250 ms allowance and the request deadline remains. Only reads
+/// that take no OS lock are wrapped: a held catalog or control lock (purge,
+/// retirement) still answers busy at once. An active control fence is state,
+/// so its busy refusal also returns at once instead of waiting it out.
+fn transient<T>(
+    control: &SqliteControlStore,
+    deadline: Instant,
+    mut read: impl FnMut() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    loop {
+        let error = match read() {
+            Err(error @ PortError::WriterBusy(_)) => error,
+            other => return other,
+        };
+        if Instant::now() >= deadline || fenced(control, deadline) {
+            return Err(error);
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+fn fenced(control: &SqliteControlStore, deadline: Instant) -> bool {
+    // A contended fence read proves no fence; the caller keeps its deadline.
+    control
+        .with_runtime_deadline(deadline, || {
+            control.read_policy(RequestIntersection::Selected)
+        })
+        .is_ok_and(|policy| policy.emission_blocked())
+}
+
 fn failure_reason(reason: BackgroundFailure) -> &'static str {
     match reason {
         BackgroundFailure::Paused => "paused",
@@ -891,8 +923,8 @@ fn relevant_providers(
     if let Some(id) = id {
         // Only this identity-resolution snapshot precedes admission; its content
         // is never emitted. Project/time cannot eliminate undiscovered claims.
-        return store
-            .with_read(control, RequestIntersection::Selected, deadline, |read| {
+        return transient(control, deadline, || {
+            store.with_read(control, RequestIntersection::Selected, deadline, |read| {
                 let query = ProjectionQuery {
                     filters: SearchFilters {
                         providers: requested.clone(),
@@ -937,7 +969,8 @@ fn relevant_providers(
                 }
                 Ok(providers)
             })
-            .map_err(private_port);
+        })
+        .map_err(private_port);
     }
     let mut providers = requested.clone();
     if let AppRequest::Search { filters, .. } = app {
@@ -1062,9 +1095,10 @@ fn execute(
     }
     let control = SqliteControlStore::open_current_read_only_with_deadline(&root, deadline)
         .map_err(private_port)?;
-    let status = control
-        .with_runtime_deadline(deadline, || control.status())
-        .map_err(private_port)?;
+    let status = transient(&control, deadline, || {
+        control.with_runtime_deadline(deadline, || control.status())
+    })
+    .map_err(private_port)?;
     if identity.is_some_and(|expected| expected.installation != status.policy.installation_id)
         || RootIdentity::read(&root).map_err(private_port)? != expected_root
     {
@@ -1131,21 +1165,27 @@ fn execute(
     let wait_deadline = started + Duration::from_millis(u64::from(request.latest.unwrap_or(0)));
     let result = loop {
         check_deadline(deadline)?;
-        let current = control
-            .with_runtime_deadline(deadline, || control.status())
-            .map_err(private_port)?;
+        let current = transient(&control, deadline, || {
+            control.with_runtime_deadline(deadline, || control.status())
+        })
+        .map_err(private_port)?;
         if current.policy.installation_id != status.policy.installation_id {
             return Err(boundary_error());
         }
         let barrier_now = barrier
             .as_ref()
-            .map(|b| control.with_runtime_deadline(deadline, || control.barrier(&b.id)))
+            .map(|b| {
+                transient(&control, deadline, || {
+                    control.with_runtime_deadline(deadline, || control.barrier(&b.id))
+                })
+            })
             .transpose()
             .map_err(private_port)?;
-        let worker = control
-            .with_runtime_deadline(deadline, || control.background_status())
-            .map_err(private_port)?
-            .worker;
+        let worker = transient(&control, deadline, || {
+            control.with_runtime_deadline(deadline, || control.background_status())
+        })
+        .map_err(private_port)?
+        .worker;
         let reason = if current.desired_updates == DesiredUpdates::Paused {
             "paused"
         } else if current.desired_updates == DesiredUpdates::Stopped {
@@ -1175,8 +1215,8 @@ fn execute(
         let reason = if offline { "offline" } else { reason };
         let stop =
             request.latest.is_none() || reason != "timeout" || Instant::now() >= wait_deadline;
-        let result = store
-            .with_read(&control, RequestIntersection::Selected, deadline, |read| {
+        let result = transient(&control, deadline, || {
+            store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
                 // Proof and payload use this very transaction. Drop it before every wait.
                 let satisfied = barrier_now
                     .as_ref()
@@ -1232,7 +1272,8 @@ fn execute(
                     cache.as_ref().map(|c| (c, &control)),
                 )))
             })
-            .map_err(private_port)?;
+        })
+        .map_err(private_port)?;
         if let Some(result) = result {
             break result?;
         }
@@ -1240,9 +1281,10 @@ fn execute(
         std::thread::sleep(Duration::from_millis(25).min(remaining));
     };
     drop(store);
-    let current = control
-        .with_runtime_deadline(deadline, || control.status())
-        .map_err(private_port)?;
+    let current = transient(&control, deadline, || {
+        control.with_runtime_deadline(deadline, || control.status())
+    })
+    .map_err(private_port)?;
     if current.policy.installation_id != status.policy.installation_id
         || current.policy.policy_epoch != result.epoch
         || RootIdentity::read(&root).map_err(private_port)? != expected_root
@@ -2011,4 +2053,81 @@ fn render_frame(
         outcome,
         epoch,
     })
+}
+
+#[cfg(test)]
+mod transient_read_tests {
+    use super::*;
+    use agent_session_grep_ports::control::{MaintenanceFence, MaintenancePhase, MaintenanceState};
+
+    fn store() -> (tempfile::TempDir, SqliteControlStore) {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let control = SqliteControlStore::create(
+            &temp.path().join("private"),
+            &ControlId::parse("unit-installation").unwrap(),
+            DesiredUpdates::Running,
+        )
+        .unwrap();
+        (temp, control)
+    }
+
+    #[test]
+    fn sqlite_contention_is_retried_within_the_request_deadline() {
+        let (_temp, control) = store();
+        let mut attempts = 0;
+        let value = transient(&control, Instant::now() + Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(PortError::WriterBusy("synthetic busy episode".into()))
+            } else {
+                Ok(attempts)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 3);
+        let mut attempts = 0;
+        let error = transient(&control, Instant::now() + Duration::from_secs(5), || {
+            attempts += 1;
+            Err::<(), _>(PortError::SchemaIncompatible("synthetic".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(error, PortError::SchemaIncompatible(_)));
+        assert_eq!(attempts, 1);
+        let error = transient(&control, Instant::now(), || {
+            Err::<(), _>(PortError::WriterBusy("synthetic".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(error, PortError::WriterBusy(_)));
+    }
+
+    #[test]
+    fn active_fence_answers_busy_without_waiting_out_the_deadline() {
+        let (_temp, control) = store();
+        let owner = ControlId::parse("unit-maintenance").unwrap();
+        control
+            .set_maintenance(
+                control.status().unwrap().policy.control_seq,
+                &owner,
+                MaintenanceFence {
+                    state: MaintenanceState::Updating,
+                    owner: Some(owner.clone()),
+                    phase: Some(MaintenancePhase::Quiescing),
+                },
+            )
+            .unwrap();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let error = transient(&control, started + Duration::from_secs(10), || {
+            attempts += 1;
+            Err::<(), _>(PortError::WriterBusy(
+                "managed control fence is active".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(matches!(error, PortError::WriterBusy(_)));
+        // A definite fence read stops retrying; a contended fence read may
+        // allow one more attempt, never a wait to the request deadline.
+        assert!(attempts <= 3, "fenced refusal retried {attempts} times");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
