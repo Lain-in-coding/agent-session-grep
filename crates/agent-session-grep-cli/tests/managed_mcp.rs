@@ -38,6 +38,33 @@ fn line(id: &str, text: &str) -> Vec<u8> {
     bytes
 }
 
+/// A bare control open or read outside a runtime scope has a 250 ms window,
+/// which a loaded host can exhaust although nothing holds a lock. Fixture
+/// control work retries only typed contention until one explicit end; every
+/// other error still fails the test with its own message.
+#[track_caller]
+fn bounded_until<T>(
+    deadline: Instant,
+    what: &str,
+    mut operation: impl FnMut() -> Result<T, PortError>,
+) -> T {
+    loop {
+        match operation() {
+            Ok(value) => return value,
+            Err(
+                PortError::WriterBusy(_)
+                | PortError::GenerationMismatch(_)
+                | PortError::SnapshotChanged(_),
+            ) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("synthetic {what}: {error:?}"),
+        }
+    }
+}
+#[track_caller]
+fn bounded<T>(what: &str, operation: impl FnMut() -> Result<T, PortError>) -> T {
+    bounded_until(Instant::now() + Duration::from_secs(3), what, operation)
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     db: PathBuf,
@@ -58,13 +85,11 @@ impl Fixture {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(10));
-        let control = SqliteControlStore::open_current_writable(db.parent().unwrap()).unwrap();
-        control
-            .set_desired_updates(
-                control.status().unwrap().policy.control_seq,
-                DesiredUpdates::Paused,
-            )
-            .unwrap();
+        bounded("pause after setup", || {
+            let control = SqliteControlStore::open_current_writable(db.parent().unwrap())?;
+            control
+                .set_desired_updates(control.status()?.policy.control_seq, DesiredUpdates::Paused)
+        });
         let output = Command::new(BIN)
             .args(["--robot", "--db"])
             .arg(&db)
@@ -86,16 +111,18 @@ impl Fixture {
         }
     }
     fn control(&self) -> SqliteControlStore {
-        SqliteControlStore::open_current_writable(self.db.parent().unwrap()).unwrap()
+        bounded("control open", || {
+            SqliteControlStore::open_current_writable(self.db.parent().unwrap())
+        })
     }
     fn start(&mut self) {
         let control = self.control();
-        control
-            .set_desired_updates(
-                control.status().unwrap().policy.control_seq,
+        bounded("start", || {
+            control.set_desired_updates(
+                control.status()?.policy.control_seq,
                 DesiredUpdates::Running,
             )
-            .unwrap();
+        });
         let mut command = Command::new(BIN);
         command
             .arg("__managed-background")
@@ -113,54 +140,48 @@ impl Fixture {
     }
     fn pause(&self) {
         let control = self.control();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match control.set_desired_updates(
-                control.status().unwrap().policy.control_seq,
-                DesiredUpdates::Paused,
-            ) {
-                Ok(_) => return,
-                Err(PortError::GenerationMismatch(_)) if Instant::now() < deadline => {}
-                Err(e) => panic!("pause: {e:?}"),
-            }
-        }
+        bounded("pause", || {
+            control
+                .set_desired_updates(control.status()?.policy.control_seq, DesiredUpdates::Paused)
+        });
     }
     fn revoke(&self) {
         self.pause();
         let control = self.control();
         let owner = acquire(self.db.parent().unwrap(), LockKind::PolicyOwner);
         let deadline = Instant::now() + Duration::from_secs(3);
-        let intent = loop {
-            match control.revoke_selection(
-                control.status().unwrap().policy.control_seq,
+        let intent = bounded_until(deadline, "revoke", || {
+            control.revoke_selection(
+                control.status()?.policy.control_seq,
                 &self.selection,
                 None,
                 10,
-            ) {
-                Ok(value) => break value.value.intent,
-                Err(PortError::GenerationMismatch(_)) if Instant::now() < deadline => {}
-                Err(e) => panic!("revoke: {e:?}"),
-            }
-        };
+            )
+        })
+        .value
+        .intent;
         let drain = acquire(self.db.parent().unwrap(), LockKind::PolicyEmission);
-        loop {
-            match control.settle_revocation(
-                control.status().unwrap().policy.control_seq,
+        bounded_until(deadline, "settle", || {
+            control.settle_revocation(
+                control.status()?.policy.control_seq,
                 &owner,
                 &drain,
                 &intent.id,
                 11,
-            ) {
-                Ok(_) => break,
-                Err(PortError::GenerationMismatch(_)) if Instant::now() < deadline => {}
-                Err(e) => panic!("settle: {e:?}"),
-            }
-        }
+            )
+        });
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(mut worker) = self.worker.take() {
+            // A failing test reports whether its worker had already exited;
+            // the code is a content-free canonical exit classification.
+            if std::thread::panicking()
+                && let Ok(Some(status)) = worker.try_wait()
+            {
+                eprintln!("synthetic worker had exited: {status}");
+            }
             let _ = worker.kill();
             let _ = worker.wait();
         }
@@ -316,7 +337,10 @@ fn persistent_mcp_observes_append_pause_and_revoke_without_legacy_access() {
         "search_sessions",
         json!({"query":"orchid","latest":true,"max_wait_ms":0}),
     );
-    assert_eq!(paused["result"]["structuredContent"]["outcome"], "partial");
+    assert_eq!(
+        paused["result"]["structuredContent"]["outcome"], "partial",
+        "paused latest must return bounded partial state: {paused}"
+    );
     assert_eq!(
         paused["result"]["structuredContent"]["data"]["freshness"]["latest_satisfied"],
         false
