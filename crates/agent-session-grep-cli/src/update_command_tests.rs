@@ -365,6 +365,49 @@ fn update_drain_requires_real_supervisor_and_worker_locks() {
     drop(acquire(LockKind::Supervisor));
 }
 #[test]
+fn recovery_control_admission_retries_a_real_control_handle_gate() {
+    use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().join("private");
+    let control = crate::retry_fixture_busy(|| {
+        SqliteControlStore::create(
+            &root,
+            &ControlId::parse("install").unwrap(),
+            DesiredUpdates::Paused,
+        )
+    });
+    let physical_root =
+        agent_session_grep_adapters_sqlite::managed_locks::RootIdentity::read(&root).unwrap();
+    drop(control);
+
+    let contender_root = root.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let gate = crate::retry_fixture_busy(|| {
+            ExclusiveGuard::try_acquire(&contender_root, LockKind::ControlHandles)
+        });
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        drop(gate);
+    });
+    ready_rx.recv().unwrap();
+    let started = Instant::now();
+    let admitted = open_recovery_control(
+        &root,
+        &ControlId::parse("install").unwrap(),
+        physical_root,
+        started + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(
+        admitted.status().unwrap().policy.installation_id,
+        ControlId::parse("install").unwrap()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    contender.join().unwrap();
+}
+
+#[test]
 fn private_native_binding_is_hash_confirmed_and_never_leaks_in_report() {
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -718,7 +761,14 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
 /// Idle, paused installation with one registered worker and a reconciled
 /// catalog: the real inputs that apply admission and terminal replay inspect.
 fn with_idle_admission(
-    test: impl FnOnce(&SqliteControlStore, &InstallationLockAuthority<'_>, &Path, &Path),
+    test: impl FnOnce(
+        &SqliteControlStore,
+        &InstallationLockAuthority<'_>,
+        &Path,
+        &Path,
+        &Path,
+        &agent_session_grep_adapters_sqlite::managed_locks::ExclusiveGuard,
+    ),
 ) {
     use agent_session_grep_adapters_sqlite::{
         managed_locks::{ExclusiveGuard, JobLockKey, LockKind},
@@ -765,16 +815,16 @@ fn with_idle_admission(
             .unwrap();
     }
     let installation = control.bind_installation(&prefix, &lock).unwrap();
-    test(&control, &installation, &root, &db);
+    test(&control, &installation, &root, &db, &prefix, &lock);
 }
 
-/// Hold the real catalog handle gate, then commit one real worker heartbeat
-/// before releasing it. An admission that read its first policy snapshot
-/// while the gate was held sees a changed control sequence afterwards.
+/// Hold the real catalog handle gate and commit worker heartbeats throughout
+/// that interval. Admission can begin after the first heartbeat and still
+/// observe a later sequence change before the catalog gate is released.
 fn heartbeat_while_gated(
     root: &Path,
     hold: Duration,
-) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+) -> (std::thread::JoinHandle<u64>, std::sync::mpsc::Receiver<()>) {
     use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
     use agent_session_grep_ports::control::{BackgroundFailure, UpdateState};
     let root = root.to_path_buf();
@@ -796,18 +846,27 @@ fn heartbeat_while_gated(
             ExclusiveGuard::try_acquire(&root, LockKind::CatalogHandles)
         });
         ready.send(()).unwrap();
-        std::thread::sleep(hold);
-        crate::retry_fixture_busy(|| {
-            let seq = control.status()?.policy.control_seq;
-            control.heartbeat_worker(
-                seq,
-                &worker,
-                UpdateState::Paused,
-                Some(BackgroundFailure::Paused),
-                2,
-            )
-        });
+        let until = Instant::now() + hold;
+        let mut beats = 0;
+        loop {
+            crate::retry_fixture_busy(|| {
+                let seq = control.status()?.policy.control_seq;
+                control.heartbeat_worker(
+                    seq,
+                    &worker,
+                    UpdateState::Paused,
+                    Some(BackgroundFailure::Paused),
+                    2,
+                )
+            });
+            beats += 1;
+            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
         drop(handles);
+        beats
     });
     (contender, gated)
 }
@@ -815,7 +874,7 @@ fn heartbeat_while_gated(
 #[test]
 fn terminal_pair_check_rereads_after_a_heartbeat_between_policy_snapshots() {
     use agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity;
-    with_idle_admission(|control, installation, root, db| {
+    with_idle_admission(|control, installation, root, db, _prefix, _lock| {
         let end = Instant::now() + Duration::from_secs(10);
         let initial = inspect_catalog_identity(control, db, end).unwrap();
         let before = control.status().unwrap();
@@ -843,11 +902,12 @@ fn terminal_pair_check_rereads_after_a_heartbeat_between_policy_snapshots() {
         )
         .unwrap();
         assert!(started.elapsed() >= hold);
-        contender.join().unwrap();
+        let beats = contender.join().unwrap();
+        assert!(beats > 0);
         let after = control.status().unwrap();
         assert_eq!(
             after.policy.control_seq.get(),
-            before.policy.control_seq.get() + 1
+            before.policy.control_seq.get() + i64::try_from(beats).unwrap()
         );
         assert_eq!(after.policy.policy_epoch, before.policy.policy_epoch);
         assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
@@ -857,7 +917,7 @@ fn terminal_pair_check_rereads_after_a_heartbeat_between_policy_snapshots() {
 
 #[test]
 fn apply_admission_rereads_status_after_a_heartbeat_between_policy_snapshots() {
-    with_idle_admission(|control, _installation, root, db| {
+    with_idle_admission(|control, _installation, root, db, _prefix, _lock| {
         let end = Instant::now() + Duration::from_secs(10);
         let before = control.status().unwrap();
         let (contender, gated) = heartbeat_while_gated(root, Duration::from_millis(250));
@@ -870,13 +930,14 @@ fn apply_admission_rereads_status_after_a_heartbeat_between_policy_snapshots() {
             })
         })
         .unwrap();
-        contender.join().unwrap();
+        let beats = contender.join().unwrap();
+        assert!(beats > 0);
         // The first attempt saw the pre-heartbeat sequence; admission returns
         // the status of the attempt that actually matched the catalog.
         assert!(candidates >= 2);
         assert_eq!(
             status.policy.control_seq.get(),
-            before.policy.control_seq.get() + 1
+            before.policy.control_seq.get() + i64::try_from(beats).unwrap()
         );
         assert_eq!(status, control.status().unwrap());
         assert_eq!(catalog.installation, status.policy.installation_id);
@@ -889,7 +950,7 @@ fn apply_admission_rereads_status_after_a_heartbeat_between_policy_snapshots() {
 
 #[test]
 fn busy_admission_retries_never_outlive_the_original_request_end() {
-    with_idle_admission(|control, _installation, root, db| {
+    with_idle_admission(|control, _installation, root, db, _prefix, _lock| {
         let before = control.status().unwrap();
         let hold = Duration::from_millis(1500);
         let (contender, gated) = heartbeat_while_gated(root, hold);
@@ -912,11 +973,12 @@ fn busy_admission_retries_never_outlive_the_original_request_end() {
         assert_eq!(error.0.code, CanonicalCode::WriterBusy);
         // Returned at the original end while the gate was still held.
         assert!(waited < Duration::from_millis(1200), "{waited:?}");
-        contender.join().unwrap();
+        let beats = contender.join().unwrap();
+        assert!(beats > 0);
         let after = control.status().unwrap();
         assert_eq!(
             after.policy.control_seq.get(),
-            before.policy.control_seq.get() + 1
+            before.policy.control_seq.get() + i64::try_from(beats).unwrap()
         );
         assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
     });

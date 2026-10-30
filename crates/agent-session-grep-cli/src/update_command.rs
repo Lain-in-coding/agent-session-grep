@@ -383,6 +383,56 @@ fn retry_busy<T>(
         }
     }
 }
+fn open_recovery_control(
+    root: &Path,
+    expected_installation: &ControlId,
+    physical_root: RootIdentity,
+    end: Instant,
+) -> Result<SqliteControlStore, CliError> {
+    retry_busy(end, || {
+        if RootIdentity::read(root).map_err(port)? != physical_root {
+            return Err(port(PortError::SnapshotChanged(
+                "update control root changed".into(),
+            )));
+        }
+        let control = SqliteControlStore::open_existing_writable_with_deadline(
+            root,
+            expected_installation,
+            end,
+        )
+        .map_err(port)?;
+        if RootIdentity::read(root).map_err(port)? != physical_root {
+            return Err(port(PortError::SnapshotChanged(
+                "update control root changed".into(),
+            )));
+        }
+        Ok(control)
+    })
+}
+fn bind_recovery_installation<'a>(
+    control: &SqliteControlStore,
+    prefix: &Path,
+    lock: &'a ExclusiveGuard,
+    expected_installation: &str,
+    end: Instant,
+) -> Result<InstallationLockAuthority<'a>, CliError> {
+    retry_busy(end, || {
+        if control
+            .status()
+            .map_err(port)?
+            .policy
+            .installation_id
+            .as_str()
+            != expected_installation
+        {
+            return Err(problem(
+                CanonicalCode::SchemaIncompatible,
+                "recovery installation policy identity differs",
+            ));
+        }
+        control.bind_installation(prefix, lock).map_err(port)
+    })
+}
 fn control_lock(root: &Path, end: Instant) -> Result<ExclusiveGuard, CliError> {
     // A nested caller may hold an earlier request end; never wait past it.
     let end = SqliteControlStore::effective_runtime_deadline(end);
@@ -956,7 +1006,9 @@ fn apply(
             catalog: db.clone(),
             checkpoint,
         })?;
-        let installation = control.bind_installation(&prefix, &lock).map_err(port)?;
+        let installation = retry_busy(end, || {
+            control.bind_installation(&prefix, &lock).map_err(port)
+        })?;
         // Every preflight above may refuse or race without losing the prior
         // terminal recovery record. Archive and create only after the writable
         // control, policy, catalog identity and installation binding agree.
@@ -1704,40 +1756,15 @@ fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<(Outcome, V
         ControlId::parse(&journal.state.checkpoint.installation_id).map_err(port)?;
     // An installation mismatch is refused before migration and is not Busy.
     let physical_root = RootIdentity::read(root).map_err(port)?;
-    let control = retry_busy(end, || {
-        if RootIdentity::read(root).map_err(port)? != physical_root {
-            return Err(port(PortError::SnapshotChanged(
-                "update control root changed".into(),
-            )));
-        }
-        let control = SqliteControlStore::open_existing_writable_with_deadline(
-            root,
-            &expected_installation,
-            end,
-        )
-        .map_err(port)?;
-        if RootIdentity::read(root).map_err(port)? != physical_root {
-            return Err(port(PortError::SnapshotChanged(
-                "update control root changed".into(),
-            )));
-        }
-        Ok(control)
-    })?;
+    let control = open_recovery_control(root, &expected_installation, physical_root, end)?;
     with_update_deadline(&control, end, || {
-        if control
-            .status()
-            .map_err(port)?
-            .policy
-            .installation_id
-            .as_str()
-            != journal.state.checkpoint.installation_id
-        {
-            return Err(problem(
-                CanonicalCode::SchemaIncompatible,
-                "recovery installation policy identity differs",
-            ));
-        }
-        let installation = control.bind_installation(&prefix, &lock).map_err(port)?;
+        let installation = bind_recovery_installation(
+            &control,
+            &prefix,
+            &lock,
+            &journal.state.checkpoint.installation_id,
+            end,
+        )?;
         let owner = ControlId::parse(&journal.state.owner_nonce).map_err(port)?;
         if journal.state.phase == Phase::Complete {
             verify_active(
