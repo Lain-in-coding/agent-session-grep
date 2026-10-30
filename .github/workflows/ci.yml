@@ -106,6 +106,12 @@ jobs:
 
       - name: Test
         # Run every test binary so one failure cannot hide the others.
+        # Hosted Windows keeps the profile TEMP on the slow OS disk; SQLite
+        # fixtures there stalled past their deadlines in otherwise unchanged
+        # runs. Keep fixture temp roots on the job's runner volume instead.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: cargo test --workspace --no-fail-fast
 
       # The embedded client has no npm dependencies. Node's built-in runner
