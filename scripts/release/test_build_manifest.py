@@ -752,20 +752,33 @@ class BuildManifestTests(unittest.TestCase):
         self.assertEqual(len(staged), 1)
         self.assertEqual(len(list(staged[0].glob("versions/*/asg-supervisor.exe"))), 1)
 
+    def native_posix_shell(self):
+        """Return (argv prefix, path mapper) for a real POSIX shell, or skip.
+
+        On Windows only WSL supplies one. Hosted runners ship wsl.exe without
+        a Linux distribution, where every call fails with no stderr, so run a
+        command before relying on it.
+        """
+        if os.name != "nt":
+            return [], str
+        if shutil.which("wsl"):
+            try:
+                probe = subprocess.run(["wsl", "--exec", "sh", "-c", "uname -s"], capture_output=True,
+                                       text=True, errors="backslashreplace", timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                probe = None
+            if probe is not None and probe.returncode == 0:
+                def native_path(path):
+                    absolute = str(path.resolve()).replace("\\", "/")
+                    return "/mnt/" + absolute[0].lower() + absolute[2:]
+                return ["wsl", "--exec"], native_path
+        self.skipTest("native POSIX host unavailable")
+
     def posix_fixture(self, *, schemas: tuple[int, int] = (19, 1)):
         # Execute real native fixtures, including architecture validation. WSL
         # supplies a real ELF host on Windows; do not masquerade shell scripts
         # as executables or replace the production host/limit checks.
-        if os.name == "nt":
-            if not shutil.which("wsl"):
-                self.skipTest("native POSIX host unavailable")
-            invoke = ["wsl", "--exec"]
-            def native_path(path):
-                absolute = str(path.resolve()).replace("\\", "/")
-                return "/mnt/" + absolute[0].lower() + absolute[2:]
-        else:
-            invoke = []
-            native_path = lambda path: str(path)
+        invoke, native_path = self.native_posix_shell()
         platform = subprocess.run(invoke + ["sh", "-c", "command -v cc && uname -s && uname -m && ulimit -f 32"],
                                   capture_output=True, text=True, errors="backslashreplace", timeout=30)
         if platform.returncode:
@@ -831,17 +844,7 @@ class BuildManifestTests(unittest.TestCase):
         # check read ncmds as the filetype and rejected every real binary.
         fixture = self.workspace / "macho-gate"
         fixture.mkdir(parents=True, exist_ok=True)
-        if sys.platform == "win32":
-            wsl = shutil.which("wsl")
-            if not wsl:
-                self.skipTest("native POSIX host unavailable")
-            invoke = ["wsl", "--exec"]
-            def native_path(path):
-                absolute = str(path.resolve()).replace("\\", "/")
-                return "/mnt/" + absolute[0].lower() + absolute[2:]
-        else:
-            invoke = []
-            native_path = lambda path: str(path)
+        invoke, native_path = self.native_posix_shell()
         script = fixture / "gate.sh"
         installer = (Path(__file__).parent.parent / "install" / "package-install.sh").resolve()
         source = installer.read_text(encoding="utf-8")
@@ -856,9 +859,7 @@ class BuildManifestTests(unittest.TestCase):
             struct.pack_into("<I", header, 16, 0x30)  # ncmds: any plausible value
             image = fixture / f"app-{cputype}.bin"
             image.write_bytes(header)
-            probe = ["sh", native_path(script), image.name, target]
-            if invoke:
-                probe = invoke + probe
+            probe = invoke + ["sh", native_path(script), image.name, target]
             result = subprocess.run(probe, cwd=fixture, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -938,16 +939,7 @@ class BuildManifestTests(unittest.TestCase):
         self.assertTrue((prefix / "agent-session-grep").is_file())
 
     def test_shell_invalid_setup_options_reject_before_prefix_or_staging_writes(self) -> None:
-        if os.name == "nt":
-            if not shutil.which("wsl"):
-                self.skipTest("native POSIX host unavailable")
-            invoke = ["wsl", "--exec"]
-            def native_path(path):
-                absolute = str(path.resolve()).replace("\\", "/")
-                return "/mnt/" + absolute[0].lower() + absolute[2:]
-        else:
-            invoke = []
-            native_path = lambda path: str(path)
+        invoke, native_path = self.native_posix_shell()
         script = self.workspace / "scripts/install/package-install.sh"
         manifest = self.workspace / "missing.manifest.json"
         checksums = self.workspace / "missing.SHA256SUMS"
