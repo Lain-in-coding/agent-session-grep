@@ -23,6 +23,18 @@ assert SPEC is not None and SPEC.loader is not None
 BUILD_MANIFEST = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILD_MANIFEST)
 
+# The isolated Windows profile also holds LOCALAPPDATA, as on a real account.
+# PowerShell 7 and Windows PowerShell 5.1 keep startup and module caches
+# there, and the .NET Framework keeps usage logs for managed programs. Some
+# pwsh builds derive that folder from USERPROFILE even when LOCALAPPDATA
+# points elsewhere. These files come from the test's host processes, not from
+# the installer, and their names vary by host version.
+HOST_RUNTIME_CACHES = (
+    "appdata/local/microsoft/powershell/",
+    "appdata/local/microsoft/windows/powershell/",
+    "appdata/local/microsoft/clr_v4.0/usagelogs/",
+)
+
 
 class BuildManifestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -501,6 +513,23 @@ class BuildManifestTests(unittest.TestCase):
         return {str(path.relative_to(root)): path.read_bytes()
                 for path in root.rglob("*") if path.is_file()}
 
+    @classmethod
+    def profile_snapshot(cls, root: Path) -> dict[str, bytes]:
+        def host_cache(name: str) -> bool:
+            key = name.replace("\\", "/").lower()
+            return any(key.startswith(prefix) for prefix in HOST_RUNTIME_CACHES)
+        return {name: data for name, data in cls.file_snapshot(root).items()
+                if not host_cache(name)}
+
+    def assert_profile_unchanged(self, root: Path, before: dict[str, bytes]) -> None:
+        after = self.profile_snapshot(root)
+        if after != before:
+            # Name the paths; a full dict diff of binary files is megabytes.
+            changed = sorted(name for name in before.keys() & after.keys()
+                             if before[name] != after[name])
+            self.fail(f"isolated profile changed: added={sorted(after.keys() - before.keys())} "
+                      f"removed={sorted(before.keys() - after.keys())} changed={changed}")
+
     def test_powershell_six_host_history_forwarding_records_literal_argv_and_legacy_repeat(self) -> None:
         schemas = BUILD_MANIFEST._source_schemas(MODULE_PATH.parents[2])
         self.assertEqual(schemas, (22, 2))
@@ -524,7 +553,7 @@ class BuildManifestTests(unittest.TestCase):
         unselected = profile / "unselected-source"
         unselected.mkdir()
         (unselected / "source.txt").write_bytes(b"not selected\n")
-        before = self.file_snapshot(profile)
+        before = self.profile_snapshot(profile)
         package_before = self.file_snapshot(root)
         catalog = str(profile / "catalog & literal;$(not-evaluated).db")
         hosts = ["claude", "codex", "workbuddy", "zcode", "deepseek-harness", "antigravity"]
@@ -533,7 +562,7 @@ class BuildManifestTests(unittest.TestCase):
         env = {**os.environ, "ASG_TEST_COMMAND_RECEIPT": str(receipt),
                "ASG_TEST_SETUP_EXIT": "10", "ASG_TEST_PATH_EXIT": "0",
                "HOME": str(profile), "USERPROFILE": str(profile),
-               "LOCALAPPDATA": str(self.workspace / "powershell-runtime-cache")}
+               "LOCALAPPDATA": str(profile / "AppData" / "Local")}
         result = self.run_ps_install_options(root, manifest, checksums, prefix, options, env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         setup = ["--robot", "--db", catalog, "setup", "--install-prefix", str(prefix)]
@@ -544,7 +573,7 @@ class BuildManifestTests(unittest.TestCase):
         setup += ["--no-autostart"]
         self.assertEqual(self.command_receipts(receipt), [
             setup, ["--robot", "--db", catalog, "path", "install", "--install-prefix", str(prefix)]])
-        self.assertEqual(self.file_snapshot(profile), before)
+        self.assert_profile_unchanged(profile, before)
         self.assertEqual(self.file_snapshot(root), package_before)
         installed = self.file_snapshot(prefix)
         legacy = {"HostChoice": ["Claude", "Codex"], "NoPath": True,
@@ -555,7 +584,7 @@ class BuildManifestTests(unittest.TestCase):
             "--robot", "setup", "--install-prefix", str(prefix), "--host", "claude", "--host", "codex",
             "--history", "claude-code", histories["claude-code"][1], "--history", "codex", histories["codex"][1]]])
         self.assertEqual(self.file_snapshot(prefix), installed)
-        self.assertEqual(self.file_snapshot(profile), before)
+        self.assert_profile_unchanged(profile, before)
         # A normal -File invocation remains supported for a single new host.
         result = self.run_ps_install(root, manifest, checksums, prefix, env,
             extra_args=("-HostChoice", "workbuddy", "-WorkBuddyHistory", histories["workbuddy"][1], "-NoPath"))
@@ -573,7 +602,7 @@ class BuildManifestTests(unittest.TestCase):
             self.assertEqual(self.command_receipts(receipt)[4:], [setup,
                 ["--robot", "--db", catalog, "path", "install", "--install-prefix", str(prefix)]])
             self.assertEqual(self.file_snapshot(prefix), installed)
-            self.assertEqual(self.file_snapshot(profile), before)
+            self.assert_profile_unchanged(profile, before)
 
     def test_powershell_setup_failure_retains_verified_install_and_never_registers_path(self) -> None:
         root, manifest, checksums = self.powershell_fixture()
