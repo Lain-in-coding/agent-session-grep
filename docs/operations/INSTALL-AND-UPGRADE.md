@@ -633,8 +633,27 @@ complete rewrite, including shrinking JSONL, and deletion require distinct
 verified observations at least five monotonic seconds apart; restart or
 proof/policy/root changes restart confirmation. An offline or unreadable root
 is not deletion evidence. This grace window is a correctness rule, not measured
-five-second performance acceptance. Automatic rename/alias identity preservation
-and full overlapping-root acceptance remain under implementation/review.
+five-second performance acceptance.
+
+During historical import, the worker rotates between changed active sources,
+cold sources and full verification. Already published Claude Code and Codex
+JSONL files can receive another verified observation within the same open
+cycle. A newly imported Claude Code or Codex JSONL source becomes eligible for
+revisits only in subsequent cycles. Metadata dependencies and other formats
+retain their existing complete observation and confirmation paths.
+File size and modification time only
+prioritize work; they never replace full content verification.
+
+When a source's original observation deadline expires before its first attempt
+in that cycle, it remains pending for a later cycle and is not counted as
+observed. Published
+originals can be usable while the selected range is still partial. A complete
+latest result requires a complete matching discovery cycle; observing every
+source across several partial cycles does not satisfy that condition. Large
+sources, initial import and resource limits can keep latest incomplete.
+The five-second fixed-workload target remains an acceptance gate.
+Automatic rename/alias identity preservation and final overlapping-root
+acceptance remain under implementation/review.
 
 Current source and local tests include a Windows x64 private two-version drill:
 the injected beta.5 supervisor failed after the pointer switch, beta.5 recovered

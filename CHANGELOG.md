@@ -343,6 +343,21 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Selected-history scheduling now revisits already published Claude Code and
+  Codex JSONL sources between backfill attempts. Active work rotates fairly,
+  cold import and full verification retain service, and expired unstarted
+  sources keep their place for later cycles without being counted as observed.
+  Every publication still requires complete source proof and the original
+  deadline; partial cycles cannot be combined into complete latest coverage.
+  The fixed five-second freshness and resource gates still require measurement.
+- Claude Code 2.1.292 `atis-latch` and `cost-state` metadata no longer prevent
+  an otherwise complete managed transcript from publishing. The known shapes
+  are validated without creating messages or adding cumulative cost counters
+  to message usage; malformed or unknown records remain incomplete.
+- Native Codex evidence capture retains the last thread-cumulative usage
+  snapshot as partial episode evidence and counts completed diagnostic items.
+  Repeated snapshots are not summed, and a successful final answer cannot
+  conceal native errors or certify per-turn token measurement.
 - Managed program updates now replace a terminal update journal through a
   durable, hash-bound supersede transaction instead of unlinking it before all
   preflight has passed. Recovery handles interrupted intent/state/archive
