@@ -1393,7 +1393,7 @@ def validate_manifest_obj(manifest: dict[str, Any], source: Path) -> dict[str, A
 def validate_manifest_file(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     validated = validate_manifest_obj(manifest, path)
-    print(f"valid {MANIFEST_SCHEMA_VERSION} manifest: {path}")
+    print(f"valid {MANIFEST_SCHEMA_VERSION} manifest: {str(path)!a}")
     return validated
 
 
@@ -1778,7 +1778,7 @@ def validate_report(path: Path) -> dict[str, Any]:
                     raise ValueError(f"{mode}: per-query recall_at_{k} must be a ratio in [0, 1]")
             if not isinstance(detail.get("hit_ids"), list):
                 raise ValueError(f"{mode}: per-query detail must carry ordered hit ids")
-    print(f"valid {SCHEMA_VERSION} report: {path}")
+    print(f"valid {SCHEMA_VERSION} report: {str(path)!a}")
     return report
 
 

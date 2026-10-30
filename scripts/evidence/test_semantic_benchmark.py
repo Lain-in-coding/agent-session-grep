@@ -6,12 +6,15 @@ still equal the generator output. The honesty contract is tested next: the
 bigram-hash vectorizer may never be labeled as a real semantic model, and no
 report may claim promotion while thresholds are pending.
 
-The tests never touch real transcripts and never invoke the compiled binary:
-everything except the CLI-runner path is exercised in-process.
+The tests never touch real transcripts or invoke the compiled binary. Validator
+CLI regressions use Python subprocesses; corpus checks run in-process.
 """
 
+import ast
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -378,6 +381,40 @@ class ManifestValidationTests(unittest.TestCase):
 
 
 class RunnerArgValidationTests(unittest.TestCase):
+    def test_validation_commands_preserve_unicode_paths_under_cp1252(self) -> None:
+        cases = [
+            ("validate-manifest", SEM.load_manifest(), SEM.MANIFEST_SCHEMA_VERSION, "manifest"),
+            ("validate-report", honest_report_dict(), SEM.SCHEMA_VERSION, "report"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="semantic-合成-") as name:
+            path = Path(name) / "evidence-é-🧪.json"
+            for command, payload, schema, kind in cases:
+                for valid in (True, False):
+                    with self.subTest(command=command, valid=valid):
+                        document = dict(payload)
+                        if not valid:
+                            document["schema_version"] = "unsupported"
+                        path.write_text(json.dumps(document), encoding="utf-8")
+                        result = subprocess.run(
+                            [sys.executable, "-B", str(MODULE_PATH), command, str(path)],
+                            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                            capture_output=True, check=False, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+                        if valid:
+                            self.assertEqual(result.stderr, b"")
+                            output = result.stdout.decode("ascii").strip()
+                            prefix = f"valid {schema} {kind}: "
+                            self.assertTrue(output.startswith(prefix), output)
+                            self.assertEqual(
+                                ast.literal_eval(output[len(prefix):]), str(path.resolve())
+                            )
+                        else:
+                            self.assertEqual(result.stdout, b"")
+                            self.assertTrue(result.stderr.startswith(b"error: "), result.stderr)
+                            self.assertIn(b"unsupported schema_version", result.stderr)
+                            self.assertNotIn(b"Traceback", result.stderr)
+
     def test_parser_requires_a_subcommand(self) -> None:
         with self.assertRaises(SystemExit):
             SEM.parser().parse_args([])

@@ -717,7 +717,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"regression: dry run: no file written")
             print(f"regression: would exercise {os.path.basename(args.binary)}")
             print(f"regression: would ingest {len(sources)} .jsonl source files")
-            print(f"regression: would write {out}")
+            print(f"regression: would write {out!a}")
             return 0
 
         report = run_regression(args.binary, sources)
@@ -739,8 +739,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             entry["id"] for entry in report["invariants"] if not entry["passed"]
         ]
         print(f"regression: outcome {report['outcome']}")
-        print(f"regression: report  {out}")
-        print(f"regression: summary {markdown_path}")
+        print(f"regression: report  {out!a}")
+        print(f"regression: summary {markdown_path!a}")
         for entry in report["invariants"]:
             status = "pass" if entry["passed"] else "FAIL"
             print(f"regression: {status}  {entry['id']}: {entry['detail']}")

@@ -6,6 +6,8 @@ skip themselves when it is absent instead of failing, because the harness is
 also edited on hosts that have not built the workspace.
 """
 
+import ast
+import io
 import json
 import os
 import shutil
@@ -13,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -249,6 +253,68 @@ class PureFunctionTests(unittest.TestCase):
         for invariant_id in rdr.INVARIANT_IDS:
             self.assertIn(invariant_id, markdown)
         self.assertIn(report["outcome"], markdown)
+
+
+class CliDiagnosticsTests(unittest.TestCase):
+    """Encoding checks run even when no release binary is installed."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="rdr-\u5408\u6210-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.source = self.root / "source.jsonl"
+        write_fixture(self.source, "cccc1111-2222-4333-8444-555566667773", "synthetic")
+        self.out = self.root / "report-\u00e9-\U0001f9ea.json"
+
+    def args(self, source):
+        # Dry runs only require an existing file; the interpreter is never run
+        # as ASG. Report-writing tests replace only the measured report producer.
+        return ["--binary", sys.executable, "--sources", str(source), "--out", str(self.out)]
+
+    def test_dry_run_unicode_path_under_cp1252_without_release_binary(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        for source, expected in ((self.source, 0), (empty, 2)):
+            with self.subTest(expected=expected):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(Path(rdr.__file__).resolve()),
+                     *self.args(source), "--dry-run"],
+                    env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                    capture_output=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected == 0:
+                    self.assertEqual(result.stderr, b"")
+                    prefix = "regression: would write "
+                    line = result.stdout.decode("ascii").splitlines()[-1]
+                    self.assertTrue(line.startswith(prefix), line)
+                    self.assertEqual(ast.literal_eval(line[len(prefix):]), str(self.out))
+                else:
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(b"no .jsonl files found", result.stderr)
+                    self.assertNotIn(b"Traceback", result.stderr)
+                self.assertFalse(self.out.exists())
+                self.assertFalse(self.out.with_suffix(".md").exists())
+
+    def test_report_diagnostics_escape_paths_without_changing_payload_or_verdict(self):
+        for passed in (True, False):
+            with self.subTest(passed=passed):
+                report = sample_report([
+                    rdr.invariant(id_, passed or index != 0, "synthetic observation")
+                    for index, id_ in enumerate(rdr.INVARIANT_IDS)
+                ])
+                with io.TextIOWrapper(io.BytesIO(), encoding="cp1252", write_through=True) as stdout:
+                    with redirect_stdout(stdout), patch.object(rdr, "run_regression", return_value=report):
+                        result = rdr.main(self.args(self.source))
+                    rendered = stdout.buffer.getvalue().decode("ascii").splitlines()
+                self.assertEqual(result, 0 if passed else 1)
+                self.assertEqual(json.loads(self.out.read_text(encoding="utf-8")), report)
+                markdown = self.out.with_suffix(".md")
+                self.assertEqual(markdown.read_text(encoding="utf-8"), rdr.render_markdown(report))
+                for prefix, path in (("regression: report  ", self.out),
+                                     ("regression: summary ", markdown)):
+                    line = next(line for line in rendered if line.startswith(prefix))
+                    self.assertEqual(ast.literal_eval(line[len(prefix):]), str(path))
 
 
 class EndToEndTests(unittest.TestCase):

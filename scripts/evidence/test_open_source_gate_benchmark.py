@@ -1,9 +1,11 @@
+import ast
 import contextlib
 import copy
 import importlib.util
 import io
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -516,6 +518,34 @@ class GateValidationRegressionTests(unittest.TestCase):
         manifest = self.manifest()
         del manifest["corpus"]["contains_real_transcripts"]
         self.assert_invalid(manifest, "corpus.contains_real_transcripts")
+
+    def test_validate_report_preserves_unicode_path_under_cp1252(self) -> None:
+        path = self.path.with_name("manifest-合成-é-🧪.json")
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                manifest = self.manifest()
+                if not valid:
+                    manifest["schema_version"] = "unsupported"
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                result = subprocess.run(
+                    [sys.executable, "-B", str(MODULE_PATH), "validate-report", str(path)],
+                    env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                    capture_output=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+                if valid:
+                    self.assertEqual(result.stderr, b"")
+                    output = result.stdout.decode("ascii").strip()
+                    prefix = f"valid {GATE.GATE_SCHEMA_VERSION} manifest: "
+                    self.assertTrue(output.startswith(prefix), output)
+                    self.assertEqual(
+                        ast.literal_eval(output[len(prefix):]), str(path.resolve())
+                    )
+                else:
+                    self.assertEqual(result.stdout, b"")
+                    self.assertTrue(result.stderr.startswith(b"error: "), result.stderr)
+                    self.assertIn(b"unsupported schema_version", result.stderr)
+                    self.assertNotIn(b"Traceback", result.stderr)
 
     def test_validate_report_subprocess_diagnostics_and_numeric_overflow(self) -> None:
         valid = self.manifest()

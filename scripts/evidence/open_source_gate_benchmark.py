@@ -766,7 +766,7 @@ def validate_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("gate.deferred must be an array of strings")
     if sorted(deferred) != sorted(expected_deferred):
         raise ValueError("gate.deferred must list each not_applicable metric exactly once")
-    print(f"valid {GATE_SCHEMA_VERSION} manifest: {path}")
+    print(f"valid {GATE_SCHEMA_VERSION} manifest: {str(path)!a}")
     return manifest
 
 
