@@ -135,21 +135,16 @@ class UpdateCheckHelperExecutionTests(unittest.TestCase):
         shell = shutil.which("sh")
         if shell is None or not Path(shell).is_absolute():
             self.skipTest("no absolute POSIX sh available")
-        # Git for Windows' sh.exe rebuilds PATH and still finds its curl, so
-        # an empty PATH alone would let the helper reach the network.
-        reachable = subprocess.run(
-            [shell, "-c", "command -v curl || command -v wget"],
-            check=False,
-            capture_output=True,
-            timeout=15,
-            env={"PATH": ""},
-        )
-        if reachable.returncode == 0:
-            self.skipTest("sh still finds a downloader with an empty PATH")
+        # Git for Windows' sh.exe rebuilds PATH during startup. Clear it in
+        # that shell before sourcing the unchanged helper with literal argv.
+        # The helper must exercise capability refusal without any downloader.
         completed = subprocess.run(
             [
                 shell,
-                str(SH),
+                "-c",
+                'PATH=; export PATH; helper=$1; shift; . "$helper"',
+                "asg-update-check-test",
+                SH.as_posix(),
                 "-Mode",
                 "page",
                 "-Repository",
@@ -168,8 +163,9 @@ class UpdateCheckHelperExecutionTests(unittest.TestCase):
             timeout=15,
             env={"PATH": ""},
         )
-        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.returncode, 3)
         self.assertEqual(error_document(completed.stdout)["error"], "capability")
+        self.assertEqual(completed.stderr, b"")
 
     def test_powershell_helper_rejects_invalid_repository(self) -> None:
         shell = None

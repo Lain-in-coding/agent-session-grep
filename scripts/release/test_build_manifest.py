@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -25,14 +26,11 @@ SPEC.loader.exec_module(BUILD_MANIFEST)
 
 # The isolated Windows profile also holds LOCALAPPDATA, as on a real account.
 # PowerShell 7 and Windows PowerShell 5.1 keep startup and module caches
-# there, and the .NET Framework keeps usage logs for managed programs. Some
-# pwsh builds derive that folder from USERPROFILE even when LOCALAPPDATA
-# points elsewhere. These files come from the test's host processes, not from
-# the installer, and their names vary by host version.
+# there. Exclude only the observed cache names, never these entire folders:
+# unrelated PowerShell configuration still belongs in the byte-level check.
 HOST_RUNTIME_CACHES = (
-    "appdata/local/microsoft/powershell/",
-    "appdata/local/microsoft/windows/powershell/",
-    "appdata/local/microsoft/clr_v4.0/usagelogs/",
+    "appdata/local/microsoft/powershell",
+    "appdata/local/microsoft/windows/powershell",
 )
 
 
@@ -517,7 +515,11 @@ class BuildManifestTests(unittest.TestCase):
     def profile_snapshot(cls, root: Path) -> dict[str, bytes]:
         def host_cache(name: str) -> bool:
             key = name.replace("\\", "/").lower()
-            return any(key.startswith(prefix) for prefix in HOST_RUNTIME_CACHES)
+            parent, _, filename = key.rpartition("/")
+            return parent in HOST_RUNTIME_CACHES and (
+                filename == "startupprofiledata-noninteractive"
+                or re.fullmatch(r"moduleanalysiscache-[0-9a-f]{8}", filename) is not None
+            )
         return {name: data for name, data in cls.file_snapshot(root).items()
                 if not host_cache(name)}
 
