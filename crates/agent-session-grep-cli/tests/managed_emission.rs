@@ -666,18 +666,25 @@ fn control_helper_rejects_malformed_cross_protocol_and_incomplete_frames() {
 
 #[test]
 fn control_parent_preserves_exact_cap_and_rejects_oversize_or_expired_before_spawn() {
-    let temp = agent_session_grep_testkit::tempdir().unwrap();
-    let path = temp.path().join("maximum-control-frame");
-    let frame = vec![b' '; MAX_FRAME_BYTES];
+    let frame = (0..MAX_FRAME_BYTES)
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let collected = thread::spawn(move || {
+        let mut reader = reader;
+        let mut output = Vec::with_capacity(MAX_FRAME_BYTES);
+        reader.read_to_end(&mut output).unwrap();
+        output
+    });
     let result = managed_emit::emit_control_using_for_test(
         binary(),
         &frame,
         Instant::now() + Duration::from_secs(5),
-        Stdio::from(std::fs::File::create(&path).unwrap()),
+        Stdio::from(writer),
     )
     .unwrap();
     assert_eq!(result, EmissionOutcome::Completed);
-    assert_eq!(std::fs::read(path).unwrap(), frame);
+    assert_eq!(collected.join().unwrap(), frame);
     // Expiry and size failure must not dispatch this test executable as a helper.
     assert_eq!(
         managed_emit::emit_control_frame(b"", Instant::now())
