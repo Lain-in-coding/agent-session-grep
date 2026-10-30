@@ -85,6 +85,7 @@ for event in [
         self.assertEqual(result["native_status"], "success")
         self.assertTrue(result["capture_complete"])
         self.assertEqual(result["measurements"]["tokens"]["model_input_tokens"]["value"], 41)
+        self.assertEqual(result["measurements"]["tokens"]["model_input_tokens"]["coverage"], "full-evaluation-episode")
         self.assertEqual(result["measurements"]["tokens"]["model_cache_write_tokens"]["value"], 0)
         self.assertEqual(result["measurements"]["tokens"]["model_total_tokens"]["status"], "unavailable")
         self.assertEqual(result["measurements"]["transport"]["asg_total_bytes"]["status"], "unavailable")
@@ -117,10 +118,119 @@ for event in [
         self.assertEqual(result["measurements"]["tokens"]["model_cache_read_tokens"]["value"], 30)
         self.assertEqual(result["measurements"]["tokens"]["model_cache_write_tokens"]["status"], "unavailable")
         self.assertEqual(result["measurements"]["tokens"]["model_total_tokens"]["status"], "unavailable")
+        self.assertTrue(result["capture_complete"])
+        # Clean stdout still lacks independent evidence attributing usage to this turn.
+        for metric in result["measurements"]["tokens"].values():
+            if metric["status"] == "observed":
+                self.assertEqual(metric["coverage"], "partial-episode")
+                self.assertIn("stdout-thread-cumulative", metric["method"])
         received = json.loads((self.work / "received.private.json").read_text())
         self.assertEqual(received["argv"][:2], ["exec", "--json"])
         self.assertEqual(received["argv"][-1], "-")
         self.assertEqual(received["profile"], str(self.profile))
+
+    def test_codex_resumed_usage_keeps_cumulative_counters_without_episode_coverage(self) -> None:
+        thread_id = hashlib.sha256(b"synthetic-seeded-thread").hexdigest()
+        seed = {"input_tokens": 17, "output_tokens": 3, "cached_input_tokens": 5,
+                "cache_write_input_tokens": 2, "total_tokens": 20}
+        # The resumed snapshot includes the nonzero seed; it is not a turn delta.
+        resumed = {"input_tokens": 46, "output_tokens": 9, "cached_input_tokens": 11,
+                   "cache_write_input_tokens": 6, "total_tokens": 55}
+        expected = {"model_input_tokens": 46, "model_output_tokens": 9,
+                    "model_cache_read_tokens": 11, "model_cache_write_tokens": 6,
+                    "model_total_tokens": 55}
+        for label, rows in (("resume-only", [resumed]), ("seed-and-resume", [seed, resumed]),
+                            ("duplicate-terminal", [seed, resumed, resumed])):
+            with self.subTest(capture=label):
+                native = RUNNER.NativeEvents("codex", "asg")
+                native.feed({"type": "thread.started", "thread_id": thread_id}, 1)
+                for ordinal, usage in enumerate(rows, 2):
+                    native.feed({"type": "turn.completed", "usage": usage}, ordinal)
+                metrics = native.tokens(True)
+                self.assertEqual({key: metric["value"] for key, metric in metrics.items()}, expected)
+                for metric in metrics.values():
+                    self.assertEqual(metric["coverage"], "partial-episode")
+                    self.assertIn("stdout-thread-cumulative", metric["method"])
+                self.assertEqual(native.session_id, thread_id)
+
+    def test_codex_missing_or_malformed_final_usage_never_reuses_seed(self) -> None:
+        for usage in (None, [], True, "synthetic-invalid-usage", {},
+                      {"input_tokens": -1}, {"input_tokens": True},
+                      {"input_tokens": 1.5}, {"input_tokens": "46"}):
+            with self.subTest(usage=usage):
+                native = RUNNER.NativeEvents("codex", "asg")
+                native.feed({"type": "turn.completed", "usage": {"input_tokens": 17, "output_tokens": 3}}, 1)
+                event = {"type": "turn.completed"}
+                if usage is not None:
+                    event["usage"] = usage
+                native.feed(event, 2)
+                metrics = native.tokens(True)
+                self.assertTrue(all(metric["status"] == "unavailable" for metric in metrics.values()))
+                self.assertTrue(all("value" not in metric for metric in metrics.values()))
+
+        native = RUNNER.NativeEvents("codex", "asg")
+        native.feed({"type": "turn.completed", "usage": {"input_tokens": 17, "output_tokens": 3}}, 1)
+        native.feed({"type": "turn.completed", "usage": {
+            "input_tokens": False, "output_tokens": 9, "cached_input_tokens": 0}}, 2)
+        metrics = native.tokens(True)
+        self.assertEqual(metrics["model_input_tokens"]["status"], "unavailable")
+        self.assertEqual(metrics["model_output_tokens"]["value"], 9)
+        self.assertEqual(metrics["model_output_tokens"]["coverage"], "partial-episode")
+        self.assertEqual(metrics["model_cache_read_tokens"]["value"], 0)
+        self.assertEqual(metrics["model_total_tokens"]["status"], "unavailable")
+
+    def test_codex_completed_error_items_deduplicate_by_id_not_text(self) -> None:
+        native = RUNNER.NativeEvents("codex", "asg")
+        first, second = [hashlib.sha256(f"synthetic-error-{ordinal}".encode()).hexdigest() for ordinal in (1, 2)]
+        for kind, item_id, message, expected in (
+            ("item.started", first, "synthetic diagnostic", 0),
+            ("item.updated", first, "synthetic diagnostic", 0),
+            ("item.completed", first, "synthetic diagnostic", 1),
+            ("item.completed", first, "changed synthetic diagnostic", 1),
+            ("item.completed", second, "synthetic diagnostic", 2),
+        ):
+            with self.subTest(event=kind, expected=expected):
+                native.feed({"type": kind, "item": {"id": item_id, "type": "error", "message": message}}, 1)
+                self.assertEqual(native.errors, expected)
+        self.assertFalse(native.tool_ids)
+        native.feed({"type": "turn.completed"}, 2)
+        self.assertEqual(native.terminal, "turn.completed")
+        self.assertEqual(native.errors, 2)
+
+    def test_codex_unidentified_completed_errors_cannot_claim_zero(self) -> None:
+        native = RUNNER.NativeEvents("codex", "asg")
+        for expected, item_id in enumerate((None, "", False, 0, [], {}, "synthetic-" + chr(0xD800)), 1):
+            with self.subTest(item_id=item_id):
+                item = {"type": "error"}
+                if item_id is not None:
+                    item["id"] = item_id
+                native.feed({"type": "item.completed", "item": item}, expected)
+                self.assertEqual(native.errors, expected)
+
+    def test_codex_completed_with_diagnostics_keeps_raw_details_private(self) -> None:
+        item_ids = [str(self.work / f"synthetic-error-{ordinal}") for ordinal in (1, 2)]
+        diagnostic = "Synthetic diagnostic at " + str(self.work / "synthetic-detail")
+        events = [
+            {"type": "item.completed", "item": {"id": item_id, "type": "error", "message": diagnostic}}
+            for item_id in (item_ids[0], item_ids[0], item_ids[1])
+        ] + [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "synthetic-answer", "type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 46, "output_tokens": 9}},
+        ]
+        raw = b"".join(jsonl(event) for event in events)
+        result = self.host("codex", "import sys\nsys.stdin.buffer.read()\n"
+                           f"sys.stdout.buffer.write({raw!r})\nsys.stdout.buffer.flush()\n")
+        self.assertEqual(result["native_error_count"], 2)
+        self.assertEqual(result["native_status"], "turn.completed")
+        self.assertEqual(result["execution_state"], "completed")
+        self.assertEqual(result["native_returncode_before_cleanup"], 0)
+        self.assertTrue(result["capture_complete"])
+        self.assertEqual(result["acceptance"], "open")
+        rendered = json.dumps(result, ensure_ascii=False)
+        for private_value in ("Synthetic diagnostic at", "synthetic-error-", "synthetic-detail"):
+            self.assertNotIn(private_value, rendered)
+        self.assertEqual((self.out / "run" / "stdout.private.jsonl").read_bytes(), raw)
 
     def test_missing_and_malformed_usage_are_unavailable(self) -> None:
         native = RUNNER.NativeEvents("codex", "asg")
@@ -394,6 +504,7 @@ sys.exit(17)
 """)
         self.assertEqual(result["native_returncode_before_cleanup"], 17)
         self.assertEqual(result["native_status"], "turn.failed")
+        self.assertEqual(result["native_error_count"], 2)
         self.assertNotIn("private synthetic", json.dumps(result))
         self.assertIn(b"private synthetic", (self.out / "run" / "stderr.private.bin").read_bytes())
 
@@ -756,7 +867,7 @@ time.sleep(30)
 
 
     def test_observation_matches_frozen_field_shape_and_stays_open(self) -> None:
-        summary = self.host("codex", "import json\nprint(json.dumps({'type':'item.completed','item':{'id':'a','type':'agent_message','text':'done'}}),flush=True)\nprint(json.dumps({'type':'turn.completed'}),flush=True)\n")
+        summary = self.host("codex", "import json\nprint(json.dumps({'type':'item.completed','item':{'id':'a','type':'agent_message','text':'done'}}),flush=True)\nprint(json.dumps({'type':'turn.completed','usage':{'input_tokens':46,'cached_input_tokens':11,'output_tokens':9}}),flush=True)\n")
         fields = ["run_id", "case_id", "repeat_ordinal", "description_variant", "execution_state", "host",
                   "host_version", "model_identity", "model_settings_sha256", "description_sha256", "candidate_archive_sha256",
                   "candidate_manifest_sha256", "candidate_source_identity", "pack_sha256", "corpus_sha256", "case_set_sha256",
@@ -777,6 +888,12 @@ time.sleep(30)
         self.assertEqual(observation["verdicts"]["overall"], "open")
         self.assertEqual(observation["asg_trace_completeness"], "partial")
         self.assertEqual(observation["measurements"]["calls"]["asg_operation_count"]["status"], "unavailable")
+        token_metrics = observation["measurements"]["tokens"]
+        self.assertEqual(token_metrics["model_input_tokens"]["value"], 46)
+        self.assertEqual(token_metrics["model_input_tokens"]["coverage"], "partial-episode")
+        self.assertIn("stdout-thread-cumulative", token_metrics["model_input_tokens"]["method"])
+        self.assertEqual(token_metrics["model_total_tokens"]["status"], "unavailable")
+        self.assertEqual(token_metrics, summary["measurements"]["tokens"])
         self.assertIsNone(observation["continuation_json_observed"])
         bad_metadata = dict(metadata, candidate_source_identity=str(self.work))
         with self.assertRaises(RUNNER.CaptureError):
@@ -790,6 +907,8 @@ time.sleep(30)
         self.assertEqual(merged["measurements"]["calls"]["asg_operation_count"]["value"], 0)
         self.assertEqual(merged["lifecycle"]["called"], "not_applicable")
         self.assertEqual(merged["verdicts"]["overall"], "open")
+        self.assertEqual(merged["measurements"]["tokens"], token_metrics)
+        self.assertEqual(merged["measurements"]["tokens"]["model_input_tokens"]["coverage"], "partial-episode")
         linked["proxy_covers_all_asg_channels"] = False
         partial = RUNNER.make_observation(summary, linked, pack, wire=result)
         self.assertEqual(partial["asg_trace_completeness"], "partial")

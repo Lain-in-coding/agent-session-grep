@@ -472,6 +472,7 @@ class NativeEvents:
         self.result_usage: dict | None = None
         self.permission_denials: int | None = None
         self.errors = 0
+        self.error_item_ids: set[str] = set()
         self.native_is_error = False
         self.num_turns: int | None = None
         self.statuses: set[str] = set()
@@ -527,6 +528,14 @@ class NativeEvents:
                         return
                     if kind == "item.completed" and item_type == "agent_message" and isinstance(item.get("text"), str):
                         self.final_text = item["text"]
+                    if kind == "item.completed" and item_type == "error":
+                        key = item.get("id")
+                        digest = sha_bytes(key.encode("utf-8", errors="surrogatepass")) if isinstance(key, str) and key else None
+                        # Missing identity cannot prove a duplicate or an error-free turn.
+                        if digest is None or digest not in self.error_item_ids:
+                            self.errors += 1
+                            if digest is not None:
+                                self.error_item_ids.add(digest)
                     if item_type == "mcp_tool_call":
                         key = item.get("id")
                         if isinstance(key, str):
@@ -539,8 +548,9 @@ class NativeEvents:
             if kind in {"turn.completed", "turn.failed"}:
                 self.terminal = kind
                 self.terminal_at_ns = observed_at_ns
-                if isinstance(event.get("usage"), dict):
-                    self.token_rows.append(event["usage"])
+                # Cumulative snapshots must not be summed or reuse stale usage.
+                usage = event.get("usage")
+                self.token_rows = [usage] if isinstance(usage, dict) else []
             if kind in {"error", "turn.failed"}:
                 self.errors += 1
         if isinstance(kind, str) and kind in {"turn.started", "turn.completed", "turn.failed", "error", "result"}:
@@ -563,13 +573,17 @@ class NativeEvents:
             "model_total_tokens": "total_tokens",
         }
         rows = [self.result_usage] if self.result_usage is not None else self.token_rows
+        method = self.host + "-native-usage-"
+        if self.host == "codex":
+            # Complete stdout does not bind cumulative thread usage to this turn.
+            method = "codex-stdout-thread-cumulative-usage-"
         result = {}
         for target, field in mapping.items():
             values = [row.get(field) for row in rows]
             if values and all(nonnegative(value) for value in values):
-                usage_complete = complete and self.terminal is not None and (
-                    self.host == "codex" or self.result_usage is not None)
-                result[target] = measured(sum(values), "tokens", self.host + "-native-usage-" + field, usage_complete)
+                usage_complete = (complete and self.terminal is not None
+                                  and self.host == "claude-code" and self.result_usage is not None)
+                result[target] = measured(sum(values), "tokens", method + field, usage_complete)
             else:
                 result[target] = unavailable()
         return result
