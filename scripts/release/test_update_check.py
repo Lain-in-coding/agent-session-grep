@@ -135,6 +135,17 @@ class UpdateCheckHelperExecutionTests(unittest.TestCase):
         shell = shutil.which("sh")
         if shell is None or not Path(shell).is_absolute():
             self.skipTest("no absolute POSIX sh available")
+        # Git for Windows' sh.exe rebuilds PATH and still finds its curl, so
+        # an empty PATH alone would let the helper reach the network.
+        reachable = subprocess.run(
+            [shell, "-c", "command -v curl || command -v wget"],
+            check=False,
+            capture_output=True,
+            timeout=15,
+            env={"PATH": ""},
+        )
+        if reachable.returncode == 0:
+            self.skipTest("sh still finds a downloader with an empty PATH")
         completed = subprocess.run(
             [
                 shell,
