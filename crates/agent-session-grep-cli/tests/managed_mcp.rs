@@ -71,6 +71,7 @@ struct Fixture {
     transcript: PathBuf,
     selection: ControlId,
     worker: Option<Child>,
+    restarts: u8,
 }
 impl Fixture {
     fn new() -> Self {
@@ -108,6 +109,7 @@ impl Fixture {
             transcript,
             selection,
             worker: None,
+            restarts: 0,
         }
     }
     fn control(&self) -> SqliteControlStore {
@@ -123,6 +125,9 @@ impl Fixture {
                 DesiredUpdates::Running,
             )
         });
+        self.spawn_worker();
+    }
+    fn spawn_worker(&mut self) {
         let mut command = Command::new(BIN);
         command
             .arg("__managed-background")
@@ -137,6 +142,23 @@ impl Fixture {
             command.creation_flags(0x0800_0000);
         }
         self.worker = Some(command.spawn().unwrap());
+    }
+    /// The production supervisor restarts a worker that exited unexpectedly,
+    /// with backoff. This fixture launches the worker directly, so it restarts
+    /// one that exited with writer_busy (startup contention) a bounded number
+    /// of times. Any other exit stays visible through the test's own wait.
+    fn supervise(&mut self) {
+        let busy_exit = self
+            .worker
+            .as_mut()
+            .and_then(|worker| worker.try_wait().ok().flatten())
+            .is_some_and(|status| status.code() == Some(6));
+        if busy_exit && self.restarts < 3 {
+            self.restarts += 1;
+            eprintln!("synthetic worker restarted after writer_busy exit");
+            std::thread::sleep(Duration::from_millis(100));
+            self.spawn_worker();
+        }
     }
     fn pause(&self) {
         let control = self.control();
@@ -255,9 +277,10 @@ impl Client {
     fn call(&mut self, name: &str, args: Value) -> (usize, Value) {
         self.request("tools/call", json!({"name":name,"arguments":args}))
     }
-    fn wait_hit(&mut self, query: &str) -> Value {
+    fn wait_hit(&mut self, fixture: &mut Fixture, query: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            fixture.supervise();
             let (size, result) = self.call("search_sessions", json!({"query":query}));
             assert!(
                 size <= 8192,
@@ -293,7 +316,7 @@ fn persistent_mcp_observes_append_pause_and_revoke_without_legacy_access() {
     let mut fixture = Fixture::new();
     fixture.start();
     let mut client = Client::connect(&fixture.db);
-    let result = client.wait_hit("orchid");
+    let result = client.wait_hit(&mut fixture, "orchid");
     let payload = &result["result"]["structuredContent"];
     assert_eq!(
         serde_json::from_str::<Value>(result["result"]["content"][0]["text"].as_str().unwrap())
@@ -331,7 +354,7 @@ fn persistent_mcp_observes_append_pause_and_revoke_without_legacy_access() {
         .unwrap()
         .write_all(&line("m2", "saffron appended evidence"))
         .unwrap();
-    client.wait_hit("saffron");
+    client.wait_hit(&mut fixture, "saffron");
     fixture.pause();
     let (_, paused) = client.call(
         "search_sessions",
@@ -497,7 +520,7 @@ fn managed_mcp_handoff_uses_selected_source_and_complete_frame_budget() {
     let mut fixture = Fixture::new();
     fixture.start();
     let mut client = Client::connect(&fixture.db);
-    client.wait_hit("orchid");
+    client.wait_hit(&mut fixture, "orchid");
     let (size, result) = client.call("generate_handoff", json!({"query":"orchid"}));
     assert!(size <= 8192);
     assert_eq!(result["result"]["isError"], false, "{result}");
@@ -692,7 +715,7 @@ fn searched_user_anchor_survives_metadata_break_in_selected_mainline() {
     fs::write(&fixture.transcript, &transcript).unwrap();
     fixture.start();
     let mut client = Client::connect(&fixture.db);
-    let response = client.wait_hit("orchid");
+    let response = client.wait_hit(&mut fixture, "orchid");
     let hit = response["result"]["structuredContent"]["data"]["hits"]
         .as_array()
         .unwrap()
