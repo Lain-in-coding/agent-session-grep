@@ -69,6 +69,10 @@ struct Fixture {
     history: PathBuf,
     child: Option<Child>,
     purge_child: Option<Child>,
+    /// Observations in the current `wait` that read no definite answer.
+    unavailable: std::cell::Cell<u32>,
+    /// Content-free phase and error of the latest such observation.
+    last_unavailable: std::cell::RefCell<Option<String>>,
 }
 
 /// A bare store read outside a runtime scope has a 250ms window, which a
@@ -160,6 +164,8 @@ impl Fixture {
             history,
             child: None,
             purge_child: None,
+            unavailable: std::cell::Cell::new(0),
+            last_unavailable: std::cell::RefCell::new(None),
         }
     }
     fn control(&self) -> SqliteControlStore {
@@ -262,6 +268,8 @@ impl Fixture {
     #[track_caller]
     fn wait(&self, mut predicate: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
+        self.unavailable.set(0);
+        self.last_unavailable.replace(None);
         loop {
             if predicate(self) {
                 return;
@@ -269,36 +277,56 @@ impl Fixture {
             if Instant::now() >= deadline {
                 // Bounded content-free diagnostics distinguish worker death,
                 // contention and proof deferral without printing source paths.
-                match self.control().background_status() {
-                    Ok(status) => eprintln!(
-                        "synthetic worker state={:?}, error={:?}, pid_matches={}, next_cycle={:?}",
-                        status.worker.state,
-                        status.worker.error,
-                        status.worker.pid_hint == self.child.as_ref().map(Child::id),
-                        status.next_cycle_seq,
-                    ),
-                    Err(error) => eprintln!("synthetic worker status unavailable: {error:?}"),
-                }
-                let end = Instant::now() + Duration::from_secs(1);
-                let control = self.control();
-                let diagnostics = ManagedStore::open(&self.db, &control).and_then(|store| {
-                    store.with_read(&control, RequestIntersection::Selected, end, |read| {
-                        read.source_progress()
-                    })
-                });
-                match diagnostics {
-                    Ok(sources) => {
-                        eprintln!("synthetic source count={}", sources.len());
-                        for source in sources.iter().take(4) {
-                            if let Some(receipt) = &source.last_attempt {
-                                eprintln!(
-                                    "synthetic receipt published={}, cycle={}",
-                                    receipt.published, receipt.cycle_seq
-                                );
+                // A contended diagnostic read must not panic first, or the
+                // report would name an admission failure instead of this
+                // timeout.
+                eprintln!(
+                    "synthetic observations without a definite answer={}, last={:?}",
+                    self.unavailable.get(),
+                    self.last_unavailable.borrow(),
+                );
+                match self.control_before(Instant::now() + Duration::from_secs(1)) {
+                    Err(error) => eprintln!("synthetic control unavailable: {error:?}"),
+                    Ok(control) => {
+                        match control.background_status() {
+                            Ok(status) => eprintln!(
+                                "synthetic worker state={:?}, error={:?}, pid_matches={}, next_cycle={:?}",
+                                status.worker.state,
+                                status.worker.error,
+                                status.worker.pid_hint == self.child.as_ref().map(Child::id),
+                                status.next_cycle_seq,
+                            ),
+                            Err(error) => {
+                                eprintln!("synthetic worker status unavailable: {error:?}")
+                            }
+                        }
+                        let end = Instant::now() + Duration::from_secs(1);
+                        let diagnostics =
+                            ManagedStore::open(&self.db, &control).and_then(|store| {
+                                store.with_read(
+                                    &control,
+                                    RequestIntersection::Selected,
+                                    end,
+                                    |read| read.source_progress(),
+                                )
+                            });
+                        match diagnostics {
+                            Ok(sources) => {
+                                eprintln!("synthetic source count={}", sources.len());
+                                for source in sources.iter().take(4) {
+                                    if let Some(receipt) = &source.last_attempt {
+                                        eprintln!(
+                                            "synthetic receipt published={}, cycle={}",
+                                            receipt.published, receipt.cycle_seq
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("synthetic source diagnostics unavailable: {error:?}")
                             }
                         }
                     }
-                    Err(error) => eprintln!("synthetic source diagnostics unavailable: {error:?}"),
                 }
                 if let Ok(conn) = Connection::open_with_flags(
                     SqliteControlStore::path(self.db.parent().unwrap()),
@@ -349,8 +377,13 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    /// One bounded lexical observation. Control admission, catalog admission
+    /// and the read share one two-second end. `Err` carries the phase and the
+    /// typed contention or transient sidecar denial that outlasted it: no
+    /// answer was read, which proves neither presence nor absence. Any other
+    /// failure is a defect.
     #[track_caller]
-    fn has_text(&self, text: &str) -> bool {
+    fn text_state(&self, text: &str) -> Result<bool, (&'static str, PortError)> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let mut phase = "control admission";
@@ -377,10 +410,10 @@ impl Fixture {
             }
             match result {
                 Ok(page) => {
-                    return page
+                    return Ok(page
                         .hits
                         .iter()
-                        .any(|h| h.projection.message.text.contains(text));
+                        .any(|h| h.projection.message.text.contains(text)));
                 }
                 Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10))
@@ -388,9 +421,7 @@ impl Fixture {
                 Err(PortError::Backend(_)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                Err(error @ PortError::WriterBusy(_)) => {
-                    panic!("managed source query timed out during {phase}: {error:?}")
-                }
+                Err(error @ PortError::WriterBusy(_)) => return Err((phase, error)),
                 Err(PortError::SnapshotChanged(_)) => {
                     panic!("managed source query snapshot changed")
                 }
@@ -403,27 +434,68 @@ impl Fixture {
                 Err(PortError::SchemaIncompatible(_)) => {
                     panic!("managed source query schema failure")
                 }
-                Err(PortError::Backend(_)) => panic!("managed source query backend failure"),
+                // Only a `code=5` sidecar denial reaches this arm; any other
+                // backend failure panicked above.
+                Err(error @ PortError::Backend(_)) => return Err((phase, error)),
                 Err(PortError::DeadlineExceeded(_)) => {
                     panic!("managed source query deadline exceeded")
                 }
             }
         }
     }
-    fn has_held_receipt(&self) -> bool {
+    /// A point-in-time claim. Contention that outlasts the read budget fails
+    /// the test, because a refused read supports neither answer.
+    #[track_caller]
+    fn has_text(&self, text: &str) -> bool {
+        match self.text_state(text) {
+            Ok(visible) => visible,
+            Err((phase, error)) => {
+                panic!("managed source query timed out during {phase}: {error:?}")
+            }
+        }
+    }
+    /// Eventual-condition helpers for `wait`. A refused read satisfies
+    /// neither, so a host stall delays the condition instead of failing the
+    /// test or ending a wait for disappearance early.
+    #[track_caller]
+    fn sees_text(&self, text: &str) -> bool {
+        self.observe(self.text_state(text)) == Some(true)
+    }
+    #[track_caller]
+    fn lacks_text(&self, text: &str) -> bool {
+        self.observe(self.text_state(text)) == Some(false)
+    }
+    /// Converts one bounded observation for `wait`, counting refused reads
+    /// for its timeout report.
+    fn observe(&self, state: Result<bool, (&'static str, PortError)>) -> Option<bool> {
+        match state {
+            Ok(value) => Some(value),
+            Err((phase, error)) => {
+                self.unavailable.set(self.unavailable.get() + 1);
+                self.last_unavailable
+                    .replace(Some(format!("{phase}: {error:?}")));
+                None
+            }
+        }
+    }
+    /// One bounded held-receipt observation with `text_state`'s contract.
+    #[track_caller]
+    fn held_receipt_state(&self) -> Result<bool, (&'static str, PortError)> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let control = self.control();
-            let result = ManagedStore::open(&self.db, &control).and_then(|store| {
-                store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
-                    read.source_progress()
+            let result = self.control_before(deadline).and_then(|control| {
+                control.with_runtime_deadline(deadline, || {
+                    let store = ManagedStore::open(&self.db, &control)?;
+                    store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
+                        read.source_progress()
+                    })
                 })
             });
             match result {
                 Ok(sources) => {
-                    return sources
+                    return Ok(sources
                         .iter()
-                        .any(|s| s.last_attempt.as_ref().is_some_and(|r| !r.published));
+                        .any(|s| s.last_attempt.as_ref().is_some_and(|r| !r.published)));
                 }
                 Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
                     std::thread::sleep(
@@ -431,9 +503,15 @@ impl Fixture {
                             .min(deadline.saturating_duration_since(Instant::now())),
                     );
                 }
+                Err(error @ PortError::WriterBusy(_)) => return Err(("held receipt read", error)),
                 Err(error) => panic!("synthetic held-receipt observation failed: {error:?}"),
             }
         }
+    }
+    /// True only on a definite read of a held, unpublished attempt.
+    #[track_caller]
+    fn sees_held_receipt(&self) -> bool {
+        self.observe(self.held_receipt_state()) == Some(true)
     }
     /// Suppress the untracked autostart only while the public revoke commits,
     /// then run the same real purge entry as a child owned by this fixture.
@@ -607,7 +685,7 @@ fn real_child_imports_both_providers_and_preserves_original_bytes() {
         let path = f.history.join("synthetic.jsonl");
         fs::write(&path, &bytes).unwrap();
         f.spawn();
-        f.wait(|f| f.has_text("uniqueimportneedle"));
+        f.wait(|f| f.sees_text("uniqueimportneedle"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(matches!(
             ExclusiveGuard::try_acquire(f.db.parent().unwrap(), LockKind::Background),
@@ -692,7 +770,7 @@ fn pause_restart_new_files_and_append_use_real_control_and_catalog_receipts() {
     let mut original = claude("first", "beforepauseneedle");
     fs::write(&first, &original).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("beforepauseneedle"));
+    f.wait(|f| f.sees_text("beforepauseneedle"));
     successful(run(&f.db, &["background", "pause"]));
     f.wait(|f| {
         f.control().bounded(|c| c.background_status()).worker.state
@@ -742,7 +820,7 @@ fn pause_restart_new_files_and_append_use_real_control_and_catalog_receipts() {
         boot
     );
     successful(run(&f.db, &["background", "resume"]));
-    f.wait(|f| f.has_text("afterresumeneedle") && f.has_text("appendedneedle"));
+    f.wait(|f| f.sees_text("afterresumeneedle") && f.sees_text("appendedneedle"));
     assert_eq!(fs::read(first).unwrap(), original);
     assert_eq!(fs::read(second).unwrap(), new);
     successful(run(&f.db, &["background", "stop"]));
@@ -857,7 +935,7 @@ fn malformed_empty_and_missing_root_retain_previous_evidence() {
     let bytes = claude("retained", "retainevidenceneedle");
     fs::write(&path, &bytes).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("retainevidenceneedle"));
+    f.wait(|f| f.sees_text("retainevidenceneedle"));
     let prior = m2_source_for_path(&f, &path).latest_receipt.unwrap();
     fs::write(&path, b"{\"type\":").unwrap();
     // A rejected malformed parse publishes no catalog attempt. Its typed
@@ -926,7 +1004,7 @@ fn deleted_source_requires_durable_hold_and_restart_begins_a_new_grace_period() 
     let path = f.history.join("deleted.jsonl");
     fs::write(&path, claude("delete-case", "deletionretainedneedle")).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("deletionretainedneedle"));
+    f.wait(|f| f.sees_text("deletionretainedneedle"));
     fs::remove_file(&path).unwrap();
     f.wait(|f| {
         let sources = m2_sources(f);
@@ -943,7 +1021,7 @@ fn deleted_source_requires_durable_hold_and_restart_begins_a_new_grace_period() 
     f.spawn();
     std::thread::sleep(Duration::from_secs(2));
     assert!(f.has_text("deletionretainedneedle"));
-    f.wait(|f| !f.has_text("deletionretainedneedle"));
+    f.wait(|f| f.lacks_text("deletionretainedneedle"));
     assert!(!path.exists());
 }
 
@@ -964,7 +1042,7 @@ fn equal_size_rewrite_is_held_then_published_and_old_roots_are_not_starved() {
         .unwrap();
     fs::write(&recent, original).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("rewritefirstneedle") && f.has_text("olderhistoryneedle"));
+    f.wait(|f| f.sees_text("rewritefirstneedle") && f.sees_text("olderhistoryneedle"));
     let modified = fs::metadata(&recent).unwrap().modified().unwrap();
     fs::write(&recent, &replacement).unwrap();
     fs::File::options()
@@ -973,10 +1051,10 @@ fn equal_size_rewrite_is_held_then_published_and_old_roots_are_not_starved() {
         .unwrap()
         .set_modified(modified)
         .unwrap();
-    f.wait(|f| f.has_held_receipt());
+    f.wait(|f| f.sees_held_receipt());
     assert!(f.has_text("rewritefirstneedle"));
     assert!(!f.has_text("rewritenextxneedle"));
-    f.wait(|f| f.has_text("rewritenextxneedle"));
+    f.wait(|f| f.sees_text("rewritenextxneedle"));
     assert!(!f.has_text("rewritefirstneedle"));
     assert_eq!(fs::read(recent).unwrap(), replacement);
 }
@@ -995,7 +1073,7 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
         original.extend(record("removed-two", "shrinksecondremovedneedle"));
         fs::write(&path, original).unwrap();
         f.spawn();
-        f.wait(|f| f.has_text("shrinkremovedneedle") && f.has_text("shrinkretainedneedle"));
+        f.wait(|f| f.sees_text("shrinkremovedneedle") && f.sees_text("shrinkretainedneedle"));
         let c = f.control();
         let before = m2_sources(&f).remove(0);
         let source_id = ControlId::parse(before.binding.source_id.as_str()).unwrap();
@@ -1009,19 +1087,46 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
             if let Some(candidate) = confirmation.filter(|candidate| matches!(&candidate.kind,
                 ConfirmationKind::Rewrite { candidate_digest } if candidate_digest.as_str() == digest)) {
                 first = Some(candidate);
-                f.has_held_receipt()
+                f.sees_held_receipt()
             } else { false }
         });
         let first = first.expect("matching durable confirmation was observed");
         assert!(matches!(first.kind, ConfirmationKind::Rewrite { .. }));
         assert!(f.has_text("shrinkremovedneedle"));
         std::thread::sleep(Duration::from_secs(2));
+        let mut last_seen = Instant::now();
         assert!(
             f.has_text("shrinkremovedneedle"),
             "complete parsing cannot bypass the grace period"
         );
-        f.wait(|f| !f.has_text("shrinkremovedneedle"));
-        assert!(rewritten_at.elapsed() >= Duration::from_secs(5));
+        // A refused read proves nothing about when the text vanished. Bound
+        // the transition between a definite read that still saw it and the
+        // first definite read that did not, then require that bound to be
+        // tight enough to support the five-second claim.
+        f.wait(|f| {
+            let started = Instant::now();
+            match f.observe(f.text_state("shrinkremovedneedle")) {
+                Some(true) => {
+                    last_seen = started;
+                    false
+                }
+                Some(false) => true,
+                None => false,
+            }
+        });
+        let vanished = Instant::now();
+        let localized = vanished.duration_since(last_seen);
+        assert!(
+            localized <= Duration::from_secs(1),
+            "grace-period transition was not localized within one second: {localized:?}, \
+             observations without a definite answer={}",
+            f.unavailable.get()
+        );
+        let held = vanished.duration_since(rewritten_at);
+        assert!(
+            held >= Duration::from_secs(5),
+            "removed text vanished after {held:?}"
+        );
         assert!(f.has_text("shrinkretainedneedle"));
         assert!(!f.has_text("shrinksecondremovedneedle"));
         let after = m2_sources(&f).remove(0);
@@ -1066,7 +1171,7 @@ fn public_start_returns_pipe_eof_while_its_background_worker_remains_alive() {
     );
     if received_before_stop {
         successful(output.unwrap());
-        f.wait(|f| f.has_text("publicbackgroundneedle"));
+        f.wait(|f| f.sees_text("publicbackgroundneedle"));
     }
     // Always release our detached synthetic worker, including a regression.
     let c = SqliteControlStore::open_current_writable(f.db.parent().unwrap()).unwrap();
@@ -1105,7 +1210,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     let path = f.history.join("latest.jsonl");
     fs::write(&path, claude("latest-source", "latestproofneedle")).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("latestproofneedle"));
+    f.wait(|f| f.sees_text("latestproofneedle"));
     let control = SqliteControlStore::open_current_writable(f.db.parent().unwrap()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let barrier = loop {
@@ -1152,7 +1257,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     drop(source);
     drop(c);
     fs::remove_file(&path).unwrap();
-    f.wait(|f| !f.has_text("latestproofneedle"));
+    f.wait(|f| f.lacks_text("latestproofneedle"));
     let deadline = Instant::now() + Duration::from_secs(5);
     let after_delete = loop {
         let status = control.bounded(|c| c.status());
@@ -1336,7 +1441,7 @@ fn overlapping_parent_and_child_roots_import_one_transcript_for_both_claims() {
         if !child_first {
             f.add_selected(&nested);
         }
-        f.wait(|f| f.has_text("overlapneedle"));
+        f.wait(|f| f.sees_text("overlapneedle"));
         let barrier = admit_latest_barrier(&f, 1);
         f.wait(|f| latest_satisfied(f, &barrier));
         let sources = m2_sources(&f);
@@ -1362,7 +1467,7 @@ fn revoked_parent_root_cannot_be_reallowed_by_surviving_child() {
     .unwrap();
     f.add_selected(&nested);
     f.spawn();
-    f.wait(|f| f.has_text("revokeoverlapneedle"));
+    f.wait(|f| f.sees_text("revokeoverlapneedle"));
     let control = f.control();
     let parent_locator =
         CanonicalLocator::from_path(&fs::canonicalize(&f.history).unwrap()).unwrap();
@@ -1375,7 +1480,7 @@ fn revoked_parent_root_cannot_be_reallowed_by_surviving_child() {
         .expect("parent selection exists")
         .id;
     f.revoke(&parent);
-    f.wait(|f| !f.has_text("revokeoverlapneedle"));
+    f.wait(|f| f.lacks_text("revokeoverlapneedle"));
     assert!(!f.has_text("revokeoverlapneedle"));
 }
 
@@ -1395,7 +1500,7 @@ fn offline_selected_root_keeps_partial_coverage_without_blocking_healthy_evidenc
     .unwrap();
     f.add_selected(&offline);
     f.spawn();
-    f.wait(|f| f.has_text("healthyneedle") && f.has_text("offlineneedle"));
+    f.wait(|f| f.sees_text("healthyneedle") && f.sees_text("offlineneedle"));
     let barrier = admit_latest_barrier(&f, 1);
     f.wait(|f| latest_satisfied(f, &barrier));
     fs::remove_dir_all(&offline).unwrap();
@@ -1406,7 +1511,7 @@ fn offline_selected_root_keeps_partial_coverage_without_blocking_healthy_evidenc
     let mut appended = fs::read(&path).unwrap();
     appended.extend(claude("healthy-two", "healthyafterneedle"));
     fs::write(&path, appended).unwrap();
-    f.wait(|f| f.has_text("healthyafterneedle"));
+    f.wait(|f| f.sees_text("healthyafterneedle"));
     assert!(latest_unsatisfied(&f, &barrier));
 }
 
@@ -1422,7 +1527,7 @@ fn overlapping_roots_keep_one_confirmation_root_across_rotation() {
     fs::write(&path, &original).unwrap();
     f.add_selected(&nested);
     f.spawn();
-    f.wait(|f| f.has_text("rotationfirstneedle"));
+    f.wait(|f| f.sees_text("rotationfirstneedle"));
     let barrier = admit_latest_barrier(&f, 1);
     f.wait(|f| latest_satisfied(f, &barrier));
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
@@ -1433,11 +1538,11 @@ fn overlapping_roots_keep_one_confirmation_root_across_rotation() {
         .unwrap()
         .set_modified(modified)
         .unwrap();
-    f.wait(|f| f.has_held_receipt());
+    f.wait(|f| f.sees_held_receipt());
     assert!(f.has_text("rotationfirstneedle"));
     // Fairness rotation must not move the advisory root and restart the grace
     // period between overlapping selections.
-    f.wait(|f| f.has_text("rotationnextxneedle"));
+    f.wait(|f| f.sees_text("rotationnextxneedle"));
     assert!(!f.has_text("rotationfirstneedle"));
     assert_eq!(fs::read(&path).unwrap(), replacement);
 }
@@ -1492,7 +1597,7 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
     assert_eq!(original.len(), replacement.len());
     fs::write(&path, &original).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("childbeforexneedle"));
+    f.wait(|f| f.sees_text("childbeforexneedle"));
     // Import through the parent first so its historical binding root cannot
     // accidentally be the already healthy child under review.
     let parent_locator =
@@ -1548,7 +1653,7 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
             .and_then(|progress| progress.confirmation)
     };
     f.wait(|f| {
-        f.has_held_receipt()
+        f.sees_held_receipt()
             && confirmation().is_some_and(|pending| pending.root_identity == child_root)
     });
     assert!(f.has_text("childbeforexneedle"));
@@ -1561,7 +1666,7 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
     assert!(latest_unsatisfied(&f, &child));
     assert!(latest_unsatisfied(&f, &parent));
 
-    f.wait(|f| f.has_text("childafterxxneedle") && latest_satisfied(f, &child));
+    f.wait(|f| f.sees_text("childafterxxneedle") && latest_satisfied(f, &child));
     assert!(!f.has_text("childbeforexneedle"));
     assert!(latest_unsatisfied(&f, &parent));
     assert!(latest_unsatisfied(&f, &all));
@@ -1595,7 +1700,7 @@ fn completed_codex_rollout_with_known_environment_metadata_publishes_and_keeps_e
     bytes.push(b'\n');
     fs::write(&path, &bytes).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("moderncodex"));
+    f.wait(|f| f.sees_text("moderncodex"));
     assert!(!f.has_text("environment_context"));
     f.wait(|f| {
         m2_sources(f)
@@ -1606,7 +1711,7 @@ fn completed_codex_rollout_with_known_environment_metadata_publishes_and_keeps_e
     let mut appended = bytes.clone();
     appended.extend(codex("continued", "moderncodex continuedwork proof"));
     fs::write(&path, &appended).unwrap();
-    f.wait(|f| f.has_text("continuedwork"));
+    f.wait(|f| f.sees_text("continuedwork"));
     assert_eq!(fs::read(&path).unwrap(), appended);
 }
 
@@ -1643,7 +1748,7 @@ fn codex_rollout_with_equal_usage_deltas_still_publishes() {
     bytes.extend(token_count(30, 6));
     fs::write(&path, &bytes).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("equalusage"));
+    f.wait(|f| f.sees_text("equalusage"));
     f.wait(|f| {
         m2_sources(f)
             .iter()
@@ -1856,16 +1961,43 @@ fn m2_source_for_path(
         .find(|source| source.binding.source_path == locator.as_str())
         .unwrap()
 }
+/// One receipt-currency observation. Typed control or snapshot contention
+/// retries within three seconds; `None` means no definite answer was read,
+/// which proves neither currency nor staleness.
+#[track_caller]
+fn m2_receipt_state(f: &Fixture, path: &Path) -> Option<bool> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let Some(receipt) = m2_source_for_path(f, path).latest_receipt else {
+            return Some(false);
+        };
+        let control = f.control();
+        let result = ManagedStore::open(&f.db, &control)
+            .and_then(|store| store.source_current(&receipt, &control, deadline));
+        match result {
+            Ok(current) => return Some(current),
+            Err(
+                PortError::WriterBusy(_)
+                | PortError::GenerationMismatch(_)
+                | PortError::SnapshotChanged(_),
+            ) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(
+                PortError::WriterBusy(_)
+                | PortError::GenerationMismatch(_)
+                | PortError::SnapshotChanged(_),
+            ) => return None,
+            Err(error) => panic!("synthetic receipt currency read failed: {error:?}"),
+        }
+    }
+}
+#[track_caller]
 fn m2_receipt_current(f: &Fixture, path: &Path) -> bool {
-    let Some(receipt) = m2_source_for_path(f, path).latest_receipt else {
-        return false;
-    };
-    let control = f.control();
-    ManagedStore::open(&f.db, &control)
-        .and_then(|store| {
-            store.source_current(&receipt, &control, Instant::now() + Duration::from_secs(2))
-        })
-        .unwrap_or(false)
+    m2_receipt_state(f, path) == Some(true)
+}
+/// A staleness claim needs an actual stale read, like `latest_unsatisfied`.
+#[track_caller]
+fn m2_receipt_stale(f: &Fixture, path: &Path) -> bool {
+    m2_receipt_state(f, path) == Some(false)
 }
 #[track_caller]
 fn m2_assert_no_metadata_enrichment(f: &Fixture, text: &str) {
@@ -1939,7 +2071,7 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     let metadata = f.history.parent().unwrap().join("workbuddy.db");
     let metadata_before = fs::read(&metadata).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("wbindependentoriginalneedle"));
+    f.wait(|f| f.sees_text("wbindependentoriginalneedle"));
     assert_eq!(
         m2_sources(&f).len(),
         1,
@@ -1978,7 +2110,7 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
     let metadata_selection = m2_selection(&f, &metadata);
     f.revoke(&metadata_selection);
-    f.wait(|f| !m2_receipt_current(f, &source));
+    f.wait(|f| m2_receipt_stale(f, &source));
     assert!(f.has_text("wbindependentoriginalneedle"));
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
     let (withdrawn, cycle) = m2_post_revoke_cycle_attempted(&f, 3);
@@ -2073,7 +2205,7 @@ fn m2_workbuddy_soft_delete_requires_observed_hold_and_new_boot_confirmation() {
     let path = f.history.join("projects/synthetic-project/session.jsonl");
     let metadata = f.history.join("workbuddy.db");
     f.spawn();
-    f.wait(|f| f.has_text("wbsoftdeleteoriginalneedle"));
+    f.wait(|f| f.sees_text("wbsoftdeleteoriginalneedle"));
     let barrier = admit_latest_barrier(&f, 20);
     f.wait(|f| latest_satisfied(f, &barrier));
     Connection::open(&metadata)
@@ -2081,13 +2213,13 @@ fn m2_workbuddy_soft_delete_requires_observed_hold_and_new_boot_confirmation() {
         .execute("UPDATE sessions SET deleted_at=1000 WHERE id=?1", [native])
         .unwrap();
     let metadata_after = fs::read(&metadata).unwrap();
-    f.wait(Fixture::has_held_receipt);
+    f.wait(Fixture::sees_held_receipt);
     assert!(f.has_text("wbsoftdeleteoriginalneedle"));
     f.terminate();
     f.spawn();
-    f.wait(Fixture::has_held_receipt);
+    f.wait(Fixture::sees_held_receipt);
     assert!(f.has_text("wbsoftdeleteoriginalneedle"));
-    f.wait(|f| !f.has_text("wbsoftdeleteoriginalneedle"));
+    f.wait(|f| f.lacks_text("wbsoftdeleteoriginalneedle"));
     let completed = admit_latest_barrier(&f, 21);
     f.wait(|f| latest_satisfied(f, &completed));
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -2129,7 +2261,7 @@ fn m2_dsh_highest_generation_future_refusal_and_restart_keep_one_original() {
     let session = f.history.join("synthetic-project").join(native);
     let path = session.join("session.v4.jsonl.zstd");
     f.spawn();
-    f.wait(|f| f.has_text("dshcanonicaloriginalneedle"));
+    f.wait(|f| f.sees_text("dshcanonicaloriginalneedle"));
     let latest = admit_latest_barrier(&f, 101);
     f.wait(|f| latest_satisfied(f, &latest));
     assert!(!f.has_text("dshobsoletegenerationneedle"));
@@ -2332,7 +2464,7 @@ fn m2_antigravity_full_and_database_transition_is_atomic_and_excludes_mirrors() 
     let full = logs.join("transcript_full.jsonl");
     let database_before = fs::read(&database).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("agdatabaseoriginalneedle"));
+    f.wait(|f| f.sees_text("agdatabaseoriginalneedle"));
     let old = m2_hits(&f, "agdatabaseoriginalneedle")[0]
         .projection
         .occurrence
@@ -2353,7 +2485,7 @@ fn m2_antigravity_full_and_database_transition_is_atomic_and_excludes_mirrors() 
     )
     .unwrap();
     fs::write(&full, m2_ag_full("agfulloriginalneedle")).unwrap();
-    f.wait(|f| f.has_text("agfulloriginalneedle") && !f.has_text("agdatabaseoriginalneedle"));
+    f.wait(|f| f.sees_text("agfulloriginalneedle") && f.lacks_text("agdatabaseoriginalneedle"));
     assert!(!f.has_text("agmirrormustnotpublishneedle"));
     assert!(!f.has_text("agshortmustnotpublishneedle"));
     let new = m2_hits(&f, "agfulloriginalneedle")[0]
@@ -2441,7 +2573,7 @@ fn m2_zcode_wal_parent_child_rewrite_and_pause_preserve_source_bytes() {
     let before = fs::read(&database).unwrap();
     let wal_before = fs::read(&wal).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("zcodeparentoriginalneedle") && f.has_text("zcodechildoriginalneedle"));
+    f.wait(|f| f.sees_text("zcodeparentoriginalneedle") && f.sees_text("zcodechildoriginalneedle"));
     let latest = admit_latest_barrier(&f, 108);
     f.wait(|f| latest_satisfied(f, &latest));
     assert_eq!(fs::read(&database).unwrap(), before);
@@ -2455,7 +2587,7 @@ fn m2_zcode_wal_parent_child_rewrite_and_pause_preserve_source_bytes() {
     );
     let committed = fs::read(&database).unwrap();
     let wal_committed = fs::read(&wal).unwrap();
-    f.wait(|f| f.has_text("zcodewalincrementneedle"));
+    f.wait(|f| f.sees_text("zcodewalincrementneedle"));
     let updated = admit_latest_barrier(&f, 109);
     f.wait(|f| latest_satisfied(f, &updated));
     f.desired(DesiredUpdates::Paused);
@@ -2484,7 +2616,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
         .join(native)
         .join("session.v4.jsonl.zstd");
     f.spawn();
-    f.wait(|f| f.has_text("dshintegrityoriginalneedle"));
+    f.wait(|f| f.sees_text("dshintegrityoriginalneedle"));
     let initial = admit_latest_barrier(&f, 200);
     f.wait(|f| latest_satisfied(f, &initial));
     let before = m2_hits(&f, "dshintegrityoriginalneedle")[0]
@@ -2505,7 +2637,7 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     assert!(latest_unsatisfied(&f, &pending));
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
-    assert!(!m2_receipt_current(&f, &source));
+    assert!(m2_receipt_stale(&f, &source));
     assert_eq!(fs::read(&source).unwrap(), torn);
     let mut corrupt = complete.clone();
     *corrupt.last_mut().unwrap() ^= 1;
@@ -2517,14 +2649,14 @@ fn m2_dsh_torn_and_corrupt_frames_keep_original_until_complete_rewrite() {
     assert!(!f.has_text("dshintegrityappendneedle"));
     assert_eq!(fs::read(&source).unwrap(), corrupt);
     fs::write(&source, &complete).unwrap();
-    f.wait(Fixture::has_held_receipt);
+    f.wait(Fixture::sees_held_receipt);
     assert!(f.has_text("dshintegrityoriginalneedle"));
     assert!(!f.has_text("dshintegrityappendneedle"));
     f.terminate();
     f.spawn();
-    f.wait(Fixture::has_held_receipt);
+    f.wait(Fixture::sees_held_receipt);
     assert!(!f.has_text("dshintegrityappendneedle"));
-    f.wait(|f| f.has_text("dshintegrityappendneedle"));
+    f.wait(|f| f.sees_text("dshintegrityappendneedle"));
     let refreshed = admit_latest_barrier(&f, 203);
     f.wait(|f| latest_satisfied(f, &refreshed));
     let after = m2_hits(&f, "dshintegrityoriginalneedle")[0]
@@ -2571,7 +2703,7 @@ fn m2_antigravity_full_absence_requires_new_boot_grace_before_database_fallback(
         .join(".system_generated/logs/transcript_full.jsonl");
     let database_before = fs::read(&database).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("agabsencefullneedle"));
+    f.wait(|f| f.sees_text("agabsencefullneedle"));
     let ready = admit_latest_barrier(&f, 210);
     f.wait(|f| latest_satisfied(f, &ready));
     let native_session = m2_hits(&f, "agabsencefullneedle")[0]
@@ -2607,7 +2739,7 @@ fn m2_antigravity_full_absence_requires_new_boot_grace_before_database_fallback(
     f.wait(fallback_held);
     assert!(f.has_text("agabsencefullneedle"));
     assert!(!f.has_text("agabsencedatabaseneedle"));
-    f.wait(|f| f.has_text("agabsencedatabaseneedle") && !f.has_text("agabsencefullneedle"));
+    f.wait(|f| f.sees_text("agabsencedatabaseneedle") && f.lacks_text("agabsencefullneedle"));
     let fallback = admit_latest_barrier(&f, 211);
     f.wait(|f| latest_satisfied(f, &fallback));
     assert_eq!(
@@ -2622,7 +2754,7 @@ fn m2_antigravity_full_absence_requires_new_boot_grace_before_database_fallback(
         native_session
     );
     fs::write(&full, &original).unwrap();
-    f.wait(|f| f.has_text("agabsencefullneedle") && !f.has_text("agabsencedatabaseneedle"));
+    f.wait(|f| f.sees_text("agabsencefullneedle") && f.lacks_text("agabsencedatabaseneedle"));
     let restored = admit_latest_barrier(&f, 212);
     f.wait(|f| latest_satisfied(f, &restored));
     assert_eq!(
@@ -2656,7 +2788,7 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
     let metadata = f.history.join("workbuddy.db");
     let source = f.history.join("projects/project/session.jsonl");
     f.spawn();
-    f.wait(|f| f.has_text("wbsemanticoriginalneedle"));
+    f.wait(|f| f.sees_text("wbsemanticoriginalneedle"));
     let ready = admit_latest_barrier(&f, 220);
     f.wait(|f| latest_satisfied(f, &ready));
     let canonical = m2_hits(&f, "wbsemanticoriginalneedle")[0]
@@ -2690,7 +2822,7 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
             )
         }) {
             first = Some(candidate);
-            f.has_held_receipt()
+            f.sees_held_receipt()
         } else {
             false
         }
@@ -2734,7 +2866,7 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
         assert_eq!(current.first_monotonic_ms, first.first_monotonic_ms);
         assert!(f.has_text("wbsemanticoriginalneedle"));
     }
-    f.wait(|f| !f.has_text("wbsemanticoriginalneedle"));
+    f.wait(|f| f.lacks_text("wbsemanticoriginalneedle"));
     let deleted = admit_latest_barrier(&f, 225);
     let (deleted, _) = m2_cycle_attempted(&f, &deleted);
     f.wait(|f| latest_satisfied(f, &deleted));
@@ -2748,7 +2880,7 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
         .execute("UPDATE sessions SET deleted_at=NULL WHERE id=?1", [native])
         .unwrap();
     let metadata_after = fs::read(&metadata).unwrap();
-    f.wait(|f| f.has_text("wbsemanticoriginalneedle"));
+    f.wait(|f| f.sees_text("wbsemanticoriginalneedle"));
     let restored = admit_latest_barrier(&f, 227);
     let (restored, _) = m2_cycle_attempted(&f, &restored);
     f.wait(|f| latest_satisfied(f, &restored));
@@ -2784,7 +2916,7 @@ fn m2_workbuddy_metadata_failure_restarts_delete_proof_before_original_retiremen
     let metadata = f.history.join("workbuddy.db");
     let transcript = f.history.join("projects/project/session.jsonl");
     f.spawn();
-    f.wait(|f| f.has_text("wbfailureoriginalneedle"));
+    f.wait(|f| f.sees_text("wbfailureoriginalneedle"));
     let source_id = ControlId::parse(
         m2_source_for_path(&f, &transcript)
             .binding
@@ -2808,7 +2940,7 @@ fn m2_workbuddy_metadata_failure_restarts_delete_proof_before_original_retiremen
         first.as_ref().is_some_and(|candidate| {
             matches!(&candidate.kind, ConfirmationKind::Rewrite { candidate_digest }
                 if candidate_digest.as_str().starts_with("metadata_"))
-        }) && f.has_text("wbfailureoriginalneedle")
+        }) && f.sees_text("wbfailureoriginalneedle")
     });
     let first = first.unwrap();
     // A BLOB id rejects the whole metadata inventory, even after valid rows.
@@ -2829,11 +2961,20 @@ fn m2_workbuddy_metadata_failure_restarts_delete_proof_before_original_retiremen
         if metadata_progress.error == Some(BackgroundFailure::ScopeUnverified)
             && progress.confirmation.is_none()
         {
+            let original = f.observe(f.text_state("wbfailureoriginalneedle"));
+            assert_ne!(
+                original,
+                Some(false),
+                "a failed metadata cycle retired the original"
+            );
             if let Some(token) = metadata_progress.last_observation {
-                failed_cycles.insert(token.cycle_seq);
                 last_failed = Some(token.cycle_seq);
+                // A failed cycle counts only when a definite read showed the
+                // original still published; a refused read proves neither.
+                if original == Some(true) {
+                    failed_cycles.insert(token.cycle_seq);
+                }
             }
-            assert!(f.has_text("wbfailureoriginalneedle"));
         }
         started.elapsed() >= Duration::from_secs(6) && failed_cycles.len() >= 2
     });
@@ -2856,7 +2997,7 @@ fn m2_workbuddy_metadata_failure_restarts_delete_proof_before_original_retiremen
         })
     });
     assert!(f.has_text("wbfailureoriginalneedle"));
-    f.wait(|f| !f.has_text("wbfailureoriginalneedle"));
+    f.wait(|f| f.lacks_text("wbfailureoriginalneedle"));
     assert_eq!(fs::read(&transcript).unwrap(), original);
 }
 
@@ -2887,7 +3028,7 @@ fn m2_zcode_unknown_part_keeps_child_until_complete_graph_confirms_removal() {
     let database = f.history.join("db.sqlite");
     let wal = PathBuf::from(format!("{}-wal", database.to_str().unwrap()));
     f.spawn();
-    f.wait(|f| f.has_text("zcodestableparentneedle") && f.has_text("zcoderetainedchildneedle"));
+    f.wait(|f| f.sees_text("zcodestableparentneedle") && f.sees_text("zcoderetainedchildneedle"));
     let ready = admit_latest_barrier(&f, 230);
     f.wait(|f| latest_satisfied(f, &ready));
     let native_session = m2_hits(&f, "zcodestableparentneedle")[0]
@@ -2918,9 +3059,9 @@ fn m2_zcode_unknown_part_keeps_child_until_complete_graph_confirms_removal() {
         .unwrap();
     let db_after = fs::read(&database).unwrap();
     let wal_after = fs::read(&wal).unwrap();
-    f.wait(Fixture::has_held_receipt);
+    f.wait(Fixture::sees_held_receipt);
     assert!(f.has_text("zcoderetainedchildneedle"));
-    f.wait(|f| !f.has_text("zcoderetainedchildneedle"));
+    f.wait(|f| f.lacks_text("zcoderetainedchildneedle"));
     assert!(f.has_text("zcodestableparentneedle"));
     let complete = admit_latest_barrier(&f, 232);
     f.wait(|f| latest_satisfied(f, &complete));
@@ -2946,7 +3087,7 @@ fn owned_purge_child_completes_before_synthetic_directory_cleanup() {
     let bytes = claude("teardown", "purgeteardownoriginalneedle");
     fs::write(&path, &bytes).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("purgeteardownoriginalneedle"));
+    f.wait(|f| f.sees_text("purgeteardownoriginalneedle"));
     let selection = m2_selection(&f, &f.history);
     f.revoke(&selection);
     // A poll under load can see a transient Busy read; that is "not yet",
@@ -2985,7 +3126,7 @@ fn transient_control_writer_does_not_end_background_lifetime_or_lose_next_update
     let original = claude("first", "controlcontentionoriginalneedle");
     fs::write(&path, &original).unwrap();
     f.spawn();
-    f.wait(|f| f.has_text("controlcontentionoriginalneedle"));
+    f.wait(|f| f.sees_text("controlcontentionoriginalneedle"));
     let old_boot = f
         .control()
         .bounded(|c| c.background_status())
@@ -3006,7 +3147,7 @@ fn transient_control_writer_does_not_end_background_lifetime_or_lose_next_update
         "a transient control writer ended the owned background lifetime"
     );
     contender.execute_batch("ROLLBACK").unwrap();
-    f.wait(|f| f.has_text("controlcontentionnextneedle"));
+    f.wait(|f| f.sees_text("controlcontentionnextneedle"));
     assert_eq!(
         f.control()
             .bounded(|c| c.background_status())
