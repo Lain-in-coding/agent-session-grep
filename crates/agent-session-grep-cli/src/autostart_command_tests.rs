@@ -487,33 +487,39 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
 fn replacing_physical_root_during_package_verification_never_mutates_new_control() {
     let f = Fixture::new(DesiredUpdates::Paused);
     let old = f.root.with_file_name("original root");
+    let replacement = f.root.with_file_name("replacement root");
+    let replacement_control = crate::retry_fixture_busy(|| {
+        SqliteControlStore::create(
+            &replacement,
+            &ControlId::parse("synthetic-replacement").unwrap(),
+            DesiredUpdates::Stopped,
+        )
+    });
+    drop(
+        ManagedStore::create(
+            &replacement.join(f.catalog.file_name().unwrap()),
+            &replacement_control,
+            ControlId::parse("replacement-catalog").unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
+    drop(replacement_control);
+    let mut installation = Some(f.installation(true));
+    // Only the replacement belongs inside the command. Building its catalog
+    // and package first keeps slow fixture writes from masking IdentityChanged
+    // with a timeout before the replacement can be observed.
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
             action: Action::Enable,
             prefix: None,
         },
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + BUDGET,
         &mut |_| {
-            let install = f.installation(true);
             fs::rename(&f.root, &old).unwrap();
-            let control = crate::retry_fixture_busy(|| {
-                SqliteControlStore::create(
-                    &f.root,
-                    &ControlId::parse("synthetic-replacement").unwrap(),
-                    DesiredUpdates::Stopped,
-                )
-            });
-            drop(
-                ManagedStore::create(
-                    &f.catalog,
-                    &control,
-                    ControlId::parse("replacement-catalog").unwrap(),
-                    1,
-                )
-                .unwrap(),
-            );
-            Ok(install)
+            fs::rename(&replacement, &f.root).unwrap();
+            Ok(installation.take().unwrap())
         },
         &mut || panic!("root changed before choosing user location"),
         &mut |_, _, _| panic!("root changed before native effects"),
@@ -744,7 +750,7 @@ fn native_launch_observes_the_original_autostart_deadline() {
 #[test]
 fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
     let f = Fixture::new(DesiredUpdates::Running);
-    let end = Instant::now() + Duration::from_secs(2);
+    let mut installation = Some(f.installation(true));
     let (locked, acquired) = std::sync::mpsc::channel();
     let root = f.root.clone();
     let holder = std::thread::spawn(move || {
@@ -753,11 +759,12 @@ fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked.send(()).unwrap();
         // Outlive the adapter's 250ms busy allowance, then release so the
-        // command must recover with its original two-second end.
+        // command must recover with its original command end.
         std::thread::sleep(Duration::from_millis(600));
         connection.execute_batch("ROLLBACK").unwrap();
     });
     acquired.recv_timeout(Duration::from_secs(2)).unwrap();
+    let end = Instant::now() + BUDGET;
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -765,9 +772,12 @@ fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
             prefix: None,
         },
         end,
-        &mut |_| Ok(f.installation(true)),
+        &mut |_| Ok(installation.take().unwrap()),
         &mut || Ok(f.location.clone()),
-        &mut |_, args, _| Ok(f.response(args)),
+        &mut |_, args, deadline| {
+            assert_eq!(deadline, end);
+            Ok(f.response(args))
+        },
     );
     holder.join().unwrap();
     assert_eq!(result.status, "complete", "reason={:?}", result.reason);
@@ -831,8 +841,11 @@ fn retry_helpers_never_replay_a_recorded_transaction_or_an_executed_native_call(
 #[test]
 fn native_busy_after_callback_returns_partial_once_with_the_recorded_intent() {
     let f = Fixture::new(DesiredUpdates::Running);
+    let mut installation = Some(f.installation(true));
     let callbacks = Cell::new(0);
-    let end = Instant::now() + Duration::from_secs(2);
+    // The injected verifier returns an existing package, as the real verifier
+    // does. Package construction must not consume the native command budget.
+    let end = Instant::now() + BUDGET;
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -840,7 +853,7 @@ fn native_busy_after_callback_returns_partial_once_with_the_recorded_intent() {
             prefix: None,
         },
         end,
-        &mut |_| Ok(f.installation(true)),
+        &mut |_| Ok(installation.take().unwrap()),
         &mut || Ok(f.location.clone()),
         &mut |_, _, deadline| {
             assert_eq!(deadline, end);
@@ -848,7 +861,12 @@ fn native_busy_after_callback_returns_partial_once_with_the_recorded_intent() {
             Err(native_manager::ErrorCode::Busy.into())
         },
     );
-    assert_eq!(callbacks.get(), 1);
+    assert_eq!(
+        callbacks.get(),
+        1,
+        "actual result: {}",
+        serde_json::to_string(&result).unwrap()
+    );
     assert_eq!(result.reason, Some(Reason::NativeBusy));
     assert!(result.intent_recorded && result.private_receipt_recorded);
     assert!(f.target().exists());
