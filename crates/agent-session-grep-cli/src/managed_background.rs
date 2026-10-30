@@ -30,6 +30,7 @@ use agent_session_grep_ports::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::Read,
@@ -49,6 +50,208 @@ const CONTROL_BUDGET: Duration = Duration::from_millis(250);
 const LIVE_WORKER_WINDOW_MS: i64 = 30_000;
 const SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(30);
 const MAX_DISCOVERY_PATHS: usize = 65_536;
+
+/// The monotonic confirmation clock and failures whose invalidation could not
+/// be recorded in control. Ordinary cycle aborts do not invalidate other
+/// sources. These boot-local marks retain only the affected source, metadata
+/// dependency or exact discovery region; a new epoch already invalidates every
+/// old confirmation. Capacity exhaustion ends this worker before more source
+/// work, so an unrecorded failure can never be silently forgotten.
+struct ObservationClock {
+    started: Instant,
+    failures: RefCell<LostFailures>,
+}
+
+#[derive(Default)]
+struct LostFailures {
+    epoch: Option<PolicyEpoch>,
+    sources: BTreeMap<SourceId, CycleSeq>,
+    metadata: BTreeMap<SourceId, CycleSeq>,
+    roots: Vec<LostRootFailure>,
+    exhausted: bool,
+}
+
+struct LostRootFailure {
+    region: ScopeRegion,
+    identity: ControlId,
+    all: Option<CycleSeq>,
+    deletion_only: Option<CycleSeq>,
+}
+
+#[derive(Clone, Copy)]
+enum RootConfirmations {
+    All,
+    DeletionOnly,
+}
+
+fn root_failure_confirmations(complete: bool) -> RootConfirmations {
+    if complete {
+        RootConfirmations::DeletionOnly
+    } else {
+        RootConfirmations::All
+    }
+}
+
+enum FailureScope {
+    Source(SourceId),
+    Metadata(SourceId),
+    Root {
+        selection: Selection,
+        confirmations: RootConfirmations,
+    },
+}
+
+impl ObservationClock {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            failures: RefCell::new(LostFailures::default()),
+        }
+    }
+
+    fn check_capacity(&self) -> PortResult<()> {
+        if self.failures.borrow().exhausted {
+            return Err(PortError::Backend(
+                "background failure invalidation capacity exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_failure(
+        &self,
+        cycle: &ObservationCycle,
+        scope: FailureScope,
+        acknowledge: impl FnOnce() -> PortResult<()>,
+    ) -> PortResult<()> {
+        let result = acknowledge();
+        if result.is_err() {
+            let mut failures = self.failures.borrow_mut();
+            if failures.epoch != Some(cycle.policy_epoch) {
+                *failures = LostFailures {
+                    epoch: Some(cycle.policy_epoch),
+                    ..LostFailures::default()
+                };
+            }
+            let seq = cycle.token.cycle_seq;
+            match scope {
+                FailureScope::Source(id) => {
+                    failures
+                        .sources
+                        .entry(id)
+                        .and_modify(|old| *old = (*old).max(seq))
+                        .or_insert(seq);
+                }
+                FailureScope::Metadata(id) => {
+                    failures
+                        .metadata
+                        .entry(id)
+                        .and_modify(|old| *old = (*old).max(seq))
+                        .or_insert(seq);
+                }
+                FailureScope::Root {
+                    selection,
+                    confirmations,
+                } => {
+                    if let Some(root) = selection.root_identity {
+                        let watermarks = if let Some(index) =
+                            failures.roots.iter().position(|lost| {
+                                lost.region == selection.region && lost.identity == root
+                            }) {
+                            &mut failures.roots[index]
+                        } else {
+                            failures.roots.push(LostRootFailure {
+                                region: selection.region,
+                                identity: root,
+                                all: None,
+                                deletion_only: None,
+                            });
+                            failures.roots.last_mut().expect("inserted root failure")
+                        };
+                        // Complete discovery invalidates only absence proofs;
+                        // keep that watermark separate from observation gaps
+                        // that invalidate both deletion and rewrite proofs.
+                        let latest = match confirmations {
+                            RootConfirmations::All => &mut watermarks.all,
+                            RootConfirmations::DeletionOnly => &mut watermarks.deletion_only,
+                        };
+                        *latest = (*latest).max(Some(seq));
+                    } else {
+                        failures.exhausted = true;
+                    }
+                }
+            }
+            failures.exhausted |=
+                failures.sources.len() + failures.metadata.len() + failures.roots.len()
+                    > MAX_DISCOVERY_PATHS;
+        }
+        result
+    }
+
+    fn lost_after(
+        &self,
+        source: &ConfirmationSource<'_>,
+        selection: &Selection,
+        kind: &ConfirmationKind,
+        epoch: PolicyEpoch,
+    ) -> Option<CycleSeq> {
+        let failures = self.failures.borrow();
+        if failures.epoch != Some(epoch) {
+            return None;
+        }
+        let mut latest = failures.sources.get(source.id).copied();
+        for context in source.contexts {
+            for dependency in &context.dependencies {
+                if let DependencyResolution::Resolved(proof) = &dependency.resolution {
+                    latest = latest.max(failures.metadata.get(&proof.binding.source_id).copied());
+                }
+            }
+        }
+        for lost in &failures.roots {
+            if selection.root_identity.as_ref() == Some(&lost.identity)
+                && lost
+                    .region
+                    .matches(selection.region.provider, source.locator)
+            {
+                latest = latest.max(lost.all);
+                if matches!(kind, ConfirmationKind::Deletion) {
+                    latest = latest.max(lost.deletion_only);
+                }
+            }
+        }
+        latest
+    }
+}
+
+fn record_root_failure(
+    clock: &ObservationClock,
+    cycle: &ObservationCycle,
+    selection: Selection,
+    confirmations: RootConfirmations,
+    should_acknowledge: impl FnOnce() -> PortResult<bool>,
+    acknowledge: impl FnOnce() -> PortResult<()>,
+) -> PortResult<()> {
+    clock.record_failure(
+        cycle,
+        FailureScope::Root {
+            selection,
+            confirmations,
+        },
+        || {
+            if should_acknowledge()? {
+                acknowledge()
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+struct ConfirmationSource<'a> {
+    id: &'a SourceId,
+    locator: &'a CanonicalLocator,
+    contexts: &'a [&'a SourcePublicationContext],
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct StartReport {
@@ -541,11 +744,12 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
     if initialized {
         return Ok(());
     }
-    let boot = Instant::now();
+    let boot = ObservationClock::new(Instant::now());
     let mut rounds = 0_u64;
     let mut history_pending = true;
     let mut pending_cycle = None;
     loop {
+        boot.check_capacity()?;
         let tick = Instant::now();
         // A contended short control operation is a deferred cadence, not an
         // unexpected process exit. The next cadence is a new bounded attempt;
@@ -581,7 +785,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 db,
                 &control,
                 &authority,
-                boot,
+                &boot,
                 rounds,
                 tick + CADENCE,
                 &mut pending_cycle,
@@ -1041,7 +1245,7 @@ fn run_cycle(
     db: &Path,
     control: &SqliteControlStore,
     authority: &LockedWorkerAuthority<'_>,
-    boot: Instant,
+    boot: &ObservationClock,
     round: u64,
     end: Instant,
     pending: &mut Option<PendingCycle>,
@@ -1593,7 +1797,7 @@ fn observe_cycle(
     policy: &ReadPolicy,
     selections: &[Selection],
     cycle: &ObservationCycle,
-    boot: Instant,
+    boot: &ObservationClock,
 ) -> PortResult<bool> {
     let store = ManagedStore::open(db, control)?;
     let incarnation = store.incarnation().clone();
@@ -1727,14 +1931,21 @@ fn observe_cycle(
             let failure = failed.unwrap_or(BackgroundFailure::ScopeUnverified);
             // Every participating root failed independent validation; keep the
             // source's control summary honest instead of silently skipping it.
-            acknowledge_failure(
-                control,
-                authority,
-                roots[group.roots[0]].selection,
-                cycle,
-                &group.id,
-                failure,
-            )?;
+            let scope = if group.descriptor.kind == SourceKind::WorkBuddyMetadata {
+                FailureScope::Metadata(group.id.clone())
+            } else {
+                FailureScope::Source(group.id.clone())
+            };
+            boot.record_failure(cycle, scope, || {
+                acknowledge_failure(
+                    control,
+                    authority,
+                    roots[group.roots[0]].selection,
+                    cycle,
+                    &group.id,
+                    failure,
+                )
+            })?;
             outcomes.insert(
                 group.id.as_str().to_owned(),
                 ObservationOutcome {
@@ -1814,7 +2025,9 @@ fn observe_cycle(
                 }
                 Err(error) => {
                     let reason = failure(&error);
-                    acknowledge_failure(control, authority, advisory, cycle, &group.id, reason)?;
+                    boot.record_failure(cycle, FailureScope::Metadata(group.id.clone()), || {
+                        acknowledge_failure(control, authority, advisory, cycle, &group.id, reason)
+                    })?;
                     (false, Some(reason))
                 }
             };
@@ -1863,7 +2076,9 @@ fn observe_cycle(
             }
             Err(error) => {
                 let failure = failure(&error);
-                acknowledge_failure(control, authority, advisory, cycle, &group.id, failure)?;
+                boot.record_failure(cycle, FailureScope::Source(group.id.clone()), || {
+                    acknowledge_failure(control, authority, advisory, cycle, &group.id, failure)
+                })?;
                 outcomes.insert(
                     group.id.as_str().to_owned(),
                     ObservationOutcome {
@@ -1944,13 +2159,19 @@ fn observe_cycle(
         }
         if claimed.is_empty() {
             let failure = failed.unwrap_or(BackgroundFailure::ScopeUnverified);
-            acknowledge_failure(
-                control,
-                authority,
-                roots[covering[0]].selection,
+            boot.record_failure(
                 cycle,
-                &prior.binding.source_id,
-                failure,
+                FailureScope::Source(prior.binding.source_id.clone()),
+                || {
+                    acknowledge_failure(
+                        control,
+                        authority,
+                        roots[covering[0]].selection,
+                        cycle,
+                        &prior.binding.source_id,
+                        failure,
+                    )
+                },
             )?;
             absent.insert(
                 id,
@@ -2003,13 +2224,19 @@ fn observe_cycle(
             }
             Err(error) => {
                 let failure = failure(&error);
-                acknowledge_failure(
-                    control,
-                    authority,
-                    advisory,
+                boot.record_failure(
                     cycle,
-                    &prior.binding.source_id,
-                    failure,
+                    FailureScope::Source(prior.binding.source_id.clone()),
+                    || {
+                        acknowledge_failure(
+                            control,
+                            authority,
+                            advisory,
+                            cycle,
+                            &prior.binding.source_id,
+                            failure,
+                        )
+                    },
                 )?;
                 absent.insert(
                     id,
@@ -2191,27 +2418,36 @@ fn observe_cycle(
                     prior.binding.provider,
                     &CanonicalLocator::parse(&prior.binding.source_path)?,
                 ) {
-                    let held = control
-                        .source_progress(&ControlId::parse(prior.binding.source_id.as_str())?)?
-                        .and_then(|p| p.confirmation);
-                    if held
-                        .as_ref()
-                        .is_some_and(|held| held.root_identity != own_root)
-                    {
-                        continue;
-                    }
-                    if complete
-                        && held.is_none_or(|c| !matches!(c.kind, ConfirmationKind::Deletion))
-                    {
-                        continue;
-                    }
-                    acknowledge_failure(
-                        control,
-                        authority,
-                        selection,
+                    let source_id = ControlId::parse(prior.binding.source_id.as_str())?;
+                    let root_identity = own_root.clone();
+                    record_root_failure(
+                        boot,
                         cycle,
-                        &prior.binding.source_id,
-                        error.unwrap_or(BackgroundFailure::Deferred),
+                        selection.clone(),
+                        root_failure_confirmations(complete),
+                        || {
+                            let held = control
+                                .source_progress(&source_id)?
+                                .and_then(|progress| progress.confirmation);
+                            let matches_root = !held
+                                .as_ref()
+                                .is_some_and(|held| held.root_identity != root_identity);
+                            let matches_kind = !complete
+                                || held.as_ref().is_some_and(|held| {
+                                    matches!(held.kind, ConfirmationKind::Deletion)
+                                });
+                            Ok(matches_root && matches_kind)
+                        },
+                        || {
+                            acknowledge_failure(
+                                control,
+                                authority,
+                                selection,
+                                cycle,
+                                &prior.binding.source_id,
+                                error.unwrap_or(BackgroundFailure::Deferred),
+                            )
+                        },
                     )?;
                 }
             }
@@ -2365,16 +2601,17 @@ fn empty_batch(path: &str, provider: SearchProvider, snapshot: &SourceSnapshot) 
 
 fn confirmation(
     control: &SqliteControlStore,
-    id: &SourceId,
+    source: ConfirmationSource<'_>,
     selection: &Selection,
     cycle: &ObservationCycle,
     kind: ConfirmationKind,
-    boot: Instant,
+    boot: &ObservationClock,
 ) -> PortResult<(PendingConfirmation, bool)> {
-    let now = i64::try_from(boot.elapsed().as_millis()).map_err(|_| invalid())?;
+    boot.check_capacity()?;
+    let now = i64::try_from(boot.started.elapsed().as_millis()).map_err(|_| invalid())?;
     let root = selection.root_identity.clone().ok_or_else(invalid)?;
     let prior = control
-        .source_progress(&ControlId::parse(id.as_str())?)?
+        .source_progress(&ControlId::parse(source.id.as_str())?)?
         .and_then(|p| p.confirmation);
     if let Some(mut prior) = prior.filter(|p| {
         p.kind == kind
@@ -2385,7 +2622,10 @@ fn confirmation(
             && p.first_monotonic_ms.get() <= now
     }) {
         let first = control.cycle(prior.first_cycle)?;
-        let interrupted = first.state == CycleState::Aborted
+        let interrupted = boot
+            .lost_after(&source, selection, &kind, cycle.policy_epoch)
+            .is_some_and(|lost| prior.first_cycle <= lost)
+            || first.state == CycleState::Aborted
             || first
                 .selections
                 .iter()
@@ -2437,7 +2677,7 @@ fn observe_source(
     incarnation: &ControlId,
     source: &Discovered,
     prior: Option<&BackgroundSource>,
-    boot: Instant,
+    boot: &ObservationClock,
     discovery_complete: bool,
     metadata: &BTreeMap<String, WorkBuddyMetadata>,
 ) -> PortResult<bool> {
@@ -2525,7 +2765,9 @@ fn observe_source(
                                 if previous.state == LifecycleState::SoftDeleted
                                     && previous.state_digest == current.state_digest)
                 });
-            let (candidate, stable) = confirmation(control, &source.id, advisory, cycle,
+            let (candidate, stable) = confirmation(control, ConfirmationSource {
+                id: &source.id, locator: &locator, contexts: &[&previous_context, &context],
+            }, advisory, cycle,
                 ConfirmationKind::Rewrite { candidate_digest }, boot)?;
             if (stable || already_deleted) && discovery_complete {
                 state = ObservationState::Complete;
@@ -2574,7 +2816,11 @@ fn observe_source(
         // between overlapping roots cannot restart the grace period.
         let (candidate, stable) = confirmation(
             control,
-            &source.id,
+            ConfirmationSource {
+                id: &source.id,
+                locator: &locator,
+                contexts: &[&previous_context, &context],
+            },
             advisory,
             cycle,
             ConfirmationKind::Rewrite {
@@ -2702,7 +2948,11 @@ fn observe_source(
                 ))?;
                 let (candidate, stable) = confirmation(
                     control,
-                    &source.id,
+                    ConfirmationSource {
+                        id: &source.id,
+                        locator: &locator,
+                        contexts: &[&previous_context, &context],
+                    },
                     advisory,
                     cycle,
                     ConfirmationKind::Rewrite {
@@ -2795,7 +3045,7 @@ fn observe_missing(
     cycle: &ObservationCycle,
     incarnation: &ControlId,
     prior: &BackgroundSource,
-    boot: Instant,
+    boot: &ObservationClock,
     metadata: &BTreeMap<String, WorkBuddyMetadata>,
     end: Instant,
 ) -> PortResult<bool> {
@@ -2809,6 +3059,7 @@ fn observe_missing(
     verify_root(advisory)?;
     check_policy(control, policy)?;
     let path = Path::new(&prior.binding.source_path);
+    let locator = CanonicalLocator::parse(&prior.binding.source_path)?;
     // A missing intermediate directory is ambiguous. Validate every parent;
     // only a missing final regular-file entry is deletion evidence.
     let parent = path.parent().ok_or_else(invalid)?;
@@ -2830,6 +3081,7 @@ fn observe_missing(
         .transpose()?
         .unwrap_or_default();
     drop(reader);
+    let previous_context = context.clone();
     let mut metadata_key = None;
     let candidate_kind = if prior.binding.provider.as_str() == "workbuddy" {
         let descriptor = managed_source_discovery::describe(prior.binding.provider, path, true)
@@ -2860,7 +3112,11 @@ fn observe_missing(
     };
     let (candidate, confirmed) = confirmation(
         control,
-        &prior.binding.source_id,
+        ConfirmationSource {
+            id: &prior.binding.source_id,
+            locator: &locator,
+            contexts: &[&previous_context, &context],
+        },
         advisory,
         cycle,
         candidate_kind.clone(),
@@ -3168,6 +3424,474 @@ mod control_deadline_tests {
     }
 
     #[test]
+    fn lost_failure_ack_reopens_only_its_source_dependency_or_exact_region() {
+        use agent_session_grep_ports::managed::RevisionRef;
+        for scope in ["source", "metadata", "root", "ordinary-abort"] {
+            let fixture = CycleFixture::new();
+            let control = &fixture.control;
+            let parent = Path::new(fixture.selection.region.locator.as_str());
+            let paths = [parent.join("a.jsonl"), parent.join("c.jsonl")];
+            let mut selections = vec![fixture.selection.clone()];
+            for path in &paths {
+                std::fs::write(path, b"synthetic source").unwrap();
+                let request = crate::managed_control::source_selection(
+                    SearchProvider::parse("workbuddy").unwrap(),
+                    path,
+                )
+                .unwrap();
+                selections.push(
+                    control_change_before(control, fixture.scope_end, |seq| {
+                        control.add_selection(seq, request.clone())
+                    })
+                    .unwrap()
+                    .value,
+                );
+            }
+            assert_eq!(selections[1].root_identity, selections[2].root_identity);
+            let worker = fixture.worker();
+            let next = || {
+                let queued = control_change_before(control, fixture.scope_end, |seq| {
+                    control.queue_cycle(
+                        seq,
+                        selections
+                            .iter()
+                            .map(selection_revision)
+                            .collect::<PortResult<_>>()?,
+                    )
+                })
+                .unwrap()
+                .value;
+                let CycleAdmission::Queued(queued) = queued else {
+                    panic!("synthetic multi-selection cycle was blocked")
+                };
+                fixture.start(&worker, &queued)
+            };
+            let first = next();
+            let kind = ConfirmationKind::Rewrite {
+                candidate_digest: ControlId::parse("candidate").unwrap(),
+            };
+            let ids = [
+                SourceId::parse("unrelated-claude").unwrap(),
+                SourceId::parse("affected-workbuddy").unwrap(),
+                SourceId::parse("other-workbuddy-exact").unwrap(),
+            ];
+            for (id, selection) in ids.iter().zip(&selections) {
+                let held = PendingConfirmation {
+                    kind: kind.clone(),
+                    first_cycle: first.token.cycle_seq,
+                    confirm_cycle: None,
+                    worker_boot_id: first.token.worker_boot_id.clone(),
+                    root_identity: selection.root_identity.clone().unwrap(),
+                    policy_epoch: first.policy_epoch,
+                    first_monotonic_ms: ControlSeq::new(0).unwrap(),
+                };
+                let ack = SourceAcknowledgement {
+                    source_id: ControlId::parse(id.as_str()).unwrap(),
+                    provider: selection.region.provider,
+                    token: first.token.clone(),
+                    selection: selection_revision(selection).unwrap(),
+                    attempted_at_ms: 4,
+                    coverage: Coverage::Partial,
+                    update_state: UpdateState::Deferred,
+                    backfill_state: BackfillState::Pending,
+                    error: Some(BackgroundFailure::RewritePending),
+                    receipt: None,
+                    confirmation: Some(held),
+                };
+                control_change_before(control, fixture.scope_end, |seq| {
+                    control.acknowledge_source(seq, &worker, ack.clone())
+                })
+                .unwrap();
+            }
+            control_change_before(control, fixture.scope_end, |seq| {
+                control.finish_cycle(seq, &worker, first.token.cycle_seq, CycleFinish::Partial, 5)
+            })
+            .unwrap();
+            let metadata_id = SourceId::parse("metadata").unwrap();
+            let context = SourcePublicationContext {
+                dependencies: vec![SourceDependency {
+                    native_session: NativeSessionId::parse("native").unwrap(),
+                    resolution: DependencyResolution::Resolved(Box::new(MetadataDependencyProof {
+                        binding: SourceBinding {
+                            source_id: metadata_id.clone(),
+                            source_path: parent.join("metadata.db").to_str().unwrap().into(),
+                            provider: SearchProvider::parse("workbuddy").unwrap(),
+                            namespace_id: None,
+                            root_identity: selections[1]
+                                .root_identity
+                                .as_ref()
+                                .unwrap()
+                                .as_str()
+                                .into(),
+                        },
+                        receipt: RevisionRef {
+                            revision_id: RevisionId::parse("metadata-revision").unwrap(),
+                            digest: "a".repeat(64),
+                            observed_at_ms: 1,
+                            cycle_seq: first.token.cycle_seq.get(),
+                            worker_boot_id: first.token.worker_boot_id.as_str().into(),
+                            catalog_incarnation: "pending-catalog".into(),
+                            policy_epoch: first.policy_epoch.get(),
+                            started_control_seq: first.started_control_seq.unwrap().get(),
+                            committed_generation: Some(1),
+                            published: true,
+                        },
+                        selection: SelectionProof {
+                            selection_id: selections[1].id.as_str().into(),
+                            selection_revision: selections[1].revision.get(),
+                            root_identity: selections[1]
+                                .root_identity
+                                .as_ref()
+                                .unwrap()
+                                .as_str()
+                                .into(),
+                        },
+                        state: LifecycleState::SoftDeleted,
+                        state_digest: StateDigest::parse(&"b".repeat(64)).unwrap(),
+                    })),
+                }],
+                authority: None,
+            };
+            context.validate().unwrap();
+            let clock = ObservationClock::new(Instant::now() - Duration::from_secs(6));
+            let failed = next();
+            if scope != "ordinary-abort" {
+                let lost = match scope {
+                    "source" => FailureScope::Source(ids[1].clone()),
+                    "metadata" => FailureScope::Metadata(metadata_id),
+                    "root" => FailureScope::Root {
+                        selection: selections[1].clone(),
+                        confirmations: RootConfirmations::All,
+                    },
+                    _ => unreachable!(),
+                };
+                let writer = rusqlite::Connection::open(SqliteControlStore::path(
+                    fixture.db.parent().unwrap(),
+                ))
+                .unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let failure = clock.record_failure(&failed, lost, || {
+                    acknowledge_failure(
+                        control,
+                        &worker,
+                        &selections[1],
+                        &failed,
+                        &ids[1],
+                        BackgroundFailure::SourceChanged,
+                    )
+                });
+                writer.execute_batch("ROLLBACK").unwrap();
+                assert!(matches!(failure, Err(PortError::WriterBusy(_))));
+            }
+            control_change_before(control, fixture.scope_end, |seq| {
+                control.finish_cycle(
+                    seq,
+                    &worker,
+                    failed.token.cycle_seq,
+                    CycleFinish::Aborted,
+                    6,
+                )
+            })
+            .unwrap();
+            let current = next();
+            for (index, (id, selection)) in ids.iter().zip(&selections).enumerate() {
+                let empty = SourcePublicationContext::default();
+                let contexts = if index == 1 { [&context] } else { [&empty] };
+                let source = ConfirmationSource {
+                    id,
+                    locator: &selection.region.locator,
+                    contexts: &contexts,
+                };
+                let (candidate, stable) =
+                    confirmation(control, source, selection, &current, kind.clone(), &clock)
+                        .unwrap();
+                if index == 1 && scope != "ordinary-abort" {
+                    assert_eq!(candidate.first_cycle, current.token.cycle_seq, "{scope}");
+                    assert!(!stable, "{scope}");
+                } else {
+                    assert_eq!(
+                        candidate.first_cycle, first.token.cycle_seq,
+                        "{scope}/{index}"
+                    );
+                    assert_eq!(candidate.first_monotonic_ms.get(), 0, "{scope}/{index}");
+                    assert!(stable, "{scope}/{index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_failure_scope_maps_complete_discovery_to_deletion_only() {
+        assert!(matches!(
+            root_failure_confirmations(true),
+            RootConfirmations::DeletionOnly
+        ));
+        assert!(matches!(
+            root_failure_confirmations(false),
+            RootConfirmations::All
+        ));
+    }
+
+    #[test]
+    fn lost_root_failure_preserves_rewrite_and_deletion_watermarks_separately() {
+        for scopes in [
+            [RootConfirmations::All, RootConfirmations::DeletionOnly],
+            [RootConfirmations::DeletionOnly, RootConfirmations::All],
+        ] {
+            let fixture = CycleFixture::new();
+            let control = &fixture.control;
+            let selection = &fixture.selection;
+            let worker = fixture.worker();
+            let next = || {
+                let queued = control_change_before(control, fixture.scope_end, |seq| {
+                    control.queue_cycle(seq, vec![selection_revision(selection)?])
+                })
+                .unwrap()
+                .value;
+                let CycleAdmission::Queued(queued) = queued else {
+                    panic!("synthetic root cycle was blocked")
+                };
+                fixture.start(&worker, &queued)
+            };
+            let finish = |cycle: &ObservationCycle, state| {
+                control_change_before(control, fixture.scope_end, |seq| {
+                    control.finish_cycle(seq, &worker, cycle.token.cycle_seq, state, 5)
+                })
+                .unwrap();
+            };
+            let kinds = [
+                ConfirmationKind::Deletion,
+                ConfirmationKind::Rewrite {
+                    candidate_digest: ControlId::parse("candidate").unwrap(),
+                },
+            ];
+            let ids = [
+                SourceId::parse("missing-source").unwrap(),
+                SourceId::parse("rewritten-source").unwrap(),
+            ];
+            let save = |cycle: &ObservationCycle, source: &SourceId, held: PendingConfirmation| {
+                let ack = SourceAcknowledgement {
+                    source_id: ControlId::parse(source.as_str()).unwrap(),
+                    provider: selection.region.provider,
+                    token: cycle.token.clone(),
+                    selection: selection_revision(selection).unwrap(),
+                    attempted_at_ms: 4,
+                    coverage: Coverage::Partial,
+                    update_state: UpdateState::Deferred,
+                    backfill_state: BackfillState::Pending,
+                    error: Some(if matches!(held.kind, ConfirmationKind::Deletion) {
+                        BackgroundFailure::DeletionPending
+                    } else {
+                        BackgroundFailure::RewritePending
+                    }),
+                    receipt: None,
+                    confirmation: Some(held),
+                };
+                control_change_before(control, fixture.scope_end, |seq| {
+                    control.acknowledge_source(seq, &worker, ack.clone())
+                })
+                .unwrap();
+            };
+            let first = next();
+            for (id, kind) in ids.iter().zip(&kinds) {
+                save(
+                    &first,
+                    id,
+                    PendingConfirmation {
+                        kind: kind.clone(),
+                        first_cycle: first.token.cycle_seq,
+                        confirm_cycle: None,
+                        worker_boot_id: first.token.worker_boot_id.clone(),
+                        root_identity: selection.root_identity.clone().unwrap(),
+                        policy_epoch: first.policy_epoch,
+                        first_monotonic_ms: ControlSeq::new(0).unwrap(),
+                    },
+                );
+            }
+            finish(&first, CycleFinish::Partial);
+            let clock = ObservationClock::new(Instant::now() - Duration::from_secs(6));
+            let mut expected_first = [first.token.cycle_seq; 2];
+            let empty = SourcePublicationContext::default();
+            let contexts = [&empty];
+            for scope in scopes {
+                let failed = next();
+                let writer = rusqlite::Connection::open(SqliteControlStore::path(
+                    fixture.db.parent().unwrap(),
+                ))
+                .unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let failure = clock.record_failure(
+                    &failed,
+                    FailureScope::Root {
+                        selection: selection.clone(),
+                        confirmations: scope,
+                    },
+                    || {
+                        acknowledge_failure(
+                            control,
+                            &worker,
+                            selection,
+                            &failed,
+                            &ids[0],
+                            BackgroundFailure::Deferred,
+                        )
+                    },
+                );
+                writer.execute_batch("ROLLBACK").unwrap();
+                assert!(matches!(failure, Err(PortError::WriterBusy(_))));
+                finish(&failed, CycleFinish::Aborted);
+                let current = next();
+                for (index, (id, kind)) in ids.iter().zip(&kinds).enumerate() {
+                    let source = ConfirmationSource {
+                        id,
+                        locator: &selection.region.locator,
+                        contexts: &contexts,
+                    };
+                    let (held, _) =
+                        confirmation(control, source, selection, &current, kind.clone(), &clock)
+                            .unwrap();
+                    if index == 0 || matches!(scope, RootConfirmations::All) {
+                        expected_first[index] = current.token.cycle_seq;
+                    }
+                    assert_eq!(held.first_cycle, expected_first[index], "source {index}");
+                    save(&current, id, held);
+                }
+                finish(&current, CycleFinish::Partial);
+            }
+        }
+    }
+
+    #[test]
+    fn root_progress_read_failure_records_local_invalidation() {
+        let fixture = CycleFixture::new();
+        let control = &fixture.control;
+        let selection = &fixture.selection;
+        let worker = fixture.worker();
+        let other_root = fixture._temp.path().join("other-history");
+        std::fs::create_dir(&other_root).unwrap();
+        let other_request =
+            crate::managed_control::source_selection(SearchProvider::Claude, &other_root).unwrap();
+        let other_selection = control_change_before(control, fixture.scope_end, |seq| {
+            control.add_selection(seq, other_request.clone())
+        })
+        .unwrap()
+        .value;
+        let selections = [selection.clone(), other_selection.clone()];
+        let next = || {
+            let queued = control_change_before(control, fixture.scope_end, |seq| {
+                control.queue_cycle(
+                    seq,
+                    selections
+                        .iter()
+                        .map(selection_revision)
+                        .collect::<PortResult<_>>()?,
+                )
+            })
+            .unwrap()
+            .value;
+            let CycleAdmission::Queued(queued) = queued else {
+                panic!("synthetic root cycle was blocked")
+            };
+            fixture.start(&worker, &queued)
+        };
+        let finish = |cycle: &ObservationCycle, state| {
+            control_change_before(control, fixture.scope_end, |seq| {
+                control.finish_cycle(seq, &worker, cycle.token.cycle_seq, state, 5)
+            })
+            .unwrap();
+        };
+
+        let source_path = Path::new(selection.region.locator.as_str()).join("missing.jsonl");
+        let other_source_path = other_root.join("unrelated.jsonl");
+        std::fs::write(&source_path, b"synthetic source").unwrap();
+        std::fs::write(&other_source_path, b"synthetic other source").unwrap();
+        let locator = CanonicalLocator::from_path(&source_path).unwrap();
+        let other_locator = CanonicalLocator::from_path(&other_source_path).unwrap();
+        let source_id = SourceId::parse("interrupted-deletion").unwrap();
+        let other_source_id = SourceId::parse("unrelated-deletion").unwrap();
+        let first = next();
+        for (source_id, claim) in [
+            (&source_id, selection),
+            (&other_source_id, &other_selection),
+        ] {
+            let held = PendingConfirmation {
+                kind: ConfirmationKind::Deletion,
+                first_cycle: first.token.cycle_seq,
+                confirm_cycle: None,
+                worker_boot_id: first.token.worker_boot_id.clone(),
+                root_identity: claim.root_identity.clone().unwrap(),
+                policy_epoch: first.policy_epoch,
+                first_monotonic_ms: ControlSeq::new(0).unwrap(),
+            };
+            let ack = SourceAcknowledgement {
+                source_id: ControlId::parse(source_id.as_str()).unwrap(),
+                provider: claim.region.provider,
+                token: first.token.clone(),
+                selection: selection_revision(claim).unwrap(),
+                attempted_at_ms: 4,
+                coverage: Coverage::Partial,
+                update_state: UpdateState::Deferred,
+                backfill_state: BackfillState::Pending,
+                error: Some(BackgroundFailure::DeletionPending),
+                receipt: None,
+                confirmation: Some(held),
+            };
+            control_change_before(control, fixture.scope_end, |seq| {
+                control.acknowledge_source(seq, &worker, ack.clone())
+            })
+            .unwrap();
+        }
+        finish(&first, CycleFinish::Partial);
+
+        let clock = ObservationClock::new(Instant::now() - Duration::from_secs(6));
+        let failed = next();
+        let read = record_root_failure(
+            &clock,
+            &failed,
+            selection.clone(),
+            RootConfirmations::All,
+            || Err(PortError::WriterBusy("synthetic progress read".into())),
+            || Err(PortError::Backend("failure acknowledgement ran".into())),
+        );
+        assert!(matches!(read, Err(PortError::WriterBusy(_))));
+        finish(&failed, CycleFinish::Aborted);
+
+        let current = next();
+        let contexts: [&SourcePublicationContext; 0] = [];
+        let (candidate, stable) = confirmation(
+            control,
+            ConfirmationSource {
+                id: &source_id,
+                locator: &locator,
+                contexts: &contexts,
+            },
+            selection,
+            &current,
+            ConfirmationKind::Deletion,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(candidate.first_cycle, current.token.cycle_seq);
+        assert!(!stable);
+        let (unrelated, unrelated_stable) = confirmation(
+            control,
+            ConfirmationSource {
+                id: &other_source_id,
+                locator: &other_locator,
+                contexts: &contexts,
+            },
+            &other_selection,
+            &current,
+            ConfirmationKind::Deletion,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(unrelated.first_cycle, first.token.cycle_seq);
+        assert_eq!(unrelated.first_monotonic_ms.get(), 0);
+        assert!(unrelated_stable);
+    }
+
+    #[test]
     fn pending_cycle_busy_completion_recovers_same_worker_before_next_cycle() {
         for state in [
             UpdateState::Busy,
@@ -3210,7 +3934,7 @@ mod control_deadline_tests {
                     &fixture.db,
                     control,
                     &worker,
-                    Instant::now(),
+                    &ObservationClock::new(Instant::now()),
                     0,
                     fixture_end,
                     &mut pending,
@@ -3299,7 +4023,7 @@ mod control_deadline_tests {
                 &fixture.db,
                 control,
                 &worker,
-                Instant::now(),
+                &ObservationClock::new(Instant::now()),
                 0,
                 fixture.scope_end,
                 &mut pending,
@@ -3381,7 +4105,7 @@ mod control_deadline_tests {
                         &fixture.db,
                         control,
                         &worker,
-                        Instant::now(),
+                        &ObservationClock::new(Instant::now()),
                         0,
                         fixture.scope_end,
                         &mut pending,

@@ -1159,18 +1159,7 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
         );
         std::thread::sleep(Duration::from_millis(25));
     };
-    f.wait(|f| {
-        let c = f.control();
-        let store = ManagedStore::open(&f.db, &c).unwrap();
-        store
-            .with_read(
-                &c,
-                RequestIntersection::Selected,
-                Instant::now() + Duration::from_secs(2),
-                |read| read.latest_satisfied(&after_delete),
-            )
-            .unwrap()
-    });
+    f.wait(|f| latest_satisfied(f, &after_delete));
     let c = f.control();
     let sources = m2_sources(&f);
     let receipt = sources[0].latest_receipt.as_ref().unwrap();
@@ -2699,25 +2688,34 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
             )
             .unwrap();
         let barrier = admit_latest_barrier(&f, 221 + index);
-        let _ = m2_cycle_attempted(&f, &barrier);
+        let (_, cycle) = m2_cycle_attempted(&f, &barrier);
+        assert!(matches!(
+            cycle.state,
+            CycleState::Committed | CycleState::Partial
+        ));
+        assert!(
+            cycle
+                .selections
+                .iter()
+                .all(|selection| selection.discovered_count == 2 && selection.observed_count == 2)
+        );
         let progress = f
             .control()
             .bounded(|c| c.source_progress(&source_id))
             .unwrap();
-        if let Some(current) = progress.confirmation {
-            assert!(matches!(
-                current.kind,
-                ConfirmationKind::Rewrite { ref candidate_digest }
-                    if candidate_digest.as_str().starts_with("metadata_")
-            ));
-            assert_eq!(current.first_cycle, first.first_cycle);
-            assert_eq!(current.first_monotonic_ms, first.first_monotonic_ms);
-        } else {
-            assert!(
-                !f.has_text("wbsemanticoriginalneedle"),
-                "confirmation may clear only after the original evidence is retired"
-            );
-        }
+        assert_eq!(progress.last_observation.as_ref(), Some(&cycle.token));
+        let Some(current) = progress.confirmation else {
+            assert!(!f.has_text("wbsemanticoriginalneedle"));
+            break;
+        };
+        assert!(matches!(
+            current.kind,
+            ConfirmationKind::Rewrite { ref candidate_digest }
+                if candidate_digest.as_str().starts_with("metadata_")
+        ));
+        assert_eq!(current.first_cycle, first.first_cycle);
+        assert_eq!(current.first_monotonic_ms, first.first_monotonic_ms);
+        assert!(f.has_text("wbsemanticoriginalneedle"));
     }
     f.wait(|f| !f.has_text("wbsemanticoriginalneedle"));
     let deleted = admit_latest_barrier(&f, 225);
@@ -2751,6 +2749,98 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
     m2_assert_no_metadata_enrichment(&f, "wbsemanticoriginalneedle");
     assert_eq!(fs::read(&source).unwrap(), original);
     assert_eq!(fs::read(&metadata).unwrap(), metadata_after);
+}
+
+#[test]
+fn m2_workbuddy_metadata_failure_restarts_delete_proof_before_original_retirement() {
+    use agent_session_grep_ports::control::{BackgroundFailure, ConfirmationKind};
+    let native = "synthetic-wb-gap";
+    let original = m2_wb_transcript(native, "wbfailureoriginalneedle");
+    let mut f = Fixture::selected("workbuddy", |root| {
+        let surface = root.join(".workbuddy");
+        let project = surface.join("projects/project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("session.jsonl"), &original).unwrap();
+        m2_wb_database(&surface.join("workbuddy.db"), &[(native, None, "local")]);
+        surface
+    });
+    let metadata = f.history.join("workbuddy.db");
+    let transcript = f.history.join("projects/project/session.jsonl");
+    f.spawn();
+    f.wait(|f| f.has_text("wbfailureoriginalneedle"));
+    let source_id = ControlId::parse(
+        m2_source_for_path(&f, &transcript)
+            .binding
+            .source_id
+            .as_str(),
+    )
+    .unwrap();
+    let metadata_id =
+        ControlId::parse(m2_source_for_path(&f, &metadata).binding.source_id.as_str()).unwrap();
+    Connection::open(&metadata)
+        .unwrap()
+        .execute("UPDATE sessions SET deleted_at=1000 WHERE id=?1", [native])
+        .unwrap();
+    let mut first = None;
+    f.wait(|f| {
+        first = f
+            .control()
+            .bounded(|c| c.source_progress(&source_id))
+            .unwrap()
+            .confirmation;
+        first.as_ref().is_some_and(|candidate| {
+            matches!(&candidate.kind, ConfirmationKind::Rewrite { candidate_digest }
+                if candidate_digest.as_str().starts_with("metadata_"))
+        }) && f.has_text("wbfailureoriginalneedle")
+    });
+    let first = first.unwrap();
+    // A BLOB id rejects the whole metadata inventory, even after valid rows.
+    // The provider suite independently verifies this exact type boundary.
+    Connection::open(&metadata)
+        .unwrap()
+        .execute("INSERT INTO sessions VALUES(x'00',NULL,'local','x')", [])
+        .unwrap();
+    let started = Instant::now();
+    let mut failed_cycles = std::collections::BTreeSet::new();
+    let mut last_failed = None;
+    f.wait(|f| {
+        let control = f.control();
+        let progress = control.bounded(|c| c.source_progress(&source_id)).unwrap();
+        let metadata_progress = control
+            .bounded(|c| c.source_progress(&metadata_id))
+            .unwrap();
+        if metadata_progress.error == Some(BackgroundFailure::ScopeUnverified)
+            && progress.confirmation.is_none()
+        {
+            if let Some(token) = metadata_progress.last_observation {
+                failed_cycles.insert(token.cycle_seq);
+                last_failed = Some(token.cycle_seq);
+            }
+            assert!(f.has_text("wbfailureoriginalneedle"));
+        }
+        started.elapsed() >= Duration::from_secs(6) && failed_cycles.len() >= 2
+    });
+    let last_failed = last_failed.unwrap();
+    assert!(f.has_text("wbfailureoriginalneedle"));
+    Connection::open(&metadata)
+        .unwrap()
+        .execute("DELETE FROM sessions WHERE typeof(id)='blob'", [])
+        .unwrap();
+    let mut fresh = None;
+    f.wait(|f| {
+        fresh = f
+            .control()
+            .bounded(|c| c.source_progress(&source_id))
+            .unwrap()
+            .confirmation;
+        fresh.as_ref().is_some_and(|candidate| {
+            candidate.first_cycle > last_failed
+                && candidate.first_monotonic_ms > first.first_monotonic_ms
+        })
+    });
+    assert!(f.has_text("wbfailureoriginalneedle"));
+    f.wait(|f| !f.has_text("wbfailureoriginalneedle"));
+    assert_eq!(fs::read(&transcript).unwrap(), original);
 }
 
 #[test]
