@@ -160,6 +160,199 @@ fn current_open_discovers_identity_without_resetting_policy_or_granting_writes()
 }
 
 #[test]
+fn lifecycle_status_matches_full_status_through_policy_and_maintenance_changes() {
+    let (_temp, root, store) = setup();
+    let read = SqliteControlStore::open_current_read_only(&root).unwrap();
+    let observe = || {
+        store
+            .with_runtime_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(8),
+                || {
+                    let before = control_rows(&root);
+                    let status = store.status()?;
+                    assert_eq!(store.lifecycle_status()?, status);
+                    assert_eq!(read.lifecycle_status()?, status);
+                    assert!(control_rows(&root) == before);
+                    Ok(status)
+                },
+            )
+            .unwrap()
+    };
+    let initial = observe();
+    let selected = retry_expected_success(|| {
+        store.add_selection(
+            initial.policy.control_seq,
+            request(SearchProvider::Claude, "R", RootKind::Root),
+        )
+    })
+    .unwrap();
+    let enabled = observe();
+    assert!(allowed(&enabled.policy, SearchProvider::Claude, "R/F"));
+    assert_eq!(enabled.policy.selections, vec![selected.value.clone()]);
+
+    let paused = retry_expected_success(|| {
+        store.set_desired_updates(enabled.policy.control_seq, DesiredUpdates::Paused)
+    })
+    .unwrap();
+    let paused_status = observe();
+    assert_eq!(paused_status.desired_updates, DesiredUpdates::Paused);
+    assert_eq!(
+        paused_status.policy.policy_epoch,
+        enabled.policy.policy_epoch
+    );
+    assert!(allowed(
+        &paused_status.policy,
+        SearchProvider::Claude,
+        "R/F"
+    ));
+
+    let owner = id("lifecycle_owner");
+    let fence = MaintenanceFence {
+        state: MaintenanceState::Updating,
+        owner: Some(owner.clone()),
+        phase: Some(MaintenancePhase::Quiescing),
+    };
+    let fenced =
+        retry_expected_success(|| store.set_maintenance(paused.control_seq, &owner, fence.clone()))
+            .unwrap();
+    let fenced_status = observe();
+    assert_eq!(fenced_status.policy.maintenance, fence);
+    assert_eq!(fenced_status.desired_updates, DesiredUpdates::Paused);
+    assert!(fenced_status.policy.emission_blocked());
+
+    let revoked = retry_expected_success(|| {
+        store.revoke_selection(fenced.control_seq, &selected.value.id, None, 20)
+    })
+    .unwrap();
+    let denied = observe();
+    assert!(!allowed(&denied.policy, SearchProvider::Claude, "R/F"));
+    assert_eq!(denied.policy.revocations.len(), 1);
+    assert_eq!(
+        denied.policy.revocations[0].state,
+        RevocationState::AwaitingDrain
+    );
+    assert_eq!(denied.policy.exclusions.len(), 1);
+    assert_eq!(store.purge_jobs().unwrap()[0].state, PurgeState::Pending);
+
+    retry_expected_success(|| {
+        store.set_maintenance(revoked.control_seq, &owner, MaintenanceFence::idle())
+    })
+    .unwrap();
+    let idle = observe();
+    assert_eq!(idle.policy.maintenance, MaintenanceFence::idle());
+    assert_eq!(idle.desired_updates, DesiredUpdates::Paused);
+    assert!(!allowed(&idle.policy, SearchProvider::Claude, "R/F"));
+    assert!(idle.policy.emission_blocked());
+}
+
+#[test]
+fn lifecycle_status_expired_nested_end_preserves_control_and_restores_outer_scope() {
+    use std::time::{Duration, Instant};
+
+    let (_temp, root, store) = setup();
+    let selected = retry_expected_success(|| {
+        store.add_selection(zero(), request(SearchProvider::Claude, "R", RootKind::Root))
+    })
+    .unwrap();
+    retry_expected_success(|| {
+        store.set_desired_updates(selected.control_seq, DesiredUpdates::Paused)
+    })
+    .unwrap();
+    let before = control_rows(&root);
+    let outer_end = Instant::now() + Duration::from_secs(8);
+    store
+        .with_runtime_deadline(outer_end, || {
+            let expired = Instant::now();
+            let result = store.with_runtime_deadline(expired, || store.lifecycle_status());
+            assert!(matches!(result, Err(PortError::WriterBusy(_))));
+            let inner_end = Instant::now() + Duration::from_millis(40);
+            let result = store.with_runtime_deadline(inner_end, || {
+                while Instant::now() < inner_end {
+                    std::thread::sleep(
+                        Duration::from_millis(1)
+                            .min(inner_end.saturating_duration_since(Instant::now())),
+                    );
+                }
+                // Inspect the method's result before the wrapper's trailing tick.
+                let result = store.lifecycle_status();
+                assert!(matches!(&result, Err(PortError::WriterBusy(_))));
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(outer_end),
+                    inner_end
+                );
+                result
+            });
+            assert!(matches!(result, Err(PortError::WriterBusy(_))));
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(outer_end + Duration::from_secs(1)),
+                outer_end
+            );
+
+            let result = store.with_runtime_deadline(outer_end + Duration::from_secs(1), || {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(
+                        outer_end + Duration::from_secs(2)
+                    ),
+                    outer_end
+                );
+                store.lifecycle_status()
+            })?;
+            assert_eq!(result.desired_updates, DesiredUpdates::Paused);
+            Ok(())
+        })
+        .unwrap();
+    assert!(control_rows(&root) == before);
+    let later_end = Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(later_end),
+        later_end
+    );
+}
+
+#[test]
+fn lifecycle_status_rejects_retired_root_without_creating_or_changing_state() {
+    use agent_session_grep_adapters_sqlite::managed_control_lifetime::RETIREMENT_MARKER;
+
+    let (_temp, root, store) = setup();
+    let before = control_rows(&root);
+    // Marker presence is authoritative denial, even when its bytes are corrupt.
+    let marker = root.join(RETIREMENT_MARKER);
+    std::fs::write(&marker, b"synthetic-invalid-marker").unwrap();
+    let names = || {
+        let mut names = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before_names = names();
+    assert!(matches!(
+        store.lifecycle_status(),
+        Err(PortError::SchemaIncompatible(_))
+    ));
+    assert!(control_rows(&root) == before);
+    assert_eq!(names(), before_names);
+    assert_eq!(std::fs::read(marker).unwrap(), b"synthetic-invalid-marker");
+}
+
+#[cfg(unix)]
+#[test]
+fn lifecycle_status_rejects_changed_private_root_permissions_without_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp, root, store) = setup();
+    let before = control_rows(&root);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(store.lifecycle_status().is_err());
+    assert!(control_rows(&root) == before);
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
 fn fresh_schema_has_all_normative_tables_and_roundtrips() {
     let (_temp, root, store) = setup();
     let status = store.status().unwrap();
@@ -650,6 +843,53 @@ fn persisted_selection_exclusion_intent_and_purge_decoders_validate_all_fields()
             matches!(store.status(), Err(PortError::SchemaIncompatible(_))),
             "{sql}"
         );
+    }
+}
+
+#[test]
+fn lifecycle_status_rejects_schema_and_core_policy_corruption_without_mutation() {
+    for sql in [
+        "PRAGMA user_version=3",
+        "PRAGMA application_id=0",
+        "UPDATE control_meta SET schema_version=3",
+        "DROP INDEX cycles_runtime_state",
+        "PRAGMA ignore_check_constraints=ON; UPDATE control_meta SET desired_updates='private-secret'",
+        "UPDATE control_meta SET policy_epoch=control_seq+1",
+        "UPDATE control_meta SET maintenance_phase='unknown'",
+        "UPDATE selections SET canonical_locator='relative'",
+        "UPDATE selections SET revision=999999",
+        "UPDATE exclusions SET source_id='unexpected' WHERE region_kind='exact'",
+        "DELETE FROM purge_jobs",
+        "PRAGMA ignore_check_constraints=ON; UPDATE purge_jobs SET state='unknown'",
+        "UPDATE revocation_intents SET settled_at_ms=1",
+        "INSERT INTO private_artifacts VALUES('corrupt-artifact','unknown','backups/corrupt-artifact/catalog.db',0,NULL,'unknown',NULL)",
+        "INSERT INTO backup_manifests VALUES('corrupt-backup','unknown','backups/corrupt-backup/catalog.db','catalog_a',0,22,'',0,'unknown',10)",
+    ] {
+        let (_temp, root, store) = setup();
+        let selected = retry_expected_success(|| {
+            store.add_selection(
+                zero(),
+                request(SearchProvider::Claude, "R/F", RootKind::Exact),
+            )
+        })
+        .unwrap();
+        retry_expected_success(|| {
+            store.revoke_selection(selected.control_seq, &selected.value.id, None, 20)
+        })
+        .unwrap();
+        raw(&root).execute_batch(sql).unwrap();
+        let before = control_rows(&root);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let error = store
+            .with_runtime_deadline(end, || store.lifecycle_status())
+            .unwrap_err();
+        assert!(matches!(error, PortError::SchemaIncompatible(_)), "{sql}");
+        assert!(!format!("{error:?}").contains("private-secret"));
+        assert!(matches!(
+            store.with_runtime_deadline(end, || store.status()),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert!(control_rows(&root) == before, "{sql}");
     }
 }
 
@@ -1356,6 +1596,117 @@ fn background_corrupt_rows_fail_closed_without_defaulting_to_current() {
             SqliteControlStore::open_read_only(&root, &id("installation")).is_err(),
             "{sql}"
         );
+    }
+}
+
+#[test]
+fn lifecycle_status_does_not_validate_runtime_proof_or_enable_mutations() {
+    for sql in [
+        "UPDATE worker_state SET effective_state='unknown'",
+        "UPDATE cycles SET started_control_seq=admitted_control_seq",
+        "UPDATE cycle_selections SET discovery_complete=2",
+        "UPDATE barriers SET state='satisfied'",
+        "UPDATE barrier_selections SET selection_revision=99",
+        "UPDATE source_updates SET coverage='current'",
+        "UPDATE source_updates SET receipt_cycle=9999",
+    ] {
+        let (_temp, root, store, worker, selection) = worker_setup();
+        set_catalog(&store, &worker, "catalog_a");
+        let barrier = latest(&store, &selection, 140);
+        let cycle = retry_expected_success(|| {
+            store.start_cycle(current(&store), &worker, barrier.required_cycle_seq, 141)
+        })
+        .unwrap()
+        .value;
+        retry_expected_success(|| {
+            store.acknowledge_source(
+                current(&store),
+                &worker,
+                source_ack(&cycle, &selection, true),
+            )
+        })
+        .unwrap();
+        let before_status = retry_expected_success(|| store.status()).unwrap();
+        raw(&root).execute_batch(sql).unwrap();
+        let before = control_rows(&root);
+        store
+            .with_runtime_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(8),
+                || {
+                    assert_eq!(store.lifecycle_status()?, before_status);
+                    assert!(
+                        matches!(store.status(), Err(PortError::SchemaIncompatible(_))),
+                        "{sql}"
+                    );
+                    assert!(
+                        matches!(
+                            store.cycle(cycle.token.cycle_seq),
+                            Err(PortError::SchemaIncompatible(_))
+                        ),
+                        "{sql}"
+                    );
+                    assert!(
+                        matches!(
+                            store.barrier(&barrier.id),
+                            Err(PortError::SchemaIncompatible(_))
+                        ),
+                        "{sql}"
+                    );
+                    assert!(
+                        matches!(
+                            store.set_desired_updates(
+                                before_status.policy.control_seq,
+                                DesiredUpdates::Paused
+                            ),
+                            Err(PortError::SchemaIncompatible(_))
+                        ),
+                        "{sql}"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(control_rows(&root) == before, "{sql}");
+    }
+}
+
+#[test]
+fn lifecycle_status_keeps_runtime_front_capacity_refusal() {
+    use agent_session_grep_adapters_sqlite::control::MAX_RUNTIME_REFERENCES;
+
+    for injection in [
+        "INSERT INTO cycles SELECT value+1,NULL,0,'queued',0,NULL,NULL,NULL FROM n",
+        "INSERT INTO barriers SELECT 'corrupt-barrier-'||value,0,0,1,'pending',0,0,NULL,NULL,NULL FROM n",
+        "INSERT INTO source_updates(source_id,provider_id,coverage,update_state,backfill_state)
+         SELECT 'corrupt-source-'||value,'codex','unknown','unknown','unknown' FROM n",
+    ] {
+        let (_temp, root, store) = setup();
+        let conn = raw(&root);
+        // An over-bound corrupt inventory must refuse before runtime row decoding.
+        let sql = format!(
+            "WITH RECURSIVE n(value) AS (
+                 SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<?1
+             ) {injection}"
+        );
+        conn.execute(&sql, [i64::try_from(MAX_RUNTIME_REFERENCES).unwrap()])
+            .unwrap();
+        let before = control_rows(&root);
+        store
+            .with_runtime_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(8),
+                || {
+                    for result in [store.lifecycle_status(), store.status()] {
+                        assert!(matches!(
+                            result,
+                            Err(PortError::Backend(reason))
+                                if reason == "control runtime dependency capacity exceeded"
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(control_rows(&root) == before);
     }
 }
 

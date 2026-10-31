@@ -918,6 +918,28 @@ impl SqliteControlStore {
         }
     }
 
+    /// Read core policy, desired update intent and maintenance in one snapshot.
+    /// Runtime capacity remains checked, but cycles, barriers and source progress
+    /// are not decoded. This supplies no freshness, liveness or cleanup proof.
+    pub fn lifecycle_status(&self) -> PortResult<ControlStatus> {
+        if runtime_deadline().is_none() {
+            return self
+                .with_runtime_deadline(Instant::now() + BUSY_TIMEOUT, || self.lifecycle_status());
+        }
+        runtime_tick()?;
+        self.validate_live_root()?;
+        let mut conn = self.conn.borrow_mut();
+        configure_runtime_deadline(&conn)?;
+        let tx = conn.transaction().map_err(sql_error)?;
+        validate_policy_admission_capacity(&tx)?;
+        let status = load_status_core(&tx)?;
+        runtime_tick()?;
+        tx.commit().map_err(sql_error)?;
+        self.validate_live_root()?;
+        runtime_tick()?;
+        Ok(status)
+    }
+
     pub fn open_current_read_only_with_deadline(
         root: &Path,
         deadline: Instant,
