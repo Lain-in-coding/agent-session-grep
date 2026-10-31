@@ -605,25 +605,37 @@ fn mid_backup_cancel_is_interruptible_and_resume_uses_one_verified_copy() {
     advance(session.as_mut(), &mut job);
     let backup = backup_path(&job, job.backup.as_ref().unwrap()).unwrap();
     let temporary = backup.with_file_name("copy.sqlite");
+    // The copy must start inside the cancelled execute call, not earlier.
+    assert!(!temporary.exists() && !backup.exists());
+    let copy_path = temporary.clone();
     let control = MaintenanceControl::default();
     let flag = control.cancelled.clone();
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = finished.clone();
     let monitor = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
+        // Preflight before the copy may be slow under load. Watch until
+        // execute returns; the bound only guards a hung execute call.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
             if temporary.exists() {
                 flag.store(true, Ordering::Release);
-                return;
+                return true;
             }
             std::thread::yield_now();
         }
-        panic!("copy never started");
+        false
     });
     let outcome = session.execute(job.phase, &job, &control);
-    monitor.join().unwrap();
-    assert_eq!(
-        outcome.err().unwrap().kind,
-        MaintenanceFailureKind::Cancelled
+    finished.store(true, Ordering::Release);
+    let copy_started = monitor.join().unwrap();
+    let kind = outcome.as_ref().err().map(|error| error.kind);
+    assert!(
+        copy_started,
+        "execute returned before copy.sqlite appeared: {kind:?}"
     );
+    assert_eq!(kind, Some(MaintenanceFailureKind::Cancelled));
+    // The cancelled copy is left for resume to verify or replace.
+    assert!(copy_path.exists());
     assert!(!fixture.adapter.reconcile(&job).unwrap());
     drop(session);
     let mut session = fixture.adapter.acquire(&job).unwrap();

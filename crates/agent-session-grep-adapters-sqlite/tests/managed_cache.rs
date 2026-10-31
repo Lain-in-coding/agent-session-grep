@@ -26,6 +26,9 @@ fn seq(c: &SqliteControlStore) -> ControlSeq {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
+/// Fixture preparation and state reads share one end. Production calls keep
+/// their own deadlines; a nested scope can only shorten one, never extend it.
+const FIXTURE_BUDGET: Duration = Duration::from_secs(30);
 fn acquire(root: &Path, kind: LockKind) -> ExclusiveGuard {
     let until = deadline();
     loop {
@@ -56,54 +59,59 @@ struct Fixture {
     worker_lock: ExclusiveGuard,
     observation: SourceObservation,
     selection: ControlId,
+    end: Instant,
 }
 impl Fixture {
     fn new() -> Self {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let end = Instant::now() + FIXTURE_BUDGET;
         let root = temp.path().join("private");
         let db = root.join("catalog.db");
         let control =
             SqliteControlStore::create(&root, &id("cache-installation"), DesiredUpdates::Running)
                 .unwrap();
-        let selection = control
-            .add_selection(
-                seq(&control),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: CanonicalLocator::from_path(temp.path()).unwrap(),
-                        kind: RootKind::Root,
-                    },
-                    root_identity: Some(id("source-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap()
-            .value;
-        let worker_lock = acquire(&root, LockKind::Background);
-        let worker = control.bind_worker(&worker_lock, id("boot-one")).unwrap();
-        control
-            .register_worker(seq(&control), &worker, 1, 1)
+        // Control preparation reads share the fixture end instead of each
+        // creating its own 250ms status budget. Busy/expiry still fails.
+        let (selection, worker_lock, cycle) = control
+            .with_runtime_deadline(end, || {
+                let selection = control
+                    .add_selection(
+                        seq(&control),
+                        SelectionRequest {
+                            region: ScopeRegion {
+                                provider: SearchProvider::Claude,
+                                locator: CanonicalLocator::from_path(temp.path()).unwrap(),
+                                kind: RootKind::Root,
+                            },
+                            root_identity: Some(id("source-root")),
+                            now_ms: 1,
+                        },
+                    )?
+                    .value;
+                let worker_lock = acquire(&root, LockKind::Background);
+                let worker = control.bind_worker(&worker_lock, id("boot-one"))?;
+                control.register_worker(seq(&control), &worker, 1, 1)?;
+                let cycle = match control
+                    .queue_cycle(
+                        seq(&control),
+                        vec![SelectionRevision {
+                            selection_id: selection.id.clone(),
+                            revision: selection.revision,
+                            root_identity: id("source-root"),
+                        }],
+                    )?
+                    .value
+                {
+                    CycleAdmission::Queued(c) => c,
+                    _ => panic!("fixture cycle"),
+                };
+                let cycle = control
+                    .start_cycle(seq(&control), &worker, cycle.token.cycle_seq, 2)?
+                    .value;
+                drop(worker);
+                Ok((selection, worker_lock, cycle))
+            })
             .unwrap();
-        let cycle = match control
-            .queue_cycle(
-                seq(&control),
-                vec![SelectionRevision {
-                    selection_id: selection.id.clone(),
-                    revision: selection.revision,
-                    root_identity: id("source-root"),
-                }],
-            )
-            .unwrap()
-            .value
-        {
-            CycleAdmission::Queued(c) => c,
-            _ => panic!("fixture cycle"),
-        };
-        let cycle = control
-            .start_cycle(seq(&control), &worker, cycle.token.cycle_seq, 2)
-            .unwrap()
-            .value;
         let observation = SourceObservation {
             binding: SourceBinding {
                 source_id: SourceId::parse("PRIVATE_CACHE_SOURCE").unwrap(),
@@ -133,7 +141,6 @@ impl Fixture {
             }],
             repositories: vec![],
         };
-        drop(worker);
         let f = Self {
             _temp: temp,
             root,
@@ -142,18 +149,27 @@ impl Fixture {
             worker_lock,
             observation,
             selection: selection.id,
+            end,
         };
-        let store = ManagedStore::create(&f.db, &f.control, id("catalog-one"), 1).unwrap();
-        let worker = f
-            .control
-            .bind_worker(&f.worker_lock, id("boot-one"))
-            .unwrap();
-        store
-            .commit_source(&f.control, &worker, &f.batch(4, "needle"), &f.observation)
-            .unwrap();
-        drop(store);
-        drop(worker);
+        f.bounded(|| {
+            let store = ManagedStore::create(&f.db, &f.control, id("catalog-one"), 1).unwrap();
+            let worker = f
+                .control
+                .bind_worker(&f.worker_lock, id("boot-one"))
+                .unwrap();
+            store
+                .commit_source(&f.control, &worker, &f.batch(4, "needle"), &f.observation)
+                .unwrap();
+            drop(store);
+            drop(worker);
+            Ok(())
+        })
+        .unwrap();
         f
+    }
+    /// Runs fixture preparation or a state read under the one fixture end.
+    fn bounded<T>(&self, operation: impl FnOnce() -> Result<T, PortError>) -> Result<T, PortError> {
+        self.control.with_runtime_deadline(self.end, operation)
     }
     fn batch(&self, count: usize, text: &str) -> SourceBatch {
         let session = entity(IdKind::Session, "session");
@@ -190,27 +206,31 @@ impl Fixture {
         }
     }
     fn publish(&self, count: usize, text: &str, revision: &str) {
-        let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        let mut o = self.observation.clone();
-        o.revision_id = RevisionId::parse(revision).unwrap();
-        o.revision_digest = revision.into();
-        let mut batch = self.batch(count, text);
-        batch.fingerprint = Some(o.revision_digest.clone());
-        let document = batch
-            .entries
-            .iter_mut()
-            .find(|(id, _, _)| id.kind() == IdKind::Document)
-            .unwrap();
-        let mut data: serde_json::Value = serde_json::from_slice(&document.1).unwrap();
-        data["fingerprint"] = serde_json::json!(o.revision_digest);
-        document.1 = serde_json::to_vec(&data).unwrap();
-        store
-            .commit_source(&self.control, &worker, &batch, &o)
-            .unwrap();
+        self.bounded(|| {
+            let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))
+                .unwrap();
+            let mut o = self.observation.clone();
+            o.revision_id = RevisionId::parse(revision).unwrap();
+            o.revision_digest = revision.into();
+            let mut batch = self.batch(count, text);
+            batch.fingerprint = Some(o.revision_digest.clone());
+            let document = batch
+                .entries
+                .iter_mut()
+                .find(|(id, _, _)| id.kind() == IdKind::Document)
+                .unwrap();
+            let mut data: serde_json::Value = serde_json::from_slice(&document.1).unwrap();
+            data["fingerprint"] = serde_json::json!(o.revision_digest);
+            document.1 = serde_json::to_vec(&data).unwrap();
+            store
+                .commit_source(&self.control, &worker, &batch, &o)
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
     }
     fn append_independent_source(&self) {
         let mut batch = self.batch(1, "new source evidence");
@@ -259,15 +279,19 @@ impl Fixture {
         batch.placements = vec![MessagePlacement::new(
             session, document, message, 0, false, None,
         )];
-        let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        let committed = store
-            .commit_source(&self.control, &worker, &batch, &o)
-            .unwrap();
-        assert!(!committed.destructive);
+        self.bounded(|| {
+            let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))
+                .unwrap();
+            let committed = store
+                .commit_source(&self.control, &worker, &batch, &o)
+                .unwrap();
+            assert!(!committed.destructive);
+            Ok(())
+        })
+        .unwrap();
     }
     fn candidates(read: &impl ProjectionRead) -> Vec<CacheCandidate> {
         let mut rows = read
@@ -433,19 +457,22 @@ fn rewrite_revoke_and_incarnation_change_invalidate_without_generation_equality(
     let token = f.insert(102);
     let owner = acquire(&f.root, LockKind::PolicyOwner);
     let denied = f
-        .control
-        .revoke_selection(seq(&f.control), &f.selection, None, 103)
+        .bounded(|| {
+            f.control
+                .revoke_selection(seq(&f.control), &f.selection, None, 103)
+        })
         .unwrap();
     let drain = acquire(&f.root, LockKind::PolicyEmission);
-    f.control
-        .settle_revocation(
+    f.bounded(|| {
+        f.control.settle_revocation(
             denied.control_seq,
             &owner,
             &drain,
             &denied.value.intent.id,
             104,
         )
-        .unwrap();
+    })
+    .unwrap();
     drop(drain);
     drop(owner);
     assert!(matches!(
@@ -737,9 +764,11 @@ fn malformed_enum_range_or_source_manifest_is_expired_not_an_empty_page() {
 fn emission_drain_blocks_cache_insertion_and_pause_preserves_pages() {
     let f = Fixture::new();
     let cursor = f.insert(100);
-    f.control
-        .set_desired_updates(seq(&f.control), DesiredUpdates::Paused)
-        .unwrap();
+    f.bounded(|| {
+        f.control
+            .set_desired_updates(seq(&f.control), DesiredUpdates::Paused)
+    })
+    .unwrap();
     assert!(f.page(cursor.as_str(), 101).is_ok());
     let store = ManagedStore::open(&f.db, &f.control).unwrap();
     let cache = ManagedCache::at(&f.root, &f.control).unwrap();
@@ -982,7 +1011,12 @@ fn explicit_scope_cannot_insert_or_read_an_authorized_cache() {
     let conn = Connection::open(&f.db).unwrap();
     let scope = ReadScope {
         catalog_incarnation: "catalog-one".into(),
-        policy_epoch: f.control.status().unwrap().policy.policy_epoch.get(),
+        policy_epoch: f
+            .bounded(|| f.control.status())
+            .unwrap()
+            .policy
+            .policy_epoch
+            .get(),
         allowed: vec![f.observation.binding.clone()],
     };
     let read = ManagedRead::begin(&conn, &scope, deadline()).unwrap();
