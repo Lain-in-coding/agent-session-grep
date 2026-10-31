@@ -117,6 +117,9 @@ asg --version
 asg --asg-launcher-info
 ```
 
+On Windows, an application image that cannot be launched returns a launch
+failure without waiting for a Windows error dialog, including unattended runs.
+
 Use the installed managed command for an extracted-package candidate:
 
 ```text
@@ -594,6 +597,14 @@ originals remain readable with retained-evidence disclosure until reobserved.
 Incomplete restore stages remain pending cleanup. This is recorded program
 recovery, not an unscoped legacy backup restore.
 
+Recovery performed by this candidate also clears discovery coverage before
+resuming the recorded old program. Original evidence and current scope,
+pause and stop settings are preserved. A recorded beta.7 worker must complete
+its own exact-cycle discovery before coverage becomes complete again.
+`background status` shows worker liveness; `--latest` checks new evidence and
+does not start or resume updates. The actual beta.7/beta.8 recovery pair remains
+an acceptance gate.
+
 After clearing its owned maintenance fence, successful forward completion starts
 the verified next-version supervisor only if current desired updates are running.
 It restarts the proven owned native registration when autostart is enabled;
@@ -635,23 +646,35 @@ proof/policy/root changes restart confirmation. An offline or unreadable root
 is not deletion evidence. This grace window is a correctness rule, not measured
 five-second performance acceptance.
 
-During historical import, the worker rotates between changed active sources,
-cold sources and full verification. Already published Claude Code and Codex
-JSONL files can receive another verified observation within the same open
-cycle. A newly imported Claude Code or Codex JSONL source becomes eligible for
-revisits only in subsequent cycles. Metadata dependencies and other formats
-retain their existing complete observation and confirmation paths.
-File size and modification time only
-prioritize work; they never replace full content verification.
+During historical import, background work rotates among changed active
+sources, cold sources and full verification. Plain Claude Code and Codex
+JSONL sources with a current verified receipt can contribute to complete
+as-of coverage without another full capture in every cycle. Full verification
+still runs on a schedule. When unchanged bytes are fully verified, a new
+receipt is published without rewriting indexed messages. Each overlapping
+selection must have its own complete source proof; one selection cannot
+stand in for another. Other formats and metadata dependencies retain their
+existing full observation and confirmation paths.
 
-When a source's original observation deadline expires before its first attempt
-in that cycle, it remains pending for a later cycle and is not counted as
-observed. Published
-originals can be usable while the selected range is still partial. A complete
-latest result requires a complete matching discovery cycle; observing every
-source across several partial cycles does not satisfy that condition. Large
-sources, initial import and resource limits can keep latest incomplete.
-The five-second fixed-workload target remains an acceptance gate.
+File size and modification time prioritize work; they do not verify content.
+An expired unstarted attempt remains owed, and an unfinished final enumeration
+keeps the selection incomplete. Permitted original evidence can remain usable
+while coverage is partial.
+
+Reusing earlier plain-source receipts requires a verified installed worker
+and either a clean first installation or a matching terminal update journal.
+An unverified installation or unfinished update uses exact per-cycle source
+observations. Installed state is rechecked when complete discovery is
+published; a changed or unavailable state can leave coverage partial until
+the required source observations finish.
+
+Complete `--latest` coverage requires matching discovery and source receipts
+after request admission. Older receipts and observations spread across partial
+cycles do not satisfy it. A persisted request failure is reported even after a
+worker restart; temporary Busy or Deferred states keep waiting only within the
+original live request and deadline. Large sources, initial import and resource
+limits can keep latest incomplete. The fixed-workload five-second target remains
+an acceptance gate.
 Automatic rename/alias identity preservation and final overlapping-root
 acceptance remain under implementation/review.
 

@@ -397,7 +397,11 @@ output boundary, including structured JSON nested inside legacy string payloads.
 Ordinary `data.freshness` reports `coverage=empty|partial|complete` from the
 newest selected discovery and exact source receipts in the same catalog snapshot.
 Coverage is as of that observation; it never asserts a post-request observation
-and `latest_satisfied` remains false. Worker `update_state` is independent
+and `latest_satisfied` remains false. For eligible plain Claude Code and Codex
+JSONL, complete ordinary as-of coverage may refer to current verified source
+receipts from earlier cycles. Those receipts retain their original observation
+times and ownership; they do not satisfy a request admitted later.
+Worker `update_state` is independent
 (`running|idle|paused|stopped|offline|busy|failed|deferred|upgrading`). Selected and
 complete scope counts disclose backfill, while contributing/verified/pending/
 failed source counts and the oldest verified contributor observation time are

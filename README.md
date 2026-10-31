@@ -57,6 +57,10 @@ starts or resumes updates. Pause preserves permitted stored evidence; incomplete
 or unstable sources keep the last verified projection and leave latest unmet.
 Worker liveness and heartbeat never establish source freshness.
 
+Ordinary coverage may use current verified Claude Code or Codex JSONL receipts
+from earlier background cycles. A `--latest` read still requires matching
+source and discovery observations after the request was admitted.
+
 A verified managed candidate provides `asg update check [--channel beta|stable]`,
 `asg --db <catalog> update apply --from <archive>`, `update status` and
 `update recover`. Check uses only the installed, hash-verified HTTPS helper for

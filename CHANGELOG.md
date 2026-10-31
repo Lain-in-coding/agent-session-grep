@@ -343,6 +343,37 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Background updates can maintain complete as-of coverage for plain Claude
+  Code and Codex JSONL using current verified source receipts from earlier
+  cycles. Full content verification still runs on a schedule; unchanged
+  sources receive a new verified receipt without rewriting indexed messages.
+  Each overlapping history selection keeps its own discovery proof, and a
+  deadline or unfinished final enumeration leaves coverage incomplete.
+  `--latest` still requires matching observations after its own admission;
+  older receipts do not satisfy it. Other source formats and metadata
+  dependencies retain their existing full observation paths. The fixed
+  five-second freshness target still requires measurement.
+- `--latest` reports a persisted observation-request failure even after a
+  worker restart, instead of waiting for a timeout because the new worker
+  reports Busy or Deferred. Temporary Busy or Deferred states keep waiting
+  only while the same request remains live, within its original deadline.
+- Update recovery and rollback run by this candidate clear discovery coverage
+  before resuming the recorded old program. Original transcripts, receipt
+  identities and bytes, scope, pause and revocations are preserved. Complete
+  coverage requires a new permitted discovery; an update journal's terminal
+  phase does not establish refreshed history.
+- Reusing earlier plain-source receipts requires a verified installed worker
+  and either a clean first installation or an update journal in a matching
+  terminal state. Unverified installations and unfinished updates use exact
+  per-cycle observations. Installed state is checked again when publishing
+  complete discovery. Actual old/new package recovery remains an acceptance
+  gate.
+- Windows launchers return an application launch failure without waiting for
+  a Windows error dialog, so an unlaunchable installed image no longer blocks
+  unattended commands.
+- A whitespace-only tool-name filter in CLI or MCP requests is rejected
+  instead of acting as an unrestricted search. Accepted names still match
+  byte for byte.
 - Selected-history scheduling now revisits already published Claude Code and
   Codex JSONL sources between backfill attempts. Active work rotates fairly,
   cold import and full verification retain service, and expired unstarted
