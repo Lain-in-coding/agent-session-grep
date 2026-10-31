@@ -331,9 +331,45 @@ impl MaintenanceCatalog {
         })
     }
 
+    /// Clear disposable discovery proof before an owned old-program handoff.
+    /// Original evidence, receipt tokens and control policy remain unchanged.
+    pub fn clear_discovery_after_recovery(
+        &mut self,
+        control: &SqliteControlStore,
+        installation: &InstallationLockAuthority<'_>,
+        owner: &ControlId,
+        deadline: Instant,
+    ) -> PortResult<()> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            self.validate_authority(control, installation, owner)?;
+            check_deadline(deadline)?;
+            let policy = require_fence(control, owner)?;
+            let expected = self.identity.clone();
+            let conn = self.conn.as_mut().ok_or_else(storage)?;
+            set_sql_deadline(conn, deadline)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            if validate_compatible_identity(&tx, &expected.installation)? != expected {
+                return Err(incompatible("maintenance catalog identity changed"));
+            }
+            clear_discovery_proof(&tx)?;
+            installation.validate(control)?;
+            self._handles.validate_current(control.private_root())?;
+            control.validate_private_read(&self.path, self.pin.as_ref().ok_or_else(storage)?)?;
+            if require_fence(control, owner)? != policy {
+                return Err(busy("control policy changed during discovery invalidation"));
+            }
+            check_deadline(deadline)?;
+            tx.commit().map_err(sql)
+        })
+    }
+
     /// Rotate a catalog after interrupted update recovery without replacing
-    /// unchanged evidence with an older backup. The intent's incarnation is
-    /// generated and persisted by the installation journal before this call.
+    /// unchanged evidence with an older backup. Both rotation and replay clear
+    /// discovery proof before an older program may use this catalog.
+    /// The intent's incarnation is persisted by the installation journal.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_after_recovery(
         &mut self,
@@ -357,31 +393,38 @@ impl MaintenanceCatalog {
             if actual.incarnation != *original && actual.incarnation != *recovery {
                 return Err(incompatible("unexpected catalog during recovery"));
             }
-            let committed_identity = if actual.incarnation == *original {
+            let policy = require_fence(control, owner)?;
+            let committed_identity = {
                 let tx = self
                     .conn
                     .as_mut()
                     .ok_or_else(storage)?
-                    .transaction()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                crate::managed::retain_receipts_after_recovery(
-                    &tx,
-                    original.as_str(),
-                    recovery.as_str(),
-                    owner.as_str(),
-                )?;
-                let changed = tx.execute(
-                    "UPDATE catalog_meta SET catalog_incarnation=?1 WHERE singleton=1 AND catalog_incarnation=?2",
-                    [recovery.as_str(), original.as_str()],
-                ).map_err(sql)?;
-                if changed != 1 {
+                if validate_compatible_identity(&tx, &self.installation)? != actual {
                     return Err(incompatible("catalog recovery identity changed"));
                 }
-                tx.execute(
-                    "UPDATE store_metadata SET destructive_epoch=destructive_epoch+1 WHERE singleton=1",
-                    [],
-                )
-                .map_err(sql)?;
+                clear_discovery_proof(&tx)?;
+                if actual.incarnation == *original {
+                    crate::managed::retain_receipts_after_recovery(
+                        &tx,
+                        original.as_str(),
+                        recovery.as_str(),
+                        owner.as_str(),
+                    )?;
+                    let changed = tx.execute(
+                        "UPDATE catalog_meta SET catalog_incarnation=?1 WHERE singleton=1 AND catalog_incarnation=?2",
+                        [recovery.as_str(), original.as_str()],
+                    ).map_err(sql)?;
+                    if changed != 1 {
+                        return Err(incompatible("catalog recovery identity changed"));
+                    }
+                    tx.execute(
+                        "UPDATE store_metadata SET destructive_epoch=destructive_epoch+1 WHERE singleton=1",
+                        [],
+                    )
+                    .map_err(sql)?;
+                }
                 let rotated = validate_compatible_identity(&tx, &self.installation)?;
                 if rotated.incarnation != *recovery
                     || rotated.generation != actual.generation
@@ -389,10 +432,15 @@ impl MaintenanceCatalog {
                 {
                     return Err(incompatible("catalog recovery identity changed"));
                 }
+                installation.validate(control)?;
+                self._handles.validate_current(control.private_root())?;
+                control.validate_private_read(&self.path, self.pin.as_ref().ok_or_else(storage)?)?;
+                if require_fence(control, owner)? != policy {
+                    return Err(busy("control policy changed during catalog recovery"));
+                }
+                check_deadline(deadline)?;
                 tx.commit().map_err(sql)?;
                 rotated
-            } else {
-                actual
             };
             // Publish the identity read from the committed transaction before
             // any fallible control acknowledgement. A Busy acknowledgement
@@ -606,6 +654,15 @@ impl MaintenanceCatalog {
         check_deadline(deadline)?;
         Ok(BackupOutcome::Created(metadata))
     }
+}
+
+/// Both owned recovery paths must discard dependent rows in one transaction.
+fn clear_discovery_proof(tx: &rusqlite::Transaction<'_>) -> PortResult<()> {
+    tx.execute("DELETE FROM discovery_sources", [])
+        .map_err(sql)?;
+    tx.execute("DELETE FROM discovery_receipts", [])
+        .map_err(sql)?;
+    Ok(())
 }
 
 /// Verify one completed backup from control metadata, artifact bytes and the
@@ -914,8 +971,7 @@ fn prepare_restore_mode(
             // Restore keeps exact historical receipt bytes but invalidates
             // currentness/discovery until a newly authorized observation.
             tx.execute("UPDATE source_heads SET update_state='unknown',observed_cycle_seq=NULL WHERE update_state='current'",[]).map_err(sql)?;
-            tx.execute("DELETE FROM discovery_sources",[]).map_err(sql)?;
-            tx.execute("DELETE FROM discovery_receipts",[]).map_err(sql)?;
+            clear_discovery_proof(&tx)?;
             tx.execute("UPDATE catalog_meta SET catalog_incarnation=?1 WHERE singleton=1 AND catalog_incarnation=?2", [new_incarnation.as_str(), metadata.catalog_incarnation.as_str()]).map_err(sql)?;
             verify_quick_integrity(&tx)?;
             verify_derived_integrity(&tx, deadline)?;

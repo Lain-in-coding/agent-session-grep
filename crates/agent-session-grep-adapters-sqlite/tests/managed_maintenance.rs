@@ -470,6 +470,529 @@ fn bind_source(f: &Fixture, source: &str, relative: &str) {
     ).unwrap();
 }
 
+fn recovery_discovery(f: &Fixture, as_of: bool) {
+    use agent_session_grep_adapters_sqlite::{PARSER_SEMANTIC_VERSION, SourceBatch};
+    use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
+    use agent_session_grep_ports::managed::{
+        ObservationState, RevisionId, SelectionProof, SourceBinding, SourceId, SourceObservation,
+    };
+
+    let selected = select(f, "selected", RootKind::Root);
+    let selection = SelectionRevision {
+        selection_id: selected.id.clone(),
+        revision: selected.revision,
+        root_identity: selected.root_identity.clone().unwrap(),
+    };
+    let lock = acquire(&f.root, LockKind::Background);
+    let worker = f.control.bind_worker(&lock, id("recovery_boot")).unwrap();
+    f.control
+        .register_worker(
+            f.control.status().unwrap().policy.control_seq,
+            &worker,
+            1,
+            4,
+        )
+        .unwrap();
+    let store = ManagedStore::open_for_write(&f.catalog, &f.control).unwrap();
+    store.reconcile_progress(&f.control, &worker).unwrap();
+    let CycleAdmission::Queued(queued) = f
+        .control
+        .queue_cycle(
+            f.control.status().unwrap().policy.control_seq,
+            vec![selection.clone()],
+        )
+        .unwrap()
+        .value
+    else {
+        panic!("fixture cycle refused")
+    };
+    let cycle = f
+        .control
+        .start_cycle(
+            f.control.status().unwrap().policy.control_seq,
+            &worker,
+            queued.token.cycle_seq,
+            5,
+        )
+        .unwrap()
+        .value;
+    let message = StableId::native_checked(IdKind::Message, "recovery_message").unwrap();
+    let session = StableId::native_checked(IdKind::Session, "recovery_session").unwrap();
+    let document = StableId::native_checked(IdKind::Document, "recovery_document").unwrap();
+    let text = "  original recovery needle\n\tpreserve spaces  ";
+    let observation = SourceObservation {
+        binding: SourceBinding {
+            source_id: SourceId::parse("recovery_source").unwrap(),
+            source_path: source_locator("selected/source.jsonl").as_str().into(),
+            provider: SearchProvider::Claude,
+            namespace_id: None,
+            root_identity: selection.root_identity.as_str().into(),
+        },
+        revision_id: RevisionId::parse("recovery_revision").unwrap(),
+        revision_digest: "b".repeat(64),
+        parser_version: PARSER_SEMANTIC_VERSION,
+        state: ObservationState::Complete,
+        cycle_seq: cycle.token.cycle_seq.get(),
+        worker_boot_id: worker.boot_id().as_str().into(),
+        catalog_incarnation: "original_incarnation".into(),
+        policy_epoch: cycle.policy_epoch.get(),
+        started_control_seq: cycle.started_control_seq.unwrap().get(),
+        observed_at_ms: 6,
+        committed_at_ms: 7,
+        selections: vec![SelectionProof {
+            selection_id: selection.selection_id.as_str().into(),
+            selection_revision: selection.revision.get(),
+            root_identity: selection.root_identity.as_str().into(),
+        }],
+        repositories: vec![],
+    };
+    let batch = SourceBatch {
+        source_path: observation.binding.source_path.clone(),
+        entries: vec![
+            (
+                message.clone(),
+                serde_json::to_vec(
+                    &serde_json::json!({"role":"user","text":text,"timestamp":null}),
+                )
+                .unwrap(),
+                text.into(),
+            ),
+            (
+                session.clone(),
+                serde_json::to_vec(&serde_json::json!({"documents":[document.as_str()]})).unwrap(),
+                String::new(),
+            ),
+            (
+                document.clone(),
+                serde_json::to_vec(&serde_json::json!({
+                    "provider":"claude-code","variant":"synthetic-v1",
+                    "fingerprint":observation.revision_digest,"len":100
+                }))
+                .unwrap(),
+                String::new(),
+            ),
+        ],
+        placements: vec![MessagePlacement::new(
+            session, document, message, 0, false, None,
+        )],
+        edges: vec![],
+        activities: vec![],
+        usage_events: vec![],
+        relation_complete: true,
+        len_bytes: Some(100),
+        fingerprint: Some(observation.revision_digest.clone()),
+        provider_id: Some("claude-code".into()),
+        resume_claims: vec![],
+    };
+    store
+        .begin_discovery(&f.control, &worker, &cycle, &selection, 5)
+        .unwrap();
+    store
+        .commit_source(&f.control, &worker, &batch, &observation)
+        .unwrap();
+    store
+        .commit_discovery(
+            &f.control,
+            &worker,
+            &cycle,
+            &selection,
+            std::slice::from_ref(&observation.binding.source_id),
+            8,
+        )
+        .unwrap();
+    f.control
+        .finish_cycle(
+            f.control.status().unwrap().policy.control_seq,
+            &worker,
+            cycle.token.cycle_seq,
+            CycleFinish::Aborted,
+            9,
+        )
+        .unwrap();
+    if as_of {
+        let CycleAdmission::Queued(queued) = f
+            .control
+            .queue_cycle(
+                f.control.status().unwrap().policy.control_seq,
+                vec![selection.clone()],
+            )
+            .unwrap()
+            .value
+        else {
+            panic!("fixture epoch refused")
+        };
+        let later = f
+            .control
+            .start_cycle(
+                f.control.status().unwrap().policy.control_seq,
+                &worker,
+                queued.token.cycle_seq,
+                10,
+            )
+            .unwrap()
+            .value;
+        store
+            .begin_discovery(&f.control, &worker, &later, &selection, 10)
+            .unwrap();
+        // The real plain-epoch facade closes the later admitted cycle with the
+        // original receipt, re-proving that the earlier cycle owns it.
+        store
+            .commit_discovery_epoch_with_deadline(
+                &f.control,
+                &worker,
+                &later,
+                &selection,
+                std::slice::from_ref(&observation.binding.source_id),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        // Both complete fences name the current head receipt, and that receipt
+        // still belongs to the earlier cycle: the later fence is as-of.
+        let first = rusqlite::types::Value::Integer(cycle.token.cycle_seq.get());
+        let second = rusqlite::types::Value::Integer(later.token.cycle_seq.get());
+        let yes = rusqlite::types::Value::Integer(1);
+        assert!(later.token.cycle_seq.get() > cycle.token.cycle_seq.get());
+        assert_eq!(
+            recovery_rows(
+                &f.catalog,
+                "SELECT d.cycle_seq,d.complete,r.cycle_seq,r.revision_id=h.latest_receipt_id \
+                 FROM discovery_receipts d JOIN discovery_sources s \
+                 ON s.cycle_seq=d.cycle_seq AND s.selection_id=d.selection_id \
+                 JOIN source_revision_receipts r ON r.revision_id=s.revision_id \
+                 JOIN source_heads h ON h.source_id=s.source_id ORDER BY d.cycle_seq",
+            ),
+            vec![
+                vec![first.clone(), yes.clone(), first.clone(), yes.clone()],
+                vec![second, yes.clone(), first, yes],
+            ]
+        );
+        f.control
+            .finish_cycle(
+                f.control.status().unwrap().policy.control_seq,
+                &worker,
+                later.token.cycle_seq,
+                CycleFinish::Aborted,
+                11,
+            )
+            .unwrap();
+    }
+}
+
+fn recovery_rows(path: &Path, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = conn.prepare(query).unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn recovery_originals(path: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "source_bindings",
+        "source_heads",
+        "source_revision_receipts",
+        "receipt_selection_claims",
+        "source_scope_claims",
+        "source_projections",
+        "source_occurrences",
+        "source_entity_projections",
+        "source_session_projections",
+        "source_scans",
+        "source_publication_contexts",
+        "source_context_heads",
+        "index_batches",
+    ]
+    .iter()
+    .map(|table| recovery_rows(path, &format!("SELECT * FROM {table} ORDER BY rowid")))
+    .collect()
+}
+
+#[test]
+fn normal_exact_discovery_open_preserves_original_content_and_proof() {
+    let f = Fixture::new();
+    recovery_discovery(&f, false);
+    let originals = recovery_originals(&f.catalog);
+    let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
+    let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
+    assert_eq!(discoveries.len(), 1);
+    assert_eq!(members.len(), 1);
+    let store = ManagedStore::open(&f.catalog, &f.control).unwrap();
+    drop(store);
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts"),
+        discoveries
+    );
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_sources"),
+        members
+    );
+}
+
+#[test]
+fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_receipts() {
+    let f = Fixture::new();
+    recovery_discovery(&f, true);
+    let denied = select(&f, "denied", RootKind::Root);
+    f.control
+        .revoke_selection(
+            f.control.status().unwrap().policy.control_seq,
+            &denied.id,
+            None,
+            12,
+        )
+        .unwrap();
+    f.control
+        .set_desired_updates(
+            f.control.status().unwrap().policy.control_seq,
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+    f.fence("owner");
+    let originals = recovery_originals(&f.catalog);
+    let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
+    let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
+    assert_eq!(discoveries.len(), 2);
+    assert_eq!(members.len(), 2);
+    let before = f.control.status().unwrap();
+    let installation = f
+        .control
+        .bind_installation(&f.prefix, &f.installation_lock)
+        .unwrap();
+    let mut catalog = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        end(),
+    )
+    .unwrap();
+    catalog
+        .rotate_after_recovery(
+            &f.control,
+            &installation,
+            &id("owner"),
+            &id("original_incarnation"),
+            &id("recovered"),
+            13,
+            end(),
+        )
+        .unwrap();
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_sources").is_empty());
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts").is_empty());
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    let after = f.control.status().unwrap();
+    assert_eq!(after.desired_updates, before.desired_updates);
+    assert_eq!(after.policy.selections, before.policy.selections);
+    assert_eq!(after.policy.exclusions, before.policy.exclusions);
+    assert_eq!(after.policy.revocations, before.policy.revocations);
+
+    // Reproduce a pre-fix committed rotation whose disposable proof survived.
+    let mut conn = rusqlite::Connection::open(&f.catalog).unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    let tx = conn.transaction().unwrap();
+    for row in &discoveries {
+        tx.execute(
+            "INSERT INTO discovery_receipts(cycle_seq,selection_id,selection_revision,\
+             worker_boot_id,policy_epoch,started_control_seq,catalog_incarnation,\
+             root_identity,source_set_digest,complete,committed_generation) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            rusqlite::params_from_iter(row),
+        )
+        .unwrap();
+    }
+    for row in &members {
+        tx.execute(
+            "INSERT INTO discovery_sources VALUES(?1,?2,?3,?4)",
+            rusqlite::params_from_iter(row),
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    catalog
+        .rotate_after_recovery(
+            &f.control,
+            &installation,
+            &id("owner"),
+            &id("original_incarnation"),
+            &id("recovered"),
+            14,
+            end(),
+        )
+        .unwrap();
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts").is_empty());
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_sources").is_empty());
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    assert_eq!(f.control.status().unwrap(), after);
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT destructive_epoch FROM store_metadata"),
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+    );
+}
+
+#[test]
+fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_effects() {
+    let f = Fixture::new();
+    recovery_discovery(&f, true);
+    let other = Fixture::new();
+    f.fence("owner");
+    other.fence("owner");
+    let installation = f
+        .control
+        .bind_installation(&f.prefix, &f.installation_lock)
+        .unwrap();
+    let other_installation = other
+        .control
+        .bind_installation(&other.prefix, &other.installation_lock)
+        .unwrap();
+    let mut catalog = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        end(),
+    )
+    .unwrap();
+    let before = f.control.status().unwrap();
+    let originals = recovery_originals(&f.catalog);
+    let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
+    let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
+    assert!(
+        catalog
+            .clear_discovery_after_recovery(&f.control, &installation, &id("other_owner"), end(),)
+            .is_err()
+    );
+    assert!(
+        catalog
+            .rotate_after_recovery(
+                &f.control,
+                &installation,
+                &id("owner"),
+                &id("original_incarnation"),
+                &id("original_incarnation"),
+                12,
+                end(),
+            )
+            .is_err()
+    );
+    assert!(
+        catalog
+            .clear_discovery_after_recovery(
+                &other.control,
+                &other_installation,
+                &id("owner"),
+                end(),
+            )
+            .is_err()
+    );
+    assert!(
+        f.control
+            .with_runtime_deadline(Instant::now(), || {
+                catalog.clear_discovery_after_recovery(
+                    &f.control,
+                    &installation,
+                    &id("owner"),
+                    end(),
+                )
+            })
+            .is_err()
+    );
+    assert!(
+        catalog
+            .rotate_after_recovery(
+                &f.control,
+                &installation,
+                &id("owner"),
+                &id("original_incarnation"),
+                &id("recovered"),
+                12,
+                Instant::now(),
+            )
+            .is_err()
+    );
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts"),
+        discoveries
+    );
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_sources"),
+        members
+    );
+    assert_eq!(f.control.status().unwrap(), before);
+    assert_eq!(catalog.identity().incarnation, id("original_incarnation"));
+}
+
+#[test]
+fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
+    let f = Fixture::new();
+    recovery_discovery(&f, true);
+    f.fence("owner");
+    let installation = f
+        .control
+        .bind_installation(&f.prefix, &f.installation_lock)
+        .unwrap();
+    let mut catalog = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        end(),
+    )
+    .unwrap();
+    let originals = recovery_originals(&f.catalog);
+    let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
+    let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
+    let before = f.control.status().unwrap();
+    let conn = rusqlite::Connection::open(&f.catalog).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_discovery_delete BEFORE DELETE ON discovery_receipts
+         BEGIN SELECT RAISE(ABORT,'synthetic deletion fault'); END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        catalog.clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end()),
+        Err(PortError::SchemaIncompatible(_)),
+    ));
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_sources"),
+        members
+    );
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts"),
+        discoveries
+    );
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    assert_eq!(f.control.status().unwrap(), before);
+    assert_eq!(catalog.identity().incarnation, id("original_incarnation"));
+    conn.execute_batch("DROP TRIGGER refuse_discovery_delete")
+        .unwrap();
+    catalog
+        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end())
+        .unwrap();
+    let identity = catalog.identity().clone();
+    let retained = recovery_rows(&f.catalog, "SELECT * FROM retained_source_receipts");
+    catalog
+        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end())
+        .unwrap();
+    assert_eq!(catalog.identity(), &identity);
+    assert_eq!(
+        recovery_rows(&f.catalog, "SELECT * FROM retained_source_receipts"),
+        retained,
+    );
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_sources").is_empty());
+    assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts").is_empty());
+    assert_eq!(recovery_originals(&f.catalog), originals);
+    assert_eq!(f.control.status().unwrap(), before);
+}
+
 #[test]
 fn installation_association_is_explicit_and_wrong_prefix_cannot_authorize_recovery() {
     let f = Fixture::new();

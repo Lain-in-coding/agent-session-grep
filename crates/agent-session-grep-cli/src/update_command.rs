@@ -1631,6 +1631,29 @@ fn finish_rollback(
     journal: &Journal<'_>,
     end: Instant,
 ) -> Result<(Outcome, Value), CliError> {
+    if control.status().map_err(port)?.policy.maintenance.state != MaintenanceState::Idle {
+        let mut catalog = MaintenanceCatalog::open_authorized(
+            control,
+            installation,
+            owner,
+            &journal.state.catalog,
+            end,
+        )
+        .map_err(port)?;
+        if !recovered_catalog_matches_program(
+            catalog.identity(),
+            &journal.state.old,
+            &journal.state.checkpoint,
+        ) {
+            return Err(problem(
+                CanonicalCode::UpdateRecoveryRequired,
+                "rollback catalog does not match the old program; retain the maintenance fence",
+            ));
+        }
+        catalog
+            .clear_discovery_after_recovery(control, installation, owner, end)
+            .map_err(port)?;
+    }
     verify_catalog_program_pair(
         control,
         installation,
