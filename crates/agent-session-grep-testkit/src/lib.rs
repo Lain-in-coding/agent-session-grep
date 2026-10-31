@@ -1,7 +1,7 @@
 //! Testkit：跨 crate 复用的测试构件，包括 fixture builder、只读断言和 fake Provider。
 //!
 //! 本 crate 只被其他 crate 的 `[dev-dependencies]` 依赖，绝不进入生产依赖图。
-//! 提供六类构件：
+//! 提供七类构件：
 //! 1. [`SessionBuilder`] —— 合成合法的 Canonical 会话，省去每个测试手搓样板；
 //! 2. [`InMemoryStore`] —— 同时实现 `CatalogStore` + `SearchIndex` 的内存后端；
 //! 3. [`FakeProvider`] —— 可配置的 `ProviderAdapter`，用于脱离真实格式测 ingestion；
@@ -10,6 +10,7 @@
 //!    fixture 读取与 BLAKE3 校验、canonical JSON 投影。消除 14 个适配器 golden.rs
 //!    里逐字复制的 `CollectingSink`/`Captured`/`read_expected`/`canonical_json`；
 //! 6. [`tempdir`] —— 祖先路径不含符号链接的临时目录，供托管私有根夹具使用。
+//! 7. [`cached_rustc_fixture`] —— 构建目录内按源码和编译器身份缓存的合成二进制。
 //!
 //! 所有合成数据一律用非真实内容，符合 R0 fixture 脱敏规范。
 
@@ -17,6 +18,7 @@ pub mod golden;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use agent_session_grep_domain::{
     DomainResult, IdKind, Message, MessageEdge, MessagePlacement, MessageRelation, Role,
@@ -630,6 +632,107 @@ pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
     }
 }
 
+/// Caches a std-only rustc fixture by source bytes, compiler identity and inputs.
+///
+/// Callers supply a build directory, never the system temporary directory.
+/// Each process compiles in a unique staging sibling before publishing it with
+/// one directory rename. Published directories are non-empty and never modified
+/// or deleted, so concurrent nextest processes may safely copy their binaries.
+/// An unusable cache or a bounded rename failure retains a private build copy.
+///
+/// # Panics
+///
+/// Panics if source I/O, staging creation, or a rustc invocation fails.
+pub fn cached_rustc_fixture(
+    cache: &Path,
+    source: &Path,
+    name: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> PathBuf {
+    use std::{fs, process::Command};
+
+    let compiler = || {
+        let output = Command::new("rustc").arg("-vV").output().unwrap();
+        assert!(output.status.success(), "rustc -vV failed");
+        output.stdout
+    };
+    let identity = compiler();
+    let code = fs::read(source).unwrap();
+    let mut key = blake3::Hasher::new();
+    let mut part = |bytes: &[u8]| {
+        key.update(&(bytes.len() as u64).to_le_bytes());
+        key.update(bytes);
+    };
+    part(b"asg-rustc-fixture-v1");
+    part(&identity);
+    part(&code);
+    part(name.as_bytes());
+    part(&(args.len() as u64).to_le_bytes());
+    for arg in args {
+        part(arg.as_bytes());
+    }
+    part(&(env.len() as u64).to_le_bytes());
+    for (var, value) in env {
+        part(var.as_bytes());
+        part(value.as_bytes());
+    }
+    let published = cache.join(key.finalize().to_hex().to_string());
+    let binary = published.join(name);
+    if binary.is_file() {
+        return binary;
+    }
+    fs::create_dir_all(cache).unwrap();
+    let staging = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(cache)
+        .unwrap();
+    // rustc reads the hashed bytes, so a concurrent edit cannot publish a
+    // binary under the digest of different source.
+    let staged_source = staging.path().join(source.file_name().unwrap());
+    fs::write(&staged_source, code).unwrap();
+    let result = Command::new("rustc")
+        .args(args)
+        .arg(staged_source)
+        .arg("-o")
+        .arg(staging.path().join(name))
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "fixture compilation: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    if compiler() != identity {
+        // The toolchain changed mid-build; keep this binary private.
+        return staging.keep().join(name);
+    }
+    for _ in 0..50 {
+        // Check before renaming: on Unix, rename silently replaces an empty
+        // directory, so an existing unusable entry would otherwise be lost.
+        if binary.is_file() {
+            return binary;
+        }
+        if fs::symlink_metadata(&published).is_ok() {
+            break;
+        }
+        match fs::rename(staging.path(), &published) {
+            Ok(()) => {
+                let _ = staging.keep();
+                return binary;
+            }
+            // Another process won; its directory was complete before rename.
+            Err(_) if binary.is_file() => return binary,
+            // An unusable published entry is never replaced or deleted.
+            Err(_) if fs::symlink_metadata(&published).is_ok() => break,
+            // Windows refuses the rename while a scanner holds a child open.
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    staging.keep().join(name)
+}
+
 #[cfg(windows)]
 fn windows_long_temp_dir() -> std::io::Result<std::path::PathBuf> {
     let temp = std::env::temp_dir();
@@ -926,5 +1029,239 @@ mod tests {
         let data = b"immutable source bytes";
         let count = assert_read_only(data, |b| b.iter().filter(|&&c| c == b' ').count());
         assert_eq!(count, 2);
+    }
+
+    const FIXTURE_ENV: &str = "ASG_TESTKIT_FIXTURE_VALUE";
+    const FIXTURE_ARGS: [&str; 1] = ["--edition=2024"];
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct PublishedEntry {
+        name: std::ffi::OsString,
+        len: u64,
+        modified: std::time::SystemTime,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PublishedSnapshot {
+        modified: std::time::SystemTime,
+        entries: Vec<PublishedEntry>,
+    }
+
+    fn fixture_name() -> String {
+        format!("cache-fixture{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    fn fixture_source(label: &str) -> String {
+        format!("fn main() {{ print!(\"{label}:{{}}\", env!(\"{FIXTURE_ENV}\")); }}\n")
+    }
+
+    fn fixture_cache_root() -> tempfile::TempDir {
+        let parent = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("asg-testkit-fixture-cache-tests");
+        std::fs::create_dir_all(&parent).unwrap();
+        tempfile::Builder::new()
+            .prefix("case-")
+            .tempdir_in(parent)
+            .unwrap()
+    }
+
+    fn run_fixture(binary: &Path) -> String {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let mut child = Command::new(binary)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "fixture did not exit before its deadline: {}",
+                    binary.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn published_snapshot(directory: &Path) -> PublishedSnapshot {
+        let mut entries = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                PublishedEntry {
+                    name: entry.file_name(),
+                    len: metadata.len(),
+                    modified: metadata.modified().unwrap(),
+                    bytes: metadata.is_file().then(|| std::fs::read(path).unwrap()),
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        PublishedSnapshot {
+            modified: std::fs::metadata(directory).unwrap().modified().unwrap(),
+            entries,
+        }
+    }
+
+    fn assert_complete_publications(cache: &Path, count: usize) {
+        let entries = std::fs::read_dir(cache)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), count, "cache must contain only publications");
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.starts_with(".staging-"), "staging leaked: {name}");
+            assert!(
+                !name.starts_with(".tmp"),
+                "temporary allocation leaked: {name}"
+            );
+            assert!(entry.file_type().unwrap().is_dir());
+            assert!(entry.path().join(fixture_name()).is_file());
+            assert!(entry.path().join("fixture.rs").is_file());
+        }
+    }
+
+    #[test]
+    fn cached_rustc_fixture_reuses_identical_inputs_and_separates_changed_inputs() {
+        let root = fixture_cache_root();
+        let cache = root.path().join("cache");
+        let source_a = root.path().join("source-a/fixture.rs");
+        let source_b = root.path().join("source-b/fixture.rs");
+        std::fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(source_b.parent().unwrap()).unwrap();
+        std::fs::write(&source_a, fixture_source("source-a")).unwrap();
+        std::fs::write(&source_b, fixture_source("source-b")).unwrap();
+        let name = fixture_name();
+        let compile = |source: &Path, value: &str| {
+            cached_rustc_fixture(
+                &cache,
+                source,
+                &name,
+                &FIXTURE_ARGS,
+                &[(FIXTURE_ENV, value)],
+            )
+        };
+
+        let first = compile(&source_a, "alpha");
+        assert_eq!(first.file_name(), Some(std::ffi::OsStr::new(&name)));
+        assert_eq!(first.parent().unwrap().parent(), Some(cache.as_path()));
+        assert_eq!(run_fixture(&first), "source-a:alpha");
+        let published = first.parent().unwrap().to_path_buf();
+        let before = published_snapshot(&published);
+
+        assert_eq!(compile(&source_a, "alpha"), first);
+        assert_eq!(published_snapshot(&published), before);
+
+        let env_changed = compile(&source_a, "beta");
+        assert_ne!(env_changed, first);
+        assert_eq!(run_fixture(&env_changed), "source-a:beta");
+
+        let source_changed = compile(&source_b, "alpha");
+        assert_ne!(source_changed, first);
+        assert_ne!(source_changed, env_changed);
+        assert_eq!(run_fixture(&source_changed), "source-b:alpha");
+
+        assert_eq!(compile(&source_a, "alpha"), first);
+        assert_eq!(run_fixture(&first), "source-a:alpha");
+        assert_eq!(published_snapshot(&published), before);
+        assert_complete_publications(&cache, 3);
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn cached_rustc_fixture_concurrent_cold_callers_share_one_publication() {
+        use std::sync::Barrier;
+
+        let root = fixture_cache_root();
+        let cache = root.path().join("cache");
+        let source = root.path().join("source/fixture.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, fixture_source("concurrent")).unwrap();
+        let name = fixture_name();
+        let start = Barrier::new(2);
+        let call = || {
+            start.wait();
+            cached_rustc_fixture(
+                &cache,
+                &source,
+                &name,
+                &FIXTURE_ARGS,
+                &[(FIXTURE_ENV, "same")],
+            )
+        };
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(call);
+            let second = scope.spawn(call);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_eq!(first, second);
+        assert_eq!(first.parent().unwrap().parent(), Some(cache.as_path()));
+        assert_eq!(run_fixture(&first), "concurrent:same");
+        assert_complete_publications(&cache, 1);
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn cached_rustc_fixture_keeps_an_unusable_published_entry() {
+        let root = fixture_cache_root();
+        let source = root.path().join("source/fixture.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, fixture_source("unusable")).unwrap();
+        let name = fixture_name();
+        let compile = |cache: &Path| {
+            cached_rustc_fixture(
+                cache,
+                &source,
+                &name,
+                &FIXTURE_ARGS,
+                &[(FIXTURE_ENV, "kept")],
+            )
+        };
+        // The key depends only on the inputs, so another cache root can hold
+        // an unusable entry under the same name without touching a binary.
+        let key = compile(&root.path().join("probe"))
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_owned();
+        let cache = root.path().join("cache");
+        let blocked = cache.join(key);
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        let private = compile(&cache);
+
+        assert_eq!(run_fixture(&private), "unusable:kept");
+        assert_ne!(private.parent(), Some(blocked.as_path()));
+        assert_eq!(private.parent().unwrap().parent(), Some(cache.as_path()));
+        assert_eq!(
+            std::fs::read_dir(&blocked).unwrap().count(),
+            0,
+            "an unusable published entry must not be replaced"
+        );
+        root.close().unwrap();
     }
 }

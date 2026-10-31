@@ -17,26 +17,16 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn probe() -> &'static Path {
-    static PROBE: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
-    &PROBE
-        .get_or_init(|| {
-            let temp = tempfile::tempdir().unwrap();
-            let binary = temp.path().join(APP_NAME);
-            let result = Command::new("rustc")
-                .arg("--edition=2024")
-                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/child.rs"))
-                .arg("-o")
-                .arg(&binary)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "probe build: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            (temp, binary)
-        })
-        .1
+    static PROBE: OnceLock<PathBuf> = OnceLock::new();
+    PROBE.get_or_init(|| {
+        agent_session_grep_testkit::cached_rustc_fixture(
+            &Path::new(env!("CARGO_TARGET_TMPDIR")).join("asg-rustc-fixtures"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/child.rs"),
+            APP_NAME,
+            &["--edition=2024"],
+            &[],
+        )
+    })
 }
 
 struct Fixture {

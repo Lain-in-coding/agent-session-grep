@@ -2,32 +2,23 @@ use super::*;
 use std::sync::OnceLock;
 
 fn fixture_binary() -> &'static Path {
-    static BINARY: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-    &BINARY
-        .get_or_init(|| {
-            let dir = agent_session_grep_testkit::tempdir().unwrap();
-            let binary = dir.path().join(if cfg!(windows) {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        // Lib unit tests get no CARGO_TARGET_TMPDIR; the test executable's
+        // own build directory keeps the cache out of %TEMP%.
+        let exe = std::env::current_exe().unwrap();
+        agent_session_grep_testkit::cached_rustc_fixture(
+            &exe.parent().unwrap().join("asg-rustc-fixtures"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup_hosts_app.rs"),
+            if cfg!(windows) {
                 "setup-fixture.exe"
             } else {
                 "setup-fixture"
-            });
-            let source =
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup_hosts_app.rs");
-            let output = std::process::Command::new("rustc")
-                .arg("--edition=2024")
-                .arg(source)
-                .arg("-o")
-                .arg(&binary)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "fixture compilation: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            (dir, binary)
-        })
-        .1
+            },
+            &["--edition=2024"],
+            &[],
+        )
+    })
 }
 
 struct Fixture {

@@ -71,32 +71,17 @@ fn version_dir() -> String {
     )
 }
 fn fixture_launcher() -> &'static Path {
-    static BIN: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-    &BIN.get_or_init(|| {
-        let temp = agent_session_grep_testkit::tempdir().unwrap();
-        let binary = temp.path().join(app_name());
-        let output = Command::new("rustc")
-            .arg("--edition=2024")
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/setup_command_launcher.rs"),
-            )
-            .arg("-o")
-            .arg(&binary)
-            .env(
-                "ASG_TEST_APP_RELATIVE",
-                format!("{}/{}", version_dir(), app_name()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "fixture compile: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        (temp, binary)
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let app = format!("{}/{}", version_dir(), app_name());
+        agent_session_grep_testkit::cached_rustc_fixture(
+            &Path::new(env!("CARGO_TARGET_TMPDIR")).join("asg-rustc-fixtures"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup_command_launcher.rs"),
+            app_name(),
+            &["--edition=2024"],
+            &[("ASG_TEST_APP_RELATIVE", app.as_str())],
+        )
     })
-    .1
 }
 struct Fixture {
     _temp: tempfile::TempDir,
