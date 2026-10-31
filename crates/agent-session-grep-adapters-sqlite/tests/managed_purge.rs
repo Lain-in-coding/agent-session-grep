@@ -62,7 +62,6 @@ fn entity(kind: IdKind) -> StableId {
     StableId::native_checked(kind, "shared-purge-fixture").unwrap()
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     catalog: PathBuf,
     control: SqliteControlStore,
@@ -70,6 +69,8 @@ struct Fixture {
     source_a: PathBuf,
     source_b: PathBuf,
     generation: u64,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

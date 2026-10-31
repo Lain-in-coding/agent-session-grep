@@ -75,7 +75,6 @@ fn downgrade_empty(path: &Path) {
     conn.execute_batch("ALTER TABLE store_metadata DROP COLUMN projection_contract_version; ALTER TABLE store_metadata DROP COLUMN managed_mode; ALTER TABLE store_metadata DROP COLUMN destructive_epoch; PRAGMA application_id=0; PRAGMA user_version=19; COMMIT;").unwrap();
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     source: PathBuf,
     destination: PathBuf,
     history: PathBuf,
@@ -84,6 +83,8 @@ struct Fixture {
     session: StableId,
     message: StableId,
     document: StableId,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

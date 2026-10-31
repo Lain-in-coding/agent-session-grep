@@ -46,12 +46,13 @@ fn assert_retired<T>(result: PortResult<T>) {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     prefix: PathBuf,
     catalog: PathBuf,
     control: Option<SqliteControlStore>,
     installation: ExclusiveGuard,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

@@ -36,10 +36,11 @@ fn entity(kind: IdKind, suffix: &str) -> StableId {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     catalog: PathBuf,
     conn: Connection,
+    // The SQLite connection must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

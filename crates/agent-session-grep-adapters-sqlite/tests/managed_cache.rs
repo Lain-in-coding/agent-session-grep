@@ -52,7 +52,6 @@ fn binding() -> CacheBinding {
     .unwrap()
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     db: PathBuf,
     control: SqliteControlStore,
@@ -60,6 +59,8 @@ struct Fixture {
     observation: SourceObservation,
     selection: ControlId,
     end: Instant,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

@@ -51,12 +51,13 @@ fn retry_expected_success<T>(
     }
 }
 struct Fixture {
-    _tmp: tempfile::TempDir,
     root: PathBuf,
     prefix: PathBuf,
     catalog: PathBuf,
     control: SqliteControlStore,
     installation_lock: ExclusiveGuard,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _tmp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

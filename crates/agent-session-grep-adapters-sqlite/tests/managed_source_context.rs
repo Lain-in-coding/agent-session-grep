@@ -1494,7 +1494,6 @@ fn obsolete_dependency_cycle_refuses_completion_and_rolls_back_other_deletions()
 }
 
 struct FacadeFixture {
-    _temp: tempfile::TempDir,
     root: std::path::PathBuf,
     catalog: std::path::PathBuf,
     surface: CanonicalLocator,
@@ -1503,6 +1502,8 @@ struct FacadeFixture {
     selection: Selection,
     cycle: ObservationCycle,
     provider: SearchProvider,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl FacadeFixture {
     fn new(provider: SearchProvider) -> Self {

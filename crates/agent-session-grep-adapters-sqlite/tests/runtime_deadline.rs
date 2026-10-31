@@ -64,11 +64,12 @@ fn make_v1(conn: &Connection) {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     control: SqliteControlStore,
     _background: ExclusiveGuard,
     selection: SelectionRevision,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

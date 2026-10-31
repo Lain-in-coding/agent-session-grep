@@ -36,7 +36,6 @@ fn entity(kind: IdKind) -> StableId {
 }
 
 struct Fixture {
-    temp: tempfile::TempDir,
     root: PathBuf,
     catalog: PathBuf,
     source: PathBuf,
@@ -45,6 +44,8 @@ struct Fixture {
     selection: SelectionRevision,
     snapshot: SourceSnapshot,
     session: RefCell<StableId>,
+    // Connections and OS guards must close before Windows temp cleanup.
+    temp: tempfile::TempDir,
 }
 
 impl Fixture {

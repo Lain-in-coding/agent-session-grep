@@ -41,12 +41,13 @@ fn acquire(root: &std::path::Path, kind: LockKind) -> ExclusiveGuard {
     }
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     catalog: PathBuf,
     control: SqliteControlStore,
     worker_lock: ExclusiveGuard,
     observation: SourceObservation,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {
