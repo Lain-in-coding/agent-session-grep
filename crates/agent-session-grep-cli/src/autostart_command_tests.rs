@@ -460,7 +460,10 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
         &mut |_, _, _| panic!(),
     );
     assert_eq!(expired.reason, Some(Reason::Timeout));
+    // Prepare the package before measuring the native timeout path.
+    let mut installation = Some(f.installation(true));
     let end = Instant::now() + Duration::from_secs(2);
+    let mut native_called = false;
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -468,13 +471,15 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
             prefix: None,
         },
         end,
-        &mut |_| Ok(f.installation(true)),
+        &mut |_| Ok(installation.take().unwrap()),
         &mut || Ok(f.location.clone()),
         &mut |_, _, deadline| {
             assert_eq!(deadline, end);
+            native_called = true;
             Err(native_manager::ErrorCode::Timeout.into())
         },
     );
+    assert!(native_called, "reason={:?}", result.reason);
     assert_eq!(result.status, "incomplete");
     assert_eq!(result.reason, Some(Reason::Timeout));
     assert!(result.intent_recorded && result.private_receipt_recorded);
@@ -766,6 +771,16 @@ fn transient_native_owner_contention_reads_one_verified_receipt_without_rewritin
 #[test]
 fn native_launch_observes_the_original_autostart_deadline() {
     let f = Fixture::new(DesiredUpdates::Running);
+    // Native callbacks use the prepared package within the measured deadline.
+    let mut installation = Some(f.installation(true));
+    let supervisor = installation
+        .as_ref()
+        .unwrap()
+        .supervisor
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     let end = Instant::now() + Duration::from_secs(3);
     let mut observed = false;
     let result = execute(
@@ -775,14 +790,14 @@ fn native_launch_observes_the_original_autostart_deadline() {
             prefix: None,
         },
         end,
-        &mut |_| Ok(f.installation(true)),
+        &mut |_| Ok(installation.take().unwrap()),
         &mut || Ok(f.location.clone()),
         &mut |_, args, _| {
             if args.iter().any(|arg| arg == "ExecStart") {
                 assert_eq!(SqliteControlStore::effective_runtime_deadline(end), end);
                 observed = true;
             }
-            Ok(f.response(args))
+            Ok(f.response_with_supervisor(args, &supervisor))
         },
     );
     assert!(observed, "reason={:?}", result.reason);
