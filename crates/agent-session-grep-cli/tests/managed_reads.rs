@@ -1,6 +1,6 @@
 //! Actual CLI reads over synthetic managed catalogs; no real assistant history.
 use agent_session_grep_adapters_sqlite::{
-    SourceBatch, SqliteControlStore,
+    PARSER_SEMANTIC_VERSION, SourceBatch, SqliteControlStore,
     control::BackupPurpose,
     managed_locks::{ExclusiveGuard, JobLockKey, LockKind},
     managed_maintenance::{
@@ -128,7 +128,7 @@ impl Fixture {
             revision_id: RevisionId::parse("PRIVATE_REVISION_ID").unwrap(),
             revision_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
-            parser_version: 1,
+            parser_version: PARSER_SEMANTIC_VERSION,
             state: ObservationState::Complete,
             cycle_seq: cycle.token.cycle_seq.get(),
             worker_boot_id: "private-boot".into(),
