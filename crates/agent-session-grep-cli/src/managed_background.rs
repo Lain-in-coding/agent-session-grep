@@ -4,6 +4,7 @@
 use crate::{
     CliError, ProtocolError, app_clock_ms,
     managed_source_discovery::{self, SourceDescriptor, SourceKind},
+    update_state::EpochGate,
 };
 use agent_session_grep_adapters_sqlite::{
     PARSER_SEMANTIC_VERSION, SourceBatch, SqliteControlStore, capture_with_deadline,
@@ -65,6 +66,7 @@ const FULL_VERIFICATION_INTERVAL: Duration = Duration::from_secs(300);
 struct ObservationClock {
     started: Instant,
     failures: RefCell<LostFailures>,
+    epoch_gate: EpochGate,
 }
 
 #[derive(Default)]
@@ -107,10 +109,20 @@ enum FailureScope {
 }
 
 impl ObservationClock {
+    fn at_startup(started: Instant) -> Self {
+        Self::with_epoch_gate(started, EpochGate::at_startup())
+    }
+
+    #[cfg(test)]
     fn new(started: Instant) -> Self {
+        Self::with_epoch_gate(started, EpochGate::fixture())
+    }
+
+    fn with_epoch_gate(started: Instant, epoch_gate: EpochGate) -> Self {
         Self {
             started,
             failures: RefCell::new(LostFailures::default()),
+            epoch_gate,
         }
     }
 
@@ -121,6 +133,19 @@ impl ObservationClock {
             ));
         }
         Ok(())
+    }
+
+    fn epoch_permit(
+        &self,
+        control: &SqliteControlStore,
+        end: Instant,
+        #[cfg(test)] hooks: &ScheduleTestHooks,
+    ) -> Result<crate::update_state::EpochPermit, crate::update_state::EpochRefusal> {
+        #[cfg(test)]
+        if let Some(prefix) = &hooks.epoch_lock_prefix {
+            return EpochGate::fixture_for_installation(prefix.clone()).permit(control, end);
+        }
+        self.epoch_gate.permit(control, end)
     }
 
     fn record_failure(
@@ -776,7 +801,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
     if initialized {
         return Ok(());
     }
-    let boot = ObservationClock::new(Instant::now());
+    let boot = ObservationClock::at_startup(Instant::now());
     let mut rounds = 0_u64;
     let mut history_pending = true;
     let mut pending_cycle = None;
@@ -1402,6 +1427,16 @@ fn run_cycle(
             .start_cycle(seq, authority, queued.token.cycle_seq, app_clock_ms())
             .map(|change| change.value)
     })?;
+    // A short eligibility check only chooses the plan. Release its permit
+    // before any root/source observation; publication must acquire a new one.
+    let epoch_plan_allowed = boot
+        .epoch_permit(
+            control,
+            end,
+            #[cfg(test)]
+            &schedule.hooks,
+        )
+        .is_ok();
     let result = observe_cycle(
         db,
         control,
@@ -1411,6 +1446,7 @@ fn run_cycle(
         &cycle,
         boot,
         schedule,
+        epoch_plan_allowed,
     );
     schedule.closed_idle_at = result
         .as_ref()
@@ -1834,6 +1870,7 @@ struct ScheduleTestHooks {
     probe_due: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     // Consumed only by final discover; never extends the original root end.
     final_discovery_end: Option<std::rc::Rc<std::cell::Cell<Option<Instant>>>>,
+    epoch_lock_prefix: Option<PathBuf>,
     source_phase: std::cell::Cell<SourceAttemptPhase>,
     on_event: Option<RefCell<ScheduleEventHook>>,
 }
@@ -1856,6 +1893,12 @@ enum ScheduleTestEvent<'a> {
         remaining: Duration,
     },
     Finalizing,
+    BeforeDiscoveryPublication {
+        epoch: bool,
+    },
+    AfterDiscoveryPublication {
+        epoch: bool,
+    },
 }
 
 #[cfg(test)]
@@ -3302,6 +3345,7 @@ fn observe_cycle(
     cycle: &ObservationCycle,
     boot: &ObservationClock,
     schedule: &mut SourceScheduleState,
+    epoch_plan_allowed: bool,
 ) -> PortResult<CycleOutcome> {
     let store = ManagedStore::open(db, control)?;
     let incarnation = store.incarnation().clone();
@@ -3461,8 +3505,12 @@ fn observe_cycle(
             &roots,
             scheduler.state,
         )?;
-        let full_due =
-            checked_hint.is_none() || scheduler.state.full_due(&group.id, scheduler.state.now());
+        // Still validate the inventory on refusal: a corrupt receipt is never
+        // an empty baseline. Exact planning then creates real source work.
+        let checked_hint = checked_hint.filter(|_| epoch_plan_allowed);
+        let full_due = !epoch_plan_allowed
+            || checked_hint.is_none()
+            || scheduler.state.full_due(&group.id, scheduler.state.now());
         let latest_due = scheduler.state.cycle_can_serve(
             source_revisions(group, &roots),
             cycle,
@@ -4127,34 +4175,93 @@ fn observe_cycle(
                         complete = false;
                         error = Some(BackgroundFailure::SourceChanged);
                     } else {
-                        let result = control.with_runtime_deadline(root.original_end, || {
-                            let writer = ManagedStore::open_for_write(db, control)?;
-                            if matches!(
+                        let epoch_candidate = epoch_plan_allowed
+                            && matches!(
                                 selection.region.provider,
                                 SearchProvider::Claude | SearchProvider::Codex
-                            ) {
-                                writer.commit_discovery_epoch_with_deadline(
-                                    control,
-                                    authority,
-                                    cycle,
-                                    &revision,
-                                    &ids,
-                                    root.original_end,
-                                )
-                            } else {
-                                writer.commit_discovery_with_deadline(
-                                    control,
-                                    authority,
-                                    cycle,
-                                    &revision,
-                                    &ids,
-                                    root.original_end,
-                                )
-                            }
+                            );
+                        let all_exact = ids.iter().all(|id| {
+                            matches!(
+                                outcomes.get(id.as_str()),
+                                Some(ObservationOutcome::Attempted {
+                                    published: true,
+                                    committed: true,
+                                    claimed,
+                                    ..
+                                }) if claimed.contains(&index)
+                            )
                         });
-                        if let Err(write_error) = result {
-                            error = Some(failure(&write_error));
+                        // The installation lock precedes the catalog writer and
+                        // lives through epoch publication. No lock spans the
+                        // source observation interval.
+                        let permit = if epoch_candidate {
+                            boot.epoch_permit(
+                                control,
+                                root.original_end,
+                                #[cfg(test)]
+                                &scheduler.state.hooks,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        if epoch_candidate && permit.is_none() && !all_exact {
+                            complete = false;
+                            // A baseline is not this cycle's receipt. Preserve
+                            // earned work and make later cycles pay the exact
+                            // obligation; do not reopen or extend this root.
+                            for id in &ids {
+                                if matches!(
+                                    outcomes.get(id.as_str()),
+                                    Some(ObservationOutcome::VerifiedBaseline { .. })
+                                ) && let Some(debt) = scheduler.state.sources.get_mut(id)
+                                {
+                                    debt.owed = true;
+                                }
+                            }
+                        } else {
+                            #[cfg(test)]
+                            scheduler.state.hooks.event(
+                                ScheduleTestEvent::BeforeDiscoveryPublication {
+                                    epoch: permit.is_some(),
+                                },
+                            )?;
+                            let result = control.with_runtime_deadline(root.original_end, || {
+                                let writer = ManagedStore::open_for_write(db, control)?;
+                                let result = if permit.is_some() {
+                                    writer.commit_discovery_epoch_with_deadline(
+                                        control,
+                                        authority,
+                                        cycle,
+                                        &revision,
+                                        &ids,
+                                        root.original_end,
+                                    )
+                                } else {
+                                    writer.commit_discovery_with_deadline(
+                                        control,
+                                        authority,
+                                        cycle,
+                                        &revision,
+                                        &ids,
+                                        root.original_end,
+                                    )
+                                };
+                                #[cfg(test)]
+                                if result.is_ok() {
+                                    scheduler.state.hooks.event(
+                                        ScheduleTestEvent::AfterDiscoveryPublication {
+                                            epoch: permit.is_some(),
+                                        },
+                                    )?;
+                                }
+                                result
+                            });
+                            if let Err(write_error) = result {
+                                error = Some(failure(&write_error));
+                            }
                         }
+                        drop(permit);
                     }
                 }
                 Err(PortError::WriterBusy(_)) => {
@@ -5425,6 +5532,9 @@ mod control_deadline_tests {
             let queued = self.read_control(|control| control.cycle(barrier.required_cycle_seq));
             let cycle = self.start(&worker, &queued);
             let result = self.control.with_runtime_deadline(self.scope_end, || {
+                let epoch_plan_allowed = boot
+                    .epoch_permit(&self.control, self.scope_end, &schedule.hooks)
+                    .is_ok();
                 observe_cycle(
                     &self.db,
                     &self.control,
@@ -5434,6 +5544,7 @@ mod control_deadline_tests {
                     &cycle,
                     boot,
                     schedule,
+                    epoch_plan_allowed,
                 )
             });
             let finish = match &result {
@@ -5493,6 +5604,9 @@ mod control_deadline_tests {
             };
             let cycle = self.start(&worker, &queued);
             let result = self.control.with_runtime_deadline(self.scope_end, || {
+                let epoch_plan_allowed = boot
+                    .epoch_permit(&self.control, self.scope_end, &schedule.hooks)
+                    .is_ok();
                 observe_cycle(
                     &self.db,
                     &self.control,
@@ -5502,6 +5616,7 @@ mod control_deadline_tests {
                     &cycle,
                     boot,
                     schedule,
+                    epoch_plan_allowed,
                 )
             });
             let finish = result
@@ -5515,6 +5630,39 @@ mod control_deadline_tests {
             .unwrap();
             let terminal = self.read_control(|control| control.cycle(cycle.token.cycle_seq));
             (result, terminal)
+        }
+
+        /// Uses production queue/start/planning/completion instead of repeating
+        /// the planner in the direct observation fixture.
+        fn production_cycle(
+            &self,
+            schedule: &mut SourceScheduleState,
+            boot: &ObservationClock,
+        ) -> (PortResult<CycleOutcome>, ObservationCycle) {
+            let worker = self.worker();
+            let mut pending = None;
+            let result = self.control.with_runtime_deadline(self.scope_end, || {
+                run_cycle(
+                    &self.db,
+                    &self.control,
+                    &worker,
+                    boot,
+                    0,
+                    self.scope_end,
+                    &mut pending,
+                    schedule,
+                )
+            });
+            assert!(
+                pending.is_none(),
+                "production completion must acknowledge its cycle"
+            );
+            let next = self
+                .read_control(|control| control.background_status())
+                .next_cycle_seq;
+            let cycle =
+                self.read_control(|control| control.cycle(CycleSeq::new(next.get() - 1).unwrap()));
+            (result, cycle)
         }
 
         fn head_claims(&self) -> i64 {
@@ -5572,6 +5720,7 @@ mod control_deadline_tests {
             now: Some(elapsed),
             probe_due: None,
             final_discovery_end: None,
+            epoch_lock_prefix: None,
             source_phase: Cell::new(SourceAttemptPhase::Prepare),
             on_event: Some(RefCell::new(Box::new(hook))),
         }
@@ -5627,6 +5776,364 @@ mod control_deadline_tests {
             );
             assert_eq!(std::fs::read(path).unwrap(), original);
         }
+    }
+
+    fn assert_exact_discovery(fixture: &CycleFixture, cycle: &ObservationCycle) {
+        let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+        let (members, crossed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(r.cycle_seq <> d.cycle_seq), 0)
+                 FROM discovery_receipts d
+                 JOIN discovery_sources s ON s.cycle_seq=d.cycle_seq AND s.selection_id=d.selection_id
+                 JOIN source_revision_receipts r ON r.source_id=s.source_id AND r.revision_id=s.revision_id
+                 WHERE d.cycle_seq=?1 AND d.complete=1",
+                [cycle.token.cycle_seq.get()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((members, crossed), (1, 0));
+    }
+
+    #[test]
+    fn scheduler_unverified_package_pays_real_exact_work_on_every_cycle() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("exact.jsonl", SearchProvider::Claude, "exactfallback");
+        let original = std::fs::read(&path).unwrap();
+        let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+        let mut schedule = SourceScheduleState::default();
+        let (first, first_cycle) = fixture.production_cycle(&mut schedule, &boot);
+        assert!(first.unwrap().all_sources_attempted);
+        assert_exact_discovery(&fixture, &first_cycle);
+        let before = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+
+        let (second, second_cycle) = fixture.production_cycle(&mut schedule, &boot);
+
+        let second = second.unwrap();
+        assert!(second.idle());
+        assert!(second.all_sources_attempted);
+        assert_eq!(second_cycle.state, CycleState::Committed);
+        let selection = &second_cycle.selections[0];
+        assert_eq!(
+            (
+                selection.discovered_count,
+                selection.observed_count,
+                selection.committed_count
+            ),
+            (1, 1, 1)
+        );
+        let after = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        assert_ne!(after.revision_id, before.revision_id);
+        assert_eq!(after.cycle_seq, second_cycle.token.cycle_seq.get());
+        assert_exact_discovery(&fixture, &second_cycle);
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn scheduler_commit_refusal_keeps_baselines_incomplete_and_owed_without_new_attempts() {
+        use crate::update_state::acquire_installation_lock;
+
+        let fixture = CycleFixture::new();
+        fixture.write_source("baseline.jsonl", SearchProvider::Claude, "refusedbaseline");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let before = fixture.sources().pop().unwrap();
+        let verified_at = schedule.sources[&before.binding.source_id].last_full_verified;
+        let prefix = fixture._temp.path().join("installation");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        let lock = Rc::new(RefCell::new(None));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let prefix = prefix.clone();
+            let lock = lock.clone();
+            move |event| {
+                match event {
+                    ScheduleTestEvent::BeforeAttempt(..) => {
+                        panic!("the quiet baseline should not be attempted before refusal")
+                    }
+                    ScheduleTestEvent::Finalizing => {
+                        *lock.borrow_mut() = Some(
+                            acquire_installation_lock(
+                                &prefix,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    ScheduleTestEvent::BeforeDiscoveryPublication { .. } => {
+                        panic!("a refused baseline cannot open a discovery writer")
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+        schedule.hooks.epoch_lock_prefix = Some(prefix.clone());
+        let (refused, cycle) = fixture.ordinary(&mut schedule, &boot);
+        assert!(!refused.unwrap().catalog_complete);
+        assert_eq!(cycle.state, CycleState::Partial);
+        let selection = &cycle.selections[0];
+        assert!(!selection.discovery_complete);
+        assert_eq!(selection.error, Some(BackgroundFailure::Deferred));
+        assert_eq!(
+            (selection.observed_count, selection.committed_count),
+            (0, 0)
+        );
+        assert_eq!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+        assert_eq!(
+            schedule.sources[&before.binding.source_id].last_full_verified,
+            verified_at
+        );
+        assert!(schedule.sources[&before.binding.source_id].owed);
+        assert!(lock.borrow().is_some());
+        drop(lock.borrow_mut().take());
+        schedule.hooks = ScheduleTestHooks::default();
+        let (repaid, _) = fixture.ordinary(&mut schedule, &boot);
+        assert!(repaid.unwrap().all_sources_attempted);
+        assert_ne!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+    }
+
+    #[test]
+    fn scheduler_mixed_attempt_and_baseline_refusal_preserves_earned_work_and_owes_baseline() {
+        use crate::update_state::acquire_installation_lock;
+
+        let fixture = CycleFixture::new();
+        fixture.write_source("baseline.jsonl", SearchProvider::Claude, "mixedbaseline");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(
+            fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        let before = fixture.sources().pop().unwrap();
+        let baseline_id = before.binding.source_id.clone();
+        let verified_at = schedule.sources[&baseline_id].last_full_verified;
+        fixture.write_source("new.jsonl", SearchProvider::Claude, "mixedearned");
+        let prefix = fixture._temp.path().join("installation");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        let lock = Rc::new(RefCell::new(None));
+        let attempts = Rc::new(Cell::new(0));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let prefix = prefix.clone();
+            let baseline_id = baseline_id.clone();
+            let lock = lock.clone();
+            let attempts = attempts.clone();
+            move |event| {
+                match event {
+                    ScheduleTestEvent::BeforeAttempt(id, _, _) => {
+                        assert_ne!(*id, baseline_id);
+                        attempts.set(attempts.get() + 1);
+                    }
+                    ScheduleTestEvent::Finalizing => {
+                        *lock.borrow_mut() = Some(
+                            acquire_installation_lock(
+                                &prefix,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    ScheduleTestEvent::BeforeDiscoveryPublication { .. } => {
+                        panic!("one attempted source cannot authorize an exact baseline member")
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+        schedule.hooks.epoch_lock_prefix = Some(prefix);
+
+        let (refused, cycle) = fixture.production_cycle(&mut schedule, &boot);
+
+        assert!(!refused.unwrap().catalog_complete);
+        assert_eq!(cycle.state, CycleState::Partial);
+        let selection = &cycle.selections[0];
+        assert!(!selection.discovery_complete);
+        assert_eq!(selection.error, Some(BackgroundFailure::Deferred));
+        assert_eq!(
+            (
+                selection.discovered_count,
+                selection.observed_count,
+                selection.committed_count
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(attempts.get(), 1);
+        let sources = fixture.sources();
+        let baseline = sources
+            .iter()
+            .find(|source| source.binding.source_id == baseline_id)
+            .unwrap();
+        assert_eq!(baseline.latest_receipt, before.latest_receipt);
+        assert_eq!(
+            schedule.sources[&baseline_id].last_full_verified,
+            verified_at
+        );
+        assert!(schedule.sources[&baseline_id].owed);
+        let earned = sources
+            .iter()
+            .find(|source| source.binding.source_id != baseline_id)
+            .unwrap();
+        let earned_receipt = earned.latest_receipt.clone().unwrap();
+        assert!(earned_receipt.published);
+        assert_eq!(earned_receipt.cycle_seq, cycle.token.cycle_seq.get());
+        let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT complete FROM discovery_receipts WHERE cycle_seq=?1 AND selection_id=?2",
+                rusqlite::params![cycle.token.cycle_seq.get(), fixture.selection.id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM discovery_sources WHERE cycle_seq=?1",
+                [cycle.token.cycle_seq.get()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        drop(lock.borrow_mut().take());
+        schedule.hooks = ScheduleTestHooks::default();
+        let (repaid, repaid_cycle) = fixture.production_cycle(&mut schedule, &boot);
+        assert!(repaid.unwrap().catalog_complete);
+        assert_eq!(repaid_cycle.selections[0].observed_count, 1);
+        let sources = fixture.sources();
+        assert_ne!(
+            sources
+                .iter()
+                .find(|source| source.binding.source_id == baseline_id)
+                .unwrap()
+                .latest_receipt,
+            before.latest_receipt
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .find(|source| source.binding.source_id != baseline_id)
+                .unwrap()
+                .latest_receipt,
+            Some(earned_receipt)
+        );
+    }
+
+    #[test]
+    fn scheduler_commit_refusal_can_close_only_fully_attempted_exact_receipts() {
+        use crate::update_state::acquire_installation_lock;
+
+        let fixture = CycleFixture::new();
+        fixture.write_source("attempted.jsonl", SearchProvider::Claude, "exactonrefusal");
+        let prefix = fixture._temp.path().join("installation");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let lock = Rc::new(RefCell::new(None));
+        let exact = Rc::new(Cell::new(false));
+        let mut hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let prefix = prefix.clone();
+            let lock = lock.clone();
+            let exact = exact.clone();
+            move |event| {
+                match event {
+                    ScheduleTestEvent::BeforeAttempt(..) => {
+                        // Planning released the lock before source observation.
+                        drop(
+                            acquire_installation_lock(
+                                &prefix,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    ScheduleTestEvent::Finalizing => {
+                        *lock.borrow_mut() = Some(
+                            acquire_installation_lock(
+                                &prefix,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    ScheduleTestEvent::BeforeDiscoveryPublication { epoch } => {
+                        assert!(!epoch);
+                        exact.set(true);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+        hooks.epoch_lock_prefix = Some(prefix);
+        let mut schedule = SourceScheduleState {
+            hooks,
+            ..SourceScheduleState::default()
+        };
+
+        let (outcome, cycle) = fixture.production_cycle(&mut schedule, &boot);
+
+        assert!(outcome.unwrap().all_sources_attempted);
+        assert!(exact.get());
+        assert!(cycle.selections[0].discovery_complete);
+        assert_exact_discovery(&fixture, &cycle);
+        drop(lock.borrow_mut().take());
+    }
+
+    #[test]
+    fn scheduler_epoch_holds_installation_permit_until_the_publication_returns() {
+        use crate::update_state::acquire_installation_lock;
+        use agent_session_grep_adapters_sqlite::managed_locks::JobLockKey;
+
+        let fixture = CycleFixture::new();
+        fixture.write_source("locked.jsonl", SearchProvider::Claude, "lockedevidence");
+        let prefix = fixture._temp.path().join("installation");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let published = Rc::new(Cell::new(false));
+        let committed = Rc::new(Cell::new(false));
+        let mut hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let prefix = prefix.clone();
+            let published = published.clone();
+            let committed = committed.clone();
+            move |event| {
+                if let ScheduleTestEvent::BeforeDiscoveryPublication { epoch }
+                | ScheduleTestEvent::AfterDiscoveryPublication { epoch } = event
+                {
+                    assert!(epoch);
+                    assert!(matches!(
+                        ExclusiveGuard::try_acquire(
+                            &prefix,
+                            LockKind::MaintenanceJob(
+                                JobLockKey::parse("installation-update").unwrap()
+                            )
+                        ),
+                        Err(PortError::WriterBusy(_))
+                    ));
+                    if matches!(event, ScheduleTestEvent::BeforeDiscoveryPublication { .. }) {
+                        published.set(true);
+                    } else {
+                        committed.set(true);
+                    }
+                }
+                Ok(())
+            }
+        });
+        hooks.epoch_lock_prefix = Some(prefix.clone());
+        let mut schedule = SourceScheduleState {
+            hooks,
+            ..SourceScheduleState::default()
+        };
+
+        let (outcome, _) = fixture.ordinary(&mut schedule, &boot);
+
+        assert!(outcome.unwrap().catalog_complete);
+        assert!(published.get());
+        assert!(committed.get());
+        drop(acquire_installation_lock(&prefix, fixture.scope_end).unwrap());
     }
 
     #[test]
@@ -7159,6 +7666,9 @@ mod control_deadline_tests {
             }
         });
         let result = control.with_runtime_deadline(fixture.scope_end, || {
+            let epoch_plan_allowed = boot
+                .epoch_permit(control, fixture.scope_end, &schedule.hooks)
+                .is_ok();
             observe_cycle(
                 &fixture.db,
                 control,
@@ -7168,6 +7678,7 @@ mod control_deadline_tests {
                 &interrupted,
                 &boot,
                 &mut schedule,
+                epoch_plan_allowed,
             )
         });
         assert!(retired.get());

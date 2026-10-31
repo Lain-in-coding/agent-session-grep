@@ -5,6 +5,7 @@ use crate::{
     protocol::{CanonicalCode, ProtocolError},
     setup_hosts::ExpectedAsgIdentity,
 };
+use agent_session_grep_adapters_sqlite::managed_locks::RootIdentity;
 use agent_session_grep_launcher::{
     CurrentPointer, ReleaseMetadata, VerifiedApplication, metadata, verify_installation,
 };
@@ -15,6 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek},
     path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 
 #[cfg(windows)]
@@ -287,6 +289,53 @@ pub(crate) fn safe_member(value: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
         })
 }
+
+#[derive(PartialEq, Eq)]
+struct ImageStamp {
+    identity: (u64, u64),
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+impl ImageStamp {
+    fn read(file: &File) -> Result<Self, CliError> {
+        let metadata = file.metadata().map_err(invalid_install)?;
+        Ok(Self {
+            identity: crate::native_autostart::platform::identity(file).map_err(invalid_install)?,
+            len: metadata.len(),
+            modified: metadata.modified().map_err(invalid_install)?,
+            #[cfg(unix)]
+            changed: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.ctime(), metadata.ctime_nsec())
+            },
+        })
+    }
+}
+
+/// Bind one hash operation to the same physical image before and after it,
+/// and again before every later use. The pinned handle is retained.
+pub(crate) struct ImagePin {
+    path: PathBuf,
+    file: File,
+    stamp: ImageStamp,
+}
+impl ImagePin {
+    pub(crate) fn open(path: PathBuf) -> Result<Self, CliError> {
+        let file = pinned(&path)?;
+        let stamp = ImageStamp::read(&file)?;
+        Ok(Self { path, file, stamp })
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), CliError> {
+        let named = pinned(&self.path)?;
+        if ImageStamp::read(&self.file)? != self.stamp || ImageStamp::read(&named)? != self.stamp {
+            return Err(invalid_install("image changed"));
+        }
+        Ok(())
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
@@ -480,6 +529,136 @@ pub(crate) fn verify_supervisor(prefix: &Path, executable: &Path) -> Result<(), 
     .map(|_| ())
 }
 
+/// Exact mutable package records that identify the running package. Reads are
+/// bounded and short-lived; no handle to them outlives the read.
+#[derive(PartialEq, Eq)]
+struct PackageRecords {
+    receipt: Vec<u8>,
+    pointer: Vec<u8>,
+    release: Vec<u8>,
+    prefix_identity: RootIdentity,
+    version_identity: RootIdentity,
+}
+impl PackageRecords {
+    fn read(prefix: &Path) -> Result<Self, CliError> {
+        let receipt = bytes(&mut pinned(&prefix.join("package-install.json"))?, 8192)?;
+        let pointer = bytes(&mut pinned(&prefix.join("current.json"))?, 8192)?;
+        let parsed = CurrentPointer::parse(&pointer).map_err(invalid_install)?;
+        let version_dir = prefix.join(&parsed.dir);
+        ordinary(&version_dir)?;
+        let release = bytes(&mut pinned(&version_dir.join("release.json"))?, 8192)?;
+        Ok(Self {
+            receipt,
+            pointer,
+            release,
+            prefix_identity: RootIdentity::read(prefix).map_err(invalid_install)?,
+            version_identity: RootIdentity::read(&version_dir).map_err(invalid_install)?,
+        })
+    }
+}
+
+/// The installed package this process verified once, at startup. Only the
+/// running image stays pinned; mutable metadata pins are released so an
+/// update can switch the pointer. Every later use rechecks with bounded reads.
+pub(crate) struct RunningPackage {
+    prefix: PathBuf,
+    pointer: CurrentPointer,
+    release: ReleaseMetadata,
+    updated: bool,
+    records: PackageRecords,
+    image: ImagePin,
+}
+impl RunningPackage {
+    /// Full package verification. Call it once per worker lifetime only.
+    pub(crate) fn verify() -> Result<Self, CliError> {
+        Self::verify_running(&std::env::current_exe().map_err(invalid_install)?)
+    }
+
+    fn verify_running(running: &Path) -> Result<Self, CliError> {
+        let running = absolute(running)?;
+        let before = PackageRecords::read(&running_prefix(&running)?)?;
+        let image = ImagePin::open(running.clone())?;
+        let installation =
+            installation_for(None, Some(&running), false, false, SchemaAdmission::Current)?;
+        let member = installation
+            .prefix
+            .join(&installation.pointer.dir)
+            .join(&installation.pointer.app);
+        // Equal bytes elsewhere under versions/ are not the selected member.
+        if fs::canonicalize(&running).map_err(invalid_install)?
+            != fs::canonicalize(&member).map_err(invalid_install)?
+        {
+            return Err(invalid_install("running member"));
+        }
+        image.recheck()?;
+        let records = PackageRecords::read(&installation.prefix)?;
+        let receipt: InstallReceipt =
+            serde_json::from_slice(&records.receipt).map_err(invalid_install)?;
+        let pointer = CurrentPointer::parse(&records.pointer).map_err(invalid_install)?;
+        let release =
+            ReleaseMetadata::parse(&records.release, &pointer).map_err(invalid_install)?;
+        if before != records
+            || serde_json::to_vec(&pointer).map_err(invalid_install)?
+                != serde_json::to_vec(&installation.pointer).map_err(invalid_install)?
+            || serde_json::to_vec(&release).map_err(invalid_install)?
+                != serde_json::to_vec(&installation.release).map_err(invalid_install)?
+            // The recorded receipt is the one installation_for verified.
+            || receipt.version != pointer.version
+            || receipt.package_files_sha256 != installation.package_files_sha256
+            || receipt.manifest_sha256 != installation.manifest_sha256
+            || receipt.archive_sha256 != installation.archive_sha256
+        {
+            return Err(invalid_install("package records changed"));
+        }
+        Ok(Self {
+            updated: receipt.schema == "asg.package-install/v2",
+            prefix: installation.prefix,
+            pointer: installation.pointer,
+            release: installation.release,
+            records,
+            image,
+        })
+    }
+
+    pub(crate) fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+    pub(crate) fn pointer(&self) -> &CurrentPointer {
+        &self.pointer
+    }
+    pub(crate) fn release(&self) -> &ReleaseMetadata {
+        &self.release
+    }
+    /// Whether the receipt was written by a managed update (v2).
+    pub(crate) fn updated(&self) -> bool {
+        self.updated
+    }
+
+    /// Bounded recheck under the caller's installation lock: the pinned image
+    /// stamp and the exact package records. It never rehashes the package.
+    pub(crate) fn recheck(&self) -> Result<(), CliError> {
+        self.image.recheck()?;
+        if PackageRecords::read(&self.prefix)? != self.records {
+            return Err(invalid_install("package records changed"));
+        }
+        Ok(())
+    }
+}
+
+fn running_prefix(running: &Path) -> Result<PathBuf, CliError> {
+    let version = running
+        .parent()
+        .ok_or_else(|| invalid_install("app location"))?;
+    let versions = version
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "versions"))
+        .ok_or_else(|| invalid_install("managed location"))?;
+    versions
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| invalid_install("prefix"))
+}
+
 #[derive(Clone, Copy)]
 enum SchemaAdmission {
     Current,
@@ -523,20 +702,7 @@ fn installation_for(
 ) -> Result<Installation, CliError> {
     let prefix = match prefix {
         Some(path) => absolute(path)?,
-        None => {
-            let version = running
-                .ok_or_else(|| invalid_install("app location"))?
-                .parent()
-                .ok_or_else(|| invalid_install("app location"))?;
-            let versions = version
-                .parent()
-                .filter(|p| p.file_name().is_some_and(|s| s == "versions"))
-                .ok_or_else(|| invalid_install("managed location"))?;
-            versions
-                .parent()
-                .ok_or_else(|| invalid_install("prefix"))?
-                .to_path_buf()
-        }
+        None => running_prefix(running.ok_or_else(|| invalid_install("app location"))?)?,
     };
     ordinary(&prefix)?;
     let mut metadata_files = Vec::new();
@@ -1427,6 +1593,124 @@ mod tests {
         // Mutable metadata pins must not survive pointer switching.
         install.release_update_pins();
         fs::write(install.prefix.join("current.json"), b"{}\n").expect("pointer released");
+    }
+
+    #[test]
+    fn running_package_rechecks_records_without_retaining_mutable_metadata_pins() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let prefix = temp.path().canonicalize().unwrap();
+        fixture(&prefix);
+        let member = prefix.join(version_dir()).join(metadata::APP_NAME);
+        let copy = prefix.join("versions/other-copy").join(metadata::APP_NAME);
+        write(
+            &prefix,
+            &format!("versions/other-copy/{}", metadata::APP_NAME),
+            &fs::read(&member).unwrap(),
+            "0755",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        assert_eq!(fs::read(&copy).unwrap(), fs::read(&member).unwrap());
+        assert!(RunningPackage::verify_running(&copy).is_err());
+        let package = RunningPackage::verify_running(&member).unwrap();
+        assert_eq!(package.pointer().generation.get(), 1);
+        assert!(!package.updated());
+        assert_eq!(package.prefix(), prefix.as_path());
+        assert_eq!(package.release().version, env!("CARGO_PKG_VERSION"));
+        package.recheck().unwrap();
+
+        for name in [
+            PathBuf::from("current.json"),
+            PathBuf::from("package-install.json"),
+            PathBuf::from(version_dir()).join("release.json"),
+        ] {
+            let path = prefix.join(name);
+            let original = fs::read(&path).unwrap();
+            let mut changed = original.clone();
+            changed.push(b'\n');
+            // Still valid JSON, but any changed byte invalidates the startup pin.
+            fs::write(&path, &changed).expect("mutable package record must be released");
+            assert!(package.recheck().is_err());
+            fs::write(&path, original).unwrap();
+            package.recheck().unwrap();
+        }
+        #[cfg(windows)]
+        assert!(fs::write(&member, b"blocked by running image pin").is_err());
+        #[cfg(unix)]
+        {
+            // Unix pins an inode; rechecking must reject in-place byte changes.
+            fs::write(&member, b"changed running image").unwrap();
+            assert!(package.recheck().is_err());
+        }
+    }
+
+    #[test]
+    fn installed_epoch_permit_requires_control_binding_and_retains_the_update_lock() {
+        use crate::update_state::{EpochGate, EpochRefusal, acquire_installation_lock};
+        use agent_session_grep_adapters_sqlite::{
+            SqliteControlStore,
+            managed_locks::{ExclusiveGuard, LockKind},
+        };
+        use agent_session_grep_ports::control::{ControlId, DesiredUpdates};
+        use std::time::{Duration, Instant};
+
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let prefix = base.join("installed");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        fixture(&prefix);
+        let member = prefix.join(version_dir()).join(metadata::APP_NAME);
+        let gate = EpochGate::Installed(Box::new(RunningPackage::verify_running(&member).unwrap()));
+        let root = base.join("private");
+        let control = crate::retry_fixture_busy(|| {
+            SqliteControlStore::create(
+                &root,
+                &ControlId::parse("epoch-installation").unwrap(),
+                DesiredUpdates::Running,
+            )
+        });
+        let end = Instant::now() + Duration::from_secs(10);
+        assert!(matches!(
+            gate.permit(&control, end),
+            Err(EpochRefusal::Unbound)
+        ));
+        {
+            let lock = acquire_installation_lock(&prefix, end).unwrap();
+            let owner = crate::retry_fixture_busy(|| {
+                ExclusiveGuard::try_acquire(&root, LockKind::PolicyOwner)
+            });
+            control
+                .with_runtime_deadline(end, || {
+                    let bound = control.bind_control_root(&owner)?;
+                    control.record_verified_installation_prefix(&prefix, &lock, &bound, end)
+                })
+                .unwrap();
+        }
+        let permit = gate.permit(&control, end).unwrap();
+        assert!(matches!(
+            gate.permit(&control, end),
+            Err(EpochRefusal::Busy)
+        ));
+        drop(permit);
+        drop(acquire_installation_lock(&prefix, end).unwrap());
+        let pointer = prefix.join("current.json");
+        let original = fs::read(&pointer).unwrap();
+        let mut changed: Value = serde_json::from_slice(&original).unwrap();
+        changed["generation"] = json!(2);
+        fs::write(&pointer, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            gate.permit(&control, end),
+            Err(EpochRefusal::Changed)
+        ));
+        fs::write(&pointer, original).unwrap();
+        assert!(gate.permit(&control, end).is_ok());
     }
 
     #[test]

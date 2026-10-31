@@ -23,8 +23,10 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
+
+use crate::package_installation::ImagePin;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEALTHY_RESET: Duration = Duration::from_secs(600);
@@ -226,55 +228,9 @@ fn read_package_record(path: &Path, end: Instant) -> PortResult<(Vec<u8>, File)>
     Ok((bytes, file))
 }
 
-#[derive(PartialEq, Eq)]
-struct ImageStamp {
-    identity: (u64, u64),
-    len: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    changed: (i64, i64),
-}
-
-impl ImageStamp {
-    fn read(file: &File) -> PortResult<Self> {
-        let metadata = file.metadata().map_err(|_| changed())?;
-        Ok(Self {
-            identity: crate::native_autostart::platform::identity(file).map_err(|_| changed())?,
-            len: metadata.len(),
-            modified: metadata.modified().map_err(|_| changed())?,
-            #[cfg(unix)]
-            changed: {
-                use std::os::unix::fs::MetadataExt;
-                (metadata.ctime(), metadata.ctime_nsec())
-            },
-        })
-    }
-}
-
-/// Bind the hash operation to the same physical image before and after it, and
-/// again immediately before launch. The launcher also retains its own file pin.
-struct ImagePin {
-    path: PathBuf,
-    file: File,
-    stamp: ImageStamp,
-}
-
-impl ImagePin {
-    fn open(path: PathBuf) -> PortResult<Self> {
-        let file = crate::package_installation::pinned(&path).map_err(|_| changed())?;
-        let stamp = ImageStamp::read(&file)?;
-        Ok(Self { path, file, stamp })
-    }
-
-    fn recheck(&self) -> PortResult<()> {
-        let named = crate::package_installation::pinned(&self.path).map_err(|_| changed())?;
-        if ImageStamp::read(&self.file)? != self.stamp || ImageStamp::read(&named)? != self.stamp {
-            return Err(changed());
-        }
-        Ok(())
-    }
-}
-
+// The shared image pin binds the hash operation to the same physical image
+// before and after it, and again immediately before launch. The launcher also
+// retains its own file pin.
 struct StartupApplication {
     application: VerifiedApplication,
     witness: PackageWitness,
@@ -292,10 +248,12 @@ impl StartupApplication {
     ) -> PortResult<Self> {
         check_deadline(end)?;
         let (witness, metadata_pins) = PackageWitness::read(prefix, end)?;
-        let image = ImagePin::open(prefix.join(&witness.pointer.dir).join(&witness.pointer.app))?;
+        let image = ImagePin::open(prefix.join(&witness.pointer.dir).join(&witness.pointer.app))
+            .map_err(|_| changed())?;
         let supervisor_image = executable
             .map(|path| ImagePin::open(path.into()))
-            .transpose()?;
+            .transpose()
+            .map_err(|_| changed())?;
         drop(metadata_pins);
         check_deadline(end)?;
         // This verifier has no cancellation API. Invoke it only once per
@@ -322,9 +280,9 @@ impl StartupApplication {
         if ApplicationIdentity::read(&application)? != *expected || !witness.matches(&application) {
             return Err(changed());
         }
-        image.recheck()?;
+        image.recheck().map_err(|_| changed())?;
         if let Some(image) = &supervisor_image {
-            image.recheck()?;
+            image.recheck().map_err(|_| changed())?;
         }
         drop(witness.recheck(prefix, end)?);
         Ok(Self {
@@ -338,9 +296,9 @@ impl StartupApplication {
 
     fn recheck(&self, prefix: &Path, end: Instant) -> PortResult<[File; 2]> {
         check_deadline(end)?;
-        self.image.recheck()?;
+        self.image.recheck().map_err(|_| changed())?;
         if let Some(image) = &self.supervisor_image {
-            image.recheck()?;
+            image.recheck().map_err(|_| changed())?;
         }
         self.witness.recheck(prefix, end)
     }

@@ -946,3 +946,234 @@ fn equal_metadata_images_and_repeated_restore_keep_original_hash_chain() {
     let j = Journal::open(&f.prefix, &f.lock, end()).unwrap();
     assert_eq!(j.state.effects.len(), count);
 }
+
+fn running(version: &str, digest: char, generation: u64, updated: bool) -> RunningIdentity {
+    RunningIdentity {
+        version: identity(version, &digest.to_string().repeat(64)),
+        generation,
+        updated,
+        installation_id: "installation_one".into(),
+    }
+}
+fn rewrite_state(f: &Fixture, state: &State) {
+    let path = f.prefix.join("update").join("state.json");
+    fs::remove_file(&path).unwrap();
+    write_new(&path, &serde_json::to_vec(state).unwrap()).unwrap();
+}
+fn phased(base: &State, phase: Phase, error_code: Option<&str>) -> State {
+    let mut state = base.clone();
+    state.phase = phase;
+    state.error_code = error_code.map(str::to_owned);
+    if matches!(
+        phase,
+        Phase::Complete | Phase::SelfChecked | Phase::Switched
+    ) {
+        let mut quiesced = state.checkpoint.clone();
+        quiesced.catalog_generation += 2;
+        quiesced.control_seq += 1;
+        state.backup = Some(backup_for(&quiesced));
+        state.quiesced_checkpoint = Some(quiesced);
+        (state.staged, state.migrated, state.self_checked) = (true, true, true);
+        state.effects = vec![Replacement {
+            file: MetadataFile::Current,
+            before_sha256: Some("a".repeat(64)),
+            after_sha256: "b".repeat(64),
+            artifact: "1-current".into(),
+        }];
+    }
+    state.validate().unwrap();
+    state
+}
+
+#[test]
+fn epoch_requires_a_terminal_journal_that_names_the_running_package() {
+    let f = Fixture::new();
+    let id = RootIdentity::read(&f.prefix).unwrap();
+    let (old, new) = (("0.2.0-beta.1", 'a', 7), ("0.2.0-beta.2", 'b', 8));
+    let check = |(version, digest, generation): (&str, char, u64), updated: bool| {
+        journal_permits(
+            &f.prefix,
+            &id,
+            &running(version, digest, generation, updated),
+        )
+    };
+    // A clean install has no update directory and an untouched package.
+    assert_eq!(check(("0.2.0-beta.1", 'a', 1), false), Ok(()));
+    assert_eq!(
+        check(("0.2.0-beta.1", 'a', 1), true),
+        Err(EpochRefusal::Mismatch)
+    );
+    assert_eq!(
+        check(("0.2.0-beta.1", 'a', 2), false),
+        Err(EpochRefusal::Mismatch)
+    );
+    let base = f.journal().state.clone();
+    rewrite_state(&f, &phased(&base, Phase::Complete, None));
+    assert_eq!(check(new, true), Ok(()));
+    for stale in [old, (new.0, new.1, old.2)] {
+        assert_eq!(check(stale, true), Err(EpochRefusal::Mismatch));
+    }
+    let mut other = running(new.0, new.1, new.2, true);
+    other.installation_id = "installation_two".into();
+    assert_eq!(
+        journal_permits(&f.prefix, &id, &other),
+        Err(EpochRefusal::Mismatch)
+    );
+    for (phase, code) in [
+        (Phase::Failed, None),
+        (Phase::Failed, Some("restart_failed")),
+        (Phase::RolledBack, None),
+        (Phase::RolledBack, Some("restart_failed")),
+    ] {
+        rewrite_state(&f, &phased(&base, phase, code));
+        assert_eq!(check(old, true), Ok(()));
+        assert_eq!(check(new, true), Err(EpochRefusal::Mismatch));
+    }
+    // The old executor starts the new worker before it journals Complete, and
+    // an outcome that carries an error is never complete.
+    for (phase, code) in [
+        (Phase::SelfChecked, Some("restart_failed")),
+        (Phase::SelfChecked, None),
+        (Phase::Switched, None),
+        (Phase::Verified, None),
+        (Phase::Complete, Some("update_failed")),
+    ] {
+        rewrite_state(&f, &phased(&base, phase, code));
+        assert_eq!(check(new, true), Err(EpochRefusal::Unfinished));
+    }
+    drop(f.lock);
+}
+
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut entries = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            let bytes = if kind.is_file() {
+                Some(fs::read(&path).unwrap())
+            } else {
+                assert!(kind.is_dir());
+                pending.push(path.clone());
+                None
+            };
+            entries.push((path.strip_prefix(dir).unwrap().to_path_buf(), bytes));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+#[test]
+fn epoch_check_refuses_unfinished_residue_without_reconciling_it() {
+    let f = Fixture::new();
+    let id = RootIdentity::read(&f.prefix).unwrap();
+    let base = f.journal().state.clone();
+    rewrite_state(&f, &phased(&base, Phase::Complete, None));
+    let new = running("0.2.0-beta.2", 'b', 8, true);
+    assert_eq!(journal_permits(&f.prefix, &id, &new), Ok(()));
+    let root = f.prefix.join("update");
+    let terminal = fs::read(root.join("state.json")).unwrap();
+    // A valid duplicate old slot is consumed by normal owner reconciliation.
+    let previous = root.join("state.previous.json");
+    write_new(&previous, &terminal).unwrap();
+    let before = snapshot(&root);
+    assert_eq!(
+        journal_permits(&f.prefix, &id, &new),
+        Err(EpochRefusal::Unfinished)
+    );
+    assert_eq!(snapshot(&root), before);
+    reconcile_state(&root, &id, end()).unwrap();
+    assert!(!previous.exists());
+    assert_eq!(fs::read(root.join("state.json")).unwrap(), terminal);
+
+    for name in STATE_SLOTS[1..].iter().chain(EPOCH_RESIDUE.iter()) {
+        // State slots and archive intent carry legitimate terminal state bytes.
+        // Supersede intents retain separate malformed-residue coverage.
+        let bytes = if STATE_SLOTS.contains(name) || *name == "state.archive.json" {
+            terminal.as_slice()
+        } else {
+            b"{}".as_slice()
+        };
+        write_new(&root.join(name), bytes).unwrap();
+        let before = snapshot(&root);
+        let result = journal_permits(&f.prefix, &id, &new);
+        assert_eq!(result, Err(EpochRefusal::Unfinished), "{name}");
+        assert_eq!(snapshot(&root), before, "{name}");
+        fs::remove_file(root.join(name)).unwrap();
+    }
+    assert_eq!(journal_permits(&f.prefix, &id, &new), Ok(()));
+    fs::remove_file(root.join("state.json")).unwrap();
+    let result = journal_permits(&f.prefix, &id, &new);
+    assert_eq!(result, Err(EpochRefusal::Unfinished));
+    drop(f.lock);
+}
+
+#[test]
+fn epoch_lock_attempt_never_waits_for_an_update_owner() {
+    let f = Fixture::new();
+    let started = Instant::now();
+    assert!(matches!(try_epoch_lock(&f.prefix), Err(EpochRefusal::Busy)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    drop(f.lock);
+    assert!(try_epoch_lock(&f.prefix).is_ok());
+}
+
+#[test]
+fn epoch_check_refuses_malformed_or_oversized_journals_without_changing_bytes() {
+    let f = Fixture::new();
+    let base = f.journal().state.clone();
+    let mut terminal = phased(&base, Phase::Complete, None);
+    terminal.prefix_binding = "wrong_prefix".into();
+    let mut unknown = serde_json::to_value(phased(&base, Phase::Complete, None)).unwrap();
+    unknown["unknown"] = serde_json::json!(true);
+    let path = f.prefix.join("update").join("state.json");
+    let id = RootIdentity::read(&f.prefix).unwrap();
+    let new = running("0.2.0-beta.2", 'b', 8, true);
+    let valid = phased(&base, Phase::Complete, None);
+    let mut oversized = serde_json::to_vec(&valid).unwrap();
+    oversized.resize(MAX_STATE as usize + 1, b' ');
+    // Without the read bound this is valid, eligible terminal JSON.
+    assert_eq!(decode_state(&oversized, &id).unwrap(), valid);
+    assert!(oversized.len() as u64 > MAX_STATE);
+    for bytes in [
+        b"{".to_vec(),
+        serde_json::to_vec(&terminal).unwrap(),
+        serde_json::to_vec(&unknown).unwrap(),
+        oversized,
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            journal_permits(&f.prefix, &id, &new),
+            Err(EpochRefusal::Unfinished)
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    drop(f.lock);
+}
+
+#[test]
+fn only_a_startup_verified_package_or_test_fixture_can_hold_an_epoch_permit() {
+    // A source or debug worker has no installed prefix to verify.
+    assert!(matches!(EpochGate::at_startup(), EpochGate::Unverified));
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let control = crate::retry_fixture_busy(|| {
+        SqliteControlStore::create(
+            &temp.path().join("private"),
+            &ControlId::parse("installation_one").unwrap(),
+            agent_session_grep_ports::control::DesiredUpdates::Running,
+        )
+    });
+    assert!(matches!(
+        EpochGate::Unverified.permit(&control, end()),
+        Err(EpochRefusal::Unverified)
+    ));
+    assert!(EpochGate::fixture().permit(&control, end()).is_ok());
+    // The caller's original end also bounds the test-only fixture permit.
+    assert!(matches!(
+        EpochGate::fixture().permit(&control, Instant::now()),
+        Err(EpochRefusal::Busy)
+    ));
+}

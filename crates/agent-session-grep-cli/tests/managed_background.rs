@@ -1,7 +1,7 @@
 //! Real CLI child processes over disposable synthetic profiles only.
 use agent_session_grep_adapters_sqlite::{
     SqliteControlStore,
-    managed_locks::{ExclusiveGuard, LockKind, RootIdentity},
+    managed_locks::{ExclusiveGuard, JobLockKey, LockKind, RootIdentity},
     managed_store::ManagedStore,
 };
 use agent_session_grep_ports::{
@@ -14,6 +14,7 @@ use agent_session_grep_ports::{
     managed::{ProjectionQuery, ProjectionRead},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -246,8 +247,234 @@ impl Fixture {
         ));
         self.desired(DesiredUpdates::Running);
     }
+    /// A clean generation-one package for the ordinary idle EpochGate test.
+    /// The worker and supervisor are real builds; the launcher is a synthetic
+    /// forwarder and supporting text is synthetic.
+    fn installed_application(&self) -> PathBuf {
+        use agent_session_grep_launcher::metadata::{APP_NAME, BUILD_TARGET};
+        use std::collections::BTreeMap;
+
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let alias = format!("asg{suffix}");
+        let supervisor = format!("asg-supervisor{suffix}");
+        let app_bytes = fs::read(BIN).unwrap();
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let app_sha = digest(&app_bytes);
+        let version = env!("CARGO_PKG_VERSION");
+        let dir = format!("versions/{version}-{}", &app_sha[..12]);
+        let app_member = format!("{dir}/{APP_NAME}");
+        let launcher = agent_session_grep_testkit::cached_rustc_fixture(
+            &Path::new(env!("CARGO_TARGET_TMPDIR")).join("asg-rustc-fixtures"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup_command_launcher.rs"),
+            APP_NAME,
+            &["--edition=2024"],
+            &[("ASG_TEST_APP_RELATIVE", app_member.as_str())],
+        );
+        let launcher_bytes = fs::read(launcher).unwrap();
+        let supervisor_bytes = fs::read(env!("CARGO_BIN_EXE_asg-supervisor")).unwrap();
+        let prefix = self._temp.path().join("installed-worker");
+        // Self-reported synthetic release origin, never hosted build evidence.
+        let source_commit = "0123456789abcdef0123456789abcdef01234567";
+        let built_at = "2023-11-14T22:13:20Z";
+        let write = |name: &str, bytes: &[u8], mode: u32| {
+            let path = prefix.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            (digest(bytes), bytes.len(), mode)
+        };
+        let supervisor_member = format!("{dir}/{supervisor}");
+        let mut members = BTreeMap::new();
+        for (name, bytes) in [
+            (APP_NAME, launcher_bytes.as_slice()),
+            (alias.as_str(), launcher_bytes.as_slice()),
+            (app_member.as_str(), app_bytes.as_slice()),
+            (supervisor_member.as_str(), supervisor_bytes.as_slice()),
+        ] {
+            members.insert(name.to_owned(), write(name, bytes, 0o755));
+        }
+        let pointer = json!({
+            "schema": "asg.current/v1", "generation": 1, "version": version,
+            "dir": dir, "app": APP_NAME, "app_sha256": app_sha,
+            "launcher_protocol": 1, "activated_at": built_at,
+        });
+        let release = json!({
+            "schema": "asg.version/v1", "version": version, "target": BUILD_TARGET,
+            "source_commit": source_commit, "app_sha256": app_sha,
+            "catalog_schema": agent_session_grep_adapters_sqlite::SCHEMA_VERSION,
+            "control_schema": agent_session_grep_adapters_sqlite::control::CONTROL_SCHEMA_VERSION,
+            "launcher_protocol_min": 1, "launcher_protocol_max": 1, "built_at": built_at,
+        });
+        for (name, value) in [
+            ("current.json".to_owned(), pointer),
+            (format!("{dir}/release.json"), release),
+        ] {
+            members.insert(
+                name.clone(),
+                write(&name, &serde_json::to_vec(&value).unwrap(), 0o644),
+            );
+        }
+        for name in [
+            "package-install.ps1",
+            "package-install.sh",
+            "INSTALL-AND-UPGRADE.md",
+            "README.md",
+            "CHANGELOG.md",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            "NOTICE",
+            "SECURITY.md",
+            "THIRD-PARTY-DEPENDENCIES.json",
+            "THIRD-PARTY-DEPENDENCIES.csv",
+        ] {
+            let mode = if name == "package-install.sh" {
+                0o755
+            } else {
+                0o644
+            };
+            members.insert(
+                name.to_owned(),
+                write(
+                    name,
+                    b"Synthetic package support; not release evidence.\n",
+                    mode,
+                ),
+            );
+        }
+        let mut tsv = format!(
+            "asg.package-files/v1\nversion\t{version}\ntarget\t{BUILD_TARGET}\nsource_commit\t{source_commit}\napp\t{APP_NAME}\napp_sha256\t{app_sha}\ndir\t{dir}\nsupervisor\t{supervisor}\nsupervisor_sha256\t{}\nlauncher_protocol\t1\ncatalog_schema\t{}\ncontrol_schema\t{}\nbuilt_at\t{built_at}\n",
+            digest(&supervisor_bytes),
+            agent_session_grep_adapters_sqlite::SCHEMA_VERSION,
+            agent_session_grep_adapters_sqlite::control::CONTROL_SCHEMA_VERSION,
+        );
+        for (name, (sha, size, mode)) in &members {
+            tsv.push_str(&format!("file\t{sha}\t{mode:04o}\t{size}\t{name}\n"));
+        }
+        let tsv_sha = digest(tsv.as_bytes());
+        members.insert(
+            "PACKAGE-MANIFEST.tsv".into(),
+            write("PACKAGE-MANIFEST.tsv", tsv.as_bytes(), 0o644),
+        );
+        let root = format!("agent-session-grep-v{version}-{BUILD_TARGET}");
+        let format = if cfg!(windows) { "zip" } else { "tar.gz" };
+        let archive_name = format!("{root}.{format}");
+        let archive_path = self._temp.path().join(&archive_name);
+        let archive = fs::File::create(&archive_path).unwrap();
+        #[cfg(windows)]
+        {
+            let mut zip = zip::ZipWriter::new(archive);
+            for (name, (_, _, mode)) in &members {
+                zip.start_file(
+                    format!("{root}/{name}"),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored)
+                        .system(zip::System::Unix)
+                        .unix_permissions(*mode),
+                )
+                .unwrap();
+                zip.write_all(&fs::read(prefix.join(name)).unwrap())
+                    .unwrap();
+            }
+            drop(zip.finish().unwrap());
+        }
+        #[cfg(not(windows))]
+        {
+            let encoder = flate2::write::GzEncoder::new(archive, flate2::Compression::none());
+            let mut tar = tar::Builder::new(encoder);
+            for (name, (_, size, mode)) in &members {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(*size as u64);
+                header.set_mode(*mode);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(1_700_000_000);
+                tar.append_data(
+                    &mut header,
+                    format!("{root}/{name}"),
+                    fs::File::open(prefix.join(name)).unwrap(),
+                )
+                .unwrap();
+            }
+            drop(tar.into_inner().unwrap().finish().unwrap());
+        }
+        let archive_sha = digest(&fs::read(&archive_path).unwrap());
+        let inventory = members.iter().map(|(name, (sha, size, mode))| {
+            json!({"name": format!("{root}/{name}"), "sha256": sha, "size_bytes": size, "mode": format!("{mode:04o}")})
+        }).collect::<Vec<_>>();
+        let manifest = serde_json::to_vec(&json!({
+            "schema": "agent-session-grep.release-archive-manifest/v1",
+            "release": {"tag": format!("v{version}"), "version": version, "target": BUILD_TARGET,
+                "source_commit": source_commit, "source_date_epoch": 1_700_000_000u64, "unsigned": true},
+            "archive": {"filename": archive_name, "format": format, "root": root,
+                "sha256": archive_sha, "size_bytes": fs::metadata(&archive_path).unwrap().len(), "files": inventory},
+            "inputs": {"cargo_lock_sha256": digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))),
+                "dependency_inventory_schema": "agent-session-grep.third-party-dependencies/v1"},
+            "provenance": {"kind": "self-reported-build-metadata", "cryptographic_attestation": false,
+                "limitation": "Synthetic installed-worker fixture with real CLI and supervisor, a synthetic forwarder, and synthetic support text; not release evidence."},
+            "layout": "asg.managed-candidate/v1", "install_manifest_sha256": tsv_sha,
+        })).unwrap();
+        let manifest_sha = digest(&manifest);
+        write("release.manifest.json", &manifest, 0o644);
+        write(
+            "SHA256SUMS",
+            format!("{archive_sha}  {archive_name}\n{manifest_sha}  {root}.manifest.json\n")
+                .as_bytes(),
+            0o644,
+        );
+        write("package-install.json", &serde_json::to_vec(&json!({
+            "schema": "asg.package-install/v1", "product": "agent-session-grep", "version": version,
+            "target": BUILD_TARGET, "source_commit": source_commit, "launcher_protocol": 1,
+            "manifest_sha256": manifest_sha, "archive_sha256": archive_sha, "package_files_sha256": tsv_sha,
+        })).unwrap(), 0o644);
+        drop(agent_session_grep_launcher::verify_installation(&prefix).unwrap());
+        let end = Instant::now() + Duration::from_secs(15);
+        let acquire = |root: &Path, kind: LockKind| loop {
+            match ExclusiveGuard::try_acquire(root, kind.clone()) {
+                Ok(guard) => break guard,
+                Err(PortError::WriterBusy(_)) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("installed fixture lock: {error:?}"),
+            }
+        };
+        let installation = acquire(
+            &prefix,
+            LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+        );
+        let witness = self.control_before(end).unwrap();
+        let installation_id = witness
+            .with_runtime_deadline(end, || witness.status())
+            .unwrap()
+            .policy
+            .installation_id;
+        drop(witness);
+        let control = SqliteControlStore::open_existing_writable_with_deadline(
+            self.db.parent().unwrap(),
+            &installation_id,
+            end,
+        )
+        .unwrap();
+        control
+            .with_runtime_deadline(end, || {
+                let guard = acquire(self.db.parent().unwrap(), LockKind::PolicyOwner);
+                let bound = control.bind_control_root(&guard)?;
+                control.record_verified_installation_prefix(&prefix, &installation, &bound, end)?;
+                control.bind_installation(&prefix, &installation)?;
+                Ok(())
+            })
+            .unwrap();
+        prefix.join(app_member)
+    }
     fn spawn(&mut self) {
-        let mut command = Command::new(BIN);
+        self.spawn_from(Path::new(BIN));
+    }
+    fn spawn_from(&mut self, executable: &Path) {
+        let mut command = Command::new(executable);
         command
             .arg("__managed-background")
             .arg("--db")
@@ -1218,7 +1445,8 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
             codex("scheduled-id", "scheduledproofneedle")
         };
         fs::write(&path, &bytes).unwrap();
-        f.spawn();
+        let installed = f.installed_application();
+        f.spawn_from(&installed);
         f.wait(|f| f.sees_text("scheduledproofneedle"));
         let initial = admit_latest_barrier(&f, 400);
         f.wait(|f| latest_satisfied(f, &initial));

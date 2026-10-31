@@ -4,12 +4,13 @@
 use crate::{
     CliError,
     native_autostart::platform,
-    package_installation::{absolute, ordinary},
+    package_installation::{RunningPackage, absolute, ordinary},
     protocol::{CanonicalCode, ProtocolError},
     update_check::MANAGED_TARGETS,
 };
-use agent_session_grep_adapters_sqlite::managed_locks::{
-    ExclusiveGuard, JobLockKey, LockKind, RootIdentity,
+use agent_session_grep_adapters_sqlite::{
+    SqliteControlStore,
+    managed_locks::{ExclusiveGuard, JobLockKey, LockKind, RootIdentity},
 };
 use agent_session_grep_launcher::CurrentPointer;
 use agent_session_grep_ports::control::ControlId;
@@ -720,6 +721,206 @@ pub(crate) fn acquire_installation_lock(
             Err(e) => return Err(io(e)),
         }
     }
+}
+
+/// Why this worker may not publish a cross-cycle discovery epoch now. Exact
+/// cycles and background liveness are unaffected by every value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpochRefusal {
+    /// This process did not verify itself as the installed package at startup.
+    Unverified,
+    /// An update owner holds the installation, or the caller's end passed.
+    Busy,
+    /// The prefix has no verified binding to this control installation.
+    Unbound,
+    /// The prefix, running image or package records changed after startup.
+    Changed,
+    /// The update journal is absent, unfinished or needs owner recovery.
+    Unfinished,
+    /// A terminal journal does not describe the running package.
+    Mismatch,
+}
+
+/// The running package as the journal records it.
+struct RunningIdentity {
+    version: VersionIdentity,
+    generation: u64,
+    updated: bool,
+    installation_id: String,
+}
+
+/// Decided once per worker lifetime. An older updater clears its fence and
+/// starts the new worker before it journals Complete, so liveness alone is no
+/// proof that the update finished.
+pub(crate) enum EpochGate {
+    Unverified,
+    Installed(Box<RunningPackage>),
+    /// Test-only developer fixture worker without an installed prefix.
+    #[cfg(test)]
+    Fixture,
+    /// Test-only fixture that still contends on the real installation lock.
+    #[cfg(test)]
+    FixtureInstallation(PathBuf),
+}
+
+/// Held across one epoch commit, so no update owner can start meanwhile.
+#[must_use = "hold the installation permit until the epoch commit finishes"]
+pub(crate) struct EpochPermit {
+    _lock: Option<ExclusiveGuard>,
+}
+
+impl EpochGate {
+    /// Full package verification, once, at worker startup.
+    pub(crate) fn at_startup() -> Self {
+        RunningPackage::verify().map_or(Self::Unverified, |package| {
+            Self::Installed(Box::new(package))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self::Fixture
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_for_installation(prefix: PathBuf) -> Self {
+        Self::FixtureInstallation(prefix)
+    }
+
+    /// One nonblocking lock attempt plus bounded reads; never waits or repairs
+    /// the journal. The caller's original end also applies to test fixtures.
+    pub(crate) fn permit(
+        &self,
+        control: &SqliteControlStore,
+        end: Instant,
+    ) -> Result<EpochPermit, EpochRefusal> {
+        if Instant::now() >= end {
+            return Err(EpochRefusal::Busy);
+        }
+        let package = match self {
+            Self::Unverified => return Err(EpochRefusal::Unverified),
+            #[cfg(test)]
+            Self::Fixture => return Ok(EpochPermit { _lock: None }),
+            #[cfg(test)]
+            Self::FixtureInstallation(prefix) => {
+                let guard = try_epoch_lock(prefix)?;
+                if Instant::now() >= end {
+                    return Err(EpochRefusal::Busy);
+                }
+                return Ok(EpochPermit { _lock: Some(guard) });
+            }
+            Self::Installed(package) => package,
+        };
+        let prefix = package.prefix();
+        let guard = try_epoch_lock(prefix)?;
+        if RootIdentity::read(prefix).map_err(|_| EpochRefusal::Changed)? != guard.root_identity() {
+            return Err(EpochRefusal::Changed);
+        }
+        let installation_id = control
+            .with_runtime_deadline(end, || control.bind_installation(prefix, &guard))
+            .map(|binding| binding.installation_id().as_str().to_owned())
+            .map_err(|error| match error {
+                agent_session_grep_ports::PortError::WriterBusy(_) => EpochRefusal::Busy,
+                _ => EpochRefusal::Unbound,
+            })?;
+        package.recheck().map_err(|_| EpochRefusal::Changed)?;
+        let (pointer, release) = (package.pointer(), package.release());
+        let running = RunningIdentity {
+            version: VersionIdentity {
+                version: pointer.version.clone(),
+                target: release.target.clone(),
+                source_commit: release.source_commit.clone(),
+                relative_dir: pointer.dir.clone(),
+                app_sha256: pointer.app_sha256.clone(),
+                catalog_schema: release.catalog_schema.get(),
+                control_schema: release.control_schema.get(),
+                launcher_protocol: pointer.launcher_protocol,
+            },
+            generation: pointer.generation.get(),
+            updated: package.updated(),
+            installation_id,
+        };
+        journal_permits(prefix, &guard.root_identity(), &running)?;
+        if Instant::now() >= end {
+            return Err(EpochRefusal::Busy);
+        }
+        Ok(EpochPermit { _lock: Some(guard) })
+    }
+}
+
+/// The update owner's own lock, attempted once. Contention is never awaited.
+fn try_epoch_lock(prefix: &Path) -> Result<ExclusiveGuard, EpochRefusal> {
+    let key = JobLockKey::parse("installation-update").map_err(|_| EpochRefusal::Unfinished)?;
+    ExclusiveGuard::try_acquire(prefix, LockKind::MaintenanceJob(key)).map_err(
+        |error| match error {
+            agent_session_grep_ports::PortError::WriterBusy(_) => EpochRefusal::Busy,
+            _ => EpochRefusal::Unfinished,
+        },
+    )
+}
+
+/// Names that exist at rest only while a write, supersede or archive is
+/// unfinished. Their recovery belongs to the update owner, never to this check.
+const EPOCH_RESIDUE: [&str; 5] = [
+    "state.supersede.json",
+    "state.supersede.intent.next.json",
+    "state.supersede.next.json",
+    "state.supersede.displaced.json",
+    "state.archive.json",
+];
+
+/// Read-only: no Journal::open, reconcile or write, and every read is bounded.
+/// Only a terminal journal that names the running package permits an epoch.
+fn journal_permits(
+    prefix: &Path,
+    identity: &RootIdentity,
+    running: &RunningIdentity,
+) -> Result<(), EpochRefusal> {
+    let unfinished = |_: CliError| EpochRefusal::Unfinished;
+    let root = prefix.join("update");
+    match fs::symlink_metadata(&root) {
+        // Journal::create makes this directory before any update effect.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if !running.updated && running.generation == 1 {
+                Ok(())
+            } else {
+                Err(EpochRefusal::Mismatch)
+            };
+        }
+        Err(_) => return Err(EpochRefusal::Unfinished),
+        Ok(_) => {}
+    }
+    ordinary(&root).map_err(unfinished)?;
+    platform::validate_private(&root).map_err(|_| EpochRefusal::Unfinished)?;
+    for name in STATE_SLOTS.iter().skip(1).chain(EPOCH_RESIDUE.iter()) {
+        match fs::symlink_metadata(root.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(EpochRefusal::Unfinished),
+        }
+    }
+    let bytes = read(&root.join(STATE_SLOTS[0]), MAX_STATE)
+        .map_err(unfinished)?
+        .ok_or(EpochRefusal::Unfinished)?;
+    let state = decode_state(&bytes, identity).map_err(unfinished)?;
+    let run = root.join(&state.update_id);
+    ordinary(&run).map_err(unfinished)?;
+    platform::validate_private(&run).map_err(|_| EpochRefusal::Unfinished)?;
+    if !state.phase.terminal() {
+        return Err(EpochRefusal::Unfinished);
+    }
+    if state.checkpoint.installation_id != running.installation_id {
+        return Err(EpochRefusal::Mismatch);
+    }
+    let selected = match state.phase {
+        Phase::Complete if state.error_code.is_some() => return Err(EpochRefusal::Unfinished),
+        Phase::Complete => (&state.new, state.new_pointer_generation),
+        Phase::Failed | Phase::RolledBack => (&state.old, state.old_pointer_generation),
+        _ => return Err(EpochRefusal::Mismatch),
+    };
+    if selected != (&running.version, running.generation) {
+        return Err(EpochRefusal::Mismatch);
+    }
+    Ok(())
 }
 
 /// Updates cannot derive their own authority from the journal nonce. The real
