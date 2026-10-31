@@ -2101,7 +2101,9 @@ fn m2_assert_no_metadata_enrichment(f: &Fixture, text: &str) {
         }
         Ok(())
     });
-    assert!(!f.has_text("metadataonlycwdneedle"));
+    // Revocation can still own catalog/emission gates between these reads.
+    // Only a definite empty query proves that metadata did not enrich text.
+    f.wait(|f| f.lacks_text("metadataonlycwdneedle"));
 }
 
 fn m2_wb_transcript(native: &str, text: &str) -> Vec<u8> {
@@ -2186,7 +2188,11 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
     let (withdrawn, cycle) = m2_post_revoke_cycle_attempted(&f, 3);
     assert_eq!(cycle.state, CycleState::Partial);
-    assert!(latest_unsatisfied(&f, &withdrawn));
+    f.wait(|f| match latest_state(f, &withdrawn) {
+        Some(false) => true,
+        Some(true) => panic!("withdrawn metadata scope must not satisfy latest"),
+        None => false,
+    });
     f.desired(DesiredUpdates::Paused);
     f.terminate();
     f.spawn();
