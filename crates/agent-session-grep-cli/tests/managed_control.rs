@@ -611,12 +611,29 @@ fn selected_history_start_pause_resume_stop_uses_actual_worker_liveness() {
     assert!(matches!(resumed_output.status.code(), Some(0 | 10)));
     let resumed: Value = serde_json::from_slice(&resumed_output.stdout).unwrap();
     assert_eq!(resumed["data"]["requested_updates"], "running");
-    let stopped = data(&run(&db, &["background", "stop"]), 10);
+    // Stop may observe the worker's exit in this call. The transition is
+    // success then; an owned worker still draining is explicitly partial.
+    let stopped_output = run(&db, &["background", "stop"]);
+    let stop_code = stopped_output.status.code().unwrap();
+    assert!(matches!(stop_code, 0 | 10));
+    let stopped_envelope: Value = serde_json::from_slice(&stopped_output.stdout).unwrap();
+    assert_eq!(
+        stopped_envelope["outcome"],
+        if stop_code == 0 { "success" } else { "partial" }
+    );
+    let stopped = &stopped_envelope["data"];
     assert_eq!(stopped["requested_updates"], "stopped");
+    assert_eq!(stopped["desired_updates"], "stopped");
+    assert_eq!(stopped["intent_recorded"], true);
+    assert_eq!(stopped["latest_satisfied"], false);
     wait_until(|| data(&run(&db, &["background", "status"]), 0)["running"] == false);
     let offline = data(&run(&db, &["background", "status"]), 0);
     assert_eq!(offline["effective_state"], "offline");
     assert_eq!(offline["desired_updates"], "stopped");
+    let settled = data(&run(&db, &["background", "stop"]), 0);
+    assert_eq!(settled["requested_updates"], "stopped");
+    assert_eq!(settled["running"], false);
+    assert_eq!(settled["effective_state"], "offline");
     assert_eq!(
         data(&run(&db, &["background", "start"]), 10)["reason"],
         "stopped"
