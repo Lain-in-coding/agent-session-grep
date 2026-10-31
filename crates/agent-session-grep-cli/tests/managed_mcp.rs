@@ -79,18 +79,28 @@ impl Fixture {
         let db = temp.path().join("private/catalog.db");
         let history = temp.path().join("history");
         fs::create_dir(&history).unwrap();
+        let setup_started = Instant::now();
         let output = Command::new(BIN)
             .args(["--robot", "--db"])
             .arg(&db)
             .arg("setup")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(10));
+        let setup: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(10),
+            "synthetic fixture preparation at setup: elapsed_ms={}, error={}, stages={}",
+            setup_started.elapsed().as_millis(),
+            setup["error"],
+            setup["data"]["stages"],
+        );
         bounded("pause after setup", || {
             let control = SqliteControlStore::open_current_writable(db.parent().unwrap())?;
             control
                 .set_desired_updates(control.status()?.policy.control_seq, DesiredUpdates::Paused)
         });
+        let selection_started = Instant::now();
         let output = Command::new(BIN)
             .args(["--robot", "--db"])
             .arg(&db)
@@ -98,8 +108,14 @@ impl Fixture {
             .arg(&history)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(0));
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "synthetic fixture preparation at sources add: elapsed_ms={}, error={}",
+            selection_started.elapsed().as_millis(),
+            value["error"],
+        );
         let selection = ControlId::parse(value["data"]["id"].as_str().unwrap()).unwrap();
         let transcript = history.join("synthetic.jsonl");
         fs::write(&transcript, line("m1", "orchid original evidence")).unwrap();
@@ -398,6 +414,73 @@ fn persistent_mcp_observes_append_pause_and_revoke_without_legacy_access() {
 }
 
 #[test]
+fn tool_name_filters_preserve_exact_names_in_managed_cli_and_mcp() {
+    let mut fixture = Fixture::new();
+    let names = ["Bash", "bash", " Bash ", "\u{00a0}Bash\u{3000}", "Ba sh"];
+    let mut transcript = line("m1", "synthetic tool name lookup");
+    for (index, name) in names.into_iter().enumerate() {
+        let tool_id = format!("synthetic-tool-{index}");
+        let call_id = format!("synthetic-call-{index}");
+        for record in [
+            json!({
+                "type": "assistant", "uuid": call_id,
+                "sessionId": "mcp-synthetic-session",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+                ]}
+            }),
+            json!({
+                "type": "user", "uuid": format!("synthetic-result-{index}"),
+                "parentUuid": call_id, "sessionId": "mcp-synthetic-session",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tool_id,
+                     "content": format!("orchid tool result {index}")}
+                ]}
+            }),
+        ] {
+            transcript.extend(serde_json::to_vec(&record).unwrap());
+            transcript.push(b'\n');
+        }
+    }
+    fs::write(&fixture.transcript, &transcript).unwrap();
+    fixture.start();
+    let mut client = Client::connect(&fixture.db);
+    client.wait_hit(&mut fixture, "orchid");
+    fixture.pause();
+    for (index, name) in names.into_iter().enumerate() {
+        let (_, value) = client.call(
+            "search_sessions",
+            json!({"query":"orchid","tool_name":name}),
+        );
+        assert_eq!(value["result"]["isError"], false, "{name:?}: {value}");
+        let hits = value["result"]["structuredContent"]["data"]["hits"]
+            .as_array()
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{name:?}: {value}");
+        assert_eq!(
+            hits[0]["text"],
+            format!("orchid tool result {index}"),
+            "{name:?}: {value}"
+        );
+        let output = Command::new(BIN)
+            .args(["--robot", "--db"])
+            .arg(&fixture.db)
+            .args(["search", "orchid", "--tool-name", name])
+            .output()
+            .unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 10)), "{output:?}");
+        let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let cli_hits = cli["data"]["hits"].as_array().unwrap();
+        assert_eq!(cli_hits.len(), 1, "{name:?}: {cli}");
+        assert_eq!(cli_hits[0]["id"], hits[0]["id"], "{name:?}: {cli}");
+        assert_eq!(cli_hits[0]["text"], hits[0]["text"], "{name:?}: {cli}");
+    }
+    assert_eq!(fs::read(&fixture.transcript).unwrap(), transcript);
+}
+
+#[test]
 fn idle_mcp_releases_catalog_handles_and_preserves_protocol_validation() {
     let fixture = Fixture::new();
     let mut client = Client::connect(&fixture.db);
@@ -431,14 +514,46 @@ fn idle_mcp_releases_catalog_handles_and_preserves_protocol_validation() {
             .iter()
             .all(|t| t["inputSchema"]["properties"]["latest"]["type"] == "boolean")
     );
+    let search = tools
+        .iter()
+        .find(|tool| tool["name"] == "search_sessions")
+        .unwrap();
+    let tool_name = &search["inputSchema"]["properties"]["tool_name"];
+    assert_eq!(tool_name["minLength"], 1);
+    assert_eq!(tool_name["maxLength"], 128);
+    assert!(
+        tool_name["description"]
+            .as_str()
+            .unwrap()
+            .contains("non-whitespace character")
+    );
     for args in [
         json!({"query":"orchid","latest":"true"}),
         json!({"query":"orchid","max_wait_ms":1}),
         json!({"query":"orchid","providers":["invalid-provider"]}),
         json!({"query":"orchid","unknown":true}),
+        json!({"query":"orchid","tool_name":""}),
+        json!({"query":"orchid","tool_name":" \t\r\n"}),
+        json!({"query":"orchid","tool_name":"\u{00a0}\u{2003}\u{3000}"}),
     ] {
         let (_, value) = client.call("search_sessions", args);
         assert_eq!(value["error"]["code"], -32602, "{value}");
+        assert_eq!(
+            value["error"]["data"]["canonical_code"], "invalid_request",
+            "{value}"
+        );
+        assert!(value["result"].is_null(), "{value}");
+    }
+    for name in ["", " \t\r\n", "\u{00a0}\u{2003}\u{3000}"] {
+        let output = Command::new(BIN)
+            .args(["--robot", "--db"])
+            .arg(&fixture.db)
+            .args(["search", "orchid", "--tool-name", name])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_request", "{value}");
     }
     let (_, value) = client.call("get_status", json!({"latest":true,"max_wait_ms":0}));
     assert_eq!(

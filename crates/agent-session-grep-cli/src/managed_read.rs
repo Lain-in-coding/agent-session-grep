@@ -327,7 +327,7 @@ fn parse(rest: &[String], now_ms: i64) -> Result<Request, CliError> {
     let tool_name = extract_flag(&mut args, "--tool-name").map_err(|_| invalid())?;
     if tool_name
         .as_ref()
-        .is_some_and(|s| s.is_empty() || s.len() > 256)
+        .is_some_and(|s| s.trim().is_empty() || s.len() > 256)
     {
         return Err(invalid());
     }

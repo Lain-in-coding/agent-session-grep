@@ -601,6 +601,12 @@ impl McpServer<'_> {
             )));
         }
         let tool_name = opt_str(args, "tool_name")?;
+        if tool_name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(ToolError::Params("tool_name must not be blank".into()));
+        }
         let facets = SearchFacets {
             sidechain,
             tool_kind,
@@ -976,9 +982,11 @@ fn tool_catalog() -> Value {
                     },
                     "tool_name": {
                         "type": "string",
+                        "minLength": 1,
                         "maxLength": TOOL_NAME_MAX_CHARS,
                         "description": "Keep only messages carrying a tool activity with \
-                            this exact tool name (e.g. Bash, Read, shell)."
+                            this exact tool name (e.g. Bash, Read, shell). Must contain a \
+                            non-whitespace character. Case and spaces are matched verbatim."
                     },
                     "mode": {
                         "type": "string",
@@ -2386,6 +2394,13 @@ mod tests {
             properties["repo"]["maxLength"],
             json!(crate::repo_identity::REPO_SLUG_MAX_CHARS)
         );
+        assert_eq!(properties["tool_name"]["minLength"], 1);
+        assert!(
+            properties["tool_name"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("non-whitespace character")
+        );
 
         let valid = json!({
             "providers": ["codex", "claude", "claude-code"],
@@ -2429,6 +2444,9 @@ mod tests {
             json!({ "query": "x", "providers": [1] }),
             json!({ "query": "x", "since": "1h" }),
             json!({ "query": "x", "until": "2026-08-01" }),
+            json!({ "query": "x", "tool_name": "" }),
+            json!({ "query": "x", "tool_name": " \t\r\n" }),
+            json!({ "query": "x", "tool_name": "\u{00a0}\u{2003}\u{3000}" }),
             // repo：非字符串、空串、纯空白、超长一律 -32602（绝不静默变成无过滤）。
             json!({ "query": "x", "repo": 5 }),
             json!({ "query": "x", "repo": "" }),

@@ -1388,6 +1388,7 @@ fn tool_schemas_publish_string_and_array_bounds() {
         json!(provider_values),
         "{search}"
     );
+    assert_eq!(properties["tool_name"]["minLength"], 1, "{search}");
     assert_eq!(properties["tool_name"]["maxLength"], 128, "{search}");
     let context = tools
         .iter()
@@ -2279,28 +2280,35 @@ fn search_sessions_facet_params_filter_and_validate() {
     );
 
     let init = initialize_request(1, "2025-06-18");
-    let frames = mcp_session(
-        &db,
-        &[
-            init,
-            initialized_notification(),
-            tool_call(
-                2,
-                "search_sessions",
-                json!({ "query": "facet", "tool_kind": "command" }),
-            ),
-            tool_call(
-                3,
-                "search_sessions",
-                json!({ "query": "facet", "sidechain": "subagent_only" }),
-            ),
-            tool_call(
-                4,
-                "search_sessions",
-                json!({ "query": "facet", "tool_kind": "bogus" }),
-            ),
-        ],
-    );
+    let names = ["Bash", "bash", " Bash ", "\u{00a0}Bash\u{3000}", "Ba sh"];
+    let blanks = ["", " \t\r\n", "\u{00a0}\u{2003}\u{3000}"];
+    let mut requests = vec![
+        init,
+        initialized_notification(),
+        tool_call(
+            2,
+            "search_sessions",
+            json!({ "query": "facet", "tool_kind": "command" }),
+        ),
+        tool_call(
+            3,
+            "search_sessions",
+            json!({ "query": "facet", "sidechain": "subagent_only" }),
+        ),
+        tool_call(
+            4,
+            "search_sessions",
+            json!({ "query": "facet", "tool_kind": "bogus" }),
+        ),
+    ];
+    for (index, name) in names.into_iter().chain(blanks).enumerate() {
+        requests.push(tool_call(
+            5 + index as i64,
+            "search_sessions",
+            json!({"query":"facet","tool_name":name}),
+        ));
+    }
+    let frames = mcp_session(&db, &requests);
 
     // --tool-kind command：只有锚定 Bash 活动的 f-3 命中。
     let result = &frame_by_id(&frames, 2)["result"];
@@ -2322,6 +2330,41 @@ fn search_sessions_facet_params_filter_and_validate() {
     // 非法 tool_kind 是协议层 -32602。
     let error = &frame_by_id(&frames, 4)["error"];
     assert_eq!(error["code"], -32602, "{error}");
+
+    for (index, name) in names.into_iter().enumerate() {
+        let result = &frame_by_id(&frames, 5 + index as i64)["result"];
+        assert_eq!(result["isError"], false, "{name:?}: {result}");
+        let data = &result["structuredContent"]["data"];
+        assert_eq!(data["facets"]["tool_name"], name, "{data}");
+        let hits = data["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), usize::from(name == "Bash"), "{data}");
+        if name == "Bash" {
+            assert_eq!(hits[0]["id"], "msg_v1_f-3", "{data}");
+        }
+        let output = run_cli(&db, &["search", "facet", "--tool-name", name]);
+        assert!(output.status.success(), "{output:?}");
+        let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(cli["data"]["facets"]["tool_name"], name, "{cli}");
+        let cli_hits = cli["data"]["hits"].as_array().unwrap();
+        assert_eq!(cli_hits.len(), hits.len(), "{cli}");
+        for (cli_hit, hit) in cli_hits.iter().zip(hits) {
+            assert_eq!(cli_hit["id"], hit["id"], "{cli}");
+            assert_eq!(cli_hit["text"], hit["text"], "{cli}");
+        }
+    }
+    for (index, name) in blanks.into_iter().enumerate() {
+        let frame = frame_by_id(&frames, 5 + names.len() as i64 + index as i64);
+        assert_eq!(frame["error"]["code"], -32602, "{frame}");
+        assert_eq!(
+            frame["error"]["data"]["canonical_code"], "invalid_request",
+            "{frame}"
+        );
+        assert!(frame["result"].is_null(), "{frame}");
+        let output = run_cli(&db, &["search", "facet", "--tool-name", name]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(cli["error"]["code"], "invalid_request", "{cli}");
+    }
 }
 
 #[test]

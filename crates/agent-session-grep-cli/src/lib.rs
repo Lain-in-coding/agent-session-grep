@@ -2851,6 +2851,12 @@ fn search_command_from_args(
             "--tool-kind must be one of file|command|web|query|unknown, got {kind}"
         )));
     }
+    if tool_name
+        .as_ref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(CliError::usage("--tool-name must not be blank"));
+    }
     let facets = SearchFacets {
         sidechain,
         tool_kind,
