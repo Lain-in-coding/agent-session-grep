@@ -558,6 +558,18 @@ fn summary_never_serializes_native_locators_paths_hashes_or_private_diagnostics(
 fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
     for paused in [true, false] {
         let f = Fixture::new(DesiredUpdates::Running);
+        // Package construction is fixture preparation; injected callbacks use
+        // the existing installation within the command's real budget.
+        let mut installation = Some(f.installation(true));
+        let supervisor = installation
+            .as_ref()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        let end = Instant::now() + BUDGET;
         let mut rechecked = false;
         let result = execute(
             f.catalog.to_str().unwrap(),
@@ -565,11 +577,11 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
                 action: Action::Enable,
                 prefix: None,
             },
-            Instant::now() + Duration::from_secs(3),
-            &mut |_| Ok(f.installation(true)),
+            end,
+            &mut |_| Ok(installation.take().unwrap()),
             &mut || Ok(f.location.clone()),
             &mut |_, args, _| {
-                let response = f.response(args);
+                let response = f.response_with_supervisor(args, &supervisor);
                 if !rechecked && args.iter().any(|arg| arg == "ExecStart") {
                     rechecked = true;
                     let control = SqliteControlStore::open_current_writable(&f.root).unwrap();
