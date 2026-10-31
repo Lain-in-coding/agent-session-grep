@@ -55,7 +55,7 @@ fn encode(value: &impl Serialize) -> PortResult<Vec<u8>> {
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> PortResult<T> {
     serde_json::from_slice(bytes).map_err(|_| corrupt())
 }
-fn digest(fields: &[&[u8]]) -> String {
+pub(crate) fn digest(fields: &[&[u8]]) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"managed-projection-v1");
     for field in fields {
@@ -1050,7 +1050,10 @@ pub(crate) fn retained_receipt_matches(
         && generation <= current_generation)
 }
 
-fn stored_fingerprints(conn: &Connection, source: &str) -> PortResult<BTreeMap<String, String>> {
+pub(crate) fn stored_fingerprints(
+    conn: &Connection,
+    source: &str,
+) -> PortResult<BTreeMap<String, String>> {
     let mut statement=conn.prepare("SELECT 'm:'||message_id,payload_digest FROM source_projections WHERE source_id=?1 UNION ALL SELECT 'o:'||placement_id,payload_digest FROM source_occurrences WHERE source_id=?1 UNION ALL SELECT 'e:'||kind||':'||entity_key,payload_digest FROM source_entity_projections WHERE source_id=?1").map_err(sql)?;
     statement
         .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1306,6 +1309,7 @@ pub struct ManagedRead<'a> {
     /// Captured by the authorized constructor. An explicit test allow-list
     /// alone cannot prove that a barrier's selection revision/root is current.
     policy: Option<control::ReadPolicy>,
+    original_cycles: Option<crate::managed_discovery::OriginalCycleProof<'a>>,
 }
 /// Content-free counts from one authorized catalog snapshot. Coverage records
 /// verified selected discovery, independently of worker lifecycle or a latest
@@ -1541,6 +1545,21 @@ impl<'a> ManagedRead<'a> {
         read.policy = Some(policy.clone());
         Ok(read)
     }
+    /// The facade holds HistoryReaders and rechecks policy after this read.
+    /// Without this borrowed validator only exact-cycle discovery is usable.
+    pub(crate) fn begin_authorized_with_cycle_validator(
+        conn: &'a Connection,
+        policy: &control::ReadPolicy,
+        incarnation: &str,
+        end: Instant,
+        validator: &'a dyn crate::managed_discovery::OriginalCycleValidator,
+    ) -> PortResult<Self> {
+        let mut read = Self::begin_authorized(conn, policy, incarnation, end)?;
+        read.original_cycles = Some(crate::managed_discovery::OriginalCycleProof::new(
+            validator, end,
+        ));
+        Ok(read)
+    }
     pub fn begin(conn: &'a Connection, scope: &ReadScope, deadline: Instant) -> PortResult<Self> {
         if !conn.is_autocommit() || deadline <= Instant::now() {
             return Err(invalid());
@@ -1602,6 +1621,7 @@ impl<'a> ManagedRead<'a> {
             deadline,
             qualified_for: std::cell::RefCell::new(None),
             policy: None,
+            original_cycles: None,
         })
     }
     fn check_deadline(&self) -> PortResult<()> {
@@ -1851,9 +1871,24 @@ impl<'a> ManagedRead<'a> {
         {
             return Ok(false);
         }
+        if let Some(ownership) = &self.original_cycles
+            && !ownership.validates(
+                receipt.cycle_seq,
+                &receipt.worker_boot_id,
+                receipt.policy_epoch,
+                receipt.started_control_seq,
+                &SelectionProof {
+                    selection_id: selection.id.as_str().into(),
+                    selection_revision: receipt.selection_revision,
+                    root_identity: receipt.root_identity.clone(),
+                },
+            )?
+        {
+            return Ok(false);
+        }
         for source in &sources {
             self.check_deadline()?;
-            if !self.discovery_source_satisfied(source, &receipt, selection)? {
+            if !self.discovery_source_satisfied(source, &receipt, selection, barrier)? {
                 return Ok(false);
             }
         }
@@ -1880,9 +1915,9 @@ impl<'a> ManagedRead<'a> {
             committed_generation: row.get(9).map_err(sql)?,
         };
         if receipt.cycle_seq <= 0
-            || receipt.selection_revision < 0
+            || receipt.selection_revision < 1
             || receipt.policy_epoch < 0
-            || receipt.started_control_seq < 0
+            || receipt.started_control_seq < 1
             || !matches!(complete, 0 | 1)
             || receipt.committed_generation < 0
             || receipt.committed_generation > self.snapshot.generation
@@ -1930,76 +1965,96 @@ impl<'a> ManagedRead<'a> {
         source: &DiscoverySource,
         discovery: &DiscoveryReceipt,
         selection: &control::Selection,
+        barrier: Option<&control::LatestBarrier>,
     ) -> PortResult<bool> {
-        let mut statement = self.transaction.prepare("SELECT r.source_id,r.completeness,r.content_revision_id,r.content_set_digest,r.committed_at_ms,r.parser_version,r.revision_seq,r.reason,b.root_identity,b.provider_id,b.source_path,h.latest_receipt_id,h.visible_revision_id,h.content_set_digest,h.last_attempt_id,h.update_state FROM source_revision_receipts r LEFT JOIN source_bindings b ON b.source_id=r.source_id LEFT JOIN source_heads h ON h.source_id=r.source_id WHERE r.revision_id=?1").map_err(sql)?;
-        let mut rows = statement
-            .query([source.revision_id.as_str()])
+        use crate::managed_discovery as proof;
+        // The digest names immutable historical receipts. Later valid content
+        // is checked separately and never rewrites that membership or digest.
+        let exists: bool = self
+            .transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_revision_receipts WHERE revision_id=?1)",
+                [source.revision_id.as_str()],
+                |r| r.get(0),
+            )
             .map_err(sql)?;
-        let Some(row) = rows.next().map_err(sql)? else {
+        if !exists {
             return Ok(false);
+        }
+        let historical = crate::managed_receipt::read_checked(
+            &self.transaction,
+            source.revision_id.as_str(),
+            Some(source.source_id.as_str()),
+        )?;
+        let claim = SelectionProof {
+            selection_id: selection.id.as_str().into(),
+            selection_revision: discovery.selection_revision,
+            root_identity: discovery.root_identity.clone(),
         };
-        let receipt_source =
-            SourceId::parse(&row.get::<_, String>(0).map_err(sql)?).map_err(|_| corrupt())?;
-        let completeness: String = row.get(1).map_err(sql)?;
-        let content_revision: Option<String> = row.get(2).map_err(sql)?;
-        let content_digest: Option<String> = row.get(3).map_err(sql)?;
-        let committed_at: Option<i64> = row.get(4).map_err(sql)?;
-        let parser: i64 = row.get(5).map_err(sql)?;
-        let sequence: i64 = row.get(6).map_err(sql)?;
-        let reason: Option<String> = row.get(7).map_err(sql)?;
-        let root: Option<String> = row.get(8).map_err(sql)?;
-        let provider: Option<String> = row.get(9).map_err(sql)?;
-        let locator: Option<String> = row.get(10).map_err(sql)?;
-        let latest: Option<String> = row.get(11).map_err(sql)?;
-        let visible: Option<String> = row.get(12).map_err(sql)?;
-        let head_digest: Option<String> = row.get(13).map_err(sql)?;
-        let last_attempt: Option<String> = row.get(14).map_err(sql)?;
-        let state: Option<String> = row.get(15).map_err(sql)?;
-        let revision = self.revision(source.revision_id.as_str())?;
-        if parser <= 0
-            || sequence <= 0
-            || revision.cycle_seq <= 0
-            || revision.policy_epoch < 0
-            || revision.started_control_seq < 0
-            || revision.observed_at_ms < 0
-            || revision
+        let plain =
+            self.original_cycles.is_some() && proof::plain_receipt(&self.transaction, &historical)?;
+        let cycle_matches = if plain {
+            proof::member_cycle_matches(
+                &self.transaction,
+                &historical,
+                discovery.cycle_seq,
+                discovery.started_control_seq,
+            )?
+        } else {
+            historical.cycle_seq == discovery.cycle_seq
+                && historical.started_control_seq == discovery.started_control_seq
+        };
+        if !historical.published
+            || !cycle_matches
+            || historical.worker_boot_id != discovery.worker_boot_id
+            || historical.catalog_incarnation != discovery.catalog_incarnation
+            || historical.policy_epoch != discovery.policy_epoch
+            || historical
                 .committed_generation
-                .is_some_and(|g| g < 0 || g > self.snapshot.generation)
-            || committed_at.is_some_and(|n| n < 0)
-            || !matches!(completeness.as_str(), "complete" | "append" | "partial")
-            || revision.published != matches!(completeness.as_str(), "complete" | "append")
-            || (revision.published
-                && (revision.committed_generation.is_none()
-                    || committed_at.is_none()
-                    || content_revision.is_none()
-                    || content_digest.is_none()
-                    || reason.is_some()))
+                .is_none_or(|g| g > discovery.committed_generation)
+            || !proof::receipt_claim(&self.transaction, &historical, &claim)?
         {
-            return Err(corrupt());
+            return Ok(false);
         }
-        for value in [&revision.worker_boot_id, &revision.catalog_incarnation] {
-            control::ControlId::parse(value).map_err(|_| corrupt())?;
-        }
-        checked_label(&revision.digest).map_err(|_| corrupt())?;
-        for value in [
-            content_revision.as_ref(),
-            latest.as_ref(),
-            visible.as_ref(),
-            last_attempt.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
+        if let Some(ownership) = &self.original_cycles
+            && !ownership.receipt(&historical, &claim)?
         {
-            RevisionId::parse(value).map_err(|_| corrupt())?;
+            return Ok(false);
         }
-        let (Some(root), Some(provider), Some(locator), Some(state)) =
-            (root, provider, locator, state)
+        type Head = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+        );
+        let head: Option<Head> = self.transaction.query_row(
+            "SELECT b.provider_id,b.source_path,b.root_identity,h.latest_receipt_id,h.last_attempt_id,
+             h.visible_revision_id,h.content_set_digest,h.update_state,r.revision_seq
+             FROM source_bindings b JOIN source_heads h USING(source_id)
+             JOIN source_revision_receipts r ON r.revision_id=?1 AND r.source_id=b.source_id
+             WHERE b.source_id=?2",
+            params![source.revision_id.as_str(), source.source_id.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+        ).optional().map_err(sql)?;
+        let Some((
+            provider,
+            locator,
+            root,
+            latest,
+            attempt,
+            visible,
+            digest,
+            state,
+            historical_sequence,
+        )) = head
         else {
             return Ok(false);
         };
-        // Historical binding evidence only. The current proof is the per
-        // selection claim below checked against this selection's own discovery
-        // root, which latest_satisfied already bound to current control.
         control::ControlId::parse(&root).map_err(|_| corrupt())?;
         let provider = agent_session_grep_ports::SearchProvider::parse(&provider)
             .filter(|p| p.as_str() == provider)
@@ -2011,55 +2066,90 @@ impl<'a> ManagedRead<'a> {
         ) {
             return Err(corrupt());
         }
-        if !crate::managed_source_context::receipt_context_current(
-            &self.transaction,
-            source.revision_id.as_str(),
-            self.authorized_policy(),
-            self.deadline,
-        )? {
+        let Some(latest) = latest else {
             return Ok(false);
+        };
+        for value in [Some(&latest), attempt.as_ref(), visible.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            RevisionId::parse(value).map_err(|_| corrupt())?;
         }
-        if receipt_source != source.source_id
-            || !revision.published
-            || revision.cycle_seq != discovery.cycle_seq
-            || revision.worker_boot_id != discovery.worker_boot_id
-            || revision.catalog_incarnation != discovery.catalog_incarnation
-            || revision.policy_epoch != discovery.policy_epoch
-            || revision.started_control_seq != discovery.started_control_seq
-            || revision
-                .committed_generation
-                .is_some_and(|g| g > discovery.committed_generation)
-            || !selection.region.matches(provider, &locator)
-            || latest.as_deref() != Some(source.revision_id.as_str())
-            || visible != content_revision
-            || head_digest != content_digest
-            || last_attempt.as_deref() != Some(source.revision_id.as_str())
+        if !selection.region.matches(provider, &locator)
+            || attempt.as_deref() != Some(latest.as_str())
+            || (plain && state != "current")
             || matches!(
                 state.as_str(),
                 "partial" | "failed" | "deferred" | "revoked"
             )
+            || (!plain && latest != source.revision_id.as_str())
         {
             return Ok(false);
         }
-        let claim:Option<(i64,String)>=self.transaction.query_row("SELECT selection_revision,root_identity FROM receipt_selection_claims WHERE revision_id=?1 AND selection_id=?2",params![source.revision_id.as_str(),selection.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
-        let Some((revision, root)) = claim else {
-            return Ok(false);
+        let current = if plain {
+            let Some(receipt) = proof::current_plain_baseline(
+                &self.transaction,
+                &source.source_id,
+                self.authorized_policy().ok_or_else(invalid)?,
+                self.deadline,
+            )?
+            else {
+                return Ok(false);
+            };
+            receipt
+        } else {
+            if !crate::managed_source_context::receipt_context_current(
+                &self.transaction,
+                &latest,
+                self.authorized_policy(),
+                self.deadline,
+            )? {
+                return Ok(false);
+            }
+            crate::managed_receipt::read_checked(
+                &self.transaction,
+                &latest,
+                Some(source.source_id.as_str()),
+            )?
         };
-        if revision < 0 {
+        let (sequence, content_revision, content_digest): (i64, Option<String>, Option<String>) =
+            self.transaction.query_row(
+                "SELECT revision_seq,content_revision_id,content_set_digest FROM source_revision_receipts WHERE revision_id=?1",
+                [&latest], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).map_err(sql)?;
+        if !current.published
+            || current.cycle_seq < historical.cycle_seq
+            || sequence < historical_sequence
+            || current.worker_boot_id != discovery.worker_boot_id
+            || current.policy_epoch != discovery.policy_epoch
+            || current.catalog_incarnation != self.snapshot.catalog_incarnation
+            || current
+                .committed_generation
+                .is_none_or(|g| g > self.snapshot.generation)
+            || visible != content_revision
+            || digest != content_digest
+            || !proof::receipt_claim(&self.transaction, &current, &claim)?
+            || barrier.is_some_and(|b| {
+                current.cycle_seq < b.required_cycle_seq.get()
+                    || current.started_control_seq <= b.admission_control_seq.get()
+            })
+        {
+            return Ok(false);
+        }
+        if let Some(ownership) = &self.original_cycles
+            && !ownership.receipt(&current, &claim)?
+        {
+            return Ok(false);
+        }
+        let scope: Option<(i64,i64)> = self.transaction.query_row(
+            "SELECT selection_revision,policy_epoch FROM source_scope_claims WHERE source_id=?1 AND selection_id=?2",
+            params![source.source_id.as_str(), selection.id.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(sql)?;
+        if scope.is_some_and(|(revision, epoch)| revision < 1 || epoch < 0) {
             return Err(corrupt());
         }
-        control::ControlId::parse(&root).map_err(|_| corrupt())?;
-        if revision != discovery.selection_revision || root != discovery.root_identity {
-            return Ok(false);
-        }
-        let scope:Option<(i64,i64)>=self.transaction.query_row("SELECT selection_revision,policy_epoch FROM source_scope_claims WHERE source_id=?1 AND selection_id=?2",params![source.source_id.as_str(),selection.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
-        let Some((revision, epoch)) = scope else {
-            return Ok(false);
-        };
-        if revision < 0 || epoch < 0 {
-            return Err(corrupt());
-        }
-        Ok(revision == discovery.selection_revision && epoch == discovery.policy_epoch)
+        Ok(scope == Some((discovery.selection_revision, discovery.policy_epoch)))
     }
 
     fn discovery_heads_covered(
@@ -2086,13 +2176,18 @@ impl<'a> ManagedRead<'a> {
                 .ok_or_else(corrupt)?;
             let locator = control::CanonicalLocator::parse(&row.get::<_, String>(2).map_err(sql)?)
                 .map_err(|_| corrupt())?;
-            if !crate::managed_source_context::source_read_eligible(&self.transaction, &source)? {
-                continue;
-            }
             if expected.contains(source.as_str())
                 || !selection.region.matches(provider, &locator)
                 || !selected_policy.allows_source(provider, &locator, &source_id)
             {
+                continue;
+            }
+            // Plain scopes account for every permitted binding, even if it
+            // has never published or is too old to appear in allowed_sources.
+            if matches!(provider.as_str(), "claude-code" | "codex") {
+                return Ok(false);
+            }
+            if !crate::managed_source_context::source_read_eligible(&self.transaction, &source)? {
                 continue;
             }
             let latest: Option<String> = row.get(3).map_err(sql)?;
@@ -3761,13 +3856,13 @@ mod latest_proof_tests {
     use control::*;
     use std::time::Duration;
 
-    fn setup(conn: &Connection) {
+    pub(super) fn setup(conn: &Connection) {
         conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE store_metadata(singleton INTEGER PRIMARY KEY,active_generation INTEGER NOT NULL,projection_contract_version INTEGER NOT NULL DEFAULT 0,managed_mode INTEGER NOT NULL DEFAULT 0,destructive_epoch INTEGER NOT NULL DEFAULT 0); INSERT INTO store_metadata VALUES(1,0,0,0,0); BEGIN IMMEDIATE;").unwrap();
         create_schema(conn).unwrap();
         initialize_catalog_in_tx(conn, "synthetic-install", "synthetic-incarnation", 1).unwrap();
         conn.execute_batch("COMMIT").unwrap();
     }
-    fn locator() -> &'static str {
+    pub(super) fn locator() -> &'static str {
         #[cfg(windows)]
         {
             r"C:\synthetic"
@@ -3777,7 +3872,7 @@ mod latest_proof_tests {
             "/synthetic"
         }
     }
-    fn policy() -> ReadPolicy {
+    pub(super) fn policy() -> ReadPolicy {
         ReadPolicy {
             installation_id: ControlId::parse("synthetic-install").unwrap(),
             policy_epoch: PolicyEpoch::new(1).unwrap(),
@@ -3801,7 +3896,7 @@ mod latest_proof_tests {
             revocations: vec![],
         }
     }
-    fn barrier() -> LatestBarrier {
+    pub(super) fn barrier() -> LatestBarrier {
         LatestBarrier {
             id: ControlId::parse("barrier").unwrap(),
             policy_epoch: PolicyEpoch::new(1).unwrap(),
@@ -3819,7 +3914,7 @@ mod latest_proof_tests {
             }],
         }
     }
-    fn source_observation(name: &str, cycle: i64, complete: bool) -> SourceObservation {
+    pub(super) fn source_observation(name: &str, cycle: i64, complete: bool) -> SourceObservation {
         SourceObservation {
             binding: SourceBinding {
                 source_id: SourceId::parse(name).unwrap(),
@@ -3878,7 +3973,7 @@ mod latest_proof_tests {
             revision_id: o.revision_id.clone(),
         }
     }
-    fn discovery(cycle: i64, sources: Vec<DiscoverySource>) -> DiscoveryObservation {
+    pub(super) fn discovery(cycle: i64, sources: Vec<DiscoverySource>) -> DiscoveryObservation {
         DiscoveryObservation {
             cycle_seq: cycle,
             worker_boot_id: "boot".into(),
@@ -3904,7 +3999,7 @@ mod latest_proof_tests {
             .unwrap();
         result
     }
-    fn begin(conn: &Connection, cycle: i64) -> DiscoveryObservation {
+    pub(super) fn begin(conn: &Connection, cycle: i64) -> DiscoveryObservation {
         let mut observation = discovery(cycle, Vec::new());
         observation.complete = false;
         publish(conn, &observation);
@@ -4710,5 +4805,699 @@ mod latest_proof_tests {
         });
         let read = read(&conn, &policy);
         assert!(read.source_progress().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plain_epoch_tests {
+    use super::{latest_proof_tests as exact, *};
+    use crate::{managed_discovery as discovery, managed_history as history};
+    use control::*;
+    use std::{cell::Cell, time::Duration};
+
+    /// Deliberate control fixture: it proves only the catalog ownership seam.
+    /// It is never inferred from receipts or used as native worker evidence.
+    struct FakeCycles {
+        cycles: BTreeMap<i64, ObservationCycle>,
+        reads: Cell<usize>,
+    }
+    impl FakeCycles {
+        fn through(last: i64) -> Self {
+            Self {
+                cycles: (1..=last)
+                    .map(|seq| {
+                        (
+                            seq,
+                            ObservationCycle {
+                                token: ObservationToken {
+                                    cycle_seq: CycleSeq::new(seq).unwrap(),
+                                    worker_boot_id: ControlId::parse("boot").unwrap(),
+                                },
+                                policy_epoch: PolicyEpoch::new(1).unwrap(),
+                                state: CycleState::Partial,
+                                admitted_control_seq: ControlSeq::new(1).unwrap(),
+                                started_control_seq: Some(ControlSeq::new(10 + seq).unwrap()),
+                                started_at_ms: Some(seq),
+                                completed_at_ms: Some(seq),
+                                selections: vec![CycleSelection {
+                                    selection: exact::barrier().selections.remove(0),
+                                    discovery_complete: false,
+                                    discovered_count: 0,
+                                    observed_count: 0,
+                                    committed_count: 0,
+                                    error: None,
+                                }],
+                            },
+                        )
+                    })
+                    .collect(),
+                reads: Cell::new(0),
+            }
+        }
+    }
+    impl discovery::OriginalCycleValidator for FakeCycles {
+        fn cycle(&self, seq: CycleSeq, end: Instant) -> PortResult<ObservationCycle> {
+            assert!(Instant::now() < end);
+            self.reads.set(self.reads.get() + 1);
+            self.cycles
+                .get(&seq.get())
+                .cloned()
+                .ok_or_else(|| PortError::NotFound("synthetic cycle".into()))
+        }
+    }
+    /// One request deadline expiring inside a chosen discovery statement.
+    /// Production checks its deadline every 1,000 VM steps; the target
+    /// statements finish sooner on these fixtures, so tests check on every
+    /// step. The deadline expires once: Waiting -> Installed when the per-step
+    /// check is installed, Armed when the named statement then starts, and
+    /// Interrupted at that statement's first check.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Deadline {
+        Idle,
+        Waiting(&'static str),
+        Installed(&'static str),
+        Armed,
+        Interrupted,
+    }
+    thread_local! {
+        static DEADLINE: Cell<Deadline> = const { Cell::new(Deadline::Idle) };
+    }
+    fn arm_deadline(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, statement) = event
+            && let Deadline::Installed(target) = DEADLINE.get()
+            && statement.contains(target)
+        {
+            DEADLINE.set(Deadline::Armed);
+        }
+    }
+    fn deadline_reached() -> bool {
+        let reached = DEADLINE.get() == Deadline::Armed;
+        if reached {
+            DEADLINE.set(Deadline::Interrupted);
+        }
+        reached
+    }
+    /// Installs the per-step check from the first ownership read, after the
+    /// read or GC installed its own deadline handler. Only a target statement
+    /// that starts after this point can arm the deadline.
+    struct PerStepDeadline<'a> {
+        conn: &'a Connection,
+        cycles: &'a FakeCycles,
+    }
+    impl discovery::OriginalCycleValidator for PerStepDeadline<'_> {
+        fn cycle(&self, seq: CycleSeq, end: Instant) -> PortResult<ObservationCycle> {
+            self.conn
+                .progress_handler(1, Some(deadline_reached))
+                .unwrap();
+            if let Deadline::Waiting(target) = DEADLINE.get() {
+                DEADLINE.set(Deadline::Installed(target));
+            }
+            discovery::OriginalCycleValidator::cycle(self.cycles, seq, end)
+        }
+    }
+    fn deadline_inside<R>(conn: &Connection, target: &'static str, run: impl FnOnce() -> R) -> R {
+        DEADLINE.set(Deadline::Waiting(target));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(arm_deadline),
+        );
+        let result = run();
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert_eq!(
+            DEADLINE.replace(Deadline::Idle),
+            Deadline::Interrupted,
+            "the deadline must expire inside {target}"
+        );
+        result
+    }
+    fn end() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+    fn setup(conn: &Connection) {
+        crate::SqliteStore::init(conn).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        initialize_catalog_in_tx(conn, "synthetic-install", "synthetic-incarnation", 1).unwrap();
+        conn.pragma_update(None, "application_id", crate::managed_store::APPLICATION_ID)
+            .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    fn observation(name: &str, cycle: i64, complete: bool, text: &str) -> SourceObservation {
+        let mut o = exact::source_observation(name, cycle, complete);
+        o.binding.source_path = std::path::Path::new(exact::locator())
+            .join(format!("{name}.jsonl"))
+            .to_str()
+            .unwrap()
+            .into();
+        o.revision_digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+        o.parser_version = crate::PARSER_SEMANTIC_VERSION;
+        o.observed_at_ms = cycle;
+        o.committed_at_ms = cycle;
+        o
+    }
+    fn source(
+        conn: &Connection,
+        name: &str,
+        cycle: i64,
+        complete: bool,
+        text: &str,
+    ) -> DiscoverySource {
+        let o = observation(name, cycle, complete, text);
+        let message = StableId::native_checked(IdKind::Message, name).unwrap();
+        let session = StableId::native_checked(IdKind::Session, name).unwrap();
+        let document = StableId::native_checked(
+            IdKind::Document,
+            &format!("{name}-{}", &o.revision_digest[..12]),
+        )
+        .unwrap();
+        let batch = SourceBatch {
+            source_path: o.binding.source_path.clone(),
+            entries: vec![
+                (
+                    message.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "role":"user","text":text,"timestamp":null,
+                    }))
+                    .unwrap(),
+                    text.into(),
+                ),
+                (
+                    session.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "documents":[document.as_str()],
+                    }))
+                    .unwrap(),
+                    String::new(),
+                ),
+                (
+                    document.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "provider":o.binding.provider.as_str(),"variant":"synthetic-jsonl",
+                        "fingerprint":o.revision_digest,"len":text.len(),
+                    }))
+                    .unwrap(),
+                    String::new(),
+                ),
+            ],
+            placements: vec![agent_session_grep_domain::MessagePlacement::new(
+                session, document, message, 0, false, None,
+            )],
+            edges: vec![],
+            activities: vec![],
+            usage_events: vec![],
+            relation_complete: true,
+            len_bytes: Some(text.len() as i64),
+            fingerprint: Some(o.revision_digest.clone()),
+            provider_id: Some(o.binding.provider.as_str().into()),
+            resume_claims: vec![],
+        };
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let target: i64 = conn
+            .query_row(
+                "SELECT active_generation+1 FROM store_metadata WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut published = crate::managed_source_context::publish_source_with_context_in_tx(
+            conn,
+            &batch,
+            &o,
+            &agent_session_grep_ports::source_context::SourcePublicationContext::default(),
+            &exact::policy(),
+            target,
+            end(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE store_metadata SET active_generation=?1 WHERE singleton=1",
+            [published.required_generation],
+        )
+        .unwrap();
+        finalize_publications_in_tx(conn, std::slice::from_mut(&mut published)).unwrap();
+        if complete {
+            conn.execute(
+                "INSERT INTO source_scans(source_path,scanned_at_ms,len_bytes,fingerprint,provider_id,parser_version)
+                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(source_path) DO UPDATE SET
+                 scanned_at_ms=excluded.scanned_at_ms,len_bytes=excluded.len_bytes,fingerprint=excluded.fingerprint,
+                 provider_id=excluded.provider_id,parser_version=excluded.parser_version",
+                params![o.binding.source_path,cycle,text.len() as i64,o.revision_digest,o.binding.provider.as_str(),o.parser_version],
+            ).unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        DiscoverySource {
+            source_id: o.binding.source_id,
+            revision_id: o.revision_id,
+        }
+    }
+    fn close(
+        conn: &Connection,
+        cycle: i64,
+        sources: Vec<DiscoverySource>,
+        cycles: &FakeCycles,
+    ) -> PortResult<()> {
+        let observation = exact::discovery(cycle, sources);
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = discovery::publish_epoch_with_deadline_in_tx(
+            conn,
+            &observation,
+            &exact::policy(),
+            end(),
+            cycles,
+        );
+        conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .unwrap();
+        result
+    }
+    fn read<'a>(conn: &'a Connection, cycles: &'a FakeCycles) -> ManagedRead<'a> {
+        ManagedRead::begin_authorized_with_cycle_validator(
+            conn,
+            &exact::policy(),
+            "synthetic-incarnation",
+            end(),
+            cycles,
+        )
+        .unwrap()
+    }
+    fn coverage(conn: &Connection, cycles: &FakeCycles) -> Coverage {
+        read(conn, cycles).scope_freshness(&[]).unwrap().coverage
+    }
+    fn prune(
+        conn: &Connection,
+        cycles: &dyn discovery::OriginalCycleValidator,
+    ) -> PortResult<history::HistoryPrune> {
+        let (generation, destructive_epoch): (i64, i64) = conn
+            .query_row(
+                "SELECT active_generation,destructive_epoch FROM store_metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let dependencies = history::HistoryDependencies {
+            installation_id: ControlId::parse("synthetic-install").unwrap(),
+            snapshot: ReadSnapshot {
+                catalog_incarnation: "synthetic-incarnation".into(),
+                generation,
+                destructive_epoch,
+                policy_epoch: 1,
+            },
+            keep_cycles: vec![],
+            keep_receipts: vec![],
+        };
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = history::prune_with_cycle_validator_in_tx(
+            conn,
+            &dependencies,
+            &[],
+            history::HistoryLimits::default(),
+            end(),
+            cycles,
+        );
+        conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .unwrap();
+        result
+    }
+    #[test]
+    fn plain_epoch_old_baselines_complete_ordinary_but_each_latest_receipt_is_post_admission() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(4);
+        let a = source(&conn, "a", 1, true, "first");
+        let b = source(&conn, "b", 1, true, "first");
+        exact::begin(&conn, 2);
+        close(&conn, 2, vec![a, b], &cycles).unwrap();
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+        assert!(
+            !read(&conn, &cycles)
+                .latest_satisfied(&exact::barrier())
+                .unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT MAX(observed_at_ms) FROM source_revision_receipts",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!ManagedRead::begin_authorized(
+            &conn, &exact::policy(), "synthetic-incarnation", end(),
+        ).unwrap().scope_freshness(&[]).unwrap().coverage.eq(&Coverage::Complete));
+        source(&conn, "a", 3, true, "new a");
+        assert!(
+            !read(&conn, &cycles)
+                .latest_satisfied(&exact::barrier())
+                .unwrap()
+        );
+        source(&conn, "b", 4, true, "new b");
+        assert!(
+            read(&conn, &cycles)
+                .latest_satisfied(&exact::barrier())
+                .unwrap()
+        );
+        let mut late = exact::barrier();
+        late.admission_control_seq = ControlSeq::new(13).unwrap();
+        assert!(!read(&conn, &cycles).latest_satisfied(&late).unwrap());
+    }
+    #[test]
+    fn plain_epoch_original_boot_start_root_missing_and_queued_are_not_proof() {
+        for fault in 0..6 {
+            let conn = Connection::open_in_memory().unwrap();
+            setup(&conn);
+            let mut cycles = FakeCycles::through(2);
+            let a = source(&conn, "a", 1, true, "first");
+            exact::begin(&conn, 2);
+            let original = cycles.cycles.get_mut(&1).unwrap();
+            match fault {
+                0 => original.token.worker_boot_id = ControlId::parse("other-boot").unwrap(),
+                1 => original.started_control_seq = Some(ControlSeq::new(12).unwrap()),
+                2 => original.state = CycleState::Queued,
+                3 => original.started_control_seq = None,
+                4 => {
+                    original.selections[0].selection.root_identity =
+                        ControlId::parse("other-root").unwrap()
+                }
+                _ => {
+                    cycles.cycles.remove(&1);
+                }
+            }
+            assert!(
+                matches!(
+                    close(&conn, 2, vec![a], &cycles),
+                    Err(PortError::InvalidRequest(_))
+                ),
+                "fault={fault}"
+            );
+            assert!(
+                !conn
+                    .query_row(
+                        "SELECT complete FROM discovery_receipts WHERE cycle_seq=2",
+                        [],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let mut cycles = FakeCycles::through(2);
+        cycles.cycles.get_mut(&1).unwrap().state = CycleState::Aborted;
+        let a = source(&conn, "a", 1, true, "first");
+        exact::begin(&conn, 2);
+        close(&conn, 2, vec![a], &cycles).unwrap();
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+        cycles.cycles.get_mut(&1).unwrap().started_control_seq = None;
+        assert_eq!(coverage(&conn, &cycles), Coverage::Partial);
+        assert!(matches!(
+            prune(&conn, &cycles),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+    }
+    #[test]
+    fn plain_epoch_failed_held_unknown_or_unpublished_extra_bindings_block_at_any_age() {
+        for fault in 0..5 {
+            let conn = Connection::open_in_memory().unwrap();
+            setup(&conn);
+            let cycles = FakeCycles::through(8);
+            let a = source(&conn, "a", 1, true, "first");
+            exact::begin(&conn, 2);
+            close(&conn, 2, vec![a], &cycles).unwrap();
+            assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+            match fault {
+                0 => {
+                    source(&conn, "a", 3, false, "torn");
+                }
+                1 => {
+                    source(&conn, "old-empty", 1, false, "");
+                }
+                2 => {
+                    conn.execute("INSERT INTO source_bindings VALUES('unknown',?1,'claude-code',NULL,'root',0)",
+                        [std::path::Path::new(exact::locator()).join("unknown.jsonl").to_str().unwrap()]).unwrap();
+                }
+                3 => {
+                    conn.execute("UPDATE source_heads SET update_state='failed'", [])
+                        .unwrap();
+                }
+                _ => {
+                    conn.execute("UPDATE source_heads SET update_state='deferred'", [])
+                        .unwrap();
+                }
+            }
+            assert_eq!(coverage(&conn, &cycles), Coverage::Partial, "fault={fault}");
+            exact::begin(&conn, 8);
+            let a = DiscoverySource {
+                source_id: SourceId::parse("a").unwrap(),
+                revision_id: RevisionId::parse("revision-a-1").unwrap(),
+            };
+            assert!(close(&conn, 8, vec![a], &cycles).is_err(), "fault={fault}");
+            assert_eq!(coverage(&conn, &cycles), Coverage::Partial);
+        }
+    }
+    #[test]
+    fn plain_epoch_newest_fence_and_wal_snapshot_never_fall_back_to_old_complete() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let path = temp.path().join("catalog.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        setup(&writer);
+        let cycles = FakeCycles::through(4);
+        let a = source(&writer, "a", 1, true, "first");
+        exact::begin(&writer, 2);
+        close(&writer, 2, vec![a.clone()], &cycles).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        let pinned = read(&reader, &cycles);
+        assert_eq!(
+            pinned.scope_freshness(&[]).unwrap().coverage,
+            Coverage::Complete
+        );
+        exact::begin(&writer, 3);
+        assert_eq!(coverage(&writer, &cycles), Coverage::Partial);
+        assert!(close(&writer, 2, vec![a], &cycles).is_err());
+        assert_eq!(
+            pinned.scope_freshness(&[]).unwrap().coverage,
+            Coverage::Complete
+        );
+        source(&writer, "a", 4, false, "torn");
+        assert_eq!(
+            pinned.scope_freshness(&[]).unwrap().coverage,
+            Coverage::Complete
+        );
+        drop(pinned);
+        assert_eq!(coverage(&reader, &cycles), Coverage::Partial);
+    }
+    #[test]
+    fn plain_epoch_new_actual_content_and_generation_use_current_head_not_historical_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(3);
+        let a = source(&conn, "a", 1, true, "first");
+        exact::begin(&conn, 2);
+        close(&conn, 2, vec![a], &cycles).unwrap();
+        source(&conn, "a", 3, true, "different");
+        let (old_digest, new_digest, closing_generation, current_generation): (String, String, i64, i64) =
+            conn.query_row(
+                "SELECT old.content_set_digest,new.content_set_digest,d.committed_generation,new.committed_generation
+                 FROM source_revision_receipts old CROSS JOIN source_revision_receipts new CROSS JOIN discovery_receipts d
+                 WHERE old.revision_id='revision-a-1' AND new.revision_id='revision-a-3'",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            ).unwrap();
+        assert_ne!(old_digest, new_digest);
+        assert!(current_generation > closing_generation);
+        conn.execute(
+            "UPDATE source_revision_receipts SET parser_version=2 WHERE revision_id='revision-a-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+        assert!(
+            read(&conn, &cycles)
+                .latest_satisfied(&exact::barrier())
+                .unwrap()
+        );
+        assert_eq!(
+            conn.query_row("SELECT revision_id FROM discovery_sources", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "revision-a-1"
+        );
+        conn.execute("UPDATE source_scans SET parser_version=0", [])
+            .unwrap();
+        assert_eq!(coverage(&conn, &cycles), Coverage::Partial);
+    }
+    #[test]
+    fn plain_epoch_corrupt_digest_lineage_or_historical_context_is_an_error() {
+        for mutation in [
+            "UPDATE discovery_receipts SET source_set_digest=printf('%064d',1)",
+            // revision-a-2 is the head and reuses revision-a-1 content, so
+            // begin's head check already rejects this lineage.
+            "UPDATE source_revision_receipts SET content_set_digest=printf('%064d',1) WHERE revision_id='revision-a-2'",
+            "UPDATE source_publication_contexts SET context_digest=printf('%064d',1) WHERE revision_id='revision-a-1'",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            setup(&conn);
+            let cycles = FakeCycles::through(3);
+            source(&conn, "a", 1, true, "first");
+            let a = source(&conn, "a", 2, true, "first");
+            exact::begin(&conn, 3);
+            close(&conn, 3, vec![a], &cycles).unwrap();
+            if mutation.contains("source_publication_contexts") {
+                // Corrupt bytes at insertion while retaining the immutable
+                // update trigger; production cannot update an old context.
+                let (manifest, count): (Vec<u8>, i64) = conn.query_row(
+                    "SELECT manifest,dependency_count FROM source_publication_contexts WHERE revision_id='revision-a-1'",
+                    [], |r| Ok((r.get(0)?,r.get(1)?)),
+                ).unwrap();
+                conn.execute(
+                    "DELETE FROM source_publication_contexts WHERE revision_id='revision-a-1'",
+                    [],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO source_publication_contexts VALUES('revision-a-1','a',?1,printf('%064d',1),?2,NULL)",
+                    params![manifest,count]).unwrap();
+            } else {
+                conn.execute_batch(mutation).unwrap();
+            }
+            let result = ManagedRead::begin_authorized_with_cycle_validator(
+                &conn,
+                &exact::policy(),
+                "synthetic-incarnation",
+                end(),
+                &cycles,
+            )
+            .and_then(|read| read.scope_freshness(&[]));
+            if mutation.contains("source_publication_contexts") {
+                assert!(matches!(
+                    prune(&conn, &cycles),
+                    Err(PortError::SchemaIncompatible(_))
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(PortError::SchemaIncompatible(_))),
+                    "{mutation}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn plain_epoch_corrupt_historical_member_lineage_fails_read_and_gc_not_begin() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(4);
+        source(&conn, "a", 1, true, "first");
+        let a = source(&conn, "a", 2, true, "first");
+        exact::begin(&conn, 3);
+        close(&conn, 3, vec![a], &cycles).unwrap();
+        source(&conn, "a", 4, true, "different");
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+        // Positive control: before corruption, GC accepts the epoch member
+        // under a newer head, so the error below comes from the lineage.
+        prune(&conn, &cycles).unwrap();
+        // Only the epoch member still names the retained revision-a-1 content.
+        conn.execute(
+            "UPDATE source_revision_receipts SET content_set_digest=printf('%064d',1) WHERE revision_id='revision-a-2'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            read(&conn, &cycles).scope_freshness(&[]),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert!(matches!(
+            prune(&conn, &cycles),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+    }
+    #[test]
+    fn plain_epoch_read_deadline_inside_discovery_proof_is_writer_busy() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(2);
+        let a = source(&conn, "a", 1, true, "first");
+        exact::begin(&conn, 2);
+        close(&conn, 2, vec![a], &cycles).unwrap();
+        let validator = PerStepDeadline {
+            conn: &conn,
+            cycles: &cycles,
+        };
+        let result = deadline_inside(
+            &conn,
+            "JOIN source_scans s ON s.source_path=b.source_path",
+            || {
+                ManagedRead::begin_authorized_with_cycle_validator(
+                    &conn,
+                    &exact::policy(),
+                    "synthetic-incarnation",
+                    end(),
+                    &validator,
+                )
+                .and_then(|read| read.scope_freshness(&[]))
+            },
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+    }
+    #[test]
+    fn plain_epoch_gc_deadline_inside_ownership_proof_is_writer_busy() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(2);
+        let a = source(&conn, "a", 1, true, "first");
+        exact::begin(&conn, 2);
+        close(&conn, 2, vec![a], &cycles).unwrap();
+        let validator = PerStepDeadline {
+            conn: &conn,
+            cycles: &cycles,
+        };
+        let result = deadline_inside(&conn, "revision_id=?1 ORDER BY selection_id", || {
+            prune(&conn, &validator)
+        });
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        // The savepoint rolled back; the same catalog remains prunable.
+        prune(&conn, &cycles).unwrap();
+    }
+    #[test]
+    fn plain_epoch_retention_over_64_cycles_keeps_original_receipt_claims_and_control_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let cycles = FakeCycles::through(70);
+        let a = source(&conn, "a", 1, true, "first");
+        for cycle in 2..=70 {
+            exact::begin(&conn, cycle);
+            close(&conn, cycle, vec![a.clone()], &cycles).unwrap();
+        }
+        let first = prune(&conn, &cycles).unwrap();
+        assert_eq!(first.counts.discoveries_deleted, 64);
+        assert!(first.has_more);
+        let last = prune(&conn, &cycles).unwrap();
+        assert!(!last.has_more);
+        let history::CycleRetention::Complete(tokens) = last.cycles else {
+            panic!("complete inventory required")
+        };
+        assert_eq!(
+            tokens.iter().map(|t| t.cycle_seq.get()).collect::<Vec<_>>(),
+            vec![1, 70]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM receipt_selection_claims WHERE revision_id='revision-a-1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(coverage(&conn, &cycles), Coverage::Complete);
+        cycles.reads.set(0);
+        let snapshot = read(&conn, &cycles);
+        assert_eq!(
+            snapshot.scope_freshness(&[]).unwrap().coverage,
+            Coverage::Complete
+        );
+        assert_eq!(
+            snapshot.scope_freshness(&[]).unwrap().coverage,
+            Coverage::Complete
+        );
+        assert_eq!(cycles.reads.get(), 2);
     }
 }

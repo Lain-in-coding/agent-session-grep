@@ -147,6 +147,37 @@ pub fn prune_in_tx(
     limits: HistoryLimits,
     deadline: Instant,
 ) -> PortResult<HistoryPrune> {
+    prune(conn, dependencies, cache_revisions, limits, deadline, None)
+}
+
+/// Facade-only ownership validation under the exclusive HistoryReaders guard.
+pub(crate) fn prune_with_cycle_validator_in_tx(
+    conn: &Connection,
+    dependencies: &HistoryDependencies,
+    cache_revisions: &[RevisionId],
+    limits: HistoryLimits,
+    end: Instant,
+    validator: &dyn managed_discovery::OriginalCycleValidator,
+) -> PortResult<HistoryPrune> {
+    let ownership = managed_discovery::OriginalCycleProof::new(validator, end);
+    prune(
+        conn,
+        dependencies,
+        cache_revisions,
+        limits,
+        end,
+        Some(&ownership),
+    )
+}
+
+fn prune(
+    conn: &Connection,
+    dependencies: &HistoryDependencies,
+    cache_revisions: &[RevisionId],
+    limits: HistoryLimits,
+    deadline: Instant,
+    ownership: Option<&managed_discovery::OriginalCycleProof<'_>>,
+) -> PortResult<HistoryPrune> {
     time(deadline)?;
     limits.validate()?;
     let input_count = dependencies
@@ -176,7 +207,14 @@ pub fn prune_in_tx(
             .map_err(sql)?;
         return Err(sql(error));
     }
-    let mut result = prune_inner(conn, dependencies, cache_revisions, limits, deadline);
+    let mut result = prune_inner(
+        conn,
+        dependencies,
+        cache_revisions,
+        limits,
+        deadline,
+        ownership,
+    );
     if let Err(error) = conn.progress_handler(0, None::<fn() -> bool>) {
         result = Err(sql(error));
     }
@@ -225,6 +263,7 @@ fn prune_inner(
     cache_revisions: &[RevisionId],
     limits: HistoryLimits,
     deadline: Instant,
+    ownership: Option<&managed_discovery::OriginalCycleProof<'_>>,
 ) -> PortResult<HistoryPrune> {
     verify_snapshot(conn, dependencies)?;
     verify_structure(conn, &dependencies.snapshot)?;
@@ -263,7 +302,7 @@ fn prune_inner(
         "INSERT INTO history_delete_discoveries SELECT d.cycle_seq,d.selection_id FROM discovery_receipts d LEFT JOIN history_keep_discoveries k USING(cycle_seq,selection_id) WHERE k.cycle_seq IS NULL ORDER BY d.cycle_seq,d.selection_id LIMIT ?1",
         [limits.batch_rows as i64],
     ).map_err(sql)?;
-    verify_discoveries(conn, limits.max_dependencies, deadline)?;
+    verify_discoveries(conn, limits.max_dependencies, deadline, ownership)?;
     // Source heads and every evidence table may point at DIFFERENT historical
     // receipts. Head freshness cannot substitute for those original proofs.
     conn.execute_batch("INSERT OR IGNORE INTO history_keep_receipts SELECT visible_revision_id FROM source_heads WHERE visible_revision_id IS NOT NULL UNION SELECT latest_receipt_id FROM source_heads WHERE latest_receipt_id IS NOT NULL UNION SELECT last_attempt_id FROM source_heads WHERE last_attempt_id IS NOT NULL UNION SELECT revision_id FROM source_projections UNION SELECT revision_id FROM source_occurrences UNION SELECT revision_id FROM source_entity_projections UNION SELECT revision_id FROM source_session_projections;").map_err(sql)?;
@@ -289,7 +328,7 @@ fn prune_inner(
     };
     let remaining = limits.batch_rows - counts.discoveries_deleted as usize;
     select_delete_receipts(conn, remaining)?;
-    verify_delete_receipts(conn, deadline)?;
+    verify_delete_receipts(conn, deadline, ownership)?;
     verify_retired_contexts(conn, deadline)?;
     counts.receipt_claims_deleted = conn.execute("DELETE FROM receipt_selection_claims WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
     counts.retained_proofs_deleted = conn.execute("DELETE FROM retained_source_receipts WHERE revision_id IN(SELECT revision_id FROM history_delete_receipts)", []).map_err(sql)? as u64;
@@ -310,7 +349,13 @@ fn prune_inner(
         return Err(corrupt());
     }
     let has_more = more_discoveries || more_receipts;
-    let cycles = retained_tokens(conn, limits.max_cycle_tokens, deadline)?;
+    let cycles = if let Some(ownership) = ownership
+        && !verify_retained_ownership(conn, limits.max_dependencies, deadline, ownership)?
+    {
+        CycleRetention::PendingCatalogPrune
+    } else {
+        retained_tokens(conn, limits.max_cycle_tokens, deadline)?
+    };
     time(deadline)?;
     conn.execute_batch(CLEAN_TEMP).map_err(sql)?;
     Ok(HistoryPrune {
@@ -481,7 +526,22 @@ fn verify_structure(conn: &Connection, snapshot: &ReadSnapshot) -> PortResult<()
         return Err(corrupt());
     }
     let invalid_discovery = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM discovery_receipts WHERE cycle_seq<1 OR selection_revision<1 OR length(selection_id) NOT BETWEEN 1 AND 128 OR selection_id GLOB '*[^A-Za-z0-9_-]*' OR length(worker_boot_id) NOT BETWEEN 1 AND 128 OR worker_boot_id GLOB '*[^A-Za-z0-9_-]*' OR length(catalog_incarnation) NOT BETWEEN 1 AND 128 OR catalog_incarnation GLOB '*[^A-Za-z0-9_-]*' OR length(root_identity) NOT BETWEEN 1 AND 128 OR root_identity GLOB '*[^A-Za-z0-9_-]*' OR policy_epoch<0 OR policy_epoch>?1 OR started_control_seq<1 OR committed_generation<0 OR committed_generation>?2 OR complete NOT IN(0,1) OR length(source_set_digest)!=64 OR source_set_digest GLOB '*[^0-9a-f]*') OR EXISTS(SELECT 1 FROM discovery_sources s JOIN discovery_receipts d USING(cycle_seq,selection_id) LEFT JOIN source_revision_receipts r USING(revision_id) WHERE r.revision_id IS NULL OR r.source_id!=s.source_id OR r.published!=1 OR r.cycle_seq!=d.cycle_seq OR r.worker_boot_id!=d.worker_boot_id OR r.catalog_incarnation!=d.catalog_incarnation OR r.policy_epoch!=d.policy_epoch OR r.started_control_seq!=d.started_control_seq OR r.committed_generation>d.committed_generation OR d.complete!=1)",
+        "SELECT EXISTS(SELECT 1 FROM discovery_receipts WHERE cycle_seq<1 OR selection_revision<1 OR length(selection_id) NOT BETWEEN 1 AND 128 OR selection_id GLOB '*[^A-Za-z0-9_-]*' OR length(worker_boot_id) NOT BETWEEN 1 AND 128 OR worker_boot_id GLOB '*[^A-Za-z0-9_-]*' OR length(catalog_incarnation) NOT BETWEEN 1 AND 128 OR catalog_incarnation GLOB '*[^A-Za-z0-9_-]*' OR length(root_identity) NOT BETWEEN 1 AND 128 OR root_identity GLOB '*[^A-Za-z0-9_-]*' OR policy_epoch<0 OR policy_epoch>?1 OR started_control_seq<1 OR committed_generation<0 OR committed_generation>?2 OR complete NOT IN(0,1) OR length(source_set_digest)!=64 OR source_set_digest GLOB '*[^0-9a-f]*') OR EXISTS(
+         SELECT 1 FROM discovery_sources s JOIN discovery_receipts d USING(cycle_seq,selection_id)
+         LEFT JOIN source_revision_receipts r USING(revision_id)
+         LEFT JOIN source_bindings b ON b.source_id=r.source_id
+         LEFT JOIN source_publication_contexts p ON p.revision_id=r.revision_id
+         LEFT JOIN receipt_selection_claims c ON c.revision_id=r.revision_id AND c.selection_id=d.selection_id
+         WHERE r.revision_id IS NULL OR r.source_id!=s.source_id OR r.published!=1
+         OR r.worker_boot_id!=d.worker_boot_id OR r.catalog_incarnation!=d.catalog_incarnation
+         OR r.policy_epoch!=d.policy_epoch OR r.committed_generation>d.committed_generation OR d.complete!=1
+         OR c.revision_id IS NULL OR c.selection_revision!=d.selection_revision OR c.root_identity!=d.root_identity
+         OR CASE WHEN b.provider_id IN ('claude-code','codex') AND substr(b.source_path,-6)='.jsonl'
+              AND (r.revision_digest='confirmed_absent' OR (length(r.revision_digest)=64 AND r.revision_digest NOT GLOB '*[^0-9a-f]*'))
+              AND p.dependency_count=0 AND p.authority_id IS NULL
+            THEN r.cycle_seq>d.cycle_seq OR r.started_control_seq<1 OR r.started_control_seq>d.started_control_seq
+              OR (r.cycle_seq=d.cycle_seq AND r.started_control_seq!=d.started_control_seq)
+            ELSE r.cycle_seq!=d.cycle_seq OR r.started_control_seq!=d.started_control_seq END)",
         params![snapshot.policy_epoch,snapshot.generation], |row| row.get::<_, bool>(0),
     ).map_err(sql)?;
     if invalid_discovery {
@@ -521,16 +581,25 @@ fn verify_live_receipts(conn: &Connection, maximum: usize, deadline: Instant) ->
     }
     Ok(())
 }
-fn verify_delete_receipts(conn: &Connection, deadline: Instant) -> PortResult<()> {
+fn verify_delete_receipts(
+    conn: &Connection,
+    deadline: Instant,
+    ownership: Option<&managed_discovery::OriginalCycleProof<'_>>,
+) -> PortResult<()> {
     let mut statement = conn.prepare("SELECT r.revision_id,r.source_id FROM history_delete_receipts d JOIN source_revision_receipts r USING(revision_id)").map_err(sql)?;
     let mut rows = statement.query([]).map_err(sql)?;
     while let Some(row) = rows.next().map_err(sql)? {
         time(deadline)?;
-        managed_receipt::read_checked(
+        let receipt = managed_receipt::read_checked(
             conn,
             &row.get::<_, String>(0).map_err(sql)?,
             Some(&row.get::<_, String>(1).map_err(sql)?),
         )?;
+        if let Some(ownership) = ownership
+            && !managed_discovery::validate_receipt_ownership(conn, &receipt, ownership, deadline)?
+        {
+            return Err(corrupt());
+        }
     }
     Ok(())
 }
@@ -564,12 +633,18 @@ impl Discovery {
             generation: row.get(10)?,
         })
     }
-    fn check_receipt(&self, receipt: &RevisionRef) -> PortResult<()> {
+    fn check_receipt(
+        &self,
+        conn: &Connection,
+        receipt: &RevisionRef,
+        ownership: Option<&managed_discovery::OriginalCycleProof<'_>>,
+    ) -> PortResult<()> {
+        let relation =
+            managed_discovery::member_cycle_matches(conn, receipt, self.cycle, self.started)?;
         if !receipt.published
-            || receipt.cycle_seq != self.cycle
+            || !relation
             || receipt.worker_boot_id != self.boot
             || receipt.policy_epoch != self.policy
-            || receipt.started_control_seq != self.started
             || receipt.catalog_incarnation != self.incarnation
             || receipt
                 .committed_generation
@@ -577,16 +652,50 @@ impl Discovery {
         {
             return Err(corrupt());
         }
+        let claim = agent_session_grep_ports::managed::SelectionProof {
+            selection_id: self.selection.clone(),
+            selection_revision: self.selection_revision,
+            root_identity: self.root.clone(),
+        };
+        if let Some(ownership) = ownership {
+            if !ownership.receipt(receipt, &claim)? {
+                return Err(corrupt());
+            }
+        } else if receipt.cycle_seq != self.cycle || receipt.started_control_seq != self.started {
+            // A syntactically valid token is not proof of an earlier cycle's
+            // actual start. Exact-only callers must use the guarded facade.
+            return Err(corrupt());
+        }
         Ok(())
     }
 }
-fn verify_discoveries(conn: &Connection, maximum: usize, deadline: Instant) -> PortResult<()> {
+fn verify_discoveries(
+    conn: &Connection,
+    maximum: usize,
+    deadline: Instant,
+    ownership: Option<&managed_discovery::OriginalCycleProof<'_>>,
+) -> PortResult<()> {
     let mut statement = conn.prepare("SELECT d.cycle_seq,d.selection_id,d.selection_revision,d.worker_boot_id,d.policy_epoch,d.started_control_seq,d.catalog_incarnation,d.root_identity,d.source_set_digest,d.complete,d.committed_generation FROM discovery_receipts d WHERE (d.cycle_seq,d.selection_id) IN(SELECT cycle_seq,selection_id FROM history_keep_discoveries UNION SELECT cycle_seq,selection_id FROM history_delete_discoveries) ORDER BY d.cycle_seq,d.selection_id").map_err(sql)?;
     let mut rows = statement.query([]).map_err(sql)?;
     let mut dependencies = 0;
     while let Some(row) = rows.next().map_err(sql)? {
         time(deadline)?;
         let discovery = Discovery::read(row).map_err(sql)?;
+        if let Some(ownership) = ownership
+            && !ownership.validates(
+                discovery.cycle,
+                &discovery.boot,
+                discovery.policy,
+                discovery.started,
+                &agent_session_grep_ports::managed::SelectionProof {
+                    selection_id: discovery.selection.clone(),
+                    selection_revision: discovery.selection_revision,
+                    root_identity: discovery.root.clone(),
+                },
+            )?
+        {
+            return Err(corrupt());
+        }
         let mut sources_statement = conn.prepare("SELECT source_id,revision_id FROM discovery_sources WHERE cycle_seq=?1 AND selection_id=?2 ORDER BY source_id").map_err(sql)?;
         let mut source_rows = sources_statement
             .query(params![discovery.cycle, discovery.selection])
@@ -604,7 +713,21 @@ fn verify_discoveries(conn: &Connection, maximum: usize, deadline: Instant) -> P
                 .map_err(|_| corrupt())?;
             let receipt =
                 managed_receipt::read_checked(conn, revision.as_str(), Some(source.as_str()))?;
-            discovery.check_receipt(&receipt)?;
+            discovery.check_receipt(conn, &receipt, ownership)?;
+            let context_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_publication_contexts WHERE revision_id=?1)",
+                    [revision.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(sql)?;
+            if context_exists {
+                crate::managed_source_context::verify_context_for_retirement(
+                    conn,
+                    revision.as_str(),
+                    source.as_str(),
+                )?;
+            }
             let claim: Option<(i64,String)> = conn.query_row("SELECT selection_revision,root_identity FROM receipt_selection_claims WHERE revision_id=?1 AND selection_id=?2",params![revision.as_str(),discovery.selection],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(sql)?;
             if claim != Some((discovery.selection_revision, discovery.root.clone())) {
                 return Err(corrupt());
@@ -621,6 +744,66 @@ fn verify_discoveries(conn: &Connection, maximum: usize, deadline: Instant) -> P
         }
     }
     Ok(())
+}
+
+fn verify_retained_ownership(
+    conn: &Connection,
+    maximum: usize,
+    deadline: Instant,
+    ownership: &managed_discovery::OriginalCycleProof<'_>,
+) -> PortResult<bool> {
+    let mut statement = conn
+        .prepare("SELECT revision_id,source_id FROM source_revision_receipts ORDER BY revision_id")
+        .map_err(sql)?;
+    let mut rows = statement.query([]).map_err(sql)?;
+    let mut count = 0;
+    while let Some(row) = rows.next().map_err(sql)? {
+        time(deadline)?;
+        count += 1;
+        if count > maximum {
+            return Ok(false);
+        }
+        let receipt = managed_receipt::read_checked(
+            conn,
+            &row.get::<_, String>(0).map_err(sql)?,
+            Some(&row.get::<_, String>(1).map_err(sql)?),
+        )?;
+        if !managed_discovery::validate_receipt_ownership(conn, &receipt, ownership, deadline)? {
+            return Err(corrupt());
+        }
+    }
+    drop(rows);
+    drop(statement);
+    let mut statement = conn
+        .prepare(
+            "SELECT cycle_seq,worker_boot_id,policy_epoch,started_control_seq,
+         selection_id,selection_revision,root_identity FROM discovery_receipts
+         ORDER BY cycle_seq,selection_id",
+        )
+        .map_err(sql)?;
+    let mut rows = statement.query([]).map_err(sql)?;
+    while let Some(row) = rows.next().map_err(sql)? {
+        time(deadline)?;
+        count += 1;
+        if count > maximum {
+            return Ok(false);
+        }
+        let selection = agent_session_grep_ports::managed::SelectionProof {
+            selection_id: row.get(4).map_err(sql)?,
+            selection_revision: row.get(5).map_err(sql)?,
+            root_identity: row.get(6).map_err(sql)?,
+        };
+        if !ownership.validates(
+            row.get(0).map_err(sql)?,
+            &row.get::<_, String>(1).map_err(sql)?,
+            row.get(2).map_err(sql)?,
+            row.get(3).map_err(sql)?,
+            &selection,
+        )? {
+            return Err(corrupt());
+        }
+    }
+    Ok(true)
 }
 
 fn retained_tokens(
