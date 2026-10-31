@@ -22,6 +22,7 @@ use windows_sys::Win32::{
             CTRL_BREAK_EVENT, CTRL_C_EVENT, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
             STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
         },
+        Diagnostics::Debug::{GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode},
         Threading::{
             CREATE_SUSPENDED, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, INFINITE,
             PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
@@ -38,6 +39,30 @@ const CANCELLED: u8 = 2;
 const INTERRUPTED: u32 = 0xc000013a;
 static PHASE: AtomicU8 = AtomicU8::new(STARTING);
 static OWNER: Mutex<()> = Mutex::new(());
+
+/// Runs process creation without the system's critical-error message box.
+/// A host may start the launcher with the default error mode, where Windows
+/// answers an image it cannot run with a modal dialog and CreateProcess waits
+/// for a click. The thread mode makes it return the error instead; it is
+/// restored at once and is not inherited, so the child keeps the caller's mode.
+pub(crate) fn without_error_dialogs<T>(create: impl FnOnce() -> T) -> Result<T> {
+    let mut previous = 0;
+    // SAFETY: reads only the calling thread's current flags.
+    let mode = unsafe { GetThreadErrorMode() } | SEM_FAILCRITICALERRORS;
+    // SAFETY: both arguments are valid; this changes only the calling thread.
+    if unsafe { SetThreadErrorMode(mode, &mut previous) } == 0 {
+        return Err(LauncherError::ExecFailed);
+    }
+    struct RestoreErrorMode(u32);
+    impl Drop for RestoreErrorMode {
+        fn drop(&mut self) {
+            // SAFETY: restores this thread's own mode, including on unwind.
+            unsafe { SetThreadErrorMode(self.0, null_mut()) };
+        }
+    }
+    let _restore = RestoreErrorMode(previous);
+    Ok(create())
+}
 
 unsafe extern "system" fn handler(event: u32) -> i32 {
     if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
@@ -177,7 +202,7 @@ fn launch_observed(
     // SAFETY: terminated wide strings, writable command line and valid structs;
     // duplicated std handles remain open. Null cwd/env means inherit both.
     // No new console/group, detached flag, or ignore-Ctrl-C inheritance change.
-    let created = unsafe {
+    let created = without_error_dialogs(|| unsafe {
         CreateProcessW(
             executable.as_ptr(),
             line.as_mut_ptr(),
@@ -190,7 +215,7 @@ fn launch_observed(
             &startup,
             &mut info,
         )
-    };
+    })?;
     if created == 0 {
         return Err(LauncherError::ExecFailed);
     }
@@ -242,6 +267,39 @@ mod tests {
     // Both tests exercise the process-global callback. Serialize test callers
     // separately without holding OWNER across the production launch function.
     static TEST_OWNER: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn error_dialog_guard_preserves_other_thread_flags_and_restores_on_unwind() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+        };
+
+        let original = unsafe { GetThreadErrorMode() };
+        let _restore = ThreadModeRestore(original);
+        struct ThreadModeRestore(u32);
+        impl Drop for ThreadModeRestore {
+            fn drop(&mut self) {
+                unsafe { SetThreadErrorMode(self.0, null_mut()) };
+            }
+        }
+        let expected = SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+        assert_ne!(unsafe { SetThreadErrorMode(expected, null_mut()) }, 0);
+        without_error_dialogs(|| {
+            assert_eq!(
+                unsafe { GetThreadErrorMode() },
+                expected | SEM_FAILCRITICALERRORS
+            );
+        })
+        .unwrap();
+        assert_eq!(unsafe { GetThreadErrorMode() }, expected);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = without_error_dialogs(|| panic!("test unwind"));
+            })
+            .is_err()
+        );
+        assert_eq!(unsafe { GetThreadErrorMode() }, expected);
+    }
 
     #[test]
     fn handler_consumes_only_interrupts_and_records_startup_cancellation() {

@@ -320,8 +320,8 @@ fn hash_is_checked_on_every_invocation_including_launcher_info() {
     fixture.error(LauncherError::IntegrityFailed);
 }
 
-#[test]
-fn verified_but_non_executable_image_fails_with_exit_five() {
+/// An installation whose digest matches but whose image cannot be executed.
+fn non_executable_fixture() -> Fixture {
     let mut fixture = Fixture::new();
     fs::write(&fixture.app, b"invalid executable image\n").unwrap();
     let digest = format!("{:x}", Sha256::digest(b"invalid executable image\n"));
@@ -333,7 +333,51 @@ fn verified_but_non_executable_image_fails_with_exit_five() {
     fixture.pointer["app_sha256"] = json!(digest);
     fixture.release["app_sha256"] = json!(digest);
     fixture.save();
+    fixture
+}
+
+#[test]
+fn verified_but_non_executable_image_fails_with_exit_five() {
+    let fixture = non_executable_fixture();
     let output = fixture.run(&["--help"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        format!("{}\n", LauncherError::ExecFailed).as_bytes()
+    );
+}
+
+/// A host may start the launcher with the system default error mode. Windows
+/// then answers an image it cannot run with a modal dialog, and CreateProcess
+/// would wait for a click instead of returning the failure.
+#[cfg(windows)]
+#[test]
+fn non_executable_image_fails_without_a_dialog_under_the_default_error_mode() {
+    use std::os::windows::process::CommandExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::{CREATE_DEFAULT_ERROR_MODE, CREATE_NO_WINDOW};
+
+    let fixture = non_executable_fixture();
+    let mut child = Command::new(&fixture.launcher)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_DEFAULT_ERROR_MODE | CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= end {
+            // Ending the launcher also ends a dialog it is waiting on.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("launcher waited on a system error dialog");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(5));
     assert!(output.stdout.is_empty());
     assert_eq!(

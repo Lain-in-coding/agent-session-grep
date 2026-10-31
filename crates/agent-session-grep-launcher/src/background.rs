@@ -78,7 +78,7 @@ pub(crate) fn spawn(path: &Path, file: File, args: &[OsString]) -> Result<Backgr
         // No inheritable handle crosses this boundary, including redirected
         // caller pipes. The verified file's nonsharing handle stays open until
         // CreateProcess has selected its executable image.
-        let created = unsafe {
+        let created = crate::process::windows::without_error_dialogs(|| unsafe {
             CreateProcessW(
                 executable.as_ptr(),
                 line.as_mut_ptr(),
@@ -91,7 +91,7 @@ pub(crate) fn spawn(path: &Path, file: File, args: &[OsString]) -> Result<Backgr
                 &startup,
                 &mut info,
             )
-        };
+        })?;
         if created == 0 {
             return Err(LauncherError::ExecFailed);
         }
