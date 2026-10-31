@@ -202,6 +202,8 @@ pub struct MaintenanceCatalog {
     root: RootIdentity,
     installation: ControlId,
     identity: CatalogIdentity,
+    #[cfg(test)]
+    recovery_after_commit: Option<Box<dyn FnOnce(Instant)>>,
 }
 
 impl MaintenanceCatalog {
@@ -253,6 +255,8 @@ impl MaintenanceCatalog {
             root,
             installation: installation_id,
             identity,
+            #[cfg(test)]
+            recovery_after_commit: None,
         })
     }
 
@@ -451,6 +455,10 @@ impl MaintenanceCatalog {
             let guard =
                 acquire_exclusive(control.private_root(), LockKind::PolicyOwner, deadline)?;
             let bound = control.bind_control_root(&guard)?;
+            #[cfg(test)]
+            if let Some(observe) = self.recovery_after_commit.take() {
+                observe(deadline);
+            }
             control.reset_after_catalog_recovery(
                 control.status()?.policy.control_seq,
                 owner,
@@ -3373,4 +3381,170 @@ fn metadata_from(record: &StoredBackup, installation: &ControlId) -> PortResult<
         size_bytes: record.size_bytes,
         source_ids: record.source_ids.clone(),
     })
+}
+
+#[cfg(test)]
+mod recovery_deadline_tests {
+    use super::*;
+    use crate::{managed_locks::JobLockKey, managed_store::ManagedStore};
+    use agent_session_grep_ports::control::{DesiredUpdates, MaintenanceFence, MaintenancePhase};
+    use std::{cell::Cell, rc::Rc};
+
+    fn id(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    #[test]
+    fn recovery_rotation_keeps_control_ack_under_the_original_deadline() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let prefix = temp.path().join("install");
+        fs::create_dir(&prefix).unwrap();
+        let fixture_end = Instant::now() + Duration::from_secs(30);
+        let control =
+            SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running)
+                .unwrap();
+        let path = root.join("catalog.db");
+        drop(ManagedStore::create(&path, &control, id("original_incarnation"), 1).unwrap());
+        let installation_lock = acquire_exclusive(
+            &prefix,
+            LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+            fixture_end,
+        )
+        .unwrap();
+        control
+            .with_runtime_deadline(fixture_end, || {
+                let guard = acquire_exclusive(&root, LockKind::PolicyOwner, fixture_end)?;
+                let bound = control.bind_control_root(&guard)?;
+                control.record_verified_installation_prefix(
+                    &prefix,
+                    &installation_lock,
+                    &bound,
+                    fixture_end,
+                )?;
+                let installation = control.bind_installation(&prefix, &installation_lock)?;
+                control.begin_maintenance(
+                    control.status()?.policy.control_seq,
+                    &id("owner"),
+                    &bound,
+                    &installation,
+                    MaintenanceFence {
+                        state: MaintenanceState::Updating,
+                        owner: Some(id("owner")),
+                        phase: Some(MaintenancePhase::Quiescing),
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let installation = control
+            .bind_installation(&prefix, &installation_lock)
+            .unwrap();
+        let mut catalog = MaintenanceCatalog::open_authorized(
+            &control,
+            &installation,
+            &id("owner"),
+            &path,
+            fixture_end,
+        )
+        .unwrap();
+        let before = control
+            .with_runtime_deadline(fixture_end, || control.status())
+            .unwrap();
+        let writer = Connection::open(SqliteControlStore::path(&root)).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        let observed = Rc::new(Cell::new(false));
+        catalog.recovery_after_commit = Some(Box::new({
+            let observed = observed.clone();
+            let path = path.clone();
+            move |actual_end| {
+                assert_eq!(actual_end, end);
+                let witness = Connection::open(path).unwrap();
+                let recovered: String = witness
+                    .query_row(
+                        "SELECT catalog_incarnation FROM catalog_meta WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(recovered, "recovered");
+                observed.set(true);
+                // Consume the remainder only after the real catalog commit.
+                // An unscoped acknowledgement would now wait for its fresh
+                // 250 ms default and return a different busy reason.
+                std::thread::sleep(
+                    actual_end.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+        }));
+
+        let result = catalog.rotate_after_recovery(
+            &control,
+            &installation,
+            &id("owner"),
+            &id("original_incarnation"),
+            &id("recovered"),
+            9,
+            end,
+        );
+
+        assert!(
+            observed.get(),
+            "the real catalog commit must precede injection"
+        );
+        assert!(
+            matches!(result, Err(PortError::WriterBusy(ref reason)) if reason == "control runtime deadline reached"),
+            "acknowledgement must keep the original runtime scope: {result:?}"
+        );
+        assert_eq!(catalog.identity().incarnation, id("recovered"));
+        assert_eq!(
+            control
+                .with_runtime_deadline(fixture_end, || control.status())
+                .unwrap(),
+            before
+        );
+        let witness = Connection::open(&path).unwrap();
+        assert_eq!(
+            witness
+                .query_row(
+                    "SELECT destructive_epoch FROM store_metadata WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(witness);
+        writer.execute_batch("ROLLBACK").unwrap();
+        catalog
+            .rotate_after_recovery(
+                &control,
+                &installation,
+                &id("owner"),
+                &id("original_incarnation"),
+                &id("recovered"),
+                10,
+                fixture_end,
+            )
+            .unwrap();
+        assert_eq!(
+            control
+                .with_runtime_deadline(fixture_end, || control.status())
+                .unwrap()
+                .catalog_incarnation,
+            Some(id("recovered"))
+        );
+        let witness = Connection::open(&path).unwrap();
+        assert_eq!(
+            witness
+                .query_row(
+                    "SELECT destructive_epoch FROM store_metadata WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
 }
