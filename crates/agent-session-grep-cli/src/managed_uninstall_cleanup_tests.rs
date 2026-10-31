@@ -138,12 +138,13 @@ fn transfer_tick_keeps_original_budget_and_rejects_reboot_or_reset_value() {
 }
 
 struct PackageFixture {
-    _temp: tempfile::TempDir,
     prefix: PathBuf,
     root: PathBuf,
     catalog: PathBuf,
     control: Option<SqliteControlStore>,
     members: BTreeMap<String, (Vec<u8>, String)>,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl PackageFixture {
     fn new(tail: bool) -> Self {

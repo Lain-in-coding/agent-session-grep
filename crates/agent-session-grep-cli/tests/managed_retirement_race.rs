@@ -32,11 +32,12 @@ fn lock(root: &Path, kind: LockKind) -> ExclusiveGuard {
     }
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     db: PathBuf,
     control: Option<SqliteControlStore>,
     background: Option<ExclusiveGuard>,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

@@ -96,12 +96,13 @@ fn schema19(path: &Path) {
 }
 
 struct Fixture {
-    temp: tempfile::TempDir,
     source: PathBuf,
     destination: PathBuf,
     legacy: Connection,
     session: StableId,
     message: StableId,
+    // The SQLite connection must close before Windows temp cleanup.
+    temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

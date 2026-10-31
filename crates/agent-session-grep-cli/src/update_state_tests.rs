@@ -57,10 +57,11 @@ fn historical_state(catalog: PathBuf) -> State {
     historical
 }
 struct Fixture {
-    _temp: TempDir,
     prefix: PathBuf,
     catalog: PathBuf,
     lock: ExclusiveGuard,
+    // The installation lock must close before Windows temp cleanup.
+    _temp: TempDir,
 }
 impl Fixture {
     fn new() -> Self {

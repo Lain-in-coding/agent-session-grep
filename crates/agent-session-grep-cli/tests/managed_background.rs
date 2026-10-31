@@ -64,7 +64,6 @@ fn codex(id: &str, text: &str) -> Vec<u8> {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     db: PathBuf,
     history: PathBuf,
     child: Option<Child>,
@@ -73,6 +72,8 @@ struct Fixture {
     unavailable: std::cell::Cell<u32>,
     /// Content-free phase and error of the latest such observation.
     last_unavailable: std::cell::RefCell<Option<String>>,
+    // Child processes must be reaped before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 
 /// A bare store read outside a runtime scope has a 250ms window, which a

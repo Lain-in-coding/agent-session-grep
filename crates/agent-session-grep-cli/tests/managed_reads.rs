@@ -51,7 +51,6 @@ fn current(control: &SqliteControlStore) -> ControlSeq {
     control.status().unwrap().policy.control_seq
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     db: PathBuf,
     control: SqliteControlStore,
@@ -61,6 +60,8 @@ struct Fixture {
     session: StableId,
     batch: SourceBatch,
     observation: SourceObservation,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new(count: usize, text: &str) -> Self {

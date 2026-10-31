@@ -34,7 +34,6 @@ fn write_private(path: &Path, bytes: &[u8]) {
     }
 }
 struct Fixture {
-    _temp: tempfile::TempDir,
     root: PathBuf,
     prefix: PathBuf,
     catalog: PathBuf,
@@ -42,6 +41,8 @@ struct Fixture {
     control: SqliteControlStore,
     native_calls: RefCell<Vec<Vec<OsString>>>,
     path_calls: Cell<usize>,
+    // Connections and OS guards must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new() -> Self {

@@ -2,9 +2,10 @@ use super::*;
 use std::io::{Seek, SeekFrom};
 
 struct Fixture {
-    _temp: tempfile::TempDir,
     config: PathBuf,
     store: HostConfigStore,
+    // The store's directory handle must close before Windows temp cleanup.
+    _temp: tempfile::TempDir,
 }
 impl Fixture {
     fn new(host: Host, initial: Option<&str>) -> Self {
