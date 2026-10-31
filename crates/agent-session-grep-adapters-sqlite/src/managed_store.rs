@@ -31,6 +31,18 @@ fn invalid() -> PortError {
     PortError::InvalidRequest("invalid managed catalog operation".into())
 }
 
+impl crate::managed_discovery::OriginalCycleValidator for SqliteControlStore {
+    fn cycle(&self, number: CycleSeq, end: Instant) -> PortResult<ObservationCycle> {
+        self.with_runtime_deadline(end, || BackgroundControl::cycle(self, number))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DiscoveryPublication {
+    ExactCycle,
+    PlainEpoch,
+}
+
 pub(crate) const APPLICATION_ID: i64 = 0x41534732;
 
 /// Match the database and intent using ordinary file names, never Win32 alias
@@ -413,7 +425,7 @@ impl ManagedStore {
         control.validate_catalog_file(path)?;
         let handles = acquire_handles(path.parent().ok_or_else(invalid)?)?;
         let policy = admission(control, handles.root_identity())?;
-        if writable && control.status()?.desired_updates != DesiredUpdates::Running {
+        if writable && control.lifecycle_status()?.desired_updates != DesiredUpdates::Running {
             return Err(PortError::WriterBusy(
                 "managed updates are paused or stopped".into(),
             ));
@@ -878,6 +890,128 @@ impl ManagedStore {
         Ok(sources)
     }
 
+    /// Catalog-only scheduling baselines. No provider file is opened, no mtime
+    /// is invented, and the worker must retain its own successful capture hint.
+    pub fn current_plain_baselines(
+        &self,
+        control: &SqliteControlStore,
+        deadline: Instant,
+    ) -> PortResult<Vec<BackgroundSource>> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            self.with_context_sql_deadline(deadline, || {
+                let policy = admission(control, self.root)?;
+                if policy.installation_id != self.installation {
+                    return Err(changed());
+                }
+                let _history =
+                    SharedGuard::try_acquire(control.private_root(), LockKind::HistoryReaders)?;
+                let ownership =
+                    crate::managed_discovery::OriginalCycleProof::new(control, deadline);
+                let mut conn = self.inner.conn.borrow_mut();
+                let tx = conn.transaction().map_err(storage)?;
+                let mut statement = tx
+                    .prepare(
+                        "SELECT source_id,source_path,provider_id,namespace_id,root_identity
+                 FROM source_bindings WHERE provider_id IN ('claude-code','codex')
+                 ORDER BY source_id",
+                    )
+                    .map_err(storage)?;
+                let mut rows = statement.query([]).map_err(storage)?;
+                let mut baselines = Vec::new();
+                let mut examined = 0usize;
+                while let Some(row) = rows.next().map_err(storage)? {
+                    context_deadline(deadline)?;
+                    examined = examined.checked_add(1).ok_or_else(invalid)?;
+                    if examined > agent_session_grep_ports::source_context::MAX_AUTHORITY_KEYS {
+                        return Err(PortError::WriterBusy(
+                            "managed baseline capacity exceeded".into(),
+                        ));
+                    }
+                    let source_id = SourceId::parse(&row.get::<_, String>(0).map_err(storage)?)?;
+                    let source_path: String = row.get(1).map_err(storage)?;
+                    let provider_wire: String = row.get(2).map_err(storage)?;
+                    let provider = SearchProvider::parse(&provider_wire)
+                        .filter(|provider| provider.as_str() == provider_wire)
+                        .ok_or_else(incompatible)?;
+                    let namespace_id: Option<String> = row.get(3).map_err(storage)?;
+                    let root_identity: String = row.get(4).map_err(storage)?;
+                    ControlId::parse(&root_identity)?;
+                    let Some(namespace) = namespace_id.as_ref() else {
+                        continue;
+                    };
+                    ControlId::parse(namespace)?;
+                    let locator = CanonicalLocator::parse(&source_path)?;
+                    let key = agent_session_grep_application::relocation::normalize_absolute_path(
+                        &source_path,
+                    )?;
+                    let assignment: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM source_installations s
+                     JOIN installation_namespaces n ON n.namespace_id=s.namespace_id
+                     JOIN installation_locations l ON l.namespace_id=s.namespace_id
+                     WHERE s.source_key=?1 AND s.source_path=?2 AND s.namespace_id=?3
+                       AND n.provider_id=?4 AND l.provider_id=?4 AND l.state='current'
+                       AND n.origin!='legacy-v1')",
+                            params![key, source_path, namespace, provider.as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage)?;
+                    if !assignment {
+                        continue;
+                    }
+                    if !policy.allows_source(
+                        provider,
+                        &locator,
+                        &ControlId::parse(source_id.as_str())?,
+                    ) {
+                        continue;
+                    }
+                    let Some(receipt) = crate::managed_discovery::current_plain_baseline(
+                        &tx, &source_id, &policy, deadline,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if receipt.catalog_incarnation != self.incarnation.as_str()
+                        || !crate::managed_discovery::validate_receipt_ownership(
+                            &tx, &receipt, &ownership, deadline,
+                        )?
+                    {
+                        continue;
+                    }
+                    let len: i64 = tx
+                        .query_row(
+                            "SELECT len_bytes FROM source_scans WHERE source_path=?1",
+                            [&source_path],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage)?;
+                    baselines.push(BackgroundSource {
+                        binding: SourceBinding {
+                            source_id,
+                            source_path,
+                            provider,
+                            namespace_id,
+                            root_identity,
+                        },
+                        latest_receipt: Some(receipt),
+                        indexed_len: Some(u64::try_from(len).map_err(|_| incompatible())?),
+                        superseded: false,
+                    });
+                }
+                drop(rows);
+                drop(statement);
+                tx.rollback().map_err(storage)?;
+                if admission(control, self.root)?.policy_epoch != policy.policy_epoch {
+                    return Err(changed());
+                }
+                context_deadline(deadline)?;
+                Ok(baselines)
+            })
+        })
+    }
+
     /// Repair catalog identity and committed source heads already verified by
     /// this live connection. Never restore permissions, pause, or barrier state.
     pub fn reconcile_progress(
@@ -979,12 +1113,13 @@ impl ManagedStore {
                     keep_cycles: captured.cycles.clone(),
                     keep_receipts: captured.receipts.clone(),
                 };
-                let result = crate::managed_history::prune_in_tx(
+                let result = crate::managed_history::prune_with_cycle_validator_in_tx(
                     &tx,
                     &dependencies,
                     &cache_revisions,
                     crate::managed_history::HistoryLimits::default(),
                     deadline,
+                    control,
                 )?;
                 let now = admission(control, self.root)?;
                 if now.policy_epoch != captured.policy_epoch
@@ -1061,7 +1196,42 @@ impl ManagedStore {
     ) -> PortResult<()> {
         control.with_runtime_deadline(deadline, || {
             self.with_context_sql_deadline(deadline, || {
-                self.publish_discovery(control, worker, cycle, selection, Some(sources), deadline)
+                self.publish_discovery(
+                    control,
+                    worker,
+                    cycle,
+                    selection,
+                    Some(sources),
+                    deadline,
+                    DiscoveryPublication::ExactCycle,
+                )
+            })
+        })
+    }
+
+    /// Close the newest plain-source discovery fence using independently owned
+    /// current receipts. This never turns an old source hash into a new one.
+    pub fn commit_discovery_epoch_with_deadline(
+        &self,
+        control: &SqliteControlStore,
+        worker: &crate::control::LockedWorkerAuthority<'_>,
+        cycle: &ObservationCycle,
+        selection: &SelectionRevision,
+        sources: &[SourceId],
+        deadline: Instant,
+    ) -> PortResult<()> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            self.with_context_sql_deadline(deadline, || {
+                self.publish_discovery(
+                    control,
+                    worker,
+                    cycle,
+                    selection,
+                    Some(sources),
+                    deadline,
+                    DiscoveryPublication::PlainEpoch,
+                )
             })
         })
     }
@@ -1097,7 +1267,15 @@ impl ManagedStore {
     ) -> PortResult<()> {
         control.with_runtime_deadline(deadline, || {
             self.with_context_sql_deadline(deadline, || {
-                self.publish_discovery(control, worker, cycle, selection, None, deadline)
+                self.publish_discovery(
+                    control,
+                    worker,
+                    cycle,
+                    selection,
+                    None,
+                    deadline,
+                    DiscoveryPublication::ExactCycle,
+                )
             })
         })
     }
@@ -1138,6 +1316,7 @@ impl ManagedStore {
         selection: &SelectionRevision,
         sources: Option<&[SourceId]>,
         deadline: Instant,
+        publication: DiscoveryPublication,
     ) -> PortResult<()> {
         context_deadline(deadline)?;
         if self.inner._lease.is_none() {
@@ -1149,7 +1328,7 @@ impl ManagedStore {
             || policy.installation_id != self.installation
             || cycle.policy_epoch != policy.policy_epoch
             || cycle.token.worker_boot_id != *worker.boot_id()
-            || control.status()?.desired_updates != DesiredUpdates::Running
+            || control.lifecycle_status()?.desired_updates != DesiredUpdates::Running
         {
             return Err(changed());
         }
@@ -1171,6 +1350,20 @@ impl ManagedStore {
                     && s.root_identity.as_ref() == Some(&selection.root_identity)
             })
             .ok_or_else(changed)?;
+        let _history = if matches!(publication, DiscoveryPublication::PlainEpoch) {
+            if !matches!(
+                selected.region.provider,
+                SearchProvider::Claude | SearchProvider::Codex
+            ) {
+                return Err(invalid());
+            }
+            Some(SharedGuard::try_acquire(
+                control.private_root(),
+                LockKind::HistoryReaders,
+            )?)
+        } else {
+            None
+        };
         let mut conn = self.inner.conn.borrow_mut();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1214,12 +1407,25 @@ impl ManagedStore {
             sources: receipts,
             complete: sources.is_some(),
         };
-        crate::managed_discovery::publish_with_deadline_in_tx(
-            &tx,
-            &observation,
-            Some(&policy),
-            deadline,
-        )?;
+        match publication {
+            DiscoveryPublication::ExactCycle => {
+                crate::managed_discovery::publish_with_deadline_in_tx(
+                    &tx,
+                    &observation,
+                    Some(&policy),
+                    deadline,
+                )?;
+            }
+            DiscoveryPublication::PlainEpoch => {
+                crate::managed_discovery::publish_epoch_with_deadline_in_tx(
+                    &tx,
+                    &observation,
+                    &policy,
+                    deadline,
+                    control,
+                )?;
+            }
+        }
         if admission(control, self.root)?.policy_epoch != policy.policy_epoch {
             return Err(changed());
         }
@@ -1241,7 +1447,7 @@ impl ManagedStore {
             || o.catalog_incarnation != self.incarnation.as_str()
             || o.worker_boot_id != worker.boot_id().as_str()
             || o.policy_epoch != policy.policy_epoch.get()
-            || control.status()?.desired_updates != DesiredUpdates::Running
+            || control.lifecycle_status()?.desired_updates != DesiredUpdates::Running
         {
             return Err(changed());
         }
@@ -1312,11 +1518,12 @@ impl ManagedStore {
                 return Err(changed());
             }
             let conn = self.inner.conn.borrow();
-            let snapshot = managed::ManagedRead::begin_authorized(
+            let snapshot = managed::ManagedRead::begin_authorized_with_cycle_validator(
                 &conn,
                 &policy,
                 self.incarnation.as_str(),
                 deadline,
+                control,
             )?;
             let result = read(&snapshot)?;
             let current = admission(control, self.root)?;

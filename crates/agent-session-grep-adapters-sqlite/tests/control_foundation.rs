@@ -1507,6 +1507,80 @@ fn pause_abort_and_resume_never_relabels_previous_observation() {
 }
 
 #[test]
+fn latest_demand_inventory_retains_awaiting_work_beyond_the_history_tail() {
+    use std::time::{Duration, Instant};
+
+    let (_temp, root, store, worker, selection) = worker_setup();
+    let end = Instant::now() + Duration::from_secs(30);
+    store
+        .with_runtime_deadline(end, || {
+            let mut expected = Vec::new();
+            for index in 0..66 {
+                let barrier = latest(&store, &selection, 200 + index * 3);
+                let cycle = store
+                    .start_cycle(
+                        current(&store),
+                        &worker,
+                        barrier.required_cycle_seq,
+                        201 + index * 3,
+                    )?
+                    .value;
+                store.finish_cycle(
+                    current(&store),
+                    &worker,
+                    cycle.token.cycle_seq,
+                    CycleFinish::Partial,
+                    202 + index * 3,
+                )?;
+                expected.push(barrier.id);
+            }
+            let before = control_rows(&root);
+            let demands = store.latest_demands()?;
+            assert_eq!(
+                demands.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                demands
+                    .iter()
+                    .all(|d| d.state == BarrierState::AwaitingCatalog && d.error.is_none())
+            );
+            assert_eq!(
+                store.barrier(&expected[0])?.state,
+                BarrierState::AwaitingCatalog
+            );
+            assert!(control_rows(&root) == before);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn latest_demand_inventory_obeys_pause_policy_and_original_deadline() {
+    use std::time::{Duration, Instant};
+
+    let (_temp, root, store, _worker, selection) = worker_setup();
+    let end = Instant::now() + Duration::from_secs(8);
+    store
+        .with_runtime_deadline(end, || {
+            let barrier = latest(&store, &selection, 400);
+            let before = control_rows(&root);
+            let expired = store.with_runtime_deadline(Instant::now(), || store.latest_demands());
+            assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+            assert!(control_rows(&root) == before);
+            assert_eq!(store.latest_demands()?[0].id, barrier.id);
+            assert!(control_rows(&root) == before);
+            store.set_desired_updates(current(&store), DesiredUpdates::Paused)?;
+            let paused = control_rows(&root);
+            assert!(store.latest_demands()?.is_empty());
+            assert!(control_rows(&root) == paused);
+            assert_eq!(store.status()?.desired_updates, DesiredUpdates::Paused);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn restart_retains_committed_receipt_tokens_clears_candidates_and_resets_progress_forward() {
     let (_temp, root, store, worker, s) = worker_setup();
     set_catalog(&store, &worker, "catalog_a");

@@ -279,6 +279,107 @@ fn no_op_observation_updates_receipt_without_new_generation_or_outbox() {
 }
 
 #[test]
+fn plain_baselines_refuse_catalog_contention_at_once_and_honor_an_expired_outer_end() {
+    let f = Fixture::new();
+    let store = f.create();
+    let worker = f
+        .control
+        .bind_worker(&f.worker_lock, id("boot-one"))
+        .unwrap();
+    store
+        .commit_source(
+            &f.control,
+            &worker,
+            &f.batch("original evidence survives a refused baseline read"),
+            &f.observation,
+        )
+        .unwrap();
+    drop(store);
+
+    // Rollback journal mode makes this real SQLite writer block catalog reads.
+    // All setup ends before the caller's measured deadline begins.
+    let blocker = Connection::open(&f.catalog).unwrap();
+    let mode: String = blocker
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let store = ManagedStore::open(&f.catalog, &f.control).unwrap();
+    let catalog_before = std::fs::read(&f.catalog).unwrap();
+    let control_before = f.control.status().unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let started = Instant::now();
+    let original_end = started + Duration::from_secs(1);
+    let refused = f.control.with_runtime_deadline(original_end, || {
+        store.current_plain_baselines(&f.control, original_end + Duration::from_secs(5))
+    });
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(refused, Err(PortError::WriterBusy(reason)) if reason == "managed catalog is busy"),
+        "the real catalog lock must cause the refusal",
+    );
+    // Without the SQL deadline scope the catalog would wait its 250 ms busy timeout.
+    assert!(elapsed < Duration::from_millis(200), "elapsed: {elapsed:?}");
+    let history = ExclusiveGuard::try_acquire(&f.root, LockKind::HistoryReaders).unwrap();
+    drop(history);
+    assert_eq!(f.control.status().unwrap(), control_before);
+    assert_eq!(std::fs::read(&f.catalog).unwrap(), catalog_before);
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    // The same unlocked call succeeds below. Inside a caller scope whose end
+    // has already passed, a fresh 5 s budget must not let it run.
+    let outer_end = Instant::now() + Duration::from_millis(200);
+    let mut inner = None;
+    let outer = f.control.with_runtime_deadline(outer_end, || {
+        while Instant::now() < outer_end {
+            std::thread::sleep(outer_end.saturating_duration_since(Instant::now()));
+        }
+        let fresh_budget = Instant::now() + Duration::from_secs(5);
+        inner = Some(store.current_plain_baselines(&f.control, fresh_budget));
+        Ok(())
+    });
+    assert!(outer.is_err());
+    let inner = inner.expect("the outer scope admits the call before its end");
+    assert!(
+        matches!(inner, Err(PortError::WriterBusy(reason))
+            if reason == "control runtime deadline reached"),
+        "the expired outer end must refuse the nested call",
+    );
+    assert!(
+        store
+            .current_plain_baselines(&f.control, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.control.status().unwrap(), control_before);
+    assert_eq!(std::fs::read(&f.catalog).unwrap(), catalog_before);
+    store
+        .with_read(
+            &f.control,
+            RequestIntersection::Selected,
+            Instant::now() + Duration::from_secs(5),
+            |read| {
+                let original = read
+                    .messages(&[entity(IdKind::Message)], &ProjectionQuery::default())?
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    original.message.text,
+                    "original evidence survives a refused baseline read",
+                );
+                assert_eq!(
+                    original.proof.revision.revision_id,
+                    f.observation.revision_id
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
 fn partial_and_pause_cannot_publish_new_evidence() {
     let f = Fixture::new();
     let store = f.create();

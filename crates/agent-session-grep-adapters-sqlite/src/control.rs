@@ -940,6 +940,92 @@ impl SqliteControlStore {
         Ok(status)
     }
 
+    /// Bounded scheduling inventory. AwaitingCatalog is retained here even
+    /// outside the diagnostic history tail, but neither state proves freshness.
+    /// A worker must give each demand one nonrenewable service window.
+    pub fn latest_demands(&self) -> PortResult<Vec<LatestBarrier>> {
+        if runtime_deadline().is_none() {
+            return self
+                .with_runtime_deadline(Instant::now() + BUSY_TIMEOUT, || self.latest_demands());
+        }
+        runtime_tick()?;
+        self.validate_live_root()?;
+        let mut conn = self.conn.borrow_mut();
+        configure_runtime_deadline(&conn)?;
+        let tx = conn.transaction().map_err(sql_error)?;
+        let status = load_status_core(&tx)?;
+        runtime_rows_within(
+            &tx,
+            "SELECT 1 FROM barriers WHERE state IN ('pending','awaiting_catalog')",
+            MAX_RUNTIME_REFERENCES,
+        )?;
+        stage_runtime(&tx, None, None)?;
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO asg_runtime_barriers
+             SELECT barrier_id FROM barriers WHERE state IN ('pending','awaiting_catalog');
+             INSERT OR IGNORE INTO asg_runtime_cycles
+             SELECT required_cycle_seq FROM barriers
+              WHERE barrier_id IN (SELECT barrier_id FROM asg_runtime_barriers)
+             UNION SELECT completed_cycle_seq FROM barriers
+              WHERE barrier_id IN (SELECT barrier_id FROM asg_runtime_barriers)
+                AND completed_cycle_seq IS NOT NULL;",
+        )
+        .map_err(sql_error)?;
+        let RuntimeState {
+            worker,
+            cycles,
+            barriers,
+            ..
+        } = load_staged_runtime(&tx, &status)?;
+        let mut demands = Vec::new();
+        if status.desired_updates == DesiredUpdates::Running
+            && status.policy.maintenance.state == MaintenanceState::Idle
+        {
+            for barrier in barriers {
+                runtime_tick()?;
+                if !matches!(
+                    barrier.state,
+                    BarrierState::Pending | BarrierState::AwaitingCatalog
+                ) || barrier.policy_epoch != status.policy.policy_epoch
+                {
+                    continue;
+                }
+                let cycle = cycles
+                    .iter()
+                    .find(|cycle| cycle.token.cycle_seq == barrier.required_cycle_seq)
+                    .ok_or_else(corrupt)?;
+                if worker.boot_id.as_ref() != Some(&cycle.token.worker_boot_id) {
+                    continue;
+                }
+                if !barrier.selections.iter().all(|proof| {
+                    status.policy.selections.iter().any(|selection| {
+                        selection.enabled
+                            && selection.id == proof.selection_id
+                            && selection.revision == proof.revision
+                            && selection.root_identity.as_ref() == Some(&proof.root_identity)
+                    })
+                }) {
+                    continue;
+                }
+                demands.push(barrier);
+            }
+        }
+        demands.sort_by(|left, right| {
+            (left.admission_control_seq, &left.id).cmp(&(right.admission_control_seq, &right.id))
+        });
+        runtime_tick()?;
+        tx.commit().map_err(sql_error)?;
+        self.validate_live_root()?;
+        runtime_tick()?;
+        Ok(demands)
+    }
+
+    /// One validated scheduling snapshot for a cycle's source debt. This is
+    /// advisory progress only; catalog receipts still authorize currentness.
+    pub fn source_progress_inventory(&self) -> PortResult<Vec<SourceProgress>> {
+        self.read_runtime(|_, runtime| Ok(runtime.sources.clone()))
+    }
+
     pub fn open_current_read_only_with_deadline(
         root: &Path,
         deadline: Instant,
