@@ -665,7 +665,7 @@ pub(crate) fn legacy_publication_allowed(conn: &Connection, source: &str) -> Por
     }
     Ok(())
 }
-fn verify_observation_policy(
+pub(crate) fn verify_observation_policy(
     conn: &Connection,
     o: &SourceObservation,
     policy: &ReadPolicy,
@@ -692,6 +692,80 @@ fn verify_observation_policy(
     }
     Ok(())
 }
+
+pub(crate) fn verify_refresh_context(
+    conn: &Connection,
+    binding: &SourceBinding,
+    revision: &str,
+    deadline: Instant,
+) -> PortResult<bool> {
+    time(deadline)?;
+    verify_binding(conn, binding)?;
+    managed_receipt::read_checked(conn, revision, Some(binding.source_id.as_str()))?;
+    let owner: String = conn
+        .query_row(
+            "SELECT source_id FROM source_publication_contexts WHERE revision_id=?1",
+            [revision],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?
+        .ok_or_else(corrupt)?;
+    let context = load_context(conn, revision)?.ok_or_else(corrupt)?;
+    if owner != binding.source_id.as_str() {
+        return Err(corrupt());
+    }
+    time(deadline)?;
+    Ok(context.is_empty())
+}
+
+pub(crate) fn verify_refresh_context_head(
+    conn: &Connection,
+    binding: &SourceBinding,
+    revision: &str,
+    deadline: Instant,
+) -> PortResult<bool> {
+    let head: String = conn
+        .query_row(
+            "SELECT revision_id FROM source_context_heads WHERE source_id=?1",
+            [binding.source_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?
+        .ok_or_else(corrupt)?;
+    if head != revision {
+        return Err(stale());
+    }
+    let empty = verify_refresh_context(conn, binding, revision, deadline)?;
+    source_read_eligible(conn, binding.source_id.as_str())?;
+    let authority: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM source_authority_members WHERE source_id=?1
+                UNION ALL SELECT 1 FROM source_authority_tombstones WHERE source_id=?1
+                UNION ALL SELECT 1 FROM source_authorities WHERE active_source_id=?1)",
+            [binding.source_id.as_str()],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    Ok(empty && !authority)
+}
+
+pub(crate) fn persist_empty_refresh_context(
+    conn: &Connection,
+    observation: &SourceObservation,
+    policy: &ReadPolicy,
+    deadline: Instant,
+) -> PortResult<()> {
+    tx(conn)?;
+    time(deadline)?;
+    verify_observation_policy(conn, observation, policy)?;
+    let context = SourcePublicationContext::default();
+    let bytes = context_manifest(&context)?;
+    persist_context(conn, observation, &context, &bytes, true)
+}
+
 fn dependency_valid(
     conn: &Connection,
     dep: &SourceDependency,

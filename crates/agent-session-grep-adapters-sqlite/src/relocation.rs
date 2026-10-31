@@ -39,7 +39,7 @@ fn source_error(error: PortError) -> PortError {
         _ => PortError::SourceIo("relocation source could not be verified".into()),
     }
 }
-fn digest_fields(domain: &[u8], fields: &[&str]) -> String {
+pub(crate) fn digest_fields(domain: &[u8], fields: &[&str]) -> String {
     let mut hash = blake3::Hasher::new();
     hash_field(&mut hash, domain);
     for field in fields {

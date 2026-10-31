@@ -281,6 +281,27 @@ pub struct BackgroundSource {
     pub superseded: bool,
 }
 
+struct RefreshInstallation {
+    path: String,
+    namespace: String,
+    provider: String,
+    input: String,
+    origin: String,
+    location_provider: String,
+    root_key: String,
+    root: String,
+    state: String,
+    created: i64,
+}
+
+/// Minted and consumed only by the single admitted refresh entry below.
+struct VerifiedRefresh<'a> {
+    prior: &'a RevisionRef,
+    observation: &'a SourceObservation,
+    snapshot: &'a agent_session_grep_ports::SourceSnapshot,
+    deadline: Instant,
+}
+
 impl std::fmt::Debug for SourceNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceNamespace([private])")
@@ -557,6 +578,244 @@ impl ManagedStore {
                 )
             })
         })
+    }
+
+    /// Verify the admitted attempt's entire captured snapshot and atomically
+    /// refresh its receipt. Only Ineligible permits full publication using the
+    /// same captured input and earliest end; errors may require reconciliation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Reviewed single-entry verification contract"
+    )]
+    pub fn refresh_verified_unchanged_source(
+        &self,
+        control: &SqliteControlStore,
+        worker: &crate::control::LockedWorkerAuthority<'_>,
+        expected_prior: &RevisionRef,
+        observation: &SourceObservation,
+        snapshot: &agent_session_grep_ports::SourceSnapshot,
+        sqlite_byte_limit: u64,
+        deadline: Instant,
+    ) -> PortResult<crate::managed_refresh::RefreshOutcome> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            self.with_context_sql_deadline(deadline, || {
+                use crate::managed_refresh::{self, RefreshOutcome};
+                if self.inner._lease.is_none() {
+                    return Err(invalid());
+                }
+                managed_refresh::validate_input(
+                    observation,
+                    snapshot,
+                    sqlite_byte_limit,
+                    deadline,
+                )?;
+                self.authorize_observation(control, worker, observation)?;
+                // Neither a caller-constructed snapshot nor an old receipt is
+                // final verification. Validate the actual attempt before I/O.
+                let miss = {
+                    let mut conn = self.inner.conn.borrow_mut();
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Deferred)
+                        .map_err(storage)?;
+                    let policy = admission(control, self.root)?;
+                    let miss = managed_refresh::check_baseline(
+                        &tx,
+                        expected_prior,
+                        observation,
+                        snapshot,
+                        &policy,
+                        deadline,
+                    )?;
+                    let installation = self.refresh_installation_in_tx(&tx, observation)?;
+                    tx.rollback().map_err(storage)?;
+                    miss.or(installation)
+                };
+                if let Some(miss) = miss {
+                    return Ok(RefreshOutcome::Ineligible(miss));
+                }
+                self.authorize_observation(control, worker, observation)?;
+                managed_refresh::verify_source_path(&observation.binding, deadline)?;
+                crate::source_fs::verify_snapshot_with_deadline(
+                    Path::new(&observation.binding.source_path),
+                    snapshot,
+                    sqlite_byte_limit,
+                    deadline,
+                )?;
+                self.consume_verified_refresh(
+                    control,
+                    worker,
+                    VerifiedRefresh {
+                        prior: expected_prior,
+                        observation,
+                        snapshot,
+                        deadline,
+                    },
+                )
+            })
+        })
+    }
+
+    fn consume_verified_refresh(
+        &self,
+        control: &SqliteControlStore,
+        worker: &crate::control::LockedWorkerAuthority<'_>,
+        verified: VerifiedRefresh<'_>,
+    ) -> PortResult<crate::managed_refresh::RefreshOutcome> {
+        use crate::managed_refresh::{self, RefreshOutcome};
+        let VerifiedRefresh {
+            prior,
+            observation,
+            snapshot,
+            deadline,
+        } = verified;
+        self.authorize_observation(control, worker, observation)?;
+        let mut conn = self.inner.conn.borrow_mut();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        self.authorize_observation(control, worker, observation)?;
+        let policy = admission(control, self.root)?;
+        let installation = self.refresh_installation_in_tx(&tx, observation)?;
+        let result = managed_refresh::publish_refresh_in_tx(
+            &tx,
+            prior,
+            observation,
+            snapshot,
+            &policy,
+            installation,
+            deadline,
+        )?;
+        if matches!(result, RefreshOutcome::Ineligible(_)) {
+            tx.rollback().map_err(storage)?;
+            return Ok(result);
+        }
+        self.authorize_observation(control, worker, observation)?;
+        managed_refresh::time(deadline)?;
+        tx.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    fn refresh_installation_in_tx(
+        &self,
+        conn: &Connection,
+        observation: &SourceObservation,
+    ) -> PortResult<Option<crate::managed_refresh::RefreshIneligible>> {
+        use crate::managed_refresh::RefreshIneligible;
+        use agent_session_grep_application::relocation::{
+            legacy_installation_namespace, normalize_absolute_path, path_is_within,
+        };
+        use rusqlite::OptionalExtension;
+        let binding = &observation.binding;
+        let key = normalize_absolute_path(&binding.source_path)?;
+        let now = (self.inner.relocation_clock)()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT root_locator FROM installation_locations
+                 WHERE state='retired' AND retired_until_ms>?1 AND provider_id=?2",
+            )
+            .map_err(storage)?;
+        for root in statement
+            .query_map(params![now, binding.provider.as_str()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(storage)?
+        {
+            if path_is_within(&binding.source_path, &root.map_err(storage)?)? {
+                return Err(changed());
+            }
+        }
+        let pending = self.inner.pending_installations.borrow();
+        let reserved = pending.contains_key(&key);
+        if let Some(assignment) = pending.get(&key)
+            && binding.namespace_id.as_deref() != Some(assignment.namespace_id())
+        {
+            return Err(changed());
+        }
+        let row: Option<RefreshInstallation> = conn
+            .query_row(
+                "SELECT s.source_path,s.namespace_id,n.provider_id,n.namespace_input,n.origin,
+                        l.provider_id,l.root_key,l.root_locator,l.state,n.created_at_ms
+                 FROM source_installations s
+                 LEFT JOIN installation_namespaces n ON n.namespace_id=s.namespace_id
+                 LEFT JOIN installation_locations l ON l.namespace_id=s.namespace_id AND l.state='current'
+                 WHERE s.source_key=?1",
+                [&key],
+                |r| Ok(RefreshInstallation {
+                    path: r.get(0)?, namespace: r.get(1)?, provider: r.get(2)?,
+                    input: r.get(3)?, origin: r.get(4)?, location_provider: r.get(5)?,
+                    root_key: r.get(6)?, root: r.get(7)?, state: r.get(8)?, created: r.get(9)?,
+                }),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(RefreshInstallation {
+            path,
+            namespace,
+            provider,
+            input,
+            origin,
+            location_provider,
+            root_key,
+            root,
+            state,
+            created,
+        }) = row
+        else {
+            return Err(incompatible());
+        };
+        if path != binding.source_path || binding.namespace_id.as_deref() != Some(&namespace) {
+            return Err(changed());
+        }
+        if provider != binding.provider.as_str()
+            || location_provider != provider
+            || state != "current"
+            || root_key != normalize_absolute_path(&root)?
+            || !path_is_within(&binding.source_path, &root)?
+            || created < 0
+        {
+            return Err(incompatible());
+        }
+        ControlId::parse(&namespace).map_err(|_| incompatible())?;
+        match origin.as_str() {
+            "legacy-v1" => {
+                // A relocated legacy namespace keeps its frozen seed, so the
+                // tuple is proven from its stored fields, never from the
+                // current path. The id must be the canonical derivation, and
+                // the seed must be an exact output of the frozen derivation.
+                let rest = input
+                    .strip_prefix(provider.as_str())
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .ok_or_else(incompatible)?;
+                let probe = format!("{rest}/asg-refresh-probe");
+                if namespace
+                    != format!(
+                        "ins_v1_{}",
+                        crate::relocation::digest_fields(
+                            b"asg-legacy-installation-v1",
+                            &[&provider, &input],
+                        )
+                    )
+                    || legacy_installation_namespace(&probe, &provider) != input
+                {
+                    return Err(incompatible());
+                }
+                Ok(Some(RefreshIneligible::InstallationProof))
+            }
+            "allocated-v1" => {
+                let suffix = namespace.strip_prefix("ins_v1_").ok_or_else(incompatible)?;
+                if suffix.len() != 64
+                    || !suffix
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || input != format!("installation-v1:{suffix}")
+                {
+                    return Err(incompatible());
+                }
+                Ok(reserved.then_some(RefreshIneligible::InstallationProof))
+            }
+            _ => Err(incompatible()),
+        }
     }
 
     fn commit_source_context_inner(
