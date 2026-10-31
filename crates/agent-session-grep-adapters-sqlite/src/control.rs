@@ -4823,6 +4823,20 @@ impl SqliteControlStore {
         Ok(value)
     }
 
+    /// The barrier row exactly as stored, without `barrier()`'s live worker or
+    /// policy overlay. A stored Blocked row never reopens, so its error is
+    /// terminal for the request that admitted it. This is not freshness proof.
+    pub fn persisted_barrier(&self, identifier: &ControlId) -> PortResult<LatestBarrier> {
+        self.read_runtime_for(None, Some(identifier), |_, runtime| {
+            runtime
+                .barriers
+                .iter()
+                .find(|barrier| barrier.id == *identifier)
+                .cloned()
+                .ok_or_else(missing)
+        })
+    }
+
     /// The managed catalog facade calls this only with its verified live
     /// incarnation and a worker capability bound to this physical root. This
     /// repairs a summary forward; it never changes catalog identity or policy.

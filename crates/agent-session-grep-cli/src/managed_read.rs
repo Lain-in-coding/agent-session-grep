@@ -27,8 +27,8 @@ use agent_session_grep_ports::{
     PortError, RetrievalMode, SearchFacets, SearchFilters, SearchProvider, SidechainFacet,
     control::{
         BackgroundControl, BackgroundFailure, ControlId, ControlStatus, ControlStore,
-        DesiredUpdates, LatestAdmission, LatestBarrier, LatestRequest, PolicyEpoch,
-        RequestIntersection, SelectionRevision, UpdateState,
+        DesiredUpdates, LatestAdmission, LatestBarrier, LatestRequest, MaintenanceState,
+        PolicyEpoch, RequestIntersection, SelectionRevision, UpdateState,
     },
     managed::{
         EntityData, EntityKind, ProjectionListEntry, ProjectionQuery, ProjectionRead, ReadSnapshot,
@@ -1181,6 +1181,19 @@ fn execute(
             })
             .transpose()
             .map_err(private_port)?;
+        // barrier() overlays the live worker advisory on the stored row. A
+        // stored Blocked row never reopens, so its own error stays terminal even
+        // when a later worker boot reports Busy or Deferred over it.
+        let persisted_error = barrier
+            .as_ref()
+            .map(|b| {
+                transient(&control, deadline, || {
+                    control.with_runtime_deadline(deadline, || control.persisted_barrier(&b.id))
+                })
+            })
+            .transpose()
+            .map_err(private_port)?
+            .and_then(|b| b.error);
         let worker = transient(&control, deadline, || {
             control.with_runtime_deadline(deadline, || control.background_status())
         })
@@ -1192,15 +1205,47 @@ fn execute(
             "stopped"
         } else if current.policy.policy_epoch != status.policy.policy_epoch {
             "policy_changed"
+        } else if barrier_now.is_some()
+            && current.policy.maintenance.state != MaintenanceState::Idle
+        {
+            "upgrading"
+        } else if barrier_now.is_some()
+            && matches!(
+                worker.state,
+                UpdateState::Paused
+                    | UpdateState::Stopped
+                    | UpdateState::Offline
+                    | UpdateState::Failed
+                    | UpdateState::Upgrading
+            )
+        {
+            update_state_name(worker.state)
+        } else if barrier_now.is_some()
+            && let Some(reason) = worker.error.filter(|error| {
+                !matches!(error, BackgroundFailure::Busy | BackgroundFailure::Deferred)
+            })
+        {
+            failure_reason(reason)
         } else if let Some(reason) = blocked {
             reason
+        } else if let Some(reason) = persisted_error {
+            failure_reason(reason)
         } else if let Some(reason) = barrier_now.as_ref().and_then(|b| b.error) {
             failure_reason(reason)
+        } else if barrier_now.is_some()
+            && matches!(worker.state, UpdateState::Busy | UpdateState::Deferred)
+        {
+            update_state_name(worker.state)
         } else {
             "timeout"
         };
-        // Ownership is only a reason to stop waiting. It never establishes freshness.
-        let offline = if current.desired_updates == DesiredUpdates::Running && reason == "timeout" {
+        // A live owner permits waiting through advisory contention, never success.
+        let offline = if current.desired_updates == DesiredUpdates::Running
+            && (reason == "timeout"
+                || (barrier_now.is_some()
+                    && blocked.is_none()
+                    && matches!(reason, "busy" | "deferred")))
+        {
             match ExclusiveGuard::try_acquire(&root, LockKind::Background) {
                 Ok(guard) => {
                     drop(guard);
@@ -1213,8 +1258,23 @@ fn execute(
             false
         };
         let reason = if offline { "offline" } else { reason };
-        let stop =
-            request.latest.is_none() || reason != "timeout" || Instant::now() >= wait_deadline;
+        // Admission and stored barrier failures stay terminal. Retry only the
+        // original barrier, with its original end and unchanged update permission.
+        let can_wait = blocked.is_none()
+            && persisted_error.is_none()
+            && current.desired_updates == DesiredUpdates::Running
+            && current.policy.policy_epoch == status.policy.policy_epoch
+            && current.policy.maintenance.state == MaintenanceState::Idle
+            && worker.error.is_none_or(|error| {
+                matches!(error, BackgroundFailure::Busy | BackgroundFailure::Deferred)
+            })
+            && barrier_now.as_ref().is_some_and(|barrier| {
+                barrier.error.is_none_or(|error| {
+                    matches!(error, BackgroundFailure::Busy | BackgroundFailure::Deferred)
+                })
+            })
+            && matches!(reason, "timeout" | "busy" | "deferred");
+        let stop = request.latest.is_none() || !can_wait || Instant::now() >= wait_deadline;
         let result = transient(&control, deadline, || {
             store.with_read(&control, RequestIntersection::Selected, deadline, |read| {
                 // Proof and payload use this very transaction. Drop it before every wait.
@@ -1233,8 +1293,7 @@ fn execute(
                     DesiredUpdates::Stopped => "stopped",
                     DesiredUpdates::Running if offline => "offline",
                     DesiredUpdates::Running
-                        if current.policy.maintenance.state
-                            != agent_session_grep_ports::control::MaintenanceState::Idle =>
+                        if current.policy.maintenance.state != MaintenanceState::Idle =>
                     {
                         "upgrading"
                     }

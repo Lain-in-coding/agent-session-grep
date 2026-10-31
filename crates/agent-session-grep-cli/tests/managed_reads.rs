@@ -711,6 +711,525 @@ fn latest_uses_post_admission_source_and_discovery_receipts_in_output_snapshot()
     assert!(!value.to_string().contains("POST_ADMISSION_RECEIPT"));
 }
 
+struct LatestChild(Option<Child>);
+impl Drop for LatestChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn only_latest_barrier(f: &Fixture, end: Instant) -> LatestBarrier {
+    let conn = rusqlite::Connection::open_with_flags(
+        SqliteControlStore::path(&f.root),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM barriers", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "one CLI request must admit exactly one barrier"
+    );
+    let identifier: String = conn
+        .query_row("SELECT barrier_id FROM barriers", [], |row| row.get(0))
+        .unwrap();
+    f.control
+        .with_runtime_deadline(end, || f.control.barrier(&id(&identifier)))
+        .unwrap()
+}
+
+fn assert_same_latest_admission(before: &LatestBarrier, after: &LatestBarrier) {
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.policy_epoch, before.policy_epoch);
+    assert_eq!(after.admission_control_seq, before.admission_control_seq);
+    assert_eq!(after.required_cycle_seq, before.required_cycle_seq);
+    assert_eq!(after.requested_wait_ms, before.requested_wait_ms);
+    assert_eq!(after.admitted_at_ms, before.admitted_at_ms);
+    assert_eq!(after.selections, before.selections);
+}
+
+fn assert_latest_still_waiting(child: &mut Child, duration: Duration) {
+    let end = Instant::now() + duration;
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "latest returned before its catalog proof was published"
+        );
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+}
+
+fn await_latest_exit(child: &mut Child, end: Instant) {
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < end,
+            "latest child did not exit within its bound"
+        );
+        std::thread::sleep(
+            Duration::from_millis(10).min(end.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn latest_with_worker_advisory(
+    state: UpdateState,
+    wait_ms: u32,
+    release_owner: bool,
+    action: impl FnOnce(
+        &Fixture,
+        &ManagedStore,
+        &agent_session_grep_adapters_sqlite::control::LockedWorkerAuthority<'_>,
+        &ObservationCycle,
+        &mut Child,
+        Instant,
+    ),
+) -> Output {
+    let f = Fixture::new(1, "transient latest original needle");
+    // Preparation gets its own end; the actual CLI retains its usual budget.
+    let prepare_end = Instant::now() + Duration::from_secs(20);
+    let guard = lock(&f.root, LockKind::Background);
+    let worker = f.control.bind_worker(&guard, id("private-boot")).unwrap();
+    let store = f
+        .control
+        .with_runtime_deadline(prepare_end, || {
+            ManagedStore::open_for_write(&f.db, &f.control)
+        })
+        .unwrap();
+    f.control
+        .with_runtime_deadline(prepare_end, || {
+            store.reconcile_progress(&f.control, &worker)
+        })
+        .unwrap();
+    let next = f
+        .control
+        .with_runtime_deadline(prepare_end, || f.control.background_status())
+        .unwrap()
+        .next_cycle_seq;
+    let wait = wait_ms.to_string();
+    let mut child = LatestChild(Some(f.spawn(&[
+        "search",
+        "needle",
+        "--latest",
+        "--max-wait-ms",
+        &wait,
+    ])));
+    let queued = f.await_queued_cycle(child.0.as_mut().unwrap(), next);
+    let admitted = only_latest_barrier(&f, prepare_end);
+    assert_eq!(admitted.required_cycle_seq, queued.token.cycle_seq);
+    assert_eq!(admitted.requested_wait_ms, wait_ms);
+    let cycle = f
+        .control
+        .with_runtime_deadline(prepare_end, || {
+            f.control
+                .start_cycle(current(&f.control), &worker, next, 10)
+        })
+        .unwrap()
+        .value;
+    assert!(cycle.started_control_seq.unwrap() > admitted.admission_control_seq);
+    store
+        .begin_discovery_with_deadline(
+            &f.control,
+            &worker,
+            &cycle,
+            &cycle.selections[0].selection,
+            prepare_end,
+        )
+        .unwrap();
+    let error = match state {
+        UpdateState::Busy => BackgroundFailure::Busy,
+        UpdateState::Deferred => BackgroundFailure::Deferred,
+        _ => panic!("expected a transient worker advisory"),
+    };
+    f.control
+        .with_runtime_deadline(prepare_end, || {
+            f.control
+                .heartbeat_worker(current(&f.control), &worker, state, Some(error), 12)
+        })
+        .unwrap();
+    let advisory = only_latest_barrier(&f, prepare_end);
+    assert_eq!(advisory.state, BarrierState::Blocked);
+    assert_eq!(advisory.error, Some(error));
+    assert_same_latest_admission(&admitted, &advisory);
+    let persisted = f
+        .control
+        .with_runtime_deadline(prepare_end, || f.control.persisted_barrier(&admitted.id))
+        .unwrap();
+    assert_eq!(persisted.state, BarrierState::Pending);
+    assert_eq!(persisted.error, None);
+    assert_same_latest_admission(&admitted, &persisted);
+    action(
+        &f,
+        &store,
+        &worker,
+        &cycle,
+        child.0.as_mut().unwrap(),
+        prepare_end,
+    );
+    let output = if release_owner {
+        // Leave the advisory heartbeat untouched: only the real OS owner goes.
+        drop(worker);
+        drop(guard);
+        await_latest_exit(
+            child.0.as_mut().unwrap(),
+            Instant::now() + Duration::from_secs(3),
+        );
+        child.0.take().unwrap().wait_with_output().unwrap()
+    } else {
+        await_latest_exit(child.0.as_mut().unwrap(), prepare_end);
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        worker.validate().unwrap();
+        output
+    };
+    assert_same_latest_admission(&admitted, &only_latest_barrier(&f, prepare_end));
+    let after = f
+        .control
+        .with_runtime_deadline(prepare_end, || f.control.background_status())
+        .unwrap();
+    assert_eq!(after.next_cycle_seq.get(), next.get() + 1);
+    assert_eq!(after.worker.boot_id, Some(id("private-boot")));
+    if release_owner {
+        assert_eq!(after.worker.state, state);
+    }
+    output
+}
+
+fn latest_publishes_through_worker_advisory(state: UpdateState) {
+    let output =
+        latest_with_worker_advisory(state, 5000, false, |f, store, worker, cycle, child, end| {
+            assert_latest_still_waiting(child, Duration::from_millis(600));
+            f.control
+                .with_runtime_deadline(end, || {
+                    f.control.heartbeat_worker(
+                        current(&f.control),
+                        worker,
+                        UpdateState::Running,
+                        None,
+                        13,
+                    )
+                })
+                .unwrap();
+            // A Running heartbeat and then a source receipt still cannot
+            // substitute for discovery proof under the admitted token.
+            assert_latest_still_waiting(child, Duration::from_millis(100));
+            let mut observation = f.observation.clone();
+            observation.cycle_seq = cycle.token.cycle_seq.get();
+            observation.started_control_seq = cycle.started_control_seq.unwrap().get();
+            observation.policy_epoch = cycle.policy_epoch.get();
+            observation.revision_id = RevisionId::parse("transient-latest-receipt").unwrap();
+            observation.observed_at_ms = 14;
+            observation.committed_at_ms = 15;
+            let published = f
+                .control
+                .with_runtime_deadline(end, || {
+                    store.commit_source(&f.control, worker, &f.batch, &observation)
+                })
+                .unwrap();
+            assert!(published.receipt.published);
+            assert_latest_still_waiting(child, Duration::from_millis(100));
+            store
+                .commit_discovery_with_deadline(
+                    &f.control,
+                    worker,
+                    cycle,
+                    &cycle.selections[0].selection,
+                    std::slice::from_ref(&observation.binding.source_id),
+                    end,
+                )
+                .unwrap();
+        });
+    let value = response(output);
+    // Search retains its existing native-resume capability warning. Freshness
+    // and original evidence must still succeed under the same admitted barrier.
+    assert_eq!(value["outcome"], "partial");
+    assert_eq!(
+        value["warnings"],
+        json!(["resume_availability_unavailable"])
+    );
+    assert_eq!(value["data"]["freshness"]["latest_satisfied"], true);
+    assert_eq!(value["data"]["freshness"]["coverage"], "complete");
+    assert_eq!(value["data"]["freshness"]["reason"], "verified");
+    assert_eq!(value["data"]["freshness"]["latest_requested"], true);
+    assert_eq!(value["data"]["freshness"]["pending_sources"], 0);
+    assert_eq!(value["data"]["freshness"]["failed_sources"], 0);
+    assert_eq!(value["data"]["truncation"]["truncated"], false);
+    assert!(
+        value
+            .to_string()
+            .contains("transient latest original needle")
+    );
+}
+
+#[test]
+fn latest_waits_through_live_worker_busy_until_same_cycle_catalog_publication() {
+    latest_publishes_through_worker_advisory(UpdateState::Busy);
+}
+
+#[test]
+fn latest_waits_through_live_worker_deferred_until_same_cycle_catalog_publication() {
+    latest_publishes_through_worker_advisory(UpdateState::Deferred);
+}
+
+#[test]
+fn latest_pause_after_transient_advisory_remains_terminal() {
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let output =
+            latest_with_worker_advisory(state, 5000, false, |f, _, worker, _, child, end| {
+                assert_latest_still_waiting(child, Duration::from_millis(300));
+                f.control
+                    .with_runtime_deadline(end, || {
+                        f.control
+                            .set_desired_updates(current(&f.control), DesiredUpdates::Paused)
+                    })
+                    .unwrap();
+                let paused_seq = f
+                    .control
+                    .with_runtime_deadline(end, || Ok(current(&f.control)))
+                    .unwrap();
+                await_latest_exit(child, Instant::now() + Duration::from_secs(3));
+                let status = f
+                    .control
+                    .with_runtime_deadline(end, || f.control.status())
+                    .unwrap();
+                assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+                assert_eq!(status.policy.control_seq, paused_seq);
+                worker.validate().unwrap();
+            });
+        let value = response(output);
+        assert_eq!(value["outcome"], "partial");
+        assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+        assert_eq!(value["data"]["freshness"]["reason"], "paused");
+    }
+}
+
+#[test]
+fn latest_offline_after_transient_advisory_remains_terminal() {
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let output =
+            latest_with_worker_advisory(state, 5000, false, |f, _, worker, _, child, end| {
+                assert_latest_still_waiting(child, Duration::from_millis(300));
+                f.control
+                    .with_runtime_deadline(end, || {
+                        f.control.stop_worker(current(&f.control), worker, 13)
+                    })
+                    .unwrap();
+                await_latest_exit(child, Instant::now() + Duration::from_secs(3));
+            });
+        let value = response(output);
+        assert_eq!(value["outcome"], "partial");
+        assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+        assert_eq!(value["data"]["freshness"]["reason"], "offline");
+    }
+}
+
+#[test]
+fn latest_hard_worker_error_is_not_retried_as_a_transient_advisory() {
+    let output = latest_with_worker_advisory(
+        UpdateState::Busy,
+        5000,
+        false,
+        |f, _, worker, _, child, end| {
+            assert_latest_still_waiting(child, Duration::from_millis(300));
+            f.control
+                .with_runtime_deadline(end, || {
+                    f.control.heartbeat_worker(
+                        current(&f.control),
+                        worker,
+                        UpdateState::Busy,
+                        Some(BackgroundFailure::Failed),
+                        13,
+                    )
+                })
+                .unwrap();
+            await_latest_exit(child, Instant::now() + Duration::from_secs(3));
+        },
+    );
+    let value = response(output);
+    assert_eq!(value["outcome"], "partial");
+    assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+    assert_eq!(value["data"]["freshness"]["reason"], "failed");
+}
+
+#[test]
+fn latest_missing_os_owner_after_transient_advisory_returns_offline() {
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let output = latest_with_worker_advisory(state, 5000, true, |_, _, _, _, child, _| {
+            assert_latest_still_waiting(child, Duration::from_millis(300));
+        });
+        let value = response(output);
+        assert_eq!(value["outcome"], "partial");
+        assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+        assert_eq!(value["data"]["freshness"]["reason"], "offline");
+    }
+}
+
+#[test]
+fn latest_transient_advisory_expires_without_renewing_its_original_wait() {
+    for (state, reason) in [
+        (UpdateState::Busy, "busy"),
+        (UpdateState::Deferred, "deferred"),
+    ] {
+        let output = latest_with_worker_advisory(state, 5000, false, |_, _, _, _, child, _| {
+            assert_latest_still_waiting(child, Duration::from_millis(300));
+        });
+        let value = response(output);
+        assert_eq!(value["outcome"], "partial");
+        assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+        assert_eq!(value["data"]["freshness"]["reason"], reason);
+        assert!(value["meta"]["duration_ms"].as_u64().unwrap() >= 5000);
+        assert!(value["meta"]["duration_ms"].as_u64().unwrap() < 10_000);
+        assert!(
+            value
+                .to_string()
+                .contains("transient latest original needle")
+        );
+    }
+}
+
+/// Raw stored admission rows, read beside the typed control API.
+fn stored_latest_rows(f: &Fixture, barrier: &LatestBarrier) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        SqliteControlStore::path(&f.root),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let barrier_id = rusqlite::types::Value::Text(barrier.id.as_str().into());
+    let cycle_seq = rusqlite::types::Value::Integer(barrier.required_cycle_seq.get());
+    let mut rows = Vec::new();
+    for (query, key) in [
+        ("SELECT * FROM barriers WHERE barrier_id=?1", &barrier_id),
+        (
+            "SELECT * FROM barrier_selections WHERE barrier_id=?1 ORDER BY selection_id",
+            &barrier_id,
+        ),
+        ("SELECT * FROM cycles WHERE cycle_seq=?1", &cycle_seq),
+    ] {
+        let mut statement = conn.prepare(query).unwrap();
+        let width = statement.column_count();
+        let mut found = statement.query([key]).unwrap();
+        while let Some(row) = found.next().unwrap() {
+            rows.push(
+                (0..width)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index).unwrap())
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+#[test]
+fn latest_restart_advisory_never_masks_a_stored_offline_barrier() {
+    // Each advisory runs twice: a poll that lands between the three commits
+    // sees the unmasked Offline/Idle row and stops for the right reason anyway.
+    for (state, error) in [
+        (UpdateState::Busy, BackgroundFailure::Busy),
+        (UpdateState::Deferred, BackgroundFailure::Deferred),
+        (UpdateState::Busy, BackgroundFailure::Busy),
+        (UpdateState::Deferred, BackgroundFailure::Deferred),
+    ] {
+        let f = Fixture::new(1, "restarted latest original needle");
+        let prepare_end = Instant::now() + Duration::from_secs(20);
+        let guard = lock(&f.root, LockKind::Background);
+        let original = f.control.bind_worker(&guard, id("private-boot")).unwrap();
+        let store = f
+            .control
+            .with_runtime_deadline(prepare_end, || {
+                ManagedStore::open_for_write(&f.db, &f.control)
+            })
+            .unwrap();
+        f.control
+            .with_runtime_deadline(prepare_end, || {
+                store.reconcile_progress(&f.control, &original)
+            })
+            .unwrap();
+        drop(store);
+        let next = f
+            .control
+            .with_runtime_deadline(prepare_end, || f.control.background_status())
+            .unwrap()
+            .next_cycle_seq;
+        let mut child = LatestChild(Some(f.spawn(&[
+            "search",
+            "needle",
+            "--latest",
+            "--max-wait-ms",
+            "5000",
+        ])));
+        let queued = f.await_queued_cycle(child.0.as_mut().unwrap(), next);
+        let admitted = only_latest_barrier(&f, prepare_end);
+        assert_eq!(admitted.required_cycle_seq, queued.token.cycle_seq);
+        assert_eq!(admitted.state, BarrierState::Pending);
+        assert_latest_still_waiting(child.0.as_mut().unwrap(), Duration::from_millis(300));
+        // The original worker stops, then a new boot under the same Running
+        // policy reports an advisory while the request's barrier stays blocked.
+        let replacement = f
+            .control
+            .bind_worker(&guard, id("replacement-boot"))
+            .unwrap();
+        f.control
+            .with_runtime_deadline(prepare_end, || {
+                let stopped = f.control.stop_worker(current(&f.control), &original, 13)?;
+                let registered =
+                    f.control
+                        .register_worker(stopped.control_seq, &replacement, 2, 14)?;
+                f.control.heartbeat_worker(
+                    registered.control_seq,
+                    &replacement,
+                    state,
+                    Some(error),
+                    15,
+                )
+            })
+            .unwrap();
+        let masked = only_latest_barrier(&f, prepare_end);
+        assert_same_latest_admission(&admitted, &masked);
+        assert_eq!(masked.state, BarrierState::Blocked);
+        assert_eq!(
+            masked.error,
+            Some(error),
+            "the live advisory hides the stored row"
+        );
+        let stored = f
+            .control
+            .with_runtime_deadline(prepare_end, || f.control.persisted_barrier(&admitted.id))
+            .unwrap();
+        assert_same_latest_admission(&admitted, &stored);
+        assert_eq!(stored.state, BarrierState::Blocked);
+        assert_eq!(stored.error, Some(BackgroundFailure::Offline));
+        let rows = stored_latest_rows(&f, &admitted);
+        let control_seq = current(&f.control);
+        await_latest_exit(
+            child.0.as_mut().unwrap(),
+            Instant::now() + Duration::from_secs(3),
+        );
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        // Returning offline is read-only: no row, sequence or worker changes.
+        assert_eq!(stored_latest_rows(&f, &admitted), rows);
+        assert_eq!(current(&f.control), control_seq);
+        assert_same_latest_admission(&admitted, &only_latest_barrier(&f, prepare_end));
+        let after = f
+            .control
+            .with_runtime_deadline(prepare_end, || f.control.background_status())
+            .unwrap();
+        assert_eq!(after.worker.boot_id, Some(id("replacement-boot")));
+        assert_eq!(after.worker.state, state);
+        replacement.validate().unwrap();
+        let value = response(output);
+        assert_eq!(value["outcome"], "partial");
+        assert_eq!(value["data"]["freshness"]["latest_satisfied"], false);
+        assert_eq!(value["data"]["freshness"]["reason"], "offline");
+        assert!(value["meta"]["duration_ms"].as_u64().unwrap() < 5000);
+    }
+}
+
 #[test]
 fn latest_timeout_offline_and_pause_never_spawn_or_resume_a_worker() {
     let f = Fixture::new(1, "old permitted evidence");
