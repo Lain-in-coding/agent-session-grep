@@ -1567,6 +1567,10 @@ impl ManagedStore {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "One publisher serves exact cycles and plain epochs"
+    )]
     fn publish_discovery(
         &self,
         control: &SqliteControlStore,
