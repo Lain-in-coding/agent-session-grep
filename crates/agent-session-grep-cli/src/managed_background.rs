@@ -9,6 +9,7 @@ use agent_session_grep_adapters_sqlite::{
     PARSER_SEMANTIC_VERSION, SourceBatch, SqliteControlStore, capture_with_deadline,
     control::LockedWorkerAuthority,
     managed_locks::{ExclusiveGuard, LockKind},
+    managed_refresh::RefreshOutcome,
     managed_store::{BackgroundSource, ManagedStore},
     open_snapshot_source_with_deadline, verify_snapshot_with_deadline,
 };
@@ -31,7 +32,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     io::Read,
     path::{Path, PathBuf},
@@ -52,6 +53,8 @@ const SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(30);
 const MAX_DISCOVERY_PATHS: usize = 65_536;
 const SOURCE_SLICE_ATTEMPTS: usize = 3;
 const SOURCE_HINT_BATCH: usize = 64;
+const SOURCE_HOT_HINT_BATCH: usize = 16;
+const FULL_VERIFICATION_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The monotonic confirmation clock and failures whose invalidation could not
 /// be recorded in control. Ordinary cycle aborts do not invalidate other
@@ -226,6 +229,29 @@ impl ObservationClock {
             }
         }
         latest
+    }
+
+    fn baseline_lost(
+        &self,
+        source: &SharedSource,
+        roots: &[RootState<'_>],
+        receipt_cycle: i64,
+        epoch: PolicyEpoch,
+    ) -> bool {
+        let failures = self.failures.borrow();
+        if failures.epoch != Some(epoch) {
+            return false;
+        }
+        failures
+            .sources
+            .get(&source.id)
+            .is_some_and(|lost| lost.get() >= receipt_cycle)
+            || source.roots.iter().any(|&index| {
+                failures.roots.iter().any(|lost| {
+                    roots[index].selection.root_identity.as_ref() == Some(&lost.identity)
+                        && lost.all.is_some_and(|lost| lost.get() >= receipt_cycle)
+                })
+            })
     }
 }
 
@@ -779,6 +805,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 }
                 Err(error) => return Err(error),
             };
+        let mut idle_completed = None;
         let (state, error) = if current.desired_updates == DesiredUpdates::Paused {
             (UpdateState::Paused, Some(BackgroundFailure::Paused))
         } else {
@@ -798,18 +825,26 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 &mut pending_cycle,
                 &mut schedule,
             ) {
-                Ok(complete) => (
-                    if complete {
-                        UpdateState::Idle
+                Ok(outcome) => {
+                    let closed_idle = outcome.idle();
+                    idle_completed = if closed_idle {
+                        schedule.closed_idle_at
                     } else {
-                        UpdateState::Deferred
-                    },
-                    if complete {
                         None
-                    } else {
-                        Some(BackgroundFailure::Deferred)
-                    },
-                ),
+                    };
+                    (
+                        if closed_idle {
+                            UpdateState::Idle
+                        } else {
+                            UpdateState::Deferred
+                        },
+                        if closed_idle {
+                            None
+                        } else {
+                            Some(BackgroundFailure::Deferred)
+                        },
+                    )
+                }
                 Err(error) => (failure_state(&error), Some(failure(&error))),
             }
         };
@@ -850,6 +885,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 Ok(pending) => pending,
                 Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => true,
                 Err(error) => {
+                    idle_completed = None;
                     let reason = failure(&error);
                     match control_change(&control, |seq| {
                         control.heartbeat_worker(
@@ -868,7 +904,12 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
             };
         }
         rounds = rounds.wrapping_add(1);
-        std::thread::sleep(CADENCE.saturating_sub(tick.elapsed()));
+        let wait = if let Some(completed) = idle_completed {
+            CADENCE.saturating_sub(completed.elapsed())
+        } else {
+            CADENCE.saturating_sub(tick.elapsed())
+        };
+        std::thread::sleep(wait);
     }
 }
 
@@ -960,7 +1001,7 @@ fn selection_revision(selection: &Selection) -> PortResult<SelectionRevision> {
 }
 
 fn check_policy(control: &SqliteControlStore, policy: &ReadPolicy) -> PortResult<()> {
-    let current = control.status()?;
+    let current = control.lifecycle_status()?;
     if current.desired_updates != DesiredUpdates::Running
         || current.policy.maintenance.state != MaintenanceState::Idle
         || current.policy.policy_epoch != policy.policy_epoch
@@ -1189,6 +1230,27 @@ struct PendingCycle {
     finish: CycleFinish,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CycleOutcome {
+    catalog_complete: bool,
+    all_sources_attempted: bool,
+    remaining_work: bool,
+}
+
+impl CycleOutcome {
+    fn idle(self) -> bool {
+        self.catalog_complete && !self.remaining_work
+    }
+
+    fn finish(self) -> CycleFinish {
+        if self.catalog_complete && self.all_sources_attempted {
+            CycleFinish::Committed
+        } else {
+            CycleFinish::Partial
+        }
+    }
+}
+
 /// Retain an exact owned completion across a refused control tick. A later
 /// cadence resolves it before admitting another cycle; a policy-aborted cycle
 /// stays aborted and can never be resurrected from this process-local intent.
@@ -1259,7 +1321,7 @@ fn run_cycle(
     end: Instant,
     pending: &mut Option<PendingCycle>,
     schedule: &mut SourceScheduleState,
-) -> PortResult<bool> {
+) -> PortResult<CycleOutcome> {
     // The same live worker may have reported Busy/Deferred after a refused
     // completion. Restore activity under current intent/fence before finish,
     // whose control admission rejects those advisory states. A pause, stop or
@@ -1285,7 +1347,12 @@ fn run_cycle(
         .cloned()
         .collect::<Vec<_>>();
     if selections.is_empty() {
-        return Ok(true);
+        schedule.closed_idle_at = Some(Instant::now());
+        return Ok(CycleOutcome {
+            catalog_complete: true,
+            all_sources_attempted: true,
+            remaining_work: false,
+        });
     }
     // Rotate the first selection as well as processing every candidate. An old
     // root cannot be permanently behind a continuously busy recent root.
@@ -1295,11 +1362,40 @@ fn run_cycle(
         .iter()
         .map(selection_revision)
         .collect::<PortResult<Vec<_>>>()?;
-    let queued = control_change_before(control, end, |seq| {
-        control.queue_cycle(seq, revisions.clone())
-    })?;
-    let CycleAdmission::Queued(queued) = queued.value else {
-        return Err(changed());
+    let demands = control.with_runtime_deadline(end, || control.latest_demands())?;
+    schedule.update_demands(demands, &policy, schedule.now())?;
+    // A subset latest request can own a queued cycle that ordinary all-root
+    // allocation would never coalesce with. Start it only under its real token.
+    let demanded = schedule.queued_demand(schedule.now());
+    let demanded = demanded
+        .map(|number| control.with_runtime_deadline(end, || control.cycle(number)))
+        .transpose()?
+        .filter(|queued| {
+            queued.state == CycleState::Queued
+                && queued.token.worker_boot_id == *authority.boot_id()
+                && queued.policy_epoch == policy.policy_epoch
+                && queued
+                    .selections
+                    .iter()
+                    .all(|selected| revisions.contains(&selected.selection))
+        });
+    let queued = if let Some(queued) = demanded {
+        selections.retain(|selection| {
+            queued.selections.iter().any(|selected| {
+                selected.selection.selection_id == selection.id
+                    && selected.selection.revision == selection.revision
+                    && selection.root_identity.as_ref() == Some(&selected.selection.root_identity)
+            })
+        });
+        queued
+    } else {
+        let queued = control_change_before(control, end, |seq| {
+            control.queue_cycle(seq, revisions.clone())
+        })?;
+        let CycleAdmission::Queued(queued) = queued.value else {
+            return Err(changed());
+        };
+        queued
     };
     let cycle = start_cycle_with_pending(control, &queued, pending, end, |seq| {
         control
@@ -1316,9 +1412,13 @@ fn run_cycle(
         boot,
         schedule,
     );
+    schedule.closed_idle_at = result
+        .as_ref()
+        .ok()
+        .filter(|outcome| outcome.idle())
+        .map(|_| Instant::now());
     pending.as_mut().ok_or_else(invalid)?.finish = match &result {
-        Ok(true) => CycleFinish::Committed,
-        Ok(false) => CycleFinish::Partial,
+        Ok(outcome) => outcome.finish(),
         Err(_) => CycleFinish::Aborted,
     };
     finish_pending_cycle(control, authority, pending, end)?;
@@ -1344,8 +1444,14 @@ struct SharedSource {
 
 enum ObservationOutcome {
     NotScheduled,
+    ProbeFailed(BackgroundFailure),
+    VerifiedBaseline {
+        hint: SourceHint,
+        claimed: BTreeSet<usize>,
+    },
     Attempted {
         published: bool,
+        committed: bool,
         claimed: BTreeSet<usize>,
         failed: Option<BackgroundFailure>,
     },
@@ -1384,6 +1490,7 @@ impl SourceHint {
 
 struct SourceAttemptResult {
     current: bool,
+    published: bool,
     successful: Option<SuccessfulSourceAttempt>,
 }
 
@@ -1391,6 +1498,8 @@ struct SuccessfulSourceAttempt {
     baseline: BackgroundSource,
     hint: SourceHint,
     revisitable: bool,
+    /// Exactly the roots this attempt wrote to receipt_selection_claims.
+    claims: Vec<SelectionRevision>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1406,14 +1515,25 @@ enum SourceLane {
 struct ScheduleIdentity {
     installation: ControlId,
     incarnation: ControlId,
+    worker_boot: ControlId,
+    parser: u32,
     epoch: PolicyEpoch,
     selections: Vec<SelectionRevision>,
 }
 
 struct SourceDebt {
     ticket: u64,
-    verified: Option<(RevisionId, SourceHint)>,
+    verified: Option<(RevisionId, SourceHint, Vec<SelectionRevision>)>,
+    last_full_verified: Option<Instant>,
+    owed: bool,
     dirty: bool,
+}
+
+struct LatestDemand {
+    barrier: LatestBarrier,
+    service_end: Instant,
+    retired: bool,
+    queued_considered: bool,
 }
 
 /// Tickets rotate only when an attempt starts. An expired first turn keeps its
@@ -1426,13 +1546,23 @@ struct SourceScheduleState {
     active_attempts: u8,
     next_debt: SourceLane,
     probe_after: Option<SourceId>,
+    hot_probes: VecDeque<SourceId>,
     next_probe: Option<Instant>,
+    probes_in_window: usize,
+    probe_window: Option<Instant>,
+    demands: BTreeMap<ControlId, LatestDemand>,
+    closed_idle_at: Option<Instant>,
     #[cfg(test)]
     hooks: ScheduleTestHooks,
 }
 
 impl SourceScheduleState {
-    fn prepare(&mut self, policy: &ReadPolicy, incarnation: &ControlId) -> PortResult<()> {
+    fn prepare(
+        &mut self,
+        policy: &ReadPolicy,
+        incarnation: &ControlId,
+        worker_boot: &ControlId,
+    ) -> PortResult<()> {
         let mut selections = policy
             .selections
             .iter()
@@ -1443,6 +1573,8 @@ impl SourceScheduleState {
         let identity = ScheduleIdentity {
             installation: policy.installation_id.clone(),
             incarnation: incarnation.clone(),
+            worker_boot: worker_boot.clone(),
+            parser: PARSER_SEMANTIC_VERSION,
             epoch: policy.policy_epoch,
             selections,
         };
@@ -1452,8 +1584,12 @@ impl SourceScheduleState {
             self.active_attempts = 0;
             self.next_debt = SourceLane::Cold;
             self.probe_after = None;
+            self.hot_probes.clear();
             self.next_probe = None;
+            self.probes_in_window = 0;
+            self.probe_window = None;
             self.identity = Some(identity);
+            self.closed_idle_at = None;
         }
         Ok(())
     }
@@ -1475,12 +1611,14 @@ impl SourceScheduleState {
                 SourceDebt {
                     ticket,
                     verified: None,
+                    last_full_verified: None,
+                    owed: true,
                     dirty: false,
                 },
             );
         }
         let debt = self.sources.get_mut(id).ok_or_else(invalid)?;
-        if debt.verified.as_ref().is_some_and(|(revision, _)| {
+        if debt.verified.as_ref().is_some_and(|(revision, _, _)| {
             prior
                 .and_then(|p| p.latest_receipt.as_ref())
                 .is_none_or(|receipt| !receipt.published || &receipt.revision_id != revision)
@@ -1488,8 +1626,183 @@ impl SourceScheduleState {
             // A possibly committed failure is reconciled from the real head in
             // the next cycle. Never attach a remembered hint to another receipt.
             debt.verified = None;
+            debt.last_full_verified = None;
+            debt.owed = true;
         }
         Ok(())
+    }
+
+    fn invalidate(&mut self, id: &SourceId) {
+        if let Some(debt) = self.sources.get_mut(id) {
+            debt.verified = None;
+            debt.last_full_verified = None;
+            debt.owed = true;
+        }
+    }
+
+    fn full_due(&self, id: &SourceId, now: Instant) -> bool {
+        self.sources.get(id).is_none_or(|debt| {
+            debt.owed
+                || debt.dirty
+                || debt.last_full_verified.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= FULL_VERIFICATION_INTERVAL
+                })
+        })
+    }
+
+    fn remember_hot(&mut self, id: &SourceId) {
+        if !self.hot_probes.contains(id) {
+            self.hot_probes.push_back(id.clone());
+            if self.hot_probes.len() > SOURCE_HINT_BATCH {
+                self.hot_probes.pop_front();
+            }
+        }
+    }
+
+    fn update_demands(
+        &mut self,
+        barriers: Vec<LatestBarrier>,
+        policy: &ReadPolicy,
+        now: Instant,
+    ) -> PortResult<()> {
+        self.update_demands_within(
+            barriers,
+            policy,
+            now,
+            agent_session_grep_adapters_sqlite::control::MAX_RUNTIME_REFERENCES,
+        )
+    }
+
+    fn update_demands_within(
+        &mut self,
+        barriers: Vec<LatestBarrier>,
+        policy: &ReadPolicy,
+        now: Instant,
+        capacity: usize,
+    ) -> PortResult<()> {
+        // The inventory is complete. A barrier leaves it only as terminal,
+        // epoch-blocked or another boot's, and never returns, so forgetting it
+        // cannot reopen a window. A retired ID still listed stays retired.
+        let present = barriers
+            .iter()
+            .map(|barrier| barrier.id.clone())
+            .collect::<BTreeSet<_>>();
+        self.demands.retain(|id, _| present.contains(id));
+        for barrier in barriers {
+            let compatible = barrier.policy_epoch == policy.policy_epoch
+                && barrier.selections.iter().all(|revision| {
+                    policy.selections.iter().any(|selection| {
+                        selection.enabled
+                            && selection.id == revision.selection_id
+                            && selection.revision == revision.revision
+                            && selection.root_identity.as_ref() == Some(&revision.root_identity)
+                    })
+                });
+            if let Some(demand) = self.demands.get_mut(&barrier.id) {
+                demand.retired |= !compatible
+                    || barrier.state == BarrierState::Blocked
+                    || now >= demand.service_end;
+                // An immutable admission mismatch is never a new service window.
+                if demand.barrier.admission_control_seq != barrier.admission_control_seq
+                    || demand.barrier.required_cycle_seq != barrier.required_cycle_seq
+                    || demand.barrier.selections != barrier.selections
+                {
+                    return Err(changed());
+                }
+                demand.barrier = barrier;
+                continue;
+            }
+            if self.demands.len() >= capacity {
+                return Err(discovery_capacity());
+            }
+            let window =
+                Duration::from_millis(u64::from(barrier.requested_wait_ms.min(MAX_LATEST_WAIT_MS)));
+            self.demands.insert(
+                barrier.id.clone(),
+                LatestDemand {
+                    retired: !compatible || barrier.state == BarrierState::Blocked,
+                    barrier,
+                    service_end: now + window,
+                    queued_considered: false,
+                },
+            );
+        }
+        for demand in self.demands.values_mut() {
+            demand.retired |= now >= demand.service_end;
+        }
+        Ok(())
+    }
+
+    fn queued_demand(&mut self, now: Instant) -> Option<CycleSeq> {
+        let demand = self
+            .demands
+            .values_mut()
+            .filter(|demand| {
+                !demand.retired
+                    && now < demand.service_end
+                    && demand.barrier.state == BarrierState::Pending
+                    && !demand.queued_considered
+            })
+            .min_by_key(|demand| demand.barrier.required_cycle_seq)?;
+        demand.queued_considered = true;
+        Some(demand.barrier.required_cycle_seq)
+    }
+
+    fn latest_threshold(
+        &self,
+        revisions: impl Iterator<Item = SelectionRevision>,
+        now: Instant,
+    ) -> Option<(i64, i64)> {
+        let revisions = revisions.collect::<Vec<_>>();
+        self.demands
+            .values()
+            .filter(|demand| {
+                !demand.retired
+                    && now < demand.service_end
+                    && demand
+                        .barrier
+                        .selections
+                        .iter()
+                        .any(|selection| revisions.contains(selection))
+            })
+            .map(|demand| {
+                (
+                    demand.barrier.required_cycle_seq.get(),
+                    demand.barrier.admission_control_seq.get(),
+                )
+            })
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+    }
+
+    fn cycle_can_serve(
+        &self,
+        revisions: impl Iterator<Item = SelectionRevision>,
+        cycle: &ObservationCycle,
+        now: Instant,
+    ) -> bool {
+        self.latest_threshold(revisions, now)
+            .is_none_or(|(required, admission)| {
+                cycle.token.cycle_seq.get() >= required
+                    && cycle
+                        .started_control_seq
+                        .is_some_and(|start| start.get() > admission)
+            })
+    }
+
+    fn latest_owed(
+        &self,
+        revisions: impl Iterator<Item = SelectionRevision>,
+        receipt: Option<&agent_session_grep_ports::managed::RevisionRef>,
+        now: Instant,
+    ) -> bool {
+        self.latest_threshold(revisions, now)
+            .is_some_and(|(required, admission)| {
+                receipt.is_none_or(|receipt| {
+                    !receipt.published
+                        || receipt.cycle_seq < required
+                        || receipt.started_control_seq <= admission
+                })
+            })
     }
 
     fn now(&self) -> Instant {
@@ -1519,6 +1832,8 @@ enum SourceAttemptPhase {
 struct ScheduleTestHooks {
     now: Option<std::rc::Rc<std::cell::Cell<Duration>>>,
     probe_due: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    // Consumed only by final discover; never extends the original root end.
+    final_discovery_end: Option<std::rc::Rc<std::cell::Cell<Option<Instant>>>>,
     source_phase: std::cell::Cell<SourceAttemptPhase>,
     on_event: Option<RefCell<ScheduleEventHook>>,
 }
@@ -1528,6 +1843,7 @@ enum ScheduleTestEvent<'a> {
     Planned,
     BeforeProbe(&'a SourceId, Instant),
     BeforeAttempt(&'a SourceId, Instant, SourceLane),
+    BeforeParse(&'a SourceId, Instant),
     AfterAdmissionFailure(&'a SourceId, Instant, BackgroundFailure),
     AfterAttempt(&'a SourceId, SourceLane),
     AfterNotScheduled(&'a SourceId),
@@ -1559,6 +1875,13 @@ struct SourceTurn {
     probe: bool,
     revisitable: bool,
     last_slice: Option<u64>,
+    latest_only: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TurnObligation {
+    Owed,
+    ProbeOnly,
 }
 
 enum ScheduledTurn {
@@ -1576,6 +1899,7 @@ struct CycleSchedule<'a> {
     slice: u64,
     slice_attempts: usize,
     slice_started: Instant,
+    final_probe_done: bool,
 }
 
 impl<'a> CycleSchedule<'a> {
@@ -1591,6 +1915,7 @@ impl<'a> CycleSchedule<'a> {
             slice: 0,
             slice_attempts: 0,
             slice_started,
+            final_probe_done: false,
         }
     }
 
@@ -1602,6 +1927,21 @@ impl<'a> CycleSchedule<'a> {
         end: Instant,
         probe: bool,
     ) -> PortResult<()> {
+        self.add_obligation(id, prior, lane, end, probe, TurnObligation::Owed)?;
+        self.state.sources.get_mut(id).ok_or_else(invalid)?.owed = true;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_obligation(
+        &mut self,
+        id: &SourceId,
+        prior: Option<&BackgroundSource>,
+        lane: SourceLane,
+        end: Instant,
+        probe: bool,
+        obligation: TurnObligation,
+    ) -> PortResult<()> {
         if self.turns.len() >= MAX_DISCOVERY_PATHS || self.turns.contains_key(id) {
             return Err(discovery_capacity());
         }
@@ -1610,20 +1950,43 @@ impl<'a> CycleSchedule<'a> {
             id.clone(),
             SourceTurn {
                 original_end: end,
-                first_pending: true,
+                first_pending: matches!(obligation, TurnObligation::Owed),
                 lane: None,
                 probe,
-                revisitable: false,
+                revisitable: matches!(obligation, TurnObligation::ProbeOnly),
                 last_slice: None,
+                latest_only: false,
             },
         );
         self.expirations.insert((end, id.clone()));
         if probe {
             self.probes.insert(id.clone());
         }
-        self.first_pending += 1;
-        self.set_lane(id, Some(lane));
+        if matches!(obligation, TurnObligation::Owed) {
+            self.first_pending += 1;
+            self.set_lane(id, Some(lane));
+        }
         Ok(())
+    }
+
+    fn latest_obligation(&mut self, id: &SourceId, owed: bool) {
+        let full_due = self.state.full_due(id, self.state.now());
+        let turn = self.turns.get_mut(id).expect("registered source turn");
+        if owed && !full_due {
+            if !turn.first_pending && turn.last_slice.is_none() {
+                turn.first_pending = true;
+                self.first_pending += 1;
+            }
+            turn.latest_only = true;
+            self.set_lane(id, Some(SourceLane::Verification));
+        } else if !owed && turn.latest_only && !full_due {
+            turn.latest_only = false;
+            if turn.first_pending {
+                turn.first_pending = false;
+                self.first_pending -= 1;
+            }
+            self.set_lane(id, None);
+        }
     }
 
     fn set_lane(&mut self, id: &SourceId, lane: Option<SourceLane>) {
@@ -1654,9 +2017,17 @@ impl<'a> CycleSchedule<'a> {
         debt.dirty |= debt
             .verified
             .as_ref()
-            .map(|(_, verified)| *verified != hint)
+            .map(|(_, verified, _)| *verified != hint)
             .unwrap_or_else(|| indexed_len.is_some_and(|len| len != hint.len));
         if debt.dirty {
+            debt.owed = true;
+            let turn = self.turns.get_mut(id).expect("registered source turn");
+            turn.latest_only = false;
+            if !turn.first_pending && turn.last_slice.is_none() {
+                turn.first_pending = true;
+                self.first_pending += 1;
+            }
+            self.state.remember_hot(id);
             self.set_lane(id, Some(SourceLane::Active));
         }
     }
@@ -1673,28 +2044,70 @@ impl<'a> CycleSchedule<'a> {
         {
             self.state.next_probe = None;
         }
-        if self.first_pending == 0
+        let ready = self.queues.iter().any(|queue| !queue.is_empty());
+        let final_pass = !ready && !self.final_probe_done;
+        if (!ready && self.final_probe_done)
             || self.state.next_probe.is_some_and(|next| now < next)
             || !self.queues[SourceLane::Metadata as usize].is_empty()
         {
             return Vec::new();
         }
+        if final_pass {
+            self.final_probe_done = true;
+        }
+        if self
+            .state
+            .probe_window
+            .is_none_or(|start| now.saturating_duration_since(start) >= CADENCE)
+        {
+            self.state.probe_window = Some(now);
+            self.state.probes_in_window = 0;
+        }
+        let budget = SOURCE_HINT_BATCH.saturating_sub(self.state.probes_in_window);
+        if budget == 0 {
+            return Vec::new();
+        }
         self.state.next_probe = Some(now + CADENCE);
-        let keys = if let Some(after) = &self.state.probe_after {
+        let mut keys = Vec::new();
+        let mut selected = BTreeSet::new();
+        let hot_count = self.state.hot_probes.len();
+        for _ in 0..hot_count {
+            let Some(id) = self.state.hot_probes.pop_front() else {
+                break;
+            };
+            if self.probes.contains(&id) {
+                self.state.hot_probes.push_back(id.clone());
+                if keys.len() < SOURCE_HOT_HINT_BATCH.min(budget) {
+                    selected.insert(id.clone());
+                    keys.push(id);
+                }
+                if keys.len() == SOURCE_HOT_HINT_BATCH.min(budget) {
+                    break;
+                }
+            }
+        }
+        let aging = if let Some(after) = &self.state.probe_after {
             self.probes
                 .range((Excluded(after.clone()), Unbounded))
                 .chain(self.probes.range(..=after.clone()))
-                .take(SOURCE_HINT_BATCH)
+                .filter(|id| !selected.contains(*id))
+                .take(budget - keys.len())
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
             self.probes
                 .iter()
-                .take(SOURCE_HINT_BATCH)
+                .filter(|id| !selected.contains(*id))
+                .take(budget - keys.len())
                 .cloned()
                 .collect()
         };
-        self.state.probe_after = keys.last().cloned();
+        self.state.probe_after = aging
+            .last()
+            .cloned()
+            .or_else(|| self.state.probe_after.clone());
+        keys.extend(aging);
+        self.state.probes_in_window += keys.len();
         keys.into_iter()
             .filter(|id| {
                 let turn = &self.turns[id];
@@ -1706,6 +2119,7 @@ impl<'a> CycleSchedule<'a> {
     fn next(&mut self, now: Instant) -> Option<ScheduledTurn> {
         while self.expirations.first().is_some_and(|(end, _)| *end <= now) {
             let (_, id) = self.expirations.pop_first().expect("expired turn");
+            let owed = self.turns[&id].lane.is_some() && self.turns[&id].last_slice.is_none();
             self.set_lane(&id, None);
             self.probes.remove(&id);
             let turn = self.turns.get_mut(&id).expect("registered source turn");
@@ -1713,17 +2127,28 @@ impl<'a> CycleSchedule<'a> {
             if turn.first_pending {
                 turn.first_pending = false;
                 self.first_pending -= 1;
+            }
+            if owed {
                 return Some(ScheduledTurn::NotScheduled(id));
             }
         }
-        if self.first_pending == 0 {
-            // No quiet-period wait and no source-count cycle cutoff. Dirty
-            // revisits wait for the next independently admitted discovery.
+        if self.queues.iter().all(BTreeSet::is_empty) {
             return None;
         }
         if self.slice_attempts >= SOURCE_SLICE_ATTEMPTS
             || now.saturating_duration_since(self.slice_started) >= CADENCE
         {
+            self.slice = self.slice.wrapping_add(1);
+            self.slice_attempts = 0;
+            self.slice_started = now;
+        }
+        // If only a just-serviced dirty source remains, move to a new slice
+        // instead of abandoning its owed revisit at the first-turn boundary.
+        if self.queues.iter().all(|queue| {
+            queue
+                .iter()
+                .all(|(_, id)| self.turns[id].last_slice == Some(self.slice))
+        }) {
             self.slice = self.slice.wrapping_add(1);
             self.slice_attempts = 0;
             self.slice_started = now;
@@ -1759,10 +2184,13 @@ impl<'a> CycleSchedule<'a> {
     }
 
     fn started(&mut self, id: &SourceId, lane: SourceLane) -> PortResult<()> {
+        self.final_probe_done = false;
         let ticket = self.state.ticket()?;
         self.set_lane(id, None);
         self.probes.remove(id);
-        self.state.sources.get_mut(id).ok_or_else(invalid)?.ticket = ticket;
+        let debt = self.state.sources.get_mut(id).ok_or_else(invalid)?;
+        debt.ticket = ticket;
+        debt.owed = true;
         let turn = self.turns.get_mut(id).ok_or_else(invalid)?;
         if turn.first_pending {
             turn.first_pending = false;
@@ -1789,6 +2217,7 @@ impl<'a> CycleSchedule<'a> {
     }
 
     fn succeeded(&mut self, id: &SourceId, success: &SuccessfulSourceAttempt) {
+        let now = self.state.now();
         let debt = self
             .state
             .sources
@@ -1803,14 +2232,41 @@ impl<'a> CycleSchedule<'a> {
                 .revision_id
                 .clone(),
             success.hint,
+            success.claims.clone(),
         ));
         debt.dirty = false;
+        debt.owed = false;
+        debt.last_full_verified = Some(now);
         let turn = self.turns.get_mut(id).expect("registered source turn");
         // probe is false for sources first imported in this cycle.
         turn.revisitable = turn.probe && success.revisitable;
         if turn.revisitable {
             self.probes.insert(id.clone());
         }
+    }
+
+    fn failed(&mut self, id: &SourceId) {
+        self.set_lane(id, None);
+        self.probes.remove(id);
+        self.state.invalidate(id);
+        let turn = self.turns.get_mut(id).expect("registered source turn");
+        turn.revisitable = false;
+    }
+
+    fn probe_failed(&mut self, id: &SourceId) {
+        self.state.invalidate(id);
+        let turn = self.turns.get_mut(id).expect("registered source turn");
+        // A real probe failure leaves independently owed verification. A
+        // possibly committed source attempt is never rearmed in this cycle.
+        if !turn.revisitable && !turn.first_pending {
+            return;
+        }
+        if !turn.first_pending && turn.last_slice.is_none() {
+            turn.first_pending = true;
+            self.first_pending += 1;
+        }
+        turn.latest_only = false;
+        self.set_lane(id, Some(SourceLane::Verification));
     }
 }
 
@@ -2292,6 +2748,87 @@ fn published_baseline(prior: Option<&BackgroundSource>) -> bool {
     })
 }
 
+fn plain_source(source: &SharedSource) -> bool {
+    source.descriptor.kind == SourceKind::Jsonl
+        && matches!(
+            source.provider,
+            SearchProvider::Claude | SearchProvider::Codex
+        )
+}
+
+fn source_revisions(
+    source: &SharedSource,
+    roots: &[RootState<'_>],
+) -> impl Iterator<Item = SelectionRevision> {
+    source
+        .roots
+        .iter()
+        .map(|&index| roots[index].revision.clone())
+}
+
+/// Checked catalog state supplies membership; only a live process's successful
+/// capture supplies the monotonic full-verification timer.
+#[allow(clippy::too_many_arguments)]
+fn validated_baseline(
+    source: &SharedSource,
+    prior: Option<&BackgroundSource>,
+    inventory: &BTreeMap<SourceId, BackgroundSource>,
+    progress: &BTreeMap<ControlId, SourceProgress>,
+    boot: &ObservationClock,
+    policy: &ReadPolicy,
+    roots: &[RootState<'_>],
+    schedule: &mut SourceScheduleState,
+) -> PortResult<Option<SourceHint>> {
+    if !plain_source(source) {
+        return Ok(None);
+    }
+    let Some(checked) = inventory.get(&source.id) else {
+        schedule.invalidate(&source.id);
+        return Ok(None);
+    };
+    let Some(receipt) = checked.latest_receipt.as_ref() else {
+        return Err(changed());
+    };
+    let same_head = prior
+        .and_then(|prior| prior.latest_receipt.as_ref())
+        .is_some_and(|prior| prior == receipt);
+    // A subset-cycle receipt proves only the roots it claimed. Every covering
+    // root in this cycle needs the claim written by the remembered attempt.
+    let debt = &schedule.sources[&source.id];
+    let covering = &source.roots;
+    let hint = if let Some((revision, remembered, claims)) = debt.verified.as_ref()
+        && revision == &receipt.revision_id
+        && checked.indexed_len == Some(remembered.len)
+        && covering
+            .iter()
+            .all(|&index| claims.contains(&roots[index].revision))
+    {
+        Some(*remembered)
+    } else {
+        None
+    };
+    let progress = progress.get(&ControlId::parse(source.id.as_str())?);
+    let clean = progress.is_some_and(|progress| {
+        progress.confirmation.is_none()
+            && progress.error.is_none()
+            && progress.coverage == Coverage::Complete
+            && progress.receipt.as_ref().is_some_and(|summary| {
+                summary.revision.as_str() == receipt.revision_id.as_str()
+                    && summary.token.cycle_seq.get() == receipt.cycle_seq
+                    && progress.last_observation.as_ref() == Some(&summary.token)
+            })
+    });
+    if !same_head
+        || hint.is_none()
+        || !clean
+        || boot.baseline_lost(source, roots, receipt.cycle_seq, policy.policy_epoch)
+    {
+        schedule.invalidate(&source.id);
+        return Ok(None);
+    }
+    Ok(hint)
+}
+
 fn probe_source_hint(
     control: &SqliteControlStore,
     policy: &ReadPolicy,
@@ -2500,6 +3037,7 @@ fn observe_shared_source(
         return Ok((
             ObservationOutcome::Attempted {
                 published: false,
+                committed: false,
                 claimed: claimed.into_iter().collect(),
                 failed: Some(reason),
             },
@@ -2568,6 +3106,7 @@ fn observe_shared_source(
             );
             Ok(SourceAttemptResult {
                 current: true,
+                published: true,
                 successful: None,
             })
         } else if revisit && pending.is_some() {
@@ -2600,6 +3139,7 @@ fn observe_shared_source(
             Ok((
                 ObservationOutcome::Attempted {
                     published: result.current,
+                    committed: result.published,
                     claimed: claimed.into_iter().collect(),
                     failed: None,
                 },
@@ -2627,6 +3167,7 @@ fn observe_shared_source(
             Ok((
                 ObservationOutcome::Attempted {
                     published: false,
+                    committed: false,
                     claimed: claimed.into_iter().collect(),
                     failed: Some(reason),
                 },
@@ -2745,6 +3286,7 @@ fn observe_missing_source(
     };
     Ok(ObservationOutcome::Attempted {
         published,
+        committed: published,
         claimed: claimed.into_iter().collect(),
         failed,
     })
@@ -2760,7 +3302,7 @@ fn observe_cycle(
     cycle: &ObservationCycle,
     boot: &ObservationClock,
     schedule: &mut SourceScheduleState,
-) -> PortResult<bool> {
+) -> PortResult<CycleOutcome> {
     let store = ManagedStore::open(db, control)?;
     let incarnation = store.incarnation().clone();
     let known = store
@@ -2768,7 +3310,21 @@ fn observe_cycle(
         .into_iter()
         .map(|s| (s.binding.source_path.clone(), s))
         .collect::<BTreeMap<_, _>>();
-    schedule.prepare(policy, &incarnation)?;
+    schedule.prepare(policy, &incarnation, authority.boot_id())?;
+    let inventory_end =
+        SqliteControlStore::effective_runtime_deadline(Instant::now() + SOURCE_OBSERVATION_BUDGET);
+    let progress = control
+        .with_runtime_deadline(inventory_end, || control.source_progress_inventory())?
+        .into_iter()
+        .map(|progress| (progress.source_id.clone(), progress))
+        .collect::<BTreeMap<_, _>>();
+    let checked_baselines = store
+        .current_plain_baselines(control, inventory_end)?
+        .into_iter()
+        .map(|source| (source.binding.source_id.clone(), source))
+        .collect::<BTreeMap<_, _>>();
+    let demands = control.with_runtime_deadline(inventory_end, || control.latest_demands())?;
+    schedule.update_demands(demands, policy, schedule.now())?;
     drop(store);
     // Phase 1: fence and enumerate every participating root independently
     // before publishing any source claim.
@@ -2863,6 +3419,12 @@ fn observe_cycle(
     if roots
         .iter()
         .all(|root| root.discovery.as_ref().is_ok_and(|d| d.complete))
+        && selections.len()
+            == policy
+                .selections
+                .iter()
+                .filter(|selection| selection.enabled)
+                .count()
     {
         schedule.sources.retain(|id, _| {
             (shared.contains_key(id.as_str()) && !shadowed.contains(id.as_str()))
@@ -2870,12 +3432,46 @@ fn observe_cycle(
         });
     }
     let mut scheduler = CycleSchedule::new(schedule);
-    for group in shared
-        .values()
-        .filter(|source| !shadowed.contains(source.id.as_str()))
-    {
+    let mut outcomes = BTreeMap::<String, ObservationOutcome>::new();
+    let preferred_sources = roots
+        .iter()
+        .flat_map(|root| {
+            root.discovery
+                .as_ref()
+                .into_iter()
+                .flat_map(|discovery| discovery.files.iter().map(|source| source.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut registered = BTreeSet::new();
+    for id in preferred_sources {
+        if shadowed.contains(id.as_str()) || !registered.insert(id.clone()) {
+            continue;
+        }
+        let group = shared.get(id.as_str()).ok_or_else(invalid)?;
         let prior = group.path.to_str().and_then(|path| known.get(path));
         let published = published_baseline(prior);
+        scheduler.state.register(&group.id, prior)?;
+        let checked_hint = validated_baseline(
+            group,
+            prior,
+            &checked_baselines,
+            &progress,
+            boot,
+            policy,
+            &roots,
+            scheduler.state,
+        )?;
+        let full_due =
+            checked_hint.is_none() || scheduler.state.full_due(&group.id, scheduler.state.now());
+        let latest_due = scheduler.state.cycle_can_serve(
+            source_revisions(group, &roots),
+            cycle,
+            scheduler.state.now(),
+        ) && scheduler.state.latest_owed(
+            source_revisions(group, &roots),
+            prior.and_then(|prior| prior.latest_receipt.as_ref()),
+            scheduler.state.now(),
+        );
         let lane = if group.descriptor.kind == SourceKind::WorkBuddyMetadata {
             SourceLane::Metadata
         } else if published {
@@ -2883,14 +3479,43 @@ fn observe_cycle(
         } else {
             SourceLane::Cold
         };
-        scheduler.add(
+        if full_due {
+            scheduler
+                .state
+                .sources
+                .get_mut(&group.id)
+                .ok_or_else(invalid)?
+                .owed = true;
+        }
+        scheduler.add_obligation(
             &group.id,
             prior,
             lane,
             group.original_end,
-            published && lane != SourceLane::Metadata,
+            plain_source(group) && published,
+            if full_due || latest_due {
+                TurnObligation::Owed
+            } else {
+                TurnObligation::ProbeOnly
+            },
         )?;
-        if published && lane != SourceLane::Metadata {
+        if !full_due && latest_due {
+            scheduler
+                .turns
+                .get_mut(&group.id)
+                .ok_or_else(invalid)?
+                .latest_only = true;
+        }
+        if let Some(hint) = checked_hint {
+            outcomes.insert(
+                group.id.as_str().into(),
+                ObservationOutcome::VerifiedBaseline {
+                    hint,
+                    claimed: group.roots.iter().copied().collect(),
+                },
+            );
+        }
+        if plain_source(group) && published {
             scheduler.hint(&group.id, group.hint, prior.and_then(|p| p.indexed_len));
         }
     }
@@ -2903,14 +3528,63 @@ fn observe_cycle(
             false,
         )?;
     }
+    scheduler
+        .state
+        .hot_probes
+        .retain(|id| scheduler.turns.contains_key(id));
     let mut metadata = BTreeMap::<String, WorkBuddyMetadata>::new();
-    let mut outcomes = BTreeMap::<String, ObservationOutcome>::new();
     let mut absent = BTreeMap::<String, ObservationOutcome>::new();
     let mut baselines = BTreeMap::<SourceId, BackgroundSource>::new();
+    let mut successful_hints = BTreeMap::<SourceId, SourceHint>::new();
+    let mut attempted_sources = BTreeMap::<usize, BTreeSet<SourceId>>::new();
+    let mut published_sources = BTreeMap::<usize, BTreeSet<SourceId>>::new();
+    let mut independent_probe_failures = BTreeSet::new();
+    let mut next_demand_poll = None;
     #[cfg(test)]
     scheduler.state.hooks.event(ScheduleTestEvent::Planned)?;
     loop {
         let now = scheduler.state.now();
+        if next_demand_poll.is_none_or(|next| now >= next) {
+            let demand_end = roots
+                .iter()
+                .map(|root| root.original_end)
+                .max()
+                .ok_or_else(invalid)?;
+            if now < demand_end {
+                let demands =
+                    control.with_runtime_deadline(demand_end, || control.latest_demands())?;
+                scheduler.state.update_demands(demands, policy, now)?;
+                next_demand_poll = Some(now + CADENCE);
+                for group in shared.values().filter(|source| plain_source(source)) {
+                    if !scheduler.turns.contains_key(&group.id)
+                        || now >= group.original_end
+                        || matches!(
+                            outcomes.get(group.id.as_str()),
+                            Some(ObservationOutcome::Attempted { .. })
+                        )
+                    {
+                        continue;
+                    }
+                    let prior = baselines
+                        .get(&group.id)
+                        .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
+                    let owed = scheduler.state.latest_owed(
+                        source_revisions(group, &roots),
+                        prior.and_then(|prior| prior.latest_receipt.as_ref()),
+                        now,
+                    );
+                    if !owed
+                        || scheduler.state.cycle_can_serve(
+                            source_revisions(group, &roots),
+                            cycle,
+                            now,
+                        )
+                    {
+                        scheduler.latest_obligation(&group.id, owed);
+                    }
+                }
+            }
+        }
         for id in scheduler.probe_batch(now) {
             let group = shared.get(id.as_str()).ok_or_else(invalid)?;
             #[cfg(test)]
@@ -2918,13 +3592,33 @@ fn observe_cycle(
                 .state
                 .hooks
                 .event(ScheduleTestEvent::BeforeProbe(&id, group.original_end))?;
-            // Failed probes neither establish absence nor consume a dirty hint.
-            // Re-admit an exact selected path before even reading its metadata.
-            if let Ok(hint) = probe_source_hint(control, policy, &roots, group, scheduler.state) {
-                let prior = baselines
-                    .get(&id)
-                    .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
-                scheduler.hint(&id, hint, prior.and_then(|prior| prior.indexed_len));
+            if scheduler.state.now() >= group.original_end {
+                continue;
+            }
+            // A refusal before probe I/O at an expired unowed end records
+            // nothing. A real admitted probe failure cannot close on old hints.
+            match probe_source_hint(control, policy, &roots, group, scheduler.state) {
+                Ok(hint) => {
+                    let prior = baselines
+                        .get(&id)
+                        .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
+                    scheduler.hint(&id, hint, prior.and_then(|prior| prior.indexed_len));
+                }
+                Err(error) => {
+                    if matches!(
+                        outcomes.get(id.as_str()),
+                        Some(ObservationOutcome::Attempted { .. })
+                    ) {
+                        independent_probe_failures.insert(id.clone());
+                        scheduler.failed(&id);
+                    } else {
+                        outcomes.insert(
+                            id.as_str().into(),
+                            ObservationOutcome::ProbeFailed(failure(&error)),
+                        );
+                        scheduler.probe_failed(&id);
+                    }
+                }
             }
         }
         let Some(turn) = scheduler.next(scheduler.state.now()) else {
@@ -2956,9 +3650,13 @@ fn observe_cycle(
                 }
                 boot.check_capacity()?;
                 if missing.contains_key(&id) {
-                    absent.insert(id.as_str().into(), ObservationOutcome::NotScheduled);
+                    absent
+                        .entry(id.as_str().into())
+                        .or_insert(ObservationOutcome::NotScheduled);
                 } else {
-                    outcomes.insert(id.as_str().into(), ObservationOutcome::NotScheduled);
+                    outcomes
+                        .entry(id.as_str().into())
+                        .or_insert(ObservationOutcome::NotScheduled);
                 }
                 #[cfg(test)]
                 scheduler
@@ -2998,13 +3696,33 @@ fn observe_cycle(
                 &metadata,
                 scheduler.state,
             )?;
+            if let ObservationOutcome::Attempted {
+                committed, claimed, ..
+            } = &outcome
+            {
+                for &index in claimed {
+                    attempted_sources
+                        .entry(index)
+                        .or_default()
+                        .insert(id.clone());
+                    if *committed {
+                        published_sources
+                            .entry(index)
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                }
+            }
             absent.insert(id.as_str().into(), outcome);
         } else {
             let group = shared.get(id.as_str()).ok_or_else(invalid)?;
             let prior = baselines
                 .get(&id)
                 .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
-            let revisit = outcomes.contains_key(id.as_str());
+            let revisit = matches!(
+                outcomes.get(id.as_str()),
+                Some(ObservationOutcome::Attempted { .. })
+            );
             let (outcome, success) = observe_shared_source(
                 db,
                 control,
@@ -3022,8 +3740,46 @@ fn observe_cycle(
                 scheduler.state,
             )?;
             if let Some(success) = success {
+                successful_hints.insert(id.clone(), success.hint);
                 scheduler.succeeded(&id, &success);
                 baselines.insert(id.clone(), success.baseline);
+            } else {
+                scheduler.failed(&id);
+                if let ObservationOutcome::Attempted {
+                    published: true, ..
+                } = &outcome
+                    && let Some(observed) =
+                        metadata.values().find(|metadata| metadata.source.id == id)
+                {
+                    successful_hints
+                        .insert(id.clone(), SourceHint::from_snapshot(&observed.snapshot));
+                    baselines.insert(
+                        id.clone(),
+                        BackgroundSource {
+                            binding: observed.binding.clone(),
+                            latest_receipt: Some(observed.receipt.clone()),
+                            indexed_len: Some(observed.snapshot.len),
+                            superseded: false,
+                        },
+                    );
+                }
+            }
+            if let ObservationOutcome::Attempted {
+                committed, claimed, ..
+            } = &outcome
+            {
+                for &index in claimed {
+                    attempted_sources
+                        .entry(index)
+                        .or_default()
+                        .insert(id.clone());
+                    if *committed {
+                        published_sources
+                            .entry(index)
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                }
             }
             outcomes.insert(id.as_str().into(), outcome);
         }
@@ -3037,14 +3793,14 @@ fn observe_cycle(
     scheduler.state.hooks.event(ScheduleTestEvent::Finalizing)?;
     // Phase 3: complete each root's discovery separately from the one shared
     // source observation.
-    let mut all_complete = true;
+    let mut catalog_complete = true;
+    let mut all_sources_attempted = true;
     for (index, root) in roots.iter().enumerate() {
         check_policy(control, policy)?;
         let selection = root.selection;
         let revision = root.revision.clone();
         let mut error = None;
-        let mut observed = 0_u64;
-        let mut committed = 0_u64;
+        let mut represented = 0_u64;
         let mut ids = Vec::new();
         let mut count = 0_u64;
         let mut complete = false;
@@ -3076,19 +3832,33 @@ fn observe_cycle(
                 count += 1;
                 let outcome = outcomes.get(source.id.as_str()).ok_or_else(changed)?;
                 match outcome {
+                    ObservationOutcome::VerifiedBaseline { claimed, .. } => {
+                        if claimed.contains(&index)
+                            && !scheduler.state.full_due(&source.id, scheduler.state.now())
+                        {
+                            represented += 1;
+                        } else {
+                            observations_clean = false;
+                            error.get_or_insert(BackgroundFailure::Deferred);
+                        }
+                    }
                     ObservationOutcome::NotScheduled => {
                         observations_clean = false;
                         error.get_or_insert(BackgroundFailure::Deferred);
+                    }
+                    ObservationOutcome::ProbeFailed(reason) => {
+                        observations_clean = false;
+                        error.get_or_insert(*reason);
                     }
                     ObservationOutcome::Attempted {
                         published,
                         claimed,
                         failed,
+                        ..
                     } => {
                         if claimed.contains(&index) {
-                            observed += 1;
                             if *published {
-                                committed += 1;
+                                represented += 1;
                             } else {
                                 observations_clean = false;
                                 error.get_or_insert(failed.unwrap_or(BackgroundFailure::Deferred));
@@ -3172,10 +3942,10 @@ fn observe_cycle(
                             published,
                             claimed,
                             failed,
+                            ..
                         }) if claimed.contains(&index) => {
-                            observed += 1;
                             if *published {
-                                committed += 1;
+                                represented += 1;
                             } else {
                                 error.get_or_insert(
                                     failed.unwrap_or(BackgroundFailure::DeletionPending),
@@ -3191,6 +3961,14 @@ fn observe_cycle(
                         Some(ObservationOutcome::NotScheduled) => {
                             observations_clean = false;
                             error.get_or_insert(BackgroundFailure::Deferred);
+                        }
+                        Some(ObservationOutcome::ProbeFailed(reason)) => {
+                            observations_clean = false;
+                            error.get_or_insert(*reason);
+                        }
+                        Some(ObservationOutcome::VerifiedBaseline { .. }) => {
+                            complete = false;
+                            error.get_or_insert(BackgroundFailure::DeletionPending);
                         }
                         None => {
                             // Another covering root could not prove this absence.
@@ -3226,11 +4004,17 @@ fn observe_cycle(
                     prior.binding.provider,
                     &CanonicalLocator::parse(&prior.binding.source_path)?,
                 ) {
+                    // Unstarted work and an unattempted verified baseline made no
+                    // observation here; a durable failure token would only force
+                    // a later full rehash of unchanged bytes.
                     if matches!(
                         outcomes
                             .get(prior.binding.source_id.as_str())
                             .or_else(|| absent.get(prior.binding.source_id.as_str())),
-                        Some(ObservationOutcome::NotScheduled)
+                        Some(
+                            ObservationOutcome::NotScheduled
+                                | ObservationOutcome::VerifiedBaseline { .. }
+                        )
                     ) {
                         continue;
                     }
@@ -3268,41 +4052,118 @@ fn observe_cycle(
                 }
             }
         }
-        if complete && error.is_none() && committed == count {
-            observation_deadline_at(root.original_end, scheduler.state.now())?;
+        if complete
+            && error.is_none()
+            && represented == count
+            && observation_deadline_at(root.original_end, scheduler.state.now()).is_err()
+        {
+            // A root whose budget was spent by its last represented source
+            // defers the final re-enumeration to a later cycle. Aborting here
+            // would discard every acknowledgement this cycle has earned.
+            complete = false;
+        }
+        if complete && error.is_none() && represented == count {
             verify_root(selection)?;
             // Re-enumeration detects a new/removed candidate while earlier
             // sources were being parsed; no heartbeat substitutes for this proof.
             let final_set = control.with_runtime_deadline(root.original_end, || {
-                discover(control, policy, selection, &known, root.original_end)
-            })?;
-            let expected: BTreeSet<_> = root
-                .discovery
-                .as_ref()
-                .map_err(|_| changed())?
-                .files
-                .iter()
-                .map(|file| file.id.clone())
-                .collect();
-            let actual: BTreeSet<_> = final_set.files.into_iter().map(|f| f.id).collect();
-            if !final_set.complete || expected != actual {
-                complete = false;
-                error = Some(BackgroundFailure::SourceChanged);
-            } else {
-                let result = control.with_runtime_deadline(root.original_end, || {
-                    let writer = ManagedStore::open_for_write(db, control)?;
-                    writer.commit_discovery_with_deadline(
-                        control,
-                        authority,
-                        cycle,
-                        &revision,
-                        &ids,
-                        root.original_end,
-                    )
-                });
-                if let Err(write_error) = result {
-                    error = Some(failure(&write_error));
+                #[cfg(test)]
+                let discovery_end = scheduler
+                    .state
+                    .hooks
+                    .final_discovery_end
+                    .as_ref()
+                    .and_then(|end| end.take())
+                    .map_or(root.original_end, |end| end.min(root.original_end));
+                #[cfg(not(test))]
+                let discovery_end = root.original_end;
+                discover(control, policy, selection, &known, discovery_end)
+            });
+            match final_set {
+                Ok(final_set) => {
+                    let expected: BTreeSet<_> = root
+                        .discovery
+                        .as_ref()
+                        .map_err(|_| changed())?
+                        .files
+                        .iter()
+                        .map(|file| file.id.clone())
+                        .collect();
+                    let actual: BTreeSet<_> =
+                        final_set.files.iter().map(|file| file.id.clone()).collect();
+                    let mut hints_match = true;
+                    for file in &final_set.files {
+                        if shadowed.contains(file.id.as_str()) {
+                            continue;
+                        }
+                        let expected_hint = successful_hints.get(&file.id).copied().or_else(|| {
+                            match outcomes.get(file.id.as_str()) {
+                                Some(ObservationOutcome::VerifiedBaseline { hint, .. }) => {
+                                    Some(*hint)
+                                }
+                                _ => None,
+                            }
+                        });
+                        let source = shared.get(file.id.as_str());
+                        if source.is_none() {
+                            hints_match = false;
+                        } else if source.is_some_and(plain_source)
+                            && expected_hint != Some(file.hint)
+                        {
+                            scheduler.state.invalidate(&file.id);
+                            if let Some(debt) = scheduler.state.sources.get_mut(&file.id) {
+                                debt.dirty = true;
+                            }
+                            scheduler.state.remember_hot(&file.id);
+                            hints_match = false;
+                        }
+                        if independent_probe_failures.contains(&file.id) {
+                            // Verification after a prior success belongs to a later
+                            // cycle if any subsequent actual probe failed.
+                            hints_match = false;
+                        }
+                    }
+                    if !final_set.complete || expected != actual || !hints_match {
+                        complete = false;
+                        error = Some(BackgroundFailure::SourceChanged);
+                    } else {
+                        let result = control.with_runtime_deadline(root.original_end, || {
+                            let writer = ManagedStore::open_for_write(db, control)?;
+                            if matches!(
+                                selection.region.provider,
+                                SearchProvider::Claude | SearchProvider::Codex
+                            ) {
+                                writer.commit_discovery_epoch_with_deadline(
+                                    control,
+                                    authority,
+                                    cycle,
+                                    &revision,
+                                    &ids,
+                                    root.original_end,
+                                )
+                            } else {
+                                writer.commit_discovery_with_deadline(
+                                    control,
+                                    authority,
+                                    cycle,
+                                    &revision,
+                                    &ids,
+                                    root.original_end,
+                                )
+                            }
+                        });
+                        if let Err(write_error) = result {
+                            error = Some(failure(&write_error));
+                        }
+                    }
                 }
+                Err(PortError::WriterBusy(_)) => {
+                    // Keep the newest fence incomplete and earlier source commits
+                    // intact. Normal root accounting records Deferred without
+                    // retrying enumeration or renewing the original end.
+                    complete = false;
+                }
+                Err(discover_error) => return Err(discover_error),
             }
         }
         if !complete && error.is_none() {
@@ -3313,16 +4174,121 @@ fn observe_cycle(
             selection: revision,
             complete: complete && error.is_none(),
             discovered_count: count,
-            observed_count: observed,
-            committed_count: committed,
+            observed_count: ids
+                .iter()
+                .filter(|id| {
+                    attempted_sources
+                        .get(&index)
+                        .is_some_and(|sources| sources.contains(*id))
+                })
+                .count() as u64,
+            committed_count: ids
+                .iter()
+                .filter(|id| {
+                    published_sources
+                        .get(&index)
+                        .is_some_and(|sources| sources.contains(*id))
+                })
+                .count() as u64,
             error,
         };
-        all_complete &= ack.complete && ack.committed_count == ack.discovered_count;
+        catalog_complete &= ack.complete;
+        all_sources_attempted &= ack.complete && ack.committed_count == ack.discovered_count;
         control_change(control, |seq| {
             control.acknowledge_discovery(seq, authority, ack.clone())
         })?;
     }
-    Ok(all_complete)
+    let now = scheduler.state.now();
+    let known_plain = known
+        .values()
+        .filter(|source| {
+            matches!(
+                source.binding.provider,
+                SearchProvider::Claude | SearchProvider::Codex
+            )
+        })
+        .map(|source| source.binding.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    let due = scheduler.state.sources.iter().any(|(id, _)| {
+        !matches!(
+            absent.get(id.as_str()),
+            Some(ObservationOutcome::Attempted {
+                published: true,
+                ..
+            })
+        ) && (shared.get(id.as_str()).is_some_and(plain_source) || known_plain.contains(id))
+            && scheduler.state.full_due(id, now)
+    });
+    let latest_owed = shared.values().any(|source| {
+        let prior = baselines
+            .get(&source.id)
+            .or_else(|| source.path.to_str().and_then(|path| known.get(path)));
+        scheduler.state.latest_owed(
+            source_revisions(source, &roots),
+            prior.and_then(|prior| prior.latest_receipt.as_ref()),
+            now,
+        )
+    });
+    if catalog_complete {
+        let completed = scheduler
+            .state
+            .demands
+            .iter()
+            .filter_map(|(id, demand)| {
+                if demand.retired || now >= demand.service_end {
+                    return None;
+                }
+                let closed = demand.barrier.selections.iter().all(|revision| {
+                    roots.iter().any(|root| &root.revision == revision)
+                        && cycle.token.cycle_seq >= demand.barrier.required_cycle_seq
+                        && cycle
+                            .started_control_seq
+                            .is_some_and(|start| start > demand.barrier.admission_control_seq)
+                });
+                let sources_current = shared.values().all(|source| {
+                    if !source_revisions(source, &roots)
+                        .any(|revision| demand.barrier.selections.contains(&revision))
+                    {
+                        return true;
+                    }
+                    let receipt = baselines
+                        .get(&source.id)
+                        .or_else(|| source.path.to_str().and_then(|path| known.get(path)))
+                        .and_then(|source| source.latest_receipt.as_ref());
+                    receipt.is_some_and(|receipt| {
+                        receipt.published
+                            && receipt.cycle_seq >= demand.barrier.required_cycle_seq.get()
+                            && receipt.started_control_seq
+                                > demand.barrier.admission_control_seq.get()
+                    })
+                });
+                (closed && sources_current).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in completed {
+            scheduler
+                .state
+                .demands
+                .get_mut(&id)
+                .ok_or_else(invalid)?
+                .retired = true;
+        }
+    }
+    let other_demand = scheduler
+        .state
+        .demands
+        .values()
+        .any(|demand| !demand.retired && now < demand.service_end);
+    let remaining_scope = policy
+        .selections
+        .iter()
+        .filter(|selection| selection.enabled)
+        .any(|selection| !roots.iter().any(|root| root.selection.id == selection.id));
+    Ok(CycleOutcome {
+        catalog_complete,
+        all_sources_attempted,
+        remaining_work: due || latest_owed || other_demand || remaining_scope || !catalog_complete,
+    })
 }
 
 fn acknowledge_failure(
@@ -3518,7 +4484,106 @@ fn observe_source(
         state = ObservationState::Incomplete;
     }
     admit(control, policy, advisory, &source.path, &source.id, end)?;
+    if state == ObservationState::Complete
+        && source.descriptor.kind == SourceKind::Jsonl
+        && matches!(
+            advisory.region.provider,
+            SearchProvider::Claude | SearchProvider::Codex
+        )
+        && let Some(prior) = prior.filter(|prior| {
+            !prior.superseded
+                && prior.binding.namespace_id.is_some()
+                && prior.indexed_len == Some(snapshot.len)
+                && prior.latest_receipt.as_ref().is_some_and(|receipt| {
+                    receipt.published && receipt.digest == snapshot.fingerprint
+                })
+        })
+    {
+        let mut refresh = observation(
+            prior.binding.clone(),
+            incarnation,
+            cycle,
+            claims,
+            &snapshot.fingerprint,
+            ObservationState::Complete,
+        )?;
+        let refresh_claims = claims
+            .iter()
+            .copied()
+            .map(selection_revision)
+            .collect::<PortResult<Vec<_>>>()?;
+        for claim in claims {
+            admit(control, policy, claim, &source.path, &source.id, end)?;
+        }
+        observation_deadline(end)?;
+        let writer = ManagedStore::open_for_write(db, control)?;
+        refresh.committed_at_ms = app_clock_ms();
+        #[cfg(test)]
+        hooks.source_phase.set(SourceAttemptPhase::Publication);
+        // Only Ineligible may reach the full path below. Every Err, including
+        // SchemaIncompatible for a tuple that path would still accept, ends this
+        // attempt as the source's own durable failure (observe_shared_source);
+        // the cycle continues and WriterBusy keeps its ordinary retry meaning.
+        match writer.refresh_verified_unchanged_source(
+            control,
+            authority,
+            prior.latest_receipt.as_ref().ok_or_else(invalid)?,
+            &refresh,
+            &snapshot,
+            input_limit,
+            end,
+        )? {
+            RefreshOutcome::Refreshed(publication) => {
+                #[cfg(test)]
+                hooks.event(ScheduleTestEvent::Published(&source.id, end))?;
+                #[cfg(test)]
+                hooks.source_phase.set(SourceAttemptPhase::Currentness);
+                let current = publication.receipt.published
+                    && writer.source_current(&publication.receipt, control, end)?;
+                drop(writer);
+                #[cfg(test)]
+                hooks.source_phase.set(SourceAttemptPhase::Acknowledgement);
+                observation_deadline(end)?;
+                acknowledge(
+                    control,
+                    authority,
+                    advisory,
+                    cycle,
+                    &source.id,
+                    &publication,
+                    if current {
+                        ObservationState::Complete
+                    } else {
+                        ObservationState::Incomplete
+                    },
+                    None,
+                )?;
+                return Ok(SourceAttemptResult {
+                    current,
+                    published: publication.receipt.published,
+                    successful: current.then(|| SuccessfulSourceAttempt {
+                        baseline: BackgroundSource {
+                            binding: refresh.binding,
+                            latest_receipt: Some(publication.receipt),
+                            indexed_len: Some(snapshot.len),
+                            superseded: false,
+                        },
+                        hint: SourceHint::from_snapshot(&snapshot),
+                        revisitable: true,
+                        claims: refresh_claims,
+                    }),
+                });
+            }
+            RefreshOutcome::Ineligible(_) => {
+                drop(writer);
+                #[cfg(test)]
+                hooks.source_phase.set(SourceAttemptPhase::Prepare);
+            }
+        }
+    }
     let mut parsed = if state == ObservationState::Complete {
+        #[cfg(test)]
+        hooks.event(ScheduleTestEvent::BeforeParse(&source.id, end))?;
         let parsed =
             crate::managed_source_parse::stage(advisory.region.provider.as_str(), &content, end)
                 .map_err(|error| {
@@ -3686,6 +4751,11 @@ fn observe_source(
         &snapshot.fingerprint,
         state,
     )?;
+    let attempt_claims = claims
+        .iter()
+        .copied()
+        .map(selection_revision)
+        .collect::<PortResult<Vec<_>>>()?;
     admit(control, policy, advisory, &source.path, &source.id, end)?;
     verify_snapshot_with_deadline(&source.path, &snapshot, input_limit, end)?;
     let writer = ManagedStore::open_for_write(db, control)?;
@@ -3859,6 +4929,7 @@ fn observe_source(
     )?;
     Ok(SourceAttemptResult {
         current,
+        published: publication.receipt.published,
         successful: current.then(|| SuccessfulSourceAttempt {
             baseline: BackgroundSource {
                 binding: observation.binding,
@@ -3873,6 +4944,7 @@ fn observe_source(
                 && context.dependencies.is_empty()
                 && context.authority.is_none()
                 && surface.is_none(),
+            claims: attempt_claims,
         }),
     })
 }
@@ -4313,13 +5385,23 @@ mod control_deadline_tests {
             schedule: &mut SourceScheduleState,
             boot: &ObservationClock,
         ) -> (PortResult<bool>, ObservationCycle, LatestBarrier) {
+            self.scheduled_for(schedule, boot, |_| true)
+        }
+
+        /// Like run_cycle, a latest demand starts with only its own selections.
+        fn scheduled_for(
+            &self,
+            schedule: &mut SourceScheduleState,
+            boot: &ObservationClock,
+            include: impl Fn(&Selection) -> bool,
+        ) -> (PortResult<bool>, ObservationCycle, LatestBarrier) {
             let worker = self.worker();
             let policy =
                 self.read_control(|control| control.read_policy(RequestIntersection::Selected));
             let selections = policy
                 .selections
                 .iter()
-                .filter(|s| s.enabled)
+                .filter(|&s| s.enabled && include(s))
                 .cloned()
                 .collect::<Vec<_>>();
             let request = LatestRequest {
@@ -4328,7 +5410,7 @@ mod control_deadline_tests {
                     .map(selection_revision)
                     .collect::<PortResult<_>>()
                     .unwrap(),
-                max_wait_ms: 1000,
+                max_wait_ms: MAX_LATEST_WAIT_MS,
                 now_ms: 2,
             };
             let LatestAdmission::Queued(barrier) =
@@ -4355,8 +5437,7 @@ mod control_deadline_tests {
                 )
             });
             let finish = match &result {
-                Ok(true) => CycleFinish::Committed,
-                Ok(false) => CycleFinish::Partial,
+                Ok(outcome) => outcome.finish(),
                 Err(_) => CycleFinish::Aborted,
             };
             control_change_before(&self.control, self.scope_end, |seq| {
@@ -4365,7 +5446,87 @@ mod control_deadline_tests {
             })
             .unwrap();
             let terminal = self.read_control(|control| control.cycle(cycle.token.cycle_seq));
-            (result, terminal, barrier)
+            (
+                result.map(|outcome| outcome.catalog_complete),
+                terminal,
+                barrier,
+            )
+        }
+
+        fn ordinary(
+            &self,
+            schedule: &mut SourceScheduleState,
+            boot: &ObservationClock,
+        ) -> (PortResult<CycleOutcome>, ObservationCycle) {
+            let worker = self.worker();
+            control_change_before(&self.control, self.scope_end, |seq| {
+                self.control.heartbeat_worker(
+                    seq,
+                    &worker,
+                    UpdateState::Running,
+                    None,
+                    app_clock_ms(),
+                )
+            })
+            .unwrap();
+            let policy =
+                self.read_control(|control| control.read_policy(RequestIntersection::Selected));
+            let selections = policy
+                .selections
+                .iter()
+                .filter(|selection| selection.enabled)
+                .cloned()
+                .collect::<Vec<_>>();
+            let revisions = selections
+                .iter()
+                .map(selection_revision)
+                .collect::<PortResult<Vec<_>>>()
+                .unwrap();
+            let CycleAdmission::Queued(queued) =
+                control_change_before(&self.control, self.scope_end, |seq| {
+                    self.control.queue_cycle(seq, revisions.clone())
+                })
+                .unwrap()
+                .value
+            else {
+                panic!("synthetic ordinary cycle was blocked");
+            };
+            let cycle = self.start(&worker, &queued);
+            let result = self.control.with_runtime_deadline(self.scope_end, || {
+                observe_cycle(
+                    &self.db,
+                    &self.control,
+                    &worker,
+                    &policy,
+                    &selections,
+                    &cycle,
+                    boot,
+                    schedule,
+                )
+            });
+            let finish = result
+                .as_ref()
+                .map(|outcome| outcome.finish())
+                .unwrap_or(CycleFinish::Aborted);
+            control_change_before(&self.control, self.scope_end, |seq| {
+                self.control
+                    .finish_cycle(seq, &worker, cycle.token.cycle_seq, finish, 4)
+            })
+            .unwrap();
+            let terminal = self.read_control(|control| control.cycle(cycle.token.cycle_seq));
+            (result, terminal)
+        }
+
+        fn head_claims(&self) -> i64 {
+            let head = self.sources().pop().unwrap().latest_receipt.unwrap();
+            rusqlite::Connection::open(&self.db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM receipt_selection_claims WHERE revision_id=?1",
+                    [head.revision_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap()
         }
 
         fn latest(&self, barrier: &LatestBarrier) -> bool {
@@ -4410,9 +5571,870 @@ mod control_deadline_tests {
         ScheduleTestHooks {
             now: Some(elapsed),
             probe_due: None,
+            final_discovery_end: None,
             source_phase: Cell::new(SourceAttemptPhase::Prepare),
             on_event: Some(RefCell::new(Box::new(hook))),
         }
+    }
+
+    #[test]
+    fn scheduler_quiet_plain_poll_closes_with_zero_attempts_and_no_receipt_or_clock_change() {
+        for provider in [SearchProvider::Claude, SearchProvider::Codex] {
+            let fixture = CycleFixture::new_for_provider(provider);
+            let path = fixture.write_source("quiet.jsonl", provider, "quietbaseline");
+            let original = std::fs::read(&path).unwrap();
+            let mut schedule = SourceScheduleState::default();
+            let boot = ObservationClock::new(Instant::now());
+            let (first, _) = fixture.ordinary(&mut schedule, &boot);
+            assert!(first.unwrap().idle());
+            let before = fixture.sources().pop().unwrap();
+            let id = before.binding.source_id.clone();
+            let verified_at = schedule.sources[&id].last_full_verified;
+            let progress = fixture.read_control(|control| {
+                control.source_progress(&ControlId::parse(id.as_str()).unwrap())
+            });
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), |event| {
+                if matches!(
+                    event,
+                    ScheduleTestEvent::BeforeAttempt(..) | ScheduleTestEvent::Published(..)
+                ) {
+                    panic!("a quiet baseline must not be observed or republished");
+                }
+                Ok(())
+            });
+            let (quiet, cycle) = fixture.ordinary(&mut schedule, &boot);
+            let quiet = quiet.unwrap();
+            assert!(quiet.idle());
+            assert!(!quiet.all_sources_attempted);
+            assert_eq!(cycle.state, CycleState::Partial);
+            assert_eq!(
+                (
+                    cycle.selections[0].discovered_count,
+                    cycle.selections[0].observed_count,
+                    cycle.selections[0].committed_count
+                ),
+                (1, 0, 0)
+            );
+            assert!(cycle.selections[0].discovery_complete);
+            assert!(cycle.selections[0].error.is_none());
+            assert_eq!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+            assert_eq!(schedule.sources[&id].last_full_verified, verified_at);
+            assert_eq!(
+                fixture.read_control(|control| {
+                    control.source_progress(&ControlId::parse(id.as_str()).unwrap())
+                }),
+                progress
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn scheduler_final_discovery_deadline_keeps_earned_source_and_awaiting_catalog_barrier() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("committed.jsonl", SearchProvider::Claude, "earnedsource");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let before = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        let earned = Rc::new(RefCell::new(None));
+        let final_end = Rc::new(Cell::new(None));
+        let db = fixture.db.clone();
+        let private_root = fixture._temp.path().join("private");
+        let scope_end = fixture.scope_end;
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let earned = earned.clone();
+            let final_end = final_end.clone();
+            move |event| {
+                if matches!(event, ScheduleTestEvent::Finalizing) {
+                    // Phase 1 and the source commit/acknowledgement are durable here.
+                    let witness = SqliteControlStore::open_current_read_only_with_deadline(
+                        &private_root,
+                        scope_end,
+                    )?;
+                    let source = ManagedStore::open(&db, &witness)?
+                        .background_sources(&witness)?
+                        .pop()
+                        .unwrap();
+                    let receipt = source.latest_receipt.as_ref().unwrap();
+                    assert!(receipt.published);
+                    let source_id = ControlId::parse(source.binding.source_id.as_str())?;
+                    let progress = witness.source_progress(&source_id)?.unwrap();
+                    assert_eq!(progress.coverage, Coverage::Complete);
+                    assert!(progress.error.is_none());
+                    *earned.borrow_mut() = Some((source, progress));
+                    // Shorten only the final discover end. The normal precheck still
+                    // sees the unexpired original root end, so WriterBusy can come only
+                    // from discover's own deadline check.
+                    final_end.set(Some(Instant::now()));
+                }
+                Ok(())
+            }
+        });
+        schedule.hooks.final_discovery_end = Some(final_end.clone());
+        let (result, cycle, barrier) = fixture.scheduled(&mut schedule, &boot);
+        assert!(
+            final_end.get().is_none(),
+            "final discover must consume the shortened end; the precheck cannot substitute"
+        );
+        // The old direct `?` returned WriterBusy here and aborted the cycle.
+        assert!(matches!(result, Ok(false)), "{result:?}");
+        assert_eq!(cycle.state, CycleState::Partial);
+        let root = &cycle.selections[0];
+        assert!(!root.discovery_complete);
+        assert_eq!(root.error, Some(BackgroundFailure::Deferred));
+        assert_eq!(
+            (
+                root.discovered_count,
+                root.observed_count,
+                root.committed_count
+            ),
+            (1, 1, 1)
+        );
+        let (earned_source, earned_progress) = earned.take().unwrap();
+        let receipt = earned_source.latest_receipt.as_ref().unwrap();
+        assert_ne!(receipt.revision_id, before.revision_id);
+        assert_eq!(receipt.cycle_seq, cycle.token.cycle_seq.get());
+        let observed = earned_progress.last_observation.as_ref();
+        assert_eq!(observed, Some(&cycle.token));
+        let current = fixture.sources().pop().unwrap();
+        assert_eq!(current.latest_receipt, earned_source.latest_receipt);
+        let earned_id = earned_source.binding.source_id.clone();
+        let source_id = ControlId::parse(earned_id.as_str()).unwrap();
+        let progress = fixture.read_control(|control| control.source_progress(&source_id));
+        assert_eq!(progress, Some(earned_progress));
+        let persisted = fixture.read_control(|control| control.persisted_barrier(&barrier.id));
+        assert_eq!(persisted.state, BarrierState::AwaitingCatalog);
+        assert!(persisted.error.is_none());
+        assert_eq!(persisted.completed_cycle_seq, Some(cycle.token.cycle_seq));
+        let catalog = rusqlite::Connection::open(&fixture.db).unwrap();
+        let newest: (i64, i64) = catalog
+            .query_row(
+                "SELECT cycle_seq,complete FROM discovery_receipts
+                 WHERE selection_id=?1 ORDER BY cycle_seq DESC LIMIT 1",
+                [fixture.selection.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(newest, (cycle.token.cycle_seq.get(), 0));
+        let members: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_sources WHERE cycle_seq=?1",
+                [cycle.token.cycle_seq.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0);
+        assert!(!fixture.latest(&barrier));
+    }
+
+    /// A subset latest cycle may narrow the head receipt to its own roots. The
+    /// next all-root cycle must reclaim every covering root before closing.
+    fn subset_receipt_reclaims_both_overlapping_roots(subset_is_parent: bool) {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("shared.jsonl", SearchProvider::Claude, "sharedword");
+        let provider = SearchProvider::Claude;
+        let exact = crate::managed_control::source_selection(provider, &path).unwrap();
+        let child = control_change_before(&fixture.control, fixture.scope_end, |seq| {
+            fixture.control.add_selection(seq, exact.clone())
+        })
+        .unwrap()
+        .value;
+        assert_eq!(child.region.kind, RootKind::Exact);
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        let (first, cycle, full) = fixture.scheduled(&mut schedule, &boot);
+        assert!(first.unwrap());
+        assert_eq!(cycle.selections.len(), 2);
+        assert!(fixture.latest(&full));
+        assert_eq!(fixture.head_claims(), 2);
+        let first_revision = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        let subset_id = if subset_is_parent {
+            fixture.selection.id.clone()
+        } else {
+            child.id.clone()
+        };
+        let include = |selection: &Selection| selection.id == subset_id;
+        let (subset_result, subset, _) = fixture.scheduled_for(&mut schedule, &boot, include);
+        assert!(subset_result.unwrap());
+        assert_eq!(subset.selections.len(), 1);
+        assert_eq!(subset.selections[0].selection.selection_id, subset_id);
+        assert_eq!(subset.selections[0].observed_count, 1);
+        assert_eq!(subset.selections[0].committed_count, 1);
+        assert_eq!(fixture.head_claims(), 1);
+        let subset_revision = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        assert_ne!(subset_revision.revision_id, first_revision.revision_id);
+        let (ordinary, cycle) = fixture.ordinary(&mut schedule, &boot);
+        assert_eq!(cycle.selections.len(), 2);
+        for root in &cycle.selections {
+            assert!(root.discovery_complete, "{root:?}");
+            assert!(root.error.is_none(), "{root:?}");
+            assert_eq!((root.observed_count, root.committed_count), (1, 1));
+        }
+        assert!(ordinary.unwrap().catalog_complete);
+        assert_eq!(fixture.head_claims(), 2);
+        let reclaimed = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        assert_ne!(reclaimed.revision_id, subset_revision.revision_id);
+        assert!(fixture.latest(&full));
+    }
+
+    #[test]
+    fn scheduler_parent_subset_receipt_reclaims_both_overlapping_roots() {
+        subset_receipt_reclaims_both_overlapping_roots(true);
+    }
+
+    #[test]
+    fn scheduler_child_subset_receipt_reclaims_both_overlapping_roots() {
+        subset_receipt_reclaims_both_overlapping_roots(false);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn scheduler_incomplete_root_keeps_an_unattempted_baseline_probe_only() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("stable.jsonl", SearchProvider::Claude, "stablebaseline");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let before = fixture.sources().pop().unwrap();
+        let id = ControlId::parse(before.binding.source_id.as_str()).unwrap();
+        let progress = fixture.read_control(|control| control.source_progress(&id));
+        // A refused linked entry leaves the root enumeration incomplete without
+        // touching the stable source's bytes or hint.
+        let target = fixture._temp.path().join("refused-target");
+        std::fs::create_dir(&target).unwrap();
+        let link = Path::new(fixture.selection.region.locator.as_str()).join("refused-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let output = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic junction creation failed"
+            );
+        }
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), |event| {
+            if matches!(event, ScheduleTestEvent::BeforeAttempt(..)) {
+                panic!("an unattempted baseline must stay probe-only beside a refused entry");
+            }
+            Ok(())
+        });
+        // The second incomplete cycle proves no failure token forced a rehash.
+        for _ in 0..2 {
+            let (outcome, cycle) = fixture.ordinary(&mut schedule, &boot);
+            assert!(!outcome.unwrap().catalog_complete);
+            assert_eq!(cycle.state, CycleState::Partial);
+            assert!(!cycle.selections[0].discovery_complete);
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress(&id)),
+                progress
+            );
+            assert_eq!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+        }
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    #[test]
+    fn scheduler_latest_refresh_skips_parse_but_ineligible_scan_reuses_the_full_path() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("refresh.jsonl", SearchProvider::Claude, "refreshbaseline");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), |event| {
+            if matches!(event, ScheduleTestEvent::BeforeParse(..)) {
+                panic!("eligible unchanged latest must use verified refresh before parse");
+            }
+            Ok(())
+        });
+        assert!(fixture.scheduled(&mut schedule, &boot).0.unwrap());
+        let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+        connection
+            .execute(
+                "UPDATE source_scans SET parser_version=0 WHERE source_path=?1",
+                [CanonicalLocator::from_path(&path).unwrap().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let parsed = Rc::new(Cell::new(0));
+        let source_id = fixture.sources()[0].binding.source_id.clone();
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let parsed = parsed.clone();
+            move |event| {
+                if let ScheduleTestEvent::BeforeParse(id, end) = event {
+                    assert_eq!(*id, source_id);
+                    assert!(end > Instant::now());
+                    parsed.set(parsed.get() + 1);
+                }
+                Ok(())
+            }
+        });
+        assert!(fixture.scheduled(&mut schedule, &boot).0.unwrap());
+        assert_eq!(
+            parsed.get(),
+            1,
+            "only recognized Ineligible may reach full parsing"
+        );
+    }
+
+    #[test]
+    fn scheduler_refresh_corruption_ends_the_attempt_without_parse_or_same_cycle_retry() {
+        for provider in [SearchProvider::Claude, SearchProvider::Codex] {
+            let fixture = CycleFixture::new_for_provider(provider);
+            fixture.write_source("refresh-error.jsonl", provider, "refresherrorbaseline");
+            let mut schedule = SourceScheduleState::default();
+            let boot = ObservationClock::new(Instant::now());
+            assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+            let prior = fixture.sources().pop().unwrap();
+            let id = prior.binding.source_id.clone();
+            let path = prior.binding.source_path.clone();
+            let digest = prior.latest_receipt.as_ref().unwrap().digest.clone();
+            let db = fixture.db.clone();
+            let attempts = Rc::new(Cell::new(0));
+            let failures = Rc::new(Cell::new(0));
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let attempts = attempts.clone();
+                let failures = failures.clone();
+                move |event| {
+                    match event {
+                        ScheduleTestEvent::Planned => {
+                            rusqlite::Connection::open(&db)
+                                .unwrap()
+                                .execute(
+                                    "UPDATE source_scans SET fingerprint='broken' WHERE source_path=?1",
+                                    [&path],
+                                )
+                                .unwrap();
+                        }
+                        ScheduleTestEvent::BeforeAttempt(observed, _, _) => {
+                            assert_eq!(*observed, id);
+                            attempts.set(attempts.get() + 1);
+                        }
+                        ScheduleTestEvent::BeforeParse(..) => {
+                            panic!("refresh corruption must terminate before full parsing");
+                        }
+                        ScheduleTestEvent::SourceFailed {
+                            id: observed,
+                            phase,
+                            error,
+                            revisit,
+                            ..
+                        } => {
+                            assert_eq!(*observed, id);
+                            assert!(matches!(phase, SourceAttemptPhase::Publication));
+                            assert!(matches!(error, PortError::SchemaIncompatible(_)));
+                            assert!(!revisit);
+                            failures.set(failures.get() + 1);
+                            rusqlite::Connection::open(&db)
+                                .unwrap()
+                                .execute(
+                                    "UPDATE source_scans SET fingerprint=?2 WHERE source_path=?1",
+                                    [&path, &digest],
+                                )
+                                .unwrap();
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            });
+            let (result, cycle, barrier) = fixture.scheduled(&mut schedule, &boot);
+            assert!(!result.unwrap());
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(failures.get(), 1);
+            assert_eq!(cycle.selections[0].observed_count, 1);
+            assert_eq!(cycle.selections[0].committed_count, 0);
+            assert_eq!(fixture.sources()[0].latest_receipt, prior.latest_receipt);
+            assert!(schedule.full_due(&prior.binding.source_id, schedule.now()));
+            assert!(!fixture.latest(&barrier));
+            // The refusal is that source's own durable failure inside a cycle
+            // that still finishes: neither an abort nor a full-path fallback.
+            assert_eq!(cycle.state, CycleState::Partial);
+            let progress = fixture
+                .read_control(|control| {
+                    control.source_progress(
+                        &ControlId::parse(prior.binding.source_id.as_str()).unwrap(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                (progress.coverage, progress.error),
+                (Coverage::Partial, Some(BackgroundFailure::Failed))
+            );
+            assert_eq!(
+                progress.last_observation.map(|token| token.cycle_seq),
+                Some(cycle.token.cycle_seq)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_final_enumeration_hint_change_stays_incomplete_without_losing_debt() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("final.jsonl", SearchProvider::Claude, "beforefinal");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let before = fixture.sources().pop().unwrap();
+        let appended = path.clone();
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), move |event| {
+            if matches!(event, ScheduleTestEvent::Finalizing) {
+                append_record(
+                    &appended,
+                    SearchProvider::Claude,
+                    "final-append",
+                    "afterfinal",
+                );
+            }
+            Ok(())
+        });
+        let (changed, cycle) = fixture.ordinary(&mut schedule, &boot);
+        assert!(!changed.unwrap().catalog_complete);
+        assert_eq!(
+            cycle.selections[0].error,
+            Some(BackgroundFailure::SourceChanged)
+        );
+        assert_eq!(cycle.selections[0].observed_count, 0);
+        assert_eq!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+        assert!(schedule.full_due(&before.binding.source_id, schedule.now()));
+        assert_eq!(fixture.hits("afterfinal"), 0);
+        schedule.hooks = ScheduleTestHooks::default();
+        assert!(
+            fixture
+                .ordinary(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .catalog_complete
+        );
+        assert_eq!(fixture.hits("afterfinal"), 1);
+    }
+
+    #[test]
+    fn scheduler_failed_actual_probe_keeps_owed_work_until_an_independent_cycle() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("probe.jsonl", SearchProvider::Claude, "probeoriginal");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let before = fixture.sources().pop().unwrap();
+        let id = before.binding.source_id.clone();
+        let saved = path.with_extension("saved");
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let probe = path.clone();
+        let restore = saved.clone();
+        schedule.next_probe = None;
+        schedule.hooks = scheduler_hooks(elapsed.clone(), move |event| {
+            match event {
+                ScheduleTestEvent::BeforeProbe(..) => {
+                    std::fs::rename(&probe, &restore).unwrap();
+                }
+                ScheduleTestEvent::Finalizing => std::fs::rename(&restore, &probe).unwrap(),
+                _ => {}
+            }
+            Ok(())
+        });
+        let (failed, _) = fixture.ordinary(&mut schedule, &boot);
+        assert!(!failed.unwrap().catalog_complete);
+        assert!(schedule.full_due(&id, schedule.now()));
+        assert_eq!(fixture.sources()[0].latest_receipt, before.latest_receipt);
+        schedule.hooks = ScheduleTestHooks::default();
+        assert!(
+            fixture
+                .ordinary(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .catalog_complete
+        );
+    }
+
+    #[test]
+    fn scheduler_full_sweep_is_due_from_the_last_capture_and_registration_never_renews_it() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("sweep.jsonl", SearchProvider::Claude, "originalword");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let prior = fixture.sources().pop().unwrap();
+        let id = &prior.binding.source_id;
+        let last = schedule.sources[id].last_full_verified.unwrap();
+        for second in [1, 100, 299] {
+            schedule.register(id, Some(&prior)).unwrap();
+            assert_eq!(schedule.sources[id].last_full_verified, Some(last));
+            assert!(!schedule.full_due(id, last + Duration::from_secs(second)));
+        }
+        assert!(schedule.full_due(id, last + FULL_VERIFICATION_INTERVAL));
+        let bytes = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("originalword", "rewritenword");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(
+            fixture
+                .ordinary(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .catalog_complete
+        );
+        assert_eq!(fixture.hits("rewritenword"), 0);
+        schedule.sources.get_mut(id).unwrap().last_full_verified =
+            Instant::now().checked_sub(FULL_VERIFICATION_INTERVAL);
+        let (due, _) = fixture.ordinary(&mut schedule, &boot);
+        assert!(
+            !due.unwrap().catalog_complete,
+            "same-hint rewrite must reach the real fingerprint/confirmation path"
+        );
+        assert!(schedule.full_due(id, schedule.now()));
+        assert_eq!(fixture.hits("originalword"), 1);
+        assert_eq!(fixture.hits("rewritenword"), 0);
+    }
+
+    #[test]
+    fn scheduler_probe_only_promotes_once_and_expiry_does_not_manufacture_a_first_turn() {
+        let id = SourceId::parse("stable").unwrap();
+        let mut state = SourceScheduleState::default();
+        let now = Instant::now();
+        state.register(&id, None).unwrap();
+        {
+            let debt = state.sources.get_mut(&id).unwrap();
+            debt.owed = false;
+            debt.last_full_verified = Some(now);
+            debt.verified = Some((
+                RevisionId::parse("receipt").unwrap(),
+                SourceHint {
+                    len: 1,
+                    mtime_ms: 1,
+                },
+                Vec::new(),
+            ));
+        }
+        let ticket = state.sources[&id].ticket;
+        let mut cycle = CycleSchedule::new(&mut state);
+        cycle
+            .add_obligation(
+                &id,
+                None,
+                SourceLane::Verification,
+                now + CADENCE,
+                true,
+                TurnObligation::ProbeOnly,
+            )
+            .unwrap();
+        // No persisted head is available in this pure queue test; restore the
+        // captured pair after registration, independently of lane accounting.
+        cycle.state.sources.get_mut(&id).unwrap().verified = Some((
+            RevisionId::parse("receipt").unwrap(),
+            SourceHint {
+                len: 1,
+                mtime_ms: 1,
+            },
+            Vec::new(),
+        ));
+        cycle.state.sources.get_mut(&id).unwrap().owed = false;
+        cycle.state.sources.get_mut(&id).unwrap().last_full_verified = Some(now);
+        assert_eq!(cycle.first_pending, 0);
+        assert!(cycle.next(now).is_none());
+        let hint = SourceHint {
+            len: 2,
+            mtime_ms: 2,
+        };
+        cycle.hint(&id, hint, Some(1));
+        cycle.hint(&id, hint, Some(1));
+        assert_eq!(cycle.first_pending, 1);
+        assert_eq!(cycle.state.sources[&id].ticket, ticket);
+        let Some(ScheduledTurn::Attempt(served, lane)) = cycle.next(now) else {
+            panic!("dirty ProbeOnly source was not promoted");
+        };
+        assert_eq!(served, id);
+        assert_eq!(lane, SourceLane::Active);
+        cycle.started(&id, lane).unwrap();
+        cycle.failed(&id);
+        assert!(cycle.next(now + CADENCE).is_none());
+        assert!(cycle.state.full_due(&id, now + CADENCE));
+    }
+
+    #[test]
+    fn scheduler_unowed_probe_expiry_preserves_capture_and_creates_no_not_scheduled_outcome() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("unowed.jsonl", SearchProvider::Claude, "unowed");
+        let mut state = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut state, &boot).0.unwrap().idle());
+        let prior = fixture.sources().pop().unwrap();
+        let id = &prior.binding.source_id;
+        let verified = state.sources[id].verified.clone();
+        let verified_at = state.sources[id].last_full_verified;
+        let ticket = state.sources[id].ticket;
+        let end = Instant::now() + CADENCE;
+        let mut cycle = CycleSchedule::new(&mut state);
+        cycle
+            .add_obligation(
+                id,
+                Some(&prior),
+                SourceLane::Verification,
+                end,
+                true,
+                TurnObligation::ProbeOnly,
+            )
+            .unwrap();
+        assert!(cycle.probe_batch(end).is_empty());
+        assert!(cycle.next(end).is_none());
+        assert_eq!(cycle.first_pending, 0);
+        assert_eq!(cycle.state.sources[id].ticket, ticket);
+        assert_eq!(cycle.state.sources[id].verified, verified);
+        assert_eq!(cycle.state.sources[id].last_full_verified, verified_at);
+        assert!(!cycle.state.full_due(id, end));
+    }
+
+    #[test]
+    fn scheduler_465_full_debts_keep_fifo_tickets_across_independent_bounded_cycles() {
+        let mut state = SourceScheduleState::default();
+        let start = Instant::now();
+        let ids = (0..465)
+            .map(|n| SourceId::parse(&format!("owed-{n:03}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut served: Vec<SourceId> = Vec::new();
+        let mut first_ticket = None;
+        for round in 0..4 {
+            let remaining = ids
+                .iter()
+                .filter(|id| !served.contains(id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let end = start + Duration::from_secs(round + 1);
+            let mut cycle = CycleSchedule::new(&mut state);
+            for id in &remaining {
+                cycle
+                    .add(id, None, SourceLane::Verification, end, false)
+                    .unwrap();
+            }
+            if let Some((id, ticket)) = first_ticket.take() {
+                assert_eq!(
+                    cycle.state.sources[&id].ticket, ticket,
+                    "expiry must not rotate an unstarted obligation"
+                );
+            }
+            for _ in 0..150 {
+                let Some(ScheduledTurn::Attempt(id, lane)) = cycle.next(start) else {
+                    break;
+                };
+                cycle.started(&id, lane).unwrap();
+                served.push(id);
+            }
+            if let Some(id) = remaining.iter().find(|id| !served.contains(id)) {
+                first_ticket = Some((id.clone(), cycle.state.sources[id].ticket));
+            }
+            while let Some(turn) = cycle.next(end) {
+                assert!(matches!(turn, ScheduledTurn::NotScheduled(..)));
+            }
+        }
+        assert_eq!(served, ids);
+    }
+
+    #[test]
+    fn scheduler_invalid_baseline_scan_failure_and_new_boot_force_real_observation() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("invalid.jsonl", SearchProvider::Claude, "invalidbaseline");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        assert!(fixture.ordinary(&mut schedule, &boot).0.unwrap().idle());
+        let prior = fixture.sources().pop().unwrap();
+        let canonical = CanonicalLocator::from_path(&path).unwrap();
+        let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+        connection
+            .execute(
+                "UPDATE source_scans SET parser_version=0 WHERE source_path=?1",
+                [canonical.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let visits = Rc::new(Cell::new(0));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let visits = visits.clone();
+            move |event| {
+                if matches!(event, ScheduleTestEvent::BeforeAttempt(..)) {
+                    visits.set(visits.get() + 1);
+                }
+                Ok(())
+            }
+        });
+        assert!(
+            fixture
+                .ordinary(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .catalog_complete
+        );
+        assert_eq!(
+            visits.get(),
+            1,
+            "stale parser scan must not become ProbeOnly"
+        );
+        let mut restarted = SourceScheduleState {
+            hooks: scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let visits = visits.clone();
+                move |event| {
+                    if matches!(event, ScheduleTestEvent::BeforeAttempt(..)) {
+                        visits.set(visits.get() + 1);
+                    }
+                    Ok(())
+                }
+            }),
+            ..Default::default()
+        };
+        assert!(
+            fixture
+                .ordinary(&mut restarted, &boot)
+                .0
+                .unwrap()
+                .catalog_complete
+        );
+        assert_eq!(
+            visits.get(),
+            2,
+            "persisted receipt cannot seed a new worker's timer"
+        );
+        assert_ne!(fixture.sources()[0].latest_receipt, prior.latest_receipt);
+    }
+
+    #[test]
+    fn scheduler_probe_rotation_keeps_aging_work_under_a_hot_backfill() {
+        let mut state = SourceScheduleState::default();
+        let start = Instant::now();
+        let ids = (0..465)
+            .map(|n| SourceId::parse(&format!("source-{n:03}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut cycle = CycleSchedule::new(&mut state);
+        for id in &ids {
+            cycle
+                .add_obligation(
+                    id,
+                    None,
+                    SourceLane::Verification,
+                    start + Duration::from_secs(30),
+                    true,
+                    TurnObligation::ProbeOnly,
+                )
+                .unwrap();
+        }
+        for id in &ids[..16] {
+            cycle.state.remember_hot(id);
+        }
+        cycle
+            .add(
+                &SourceId::parse("backfill-debt").unwrap(),
+                None,
+                SourceLane::Cold,
+                start + SOURCE_OBSERVATION_BUDGET,
+                false,
+            )
+            .unwrap();
+        let mut aging = BTreeSet::new();
+        for tick in 0..10 {
+            let batch = cycle.probe_batch(start + Duration::from_secs(tick));
+            assert!(batch.len() <= SOURCE_HINT_BATCH);
+            assert_eq!(batch.iter().filter(|id| ids[..16].contains(id)).count(), 16);
+            aging.extend(batch.into_iter().filter(|id| !ids[..16].contains(id)));
+        }
+        assert_eq!(
+            aging.len(),
+            449,
+            "aging probes must not starve behind the hot set"
+        );
+        assert_eq!(cycle.first_pending, 1);
+    }
+
+    #[test]
+    fn scheduler_latest_windows_do_not_renew_and_late_admission_cannot_join_started_work() {
+        let fixture = CycleFixture::new();
+        let worker = fixture.worker();
+        let (queued, barrier) = fixture.queued();
+        let cycle = fixture.start(&worker, &queued);
+        let policy =
+            fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+        let mut schedule = SourceScheduleState::default();
+        let now = Instant::now();
+        schedule
+            .update_demands(vec![barrier.clone()], &policy, now)
+            .unwrap();
+        let revision = selection_revision(&fixture.selection).unwrap();
+        assert!(schedule.cycle_can_serve(std::iter::once(revision.clone()), &cycle, now));
+        let mut late = barrier.clone();
+        late.id = ControlId::parse("late-demand").unwrap();
+        late.required_cycle_seq = CycleSeq::new(cycle.token.cycle_seq.get() + 1).unwrap();
+        late.admission_control_seq = cycle.started_control_seq.unwrap();
+        late.requested_wait_ms = MAX_LATEST_WAIT_MS;
+        schedule
+            .update_demands(vec![barrier.clone(), late.clone()], &policy, now)
+            .unwrap();
+        assert!(!schedule.cycle_can_serve(std::iter::once(revision.clone()), &cycle, now));
+        let end = schedule.demands[&late.id].service_end;
+        late.state = BarrierState::AwaitingCatalog;
+        schedule
+            .update_demands(vec![late.clone()], &policy, now + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(schedule.demands[&late.id].service_end, end);
+        schedule
+            .update_demands(vec![late.clone()], &policy, end)
+            .unwrap();
+        schedule
+            .update_demands(vec![late], &policy, end + CADENCE)
+            .unwrap();
+        assert!(!schedule.latest_owed(std::iter::once(revision), None, end + CADENCE));
+    }
+
+    #[test]
+    fn scheduler_demand_table_forgets_departed_barriers_without_reopening_listed_windows() {
+        let fixture = CycleFixture::new();
+        let (_, barrier) = fixture.queued();
+        let policy =
+            fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+        let demand = |name: &str| {
+            let mut demand = barrier.clone();
+            demand.id = ControlId::parse(name).unwrap();
+            demand
+        };
+        let (a, b, c) = (demand("demand-a"), demand("demand-b"), demand("demand-c"));
+        let mut schedule = SourceScheduleState::default();
+        let now = Instant::now();
+        schedule
+            .update_demands_within(vec![a.clone(), b.clone()], &policy, now, 2)
+            .unwrap();
+        let b_end = schedule.demands[&b.id].service_end;
+        // Every listed barrier still counts against the bound.
+        assert!(matches!(
+            schedule.update_demands_within(vec![a.clone(), b.clone(), c.clone()], &policy, now, 2),
+            Err(PortError::WriterBusy(_))
+        ));
+        // A departed terminal barrier frees its slot; b's window has lapsed
+        // while it is still listed, so it stays retired on its first end.
+        let later = b_end + CADENCE;
+        schedule
+            .update_demands_within(vec![b.clone(), c.clone()], &policy, later, 2)
+            .unwrap();
+        assert!(!schedule.demands.contains_key(&a.id));
+        assert!(!schedule.demands[&c.id].retired);
+        schedule
+            .update_demands_within(vec![b.clone(), c], &policy, later + CADENCE, 2)
+            .unwrap();
+        assert!(schedule.demands[&b.id].retired);
+        assert_eq!(schedule.demands[&b.id].service_end, b_end);
     }
 
     #[test]
@@ -4633,7 +6655,7 @@ mod control_deadline_tests {
                 assert!(matches!(turn, ScheduledTurn::NotScheduled(_)));
                 expired += 1;
             }
-            assert_eq!(expired, 5);
+            assert_eq!(expired, 5, "only unserved first turns are NotScheduled");
         }
         let owed_ticket = state.sources[&ids[2]].ticket;
         let mut cycle = CycleSchedule::new(&mut state);
@@ -5347,6 +7369,7 @@ mod control_deadline_tests {
                 baseline: prior.clone(),
                 hint,
                 revisitable: true,
+                claims: vec![selection_revision(&fixture.selection).unwrap()],
             },
         );
         cycle.hint(
@@ -6266,19 +8289,19 @@ mod control_deadline_tests {
                 control.heartbeat_worker(seq, &worker, state, Some(BackgroundFailure::Busy), 4)
             })
             .unwrap();
-            assert!(
-                run_cycle(
-                    &fixture.db,
-                    control,
-                    &worker,
-                    &ObservationClock::new(Instant::now()),
-                    0,
-                    fixture_end,
-                    &mut pending,
-                    &mut SourceScheduleState::default(),
-                )
-                .unwrap()
-            );
+            let outcome = run_cycle(
+                &fixture.db,
+                control,
+                &worker,
+                &ObservationClock::new(Instant::now()),
+                0,
+                fixture_end,
+                &mut pending,
+                &mut SourceScheduleState::default(),
+            )
+            .unwrap();
+            assert!(outcome.idle(), "{outcome:?}");
+            assert_eq!(outcome.finish(), CycleFinish::Committed);
             let finished = control
                 .with_runtime_deadline(fixture_end, || control.cycle(cycle.token.cycle_seq))
                 .unwrap();
@@ -6356,19 +8379,19 @@ mod control_deadline_tests {
             )
         })
         .unwrap();
-        assert!(
-            run_cycle(
-                &fixture.db,
-                control,
-                &worker,
-                &ObservationClock::new(Instant::now()),
-                0,
-                fixture.scope_end,
-                &mut pending,
-                &mut SourceScheduleState::default(),
-            )
-            .unwrap()
-        );
+        let outcome = run_cycle(
+            &fixture.db,
+            control,
+            &worker,
+            &ObservationClock::new(Instant::now()),
+            0,
+            fixture.scope_end,
+            &mut pending,
+            &mut SourceScheduleState::default(),
+        )
+        .unwrap();
+        assert!(outcome.idle(), "{outcome:?}");
+        assert_eq!(outcome.finish(), CycleFinish::Committed);
         let aborted = control.cycle(queued.token.cycle_seq).unwrap();
         assert_eq!(aborted.token, queued.token);
         assert_eq!(aborted.state, CycleState::Aborted);

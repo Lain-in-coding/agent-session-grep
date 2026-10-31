@@ -1051,6 +1051,9 @@ fn equal_size_rewrite_is_held_then_published_and_old_roots_are_not_starved() {
         .unwrap()
         .set_modified(modified)
         .unwrap();
+    // Equal size and mtime leave the scheduling hint unchanged; only a fresh
+    // demand or the periodic full verification reads the rewritten bytes.
+    admit_latest_barrier(&f, 2);
     f.wait(|f| f.sees_held_receipt());
     assert!(f.has_text("rewritefirstneedle"));
     assert!(!f.has_text("rewritenextxneedle"));
@@ -1201,6 +1204,68 @@ fn public_start_returns_pipe_eof_while_its_background_worker_remains_alive() {
         "startup did not leave an independently running worker"
     );
     assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_observations() {
+    for provider in ["claude", "codex"] {
+        let mut f = Fixture::new(provider);
+        let path = f.history.join("scheduled.jsonl");
+        let bytes = if provider == "claude" {
+            claude("scheduled-id", "scheduledproofneedle")
+        } else {
+            codex("scheduled-id", "scheduledproofneedle")
+        };
+        fs::write(&path, &bytes).unwrap();
+        f.spawn();
+        f.wait(|f| f.sees_text("scheduledproofneedle"));
+        let initial = admit_latest_barrier(&f, 400);
+        f.wait(|f| latest_satisfied(f, &initial));
+        let original = m2_sources(&f).pop().unwrap();
+        let original_receipt = original.latest_receipt.clone().unwrap();
+        let mut quiet_cycle = None;
+        f.wait(|f| {
+            let control = f.control();
+            let number = control
+                .bounded(|control| control.background_status())
+                .next_cycle_seq;
+            let mut found = Vec::new();
+            for seq in (1..number.get()).rev().take(8) {
+                let cycle = control.bounded(|control| {
+                    control.cycle(agent_session_grep_ports::control::CycleSeq::new(seq).unwrap())
+                });
+                if cycle.state == CycleState::Partial
+                    && cycle.selections.iter().all(|selection| {
+                        selection.discovery_complete
+                            && selection.error.is_none()
+                            && selection.discovered_count == 1
+                            && selection.observed_count == 0
+                            && selection.committed_count == 0
+                    })
+                {
+                    found.push(cycle.token.cycle_seq);
+                }
+            }
+            if found.len() >= 2 {
+                quiet_cycle = found.first().copied();
+                true
+            } else {
+                false
+            }
+        });
+        assert!(quiet_cycle.unwrap().get() > original_receipt.cycle_seq);
+        assert_eq!(
+            m2_sources(&f)[0].latest_receipt.as_ref(),
+            Some(&original_receipt)
+        );
+        let latest = admit_latest_barrier(&f, 401);
+        f.wait(|f| latest_satisfied(f, &latest));
+        let current = m2_sources(&f).pop().unwrap().latest_receipt.unwrap();
+        assert!(current.cycle_seq >= latest.required_cycle_seq.get());
+        assert!(current.started_control_seq > latest.admission_control_seq.get());
+        assert_ne!(current.revision_id, original_receipt.revision_id);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }
 
 #[test]
@@ -1538,6 +1603,8 @@ fn overlapping_roots_keep_one_confirmation_root_across_rotation() {
         .unwrap()
         .set_modified(modified)
         .unwrap();
+    // The unchanged hint needs a fresh demand to read the rewritten bytes.
+    admit_latest_barrier(&f, 2);
     f.wait(|f| f.sees_held_receipt());
     assert!(f.has_text("rotationfirstneedle"));
     // Fairness rotation must not move the advisory root and restart the grace
@@ -1629,6 +1696,9 @@ fn overlapping_healthy_child_publishes_rewrite_while_parent_discovery_is_incompl
         .unwrap()
         .set_modified(modified)
         .unwrap();
+    // The incomplete parent no longer forces a rehash of an unattempted
+    // baseline; a fresh child demand reads the equal-size rewrite.
+    admit_latest_barrier_for(&f, 4, Some(&child_locator));
     let sources = m2_sources(&f);
     assert_eq!(sources.len(), 1);
     assert_eq!(
