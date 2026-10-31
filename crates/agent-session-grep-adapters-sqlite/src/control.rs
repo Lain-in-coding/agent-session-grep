@@ -6988,108 +6988,115 @@ mod runtime_deadline_tests {
     #[test]
     fn acknowledge_prunes_only_proven_retired_source_updates() {
         let (temp, control) = running_fixture();
-        let root = temp.path().join("private");
-        #[cfg(windows)]
-        let locator_a = CanonicalLocator::parse(r"C:\synthetic-a").unwrap();
-        #[cfg(not(windows))]
-        let locator_a = CanonicalLocator::parse("/synthetic-a").unwrap();
-        #[cfg(windows)]
-        let locator_b = CanonicalLocator::parse(r"C:\synthetic-b").unwrap();
-        #[cfg(not(windows))]
-        let locator_b = CanonicalLocator::parse("/synthetic-b").unwrap();
-        let revoked = control
-            .add_selection(
-                ControlSeq::new(0).unwrap(),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: locator_a,
-                        kind: RootKind::Exact,
-                    },
-                    root_identity: Some(cid("root-a")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap();
-        let retained = control
-            .add_selection(
-                revoked.control_seq,
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: locator_b,
-                        kind: RootKind::Exact,
-                    },
-                    root_identity: Some(cid("root-b")),
-                    now_ms: 2,
-                },
-            )
-            .unwrap();
-        let worker = ScopedWorker {
-            installation: cid("synthetic-deadline-installation"),
-            boot: cid("boot_prune"),
-            root: RootIdentity::read(&root).unwrap(),
-            lock: ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap(),
-        };
-        let current = || control.status().unwrap().policy.control_seq;
-        control.register_worker(current(), &worker, 7, 3).unwrap();
-        insert_source_row(&control, "denied_source", "claude-code");
-        insert_source_row(&control, "orphan_provider", "codex");
-        insert_source_row(&control, "locator_revoked", "claude-code");
+        let end = Instant::now() + Duration::from_secs(8);
+        // Preparation and assertions share one end, including point status reads.
         control
-            .revoke_selection(current(), &revoked.value.id, Some(&cid("denied_source")), 4)
+            .with_runtime_deadline(end, || {
+                let root = temp.path().join("private");
+                #[cfg(windows)]
+                let locator_a = CanonicalLocator::parse(r"C:\synthetic-a").unwrap();
+                #[cfg(not(windows))]
+                let locator_a = CanonicalLocator::parse("/synthetic-a").unwrap();
+                #[cfg(windows)]
+                let locator_b = CanonicalLocator::parse(r"C:\synthetic-b").unwrap();
+                #[cfg(not(windows))]
+                let locator_b = CanonicalLocator::parse("/synthetic-b").unwrap();
+                let revoked = control
+                    .add_selection(
+                        ControlSeq::new(0).unwrap(),
+                        SelectionRequest {
+                            region: ScopeRegion {
+                                provider: SearchProvider::Claude,
+                                locator: locator_a,
+                                kind: RootKind::Exact,
+                            },
+                            root_identity: Some(cid("root-a")),
+                            now_ms: 1,
+                        },
+                    )
+                    .unwrap();
+                let retained = control
+                    .add_selection(
+                        revoked.control_seq,
+                        SelectionRequest {
+                            region: ScopeRegion {
+                                provider: SearchProvider::Claude,
+                                locator: locator_b,
+                                kind: RootKind::Exact,
+                            },
+                            root_identity: Some(cid("root-b")),
+                            now_ms: 2,
+                        },
+                    )
+                    .unwrap();
+                let worker = ScopedWorker {
+                    installation: cid("synthetic-deadline-installation"),
+                    boot: cid("boot_prune"),
+                    root: RootIdentity::read(&root).unwrap(),
+                    lock: ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap(),
+                };
+                let current = || control.status().unwrap().policy.control_seq;
+                control.register_worker(current(), &worker, 7, 3).unwrap();
+                insert_source_row(&control, "denied_source", "claude-code");
+                insert_source_row(&control, "orphan_provider", "codex");
+                insert_source_row(&control, "locator_revoked", "claude-code");
+                control
+                    .revoke_selection(current(), &revoked.value.id, Some(&cid("denied_source")), 4)
+                    .unwrap();
+                let retained_revision = SelectionRevision {
+                    selection_id: retained.value.id.clone(),
+                    revision: retained.value.revision,
+                    root_identity: cid("root-b"),
+                };
+                let barrier = match control
+                    .admit_latest(
+                        current(),
+                        LatestRequest {
+                            selections: vec![retained_revision.clone()],
+                            max_wait_ms: 1,
+                            now_ms: 5,
+                        },
+                    )
+                    .unwrap()
+                    .value
+                {
+                    LatestAdmission::Queued(barrier) => barrier,
+                    blocked => panic!("expected a queued barrier, got {blocked:?}"),
+                };
+                let cycle = control
+                    .start_cycle(current(), &worker, barrier.required_cycle_seq, 6)
+                    .unwrap()
+                    .value;
+                // The retained selection stayed enabled through the revoke, so this
+                // acknowledgement is a normal observation mutation after the deny.
+                control
+                    .acknowledge_source(
+                        current(),
+                        &worker,
+                        SourceAcknowledgement {
+                            source_id: cid("locator_revoked"),
+                            provider: SearchProvider::Claude,
+                            token: cycle.token.clone(),
+                            selection: retained_revision,
+                            attempted_at_ms: 7,
+                            coverage: Coverage::Partial,
+                            update_state: UpdateState::Deferred,
+                            backfill_state: BackfillState::Pending,
+                            error: None,
+                            receipt: None,
+                            confirmation: None,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(source_row_count(&control, "denied_source"), 0);
+                assert_eq!(source_row_count(&control, "orphan_provider"), 0);
+                // Only an exact source-identity exclusion can retire this row: the
+                // revoked selection covered a different locator and claude still has
+                // an enabled selection, so control must not guess its location.
+                assert_eq!(source_row_count(&control, "locator_revoked"), 1);
+                Ok(())
+            })
             .unwrap();
-        let retained_revision = SelectionRevision {
-            selection_id: retained.value.id.clone(),
-            revision: retained.value.revision,
-            root_identity: cid("root-b"),
-        };
-        let barrier = match control
-            .admit_latest(
-                current(),
-                LatestRequest {
-                    selections: vec![retained_revision.clone()],
-                    max_wait_ms: 1,
-                    now_ms: 5,
-                },
-            )
-            .unwrap()
-            .value
-        {
-            LatestAdmission::Queued(barrier) => barrier,
-            blocked => panic!("expected a queued barrier, got {blocked:?}"),
-        };
-        let cycle = control
-            .start_cycle(current(), &worker, barrier.required_cycle_seq, 6)
-            .unwrap()
-            .value;
-        // The retained selection stayed enabled through the revoke, so this
-        // acknowledgement is a normal observation mutation after the deny.
-        control
-            .acknowledge_source(
-                current(),
-                &worker,
-                SourceAcknowledgement {
-                    source_id: cid("locator_revoked"),
-                    provider: SearchProvider::Claude,
-                    token: cycle.token.clone(),
-                    selection: retained_revision,
-                    attempted_at_ms: 7,
-                    coverage: Coverage::Partial,
-                    update_state: UpdateState::Deferred,
-                    backfill_state: BackfillState::Pending,
-                    error: None,
-                    receipt: None,
-                    confirmation: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(source_row_count(&control, "denied_source"), 0);
-        assert_eq!(source_row_count(&control, "orphan_provider"), 0);
-        // Only an exact source-identity exclusion can retire this row: the
-        // revoked selection covered a different locator and claude still has
-        // an enabled selection, so control must not guess its location.
-        assert_eq!(source_row_count(&control, "locator_revoked"), 1);
     }
 
     #[test]

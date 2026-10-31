@@ -1335,54 +1335,115 @@ fn queued_barriers_coalesce_and_started_cycle_never_accepts_new_admission() {
 #[test]
 fn concurrent_latest_admission_and_cycle_start_serialize_without_old_observations() {
     use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
     let (_temp, root, store, worker, s) = worker_setup();
-    let first = latest(&store, &s, 100);
-    let expected = current(&store);
+    let end = Instant::now() + Duration::from_secs(8);
+    let (first, before, before_runtime, queued, before_rows) = store
+        .with_runtime_deadline(end, || {
+            let first = latest(&store, &s, 100);
+            Ok((
+                first.clone(),
+                store.status()?,
+                store.background_status()?,
+                store.cycle(first.required_cycle_seq)?,
+                control_rows(&root),
+            ))
+        })
+        .unwrap();
+    let expected = before.policy.control_seq;
     let sync = Arc::new(Barrier::new(2));
+    // Race one call per side at the same sequence; neither mutation is retried.
     let (start, admission) = std::thread::scope(|scope| {
         let sync1 = sync.clone();
         let path = root.clone();
         let worker_ref = &worker;
         let t1 = scope.spawn(move || {
-            let store =
-                SqliteControlStore::open_existing_writable(&path, &id("installation")).unwrap();
-            sync1.wait();
-            store.start_cycle(expected, worker_ref, first.required_cycle_seq, 101)
+            let store = SqliteControlStore::open_existing_writable_with_deadline(
+                &path,
+                &id("installation"),
+                end,
+            )
+            .unwrap();
+            store.with_runtime_deadline(end, || {
+                sync1.wait();
+                store.start_cycle(expected, worker_ref, first.required_cycle_seq, 101)
+            })
         });
         let path = root.clone();
         let selected = s.clone();
         let t2 = scope.spawn(move || {
-            let store =
-                SqliteControlStore::open_existing_writable(&path, &id("installation")).unwrap();
-            sync.wait();
-            store.admit_latest(
-                expected,
-                LatestRequest {
-                    selections: vec![selected],
-                    max_wait_ms: 1000,
-                    now_ms: 102,
-                },
+            let store = SqliteControlStore::open_existing_writable_with_deadline(
+                &path,
+                &id("installation"),
+                end,
             )
+            .unwrap();
+            store.with_runtime_deadline(end, || {
+                sync.wait();
+                store.admit_latest(
+                    expected,
+                    LatestRequest {
+                        selections: vec![selected],
+                        max_wait_ms: 1000,
+                        now_ms: 102,
+                    },
+                )
+            })
         });
         (t1.join().unwrap(), t2.join().unwrap())
     });
-    assert_ne!(start.is_ok(), admission.is_ok());
-    match (start, admission) {
-        (Ok(c), Err(PortError::GenerationMismatch(_))) => {
-            assert!(latest(&store, &s, 103).required_cycle_seq > c.value.token.cycle_seq)
-        }
-        (Err(PortError::GenerationMismatch(_)), Ok(b)) => {
-            let LatestAdmission::Queued(b) = b.value else {
-                panic!("unexpected block")
+    assert_eq!(
+        usize::from(start.is_ok()) + usize::from(admission.is_ok()),
+        1
+    );
+    store
+        .with_runtime_deadline(end, || {
+            let committed_seq = ControlSeq::new(expected.get() + 1).unwrap();
+            let barrier_count = |rows: &[(String, Vec<String>)]| {
+                rows.iter()
+                    .find(|(name, _)| name == "barriers")
+                    .unwrap()
+                    .1
+                    .len()
             };
-            let c = store
-                .start_cycle(current(&store), &worker, first.required_cycle_seq, 104)
-                .unwrap()
-                .value;
-            assert!(c.started_control_seq.unwrap() > b.admission_control_seq);
-        }
-        other => panic!("unexpected race: {other:?}"),
-    }
+            let after_rows = control_rows(&root);
+            match (start, admission) {
+                (Ok(c), Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_))) => {
+                    assert!(c.changed);
+                    assert_eq!(c.control_seq, committed_seq);
+                    assert_eq!(c.value.state, CycleState::Observing);
+                    assert_eq!(c.value.started_control_seq, Some(committed_seq));
+                    assert!(committed_seq > first.admission_control_seq);
+                    assert_eq!(store.cycle(first.required_cycle_seq)?, c.value);
+                    assert_eq!(barrier_count(&after_rows), barrier_count(&before_rows));
+                }
+                (Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)), Ok(b)) => {
+                    assert!(b.changed);
+                    assert_eq!(b.control_seq, committed_seq);
+                    let LatestAdmission::Queued(b) = b.value else {
+                        panic!("unexpected block")
+                    };
+                    assert_eq!(b.required_cycle_seq, first.required_cycle_seq);
+                    assert_eq!(b.admission_control_seq, committed_seq);
+                    assert!(b.admission_control_seq > first.admission_control_seq);
+                    assert_eq!(store.barrier(&b.id)?, b);
+                    assert_eq!(store.cycle(first.required_cycle_seq)?, queued);
+                    assert_eq!(barrier_count(&after_rows), barrier_count(&before_rows) + 1);
+                }
+                other => panic!("unexpected race: {other:?}"),
+            }
+            assert_eq!(store.barrier(&first.id)?, first);
+            let after_runtime = store.background_status()?;
+            assert_eq!(after_runtime.control_seq, committed_seq);
+            assert_eq!(after_runtime.next_cycle_seq, before_runtime.next_cycle_seq);
+            assert_eq!(after_runtime.worker, before_runtime.worker);
+            let mut expected_status = before;
+            expected_status.policy.control_seq = committed_seq;
+            assert_eq!(store.status()?, expected_status);
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
