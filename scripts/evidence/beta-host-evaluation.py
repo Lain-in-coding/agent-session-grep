@@ -57,6 +57,11 @@ PRIVATE_FORM = re.compile(
     r"/(?:Users|home|tmp|private|var|etc)/|~[/\\]|"
     r"(?:bearer\s+|(?:api[_-]?key|password|access[_-]?token)\s*[:=])"
 )
+# codex-cli 0.166.0 reports a configured model missing from its built-in catalog
+# (for example a router model) as this non-fatal error item on every turn.
+FALLBACK_METADATA_PREFIX = "Model metadata for `"
+FALLBACK_METADATA_SUFFIX = ("` not found. Defaulting to fallback metadata; "
+                            "this can degrade performance and cause issues.")
 
 
 class CaptureError(Exception):
@@ -480,6 +485,9 @@ class NativeEvents:
         self.permission_denials: int | None = None
         self.errors = 0
         self.error_item_ids: set[str] = set()
+        self.fallback_metadata_warnings = 0
+        self.fallback_metadata_item_ids: set[str] = set()
+        self.fallback_metadata_digest: str | None = None
         self.native_is_error = False
         self.num_turns: int | None = None
         self.statuses: set[str] = set()
@@ -538,11 +546,16 @@ class NativeEvents:
                     if kind == "item.completed" and item_type == "error":
                         key = item.get("id")
                         digest = sha_bytes(key.encode("utf-8", errors="surrogatepass")) if isinstance(key, str) and key else None
+                        warning = self._fallback_metadata_warning(item.get("message"))
+                        seen = self.fallback_metadata_item_ids if warning else self.error_item_ids
                         # Missing identity cannot prove a duplicate or an error-free turn.
-                        if digest is None or digest not in self.error_item_ids:
-                            self.errors += 1
+                        if digest is None or digest not in seen:
+                            if warning:
+                                self.fallback_metadata_warnings += 1
+                            else:
+                                self.errors += 1
                             if digest is not None:
-                                self.error_item_ids.add(digest)
+                                seen.add(digest)
                     if item_type == "mcp_tool_call":
                         key = item.get("id")
                         if isinstance(key, str):
@@ -562,6 +575,28 @@ class NativeEvents:
                 self.errors += 1
         if isinstance(kind, str) and kind in {"turn.started", "turn.completed", "turn.failed", "error", "result"}:
             self.statuses.add(kind)
+
+    def _fallback_metadata_warning(self, message: Any) -> bool:
+        """Match codex-cli's exact fallback-metadata text, one distinct text per capture.
+
+        The model token must be nonempty, single-line and free of backticks, so no
+        extra text or second message can hide inside it. A later text naming another
+        model is a distinct message and remains an error.
+        """
+        if not isinstance(message, str):
+            return False
+        token_end = len(message) - len(FALLBACK_METADATA_SUFFIX)
+        if (token_end <= len(FALLBACK_METADATA_PREFIX) or not message.startswith(FALLBACK_METADATA_PREFIX)
+                or not message.endswith(FALLBACK_METADATA_SUFFIX)):
+            return False
+        token = message[len(FALLBACK_METADATA_PREFIX):token_end]
+        # splitlines() covers every line boundary, not only LF.
+        if "`" in token or token.splitlines() != [token]:
+            return False
+        digest = sha_bytes(message.encode("utf-8", errors="surrogatepass"))
+        if self.fallback_metadata_digest is None:
+            self.fallback_metadata_digest = digest
+        return digest == self.fallback_metadata_digest
 
     def _tool(self, key: Any, name: Any, arguments: Any, status: str) -> None:
         if not isinstance(key, str) or not isinstance(name, str):
@@ -1127,7 +1162,9 @@ def run_host(host: str, command: Sequence[str], *, profile_dir: Path, workdir: P
         "session_id_sha256": sha_bytes(native.session_id.encode()) if native.session_id else None,
         "resume_identity": "private-native-stdout-only" if native.session_id else "unavailable",
         "model_identity": _safe_identity(native.model), "host_version": _safe_identity(native.host_version),
-        "native_error_count": native.errors, "native_is_error": native.native_is_error,
+        "native_error_count": native.errors,
+        "native_fallback_metadata_warning_count": native.fallback_metadata_warnings if host == "codex" else None,
+        "native_is_error": native.native_is_error,
         "native_num_turns": native.num_turns,
         "native_permission_denial_count": native.permission_denials,
         "started_monotonic_ns": started, "stopped_monotonic_ns": stopped,

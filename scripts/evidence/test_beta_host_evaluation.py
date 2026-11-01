@@ -33,6 +33,12 @@ def header_frame(value: dict) -> bytes:
     return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\nContent-Type: application/json\r\n\r\n" + body
 
 
+def fallback_metadata(model: str) -> str:
+    """Exact codex-cli 0.166.0 warning text, kept independent of the module under test."""
+    return ("Model metadata for `" + model + "` not found. Defaulting to fallback metadata; "
+            "this can degrade performance and cause issues.")
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="asg-host-capture-test-")
@@ -84,6 +90,8 @@ for event in [
 """)
         self.assertEqual(result["native_status"], "success")
         self.assertTrue(result["capture_complete"])
+        # Claude captures never classify fallback metadata, so they claim no count.
+        self.assertIsNone(result["native_fallback_metadata_warning_count"])
         self.assertEqual(result["measurements"]["tokens"]["model_input_tokens"]["value"], 41)
         self.assertEqual(result["measurements"]["tokens"]["model_input_tokens"]["coverage"], "full-evaluation-episode")
         self.assertEqual(result["measurements"]["tokens"]["model_cache_write_tokens"]["value"], 0)
@@ -222,6 +230,7 @@ for event in [
         result = self.host("codex", "import sys\nsys.stdin.buffer.read()\n"
                            f"sys.stdout.buffer.write({raw!r})\nsys.stdout.buffer.flush()\n")
         self.assertEqual(result["native_error_count"], 2)
+        self.assertEqual(result["native_fallback_metadata_warning_count"], 0)
         self.assertEqual(result["native_status"], "turn.completed")
         self.assertEqual(result["execution_state"], "completed")
         self.assertEqual(result["native_returncode_before_cleanup"], 0)
@@ -231,6 +240,106 @@ for event in [
         for private_value in ("Synthetic diagnostic at", "synthetic-error-", "synthetic-detail"):
             self.assertNotIn(private_value, rendered)
         self.assertEqual((self.out / "run" / "stdout.private.jsonl").read_bytes(), raw)
+
+    def test_codex_exact_fallback_metadata_warning_is_recorded_not_counted(self) -> None:
+        first, second = [hashlib.sha256(f"synthetic-warning-{ordinal}".encode()).hexdigest() for ordinal in (1, 2)]
+        for model in ("synthetic-router/model-1", "synthetic model:2", "合成-模型"):
+            with self.subTest(model=model):
+                native = RUNNER.NativeEvents("codex", "asg")
+                for kind, item_id, warnings in (
+                    ("item.started", first, 0), ("item.updated", first, 0),
+                    ("item.completed", first, 1), ("item.completed", first, 1),
+                    ("item.completed", second, 2), ("item.completed", None, 3),
+                ):
+                    item = {"type": "error", "message": fallback_metadata(model)}
+                    if item_id is not None:
+                        item["id"] = item_id
+                    native.feed({"type": kind, "item": item}, 1)
+                    self.assertEqual((native.errors, native.fallback_metadata_warnings), (0, warnings))
+                self.assertFalse(native.tool_ids)
+                native.feed({"type": "turn.completed"}, 2)
+                self.assertEqual((native.terminal, native.errors), ("turn.completed", 0))
+
+    def test_codex_fallback_metadata_near_misses_remain_errors(self) -> None:
+        exact = fallback_metadata("synthetic-router")
+        control = RUNNER.NativeEvents("codex", "asg")
+        control.feed({"type": "item.completed", "item": {"id": "synthetic-control", "type": "error", "message": exact}}, 1)
+        self.assertEqual((control.errors, control.fallback_metadata_warnings), (0, 1))
+        near_misses = {
+            "changed wording": exact.replace("Defaulting to", "Using"),
+            "lowercase prefix": "m" + exact[1:],
+            "missing final period": exact[:-1],
+            "extra suffix": exact + " Synthetic extra text.",
+            "extra prefix": "Synthetic: " + exact,
+            "trailing newline": exact + "\n",
+            "second message on a new line": exact + "\n" + fallback_metadata("synthetic-other"),
+            "concatenated second message": exact + fallback_metadata("synthetic-other"),
+            "newline in model": fallback_metadata("synthetic\nrouter"),
+            "carriage return in model": fallback_metadata("synthetic\rrouter"),
+            "line separator in model": fallback_metadata("synthetic\u2028router"),
+            "backtick in model": fallback_metadata("synthetic`router"),
+            "empty model": fallback_metadata(""),
+            "shared backtick": fallback_metadata("").replace("``", "`"),
+        }
+        cases = [(label, {"message": message}) for label, message in near_misses.items()]
+        cases += [("missing message", {}), ("text field only", {"text": exact})]
+        cases += [(f"non-string {type(value).__name__}", {"message": value})
+                  for value in (None, [exact], {"message": exact}, 0, True)]
+        for label, fields in cases:
+            with self.subTest(case=label):
+                native = RUNNER.NativeEvents("codex", "asg")
+                native.feed({"type": "item.completed", "item": {
+                    "id": hashlib.sha256(label.encode()).hexdigest(), "type": "error", **fields}}, 1)
+                self.assertEqual((native.errors, native.fallback_metadata_warnings), (1, 0))
+
+    def test_codex_fallback_metadata_tolerance_cannot_hide_other_errors(self) -> None:
+        native = RUNNER.NativeEvents("codex", "asg")
+        ids = [hashlib.sha256(f"synthetic-item-{ordinal}".encode()).hexdigest() for ordinal in (1, 2, 3)]
+        for row, (item_id, message, expected) in enumerate((
+            (ids[0], fallback_metadata("synthetic-router"), (0, 1)),
+            # A second distinct fallback text in the same capture is not tolerated.
+            (ids[1], fallback_metadata("synthetic-other"), (1, 1)),
+            (ids[2], fallback_metadata("synthetic-router"), (1, 2)),
+            # A warning id cannot hide a later real error with the same id.
+            (ids[0], "synthetic real diagnostic", (2, 2)),
+            (ids[0], "synthetic real diagnostic", (2, 2)),
+        )):
+            with self.subTest(row=row):
+                native.feed({"type": "item.completed", "item": {"id": item_id, "type": "error", "message": message}}, 1)
+                self.assertEqual((native.errors, native.fallback_metadata_warnings), expected)
+        native.feed({"type": "error", "message": fallback_metadata("synthetic-router")}, 2)
+        self.assertEqual(native.errors, 3)
+        native.feed({"type": "turn.failed", "error": {"message": fallback_metadata("synthetic-router")}}, 3)
+        self.assertEqual((native.terminal, native.errors, native.fallback_metadata_warnings), ("turn.failed", 4, 2))
+
+    def test_codex_fallback_metadata_warning_summary_count(self) -> None:
+        warning = {"type": "item.completed", "item": {"id": "synthetic-warning", "type": "error",
+                                                      "message": fallback_metadata("synthetic-router/model")}}
+        real_error = {"type": "item.completed", "item": {"id": "synthetic-error", "type": "error",
+                                                         "message": "Synthetic real diagnostic"}}
+        tail = [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "synthetic-answer", "type": "agent_message", "text": "done"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 46, "output_tokens": 9}},
+        ]
+        # Consumers fail any capture with a nonzero native_error_count.
+        for run_id, events, expected_errors in (("warning-only", [warning], 0),
+                                                ("warning-and-error", [warning, real_error], 1)):
+            with self.subTest(run=run_id):
+                raw = b"".join(jsonl(event) for event in [
+                    {"type": "thread.started", "thread_id": "synthetic-thread"}, *events, *tail])
+                result = self.host("codex", "import sys\nsys.stdin.buffer.read()\n"
+                                   f"sys.stdout.buffer.write({raw!r})\nsys.stdout.buffer.flush()\n", run_id=run_id)
+                self.assertEqual(result["native_error_count"], expected_errors)
+                self.assertEqual(result["native_fallback_metadata_warning_count"], 1)
+                self.assertEqual(result["native_status"], "turn.completed")
+                self.assertEqual(result["execution_state"], "completed")
+                self.assertTrue(result["capture_complete"])
+                self.assertEqual(result["acceptance"], "open")
+                rendered = json.dumps(result, ensure_ascii=False)
+                for private_value in ("Model metadata", "synthetic-router", "Synthetic real diagnostic"):
+                    self.assertNotIn(private_value, rendered)
+                self.assertEqual((self.out / run_id / "stdout.private.jsonl").read_bytes(), raw)
 
     def test_missing_and_malformed_usage_are_unavailable(self) -> None:
         native = RUNNER.NativeEvents("codex", "asg")
