@@ -343,6 +343,19 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Managed `get_session_context` over MCP and Robot JSON/JSONL now chooses
+  its message prefix using the final serialized response, including redaction,
+  provenance and transport framing. Robot JSON no longer spends its budget on
+  internal proof identifiers that are never emitted. MCP keeps counting both
+  payload copies inside its frame. Probing starts with small prefixes; Human
+  output and the final output-size check keep their existing behavior.
+- Managed metadata search, list and stats qualify the entity kinds they read
+  in batched queries, removing per-row work for unrelated entities while
+  retaining source permission, scope, receipt and revocation checks.
+- A ready Active source turn can run before the next cycle's first probe
+  batch. Metadata priority, carried fairness debt, admission checks and the
+  original source deadline are preserved; normal probing resumes after the
+  first attempt.
 - Background updates can maintain complete as-of coverage for plain Claude
   Code and Codex JSONL using current verified source receipts from earlier
   cycles. Full content verification still runs on a schedule; unchanged
@@ -357,6 +370,11 @@ four native packages or Beta maturity; no provider is promoted here.
   worker restart, instead of waiting for a timeout because the new worker
   reports Busy or Deferred. Temporary Busy or Deferred states keep waiting
   only while the same request remains live, within its original deadline.
+  Reads arriving during a live Busy or Deferred advisory now queue one
+  observation request instead of returning `deferred` immediately. Admission
+  preserves three immediate CAS attempts, then retries contention at a bounded
+  polling interval until the original requested wait ends; it does not renew
+  the client wait or retry terminal failures.
 - Update recovery and rollback run by this candidate clear discovery coverage
   before resuming the recorded old program. Original transcripts, receipt
   identities and bytes, scope, pause and revocations are preserved. Complete
