@@ -145,7 +145,7 @@ impl Fixture {
     fn seed_cycles(&self, count: usize, live: bool, selections: &[SelectionRevision]) {
         let mut conn = raw(&self.root);
         let tx = conn.transaction().unwrap();
-        let policy = self.control.status().unwrap().policy;
+        let policy = bounded(&self.control, || self.control.status()).policy;
         for n in 1..=count {
             tx.execute(
                 "INSERT INTO cycles VALUES(?1,'synthetic-boot',?2,?3,?4,NULL,NULL,?5)",
@@ -229,16 +229,72 @@ fn current_indexes_cover_live_lookup_and_ordered_barrier_tail() {
 #[test]
 fn v1_read_is_unchanged_and_write_upgrade_preserves_policy_and_old_tokens() {
     let f = Fixture::new();
-    f.seed_cycles(80, false, std::slice::from_ref(&f.selection));
-    let denied = f
+    // Seed and policy changes prepare the old schema fixture. End this scope
+    // before the read-only and writable opens start their original budgets.
+    let preparation_end = Instant::now() + Duration::from_secs(10);
+    let probe_end = preparation_end + Duration::from_secs(10);
+    let (mut seed_calls, mut revoke_calls, mut pause_calls) = (0, 0, 0);
+    let mut prepare = || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        seed_calls += 1;
+        f.seed_cycles(80, false, std::slice::from_ref(&f.selection));
+        let initial = f.control.status()?;
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        revoke_calls += 1;
+        let denied = f.control.revoke_selection(
+            initial.policy.control_seq,
+            &f.selection.selection_id,
+            None,
+            4,
+        )?;
+        assert!(denied.changed);
+        assert_eq!(
+            denied.control_seq.get(),
+            initial.policy.control_seq.get() + 1
+        );
+        assert_eq!(
+            denied.policy_epoch.get(),
+            initial.policy.policy_epoch.get() + 1
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        pause_calls += 1;
+        let paused = f
+            .control
+            .set_desired_updates(denied.control_seq, DesiredUpdates::Paused)?;
+        assert!(paused.changed);
+        assert_eq!(paused.control_seq.get(), denied.control_seq.get() + 1);
+        assert_eq!(paused.policy_epoch, denied.policy_epoch);
+        let before = f.control.status()?;
+        let old = f.control.cycle(CycleSeq::new(1).unwrap())?;
+        assert_eq!(before.desired_updates, DesiredUpdates::Paused);
+        assert_eq!(before.policy.control_seq, paused.control_seq);
+        assert_eq!(before.policy.policy_epoch, paused.policy_epoch);
+        assert_eq!(before.policy.revocations, [denied.value.intent]);
+        assert_eq!(f.control.purge_jobs()?, [denied.value.purge_job]);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        Ok::<_, PortError>((before, old))
+    };
+    let (before, old) = f
         .control
-        .revoke_selection(f.seq(), &f.selection.selection_id, None, 4)
+        .with_runtime_deadline(preparation_end, &mut prepare)
         .unwrap();
-    f.control
-        .set_desired_updates(denied.control_seq, DesiredUpdates::Paused)
-        .unwrap();
-    let before = bounded(&f.control, || f.control.status());
-    let old = bounded(&f.control, || f.control.cycle(CycleSeq::new(1).unwrap()));
+    assert_eq!((seed_calls, revoke_calls, pause_calls), (1, 1, 1));
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe_end),
+        probe_end
+    );
     let conn = raw(&f.root);
     make_v1(&conn);
     let read = SqliteControlStore::open_current_read_only_with_deadline(
@@ -275,7 +331,7 @@ fn migration_checks_installation_and_rolls_back_on_original_deadline_contention(
     let f = Fixture::new();
     let conn = raw(&f.root);
     make_v1(&conn);
-    let before = f.control.status().unwrap();
+    let before = bounded(&f.control, || f.control.status());
     assert_corrupt(SqliteControlStore::open_existing_writable_with_deadline(
         &f.root,
         &id("other-installation"),
@@ -293,14 +349,14 @@ fn migration_checks_installation_and_rolls_back_on_original_deadline_contention(
     conn.execute_batch("ROLLBACK").unwrap();
     assert_eq!(version(&conn), 1);
     assert!(indexes(&conn).is_empty());
-    assert_eq!(f.control.status().unwrap(), before);
+    assert_eq!(bounded(&f.control, || f.control.status()), before);
     let write = SqliteControlStore::open_existing_writable_with_deadline(
         &f.root,
         &id("synthetic-installation"),
         Instant::now() + Duration::from_secs(1),
     )
     .unwrap();
-    assert_eq!(write.status().unwrap(), before);
+    assert_eq!(bounded(&write, || write.status()), before);
 }
 
 #[test]
@@ -342,13 +398,13 @@ fn expired_admission_and_scope_do_not_execute_or_create_artifacts() {
     });
     assert!(matches!(result, Err(PortError::WriterBusy(_))));
     assert!(!ran.get());
-    assert!(f.control.status().is_ok());
+    bounded(&f.control, || f.control.status());
 }
 
 #[test]
 fn nested_later_deadline_cannot_extend_real_sqlite_writer_wait() {
     let f = Fixture::new();
-    let before = f.control.status().unwrap();
+    let before = bounded(&f.control, || f.control.status());
     let conn = raw(&f.root);
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = Instant::now();
@@ -365,10 +421,11 @@ fn nested_later_deadline_cannot_extend_real_sqlite_writer_wait() {
     // allowance. It is a synthetic cancellation regression, not a latency gate.
     assert!(started.elapsed() < Duration::from_millis(200));
     conn.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(f.control.status().unwrap(), before);
-    f.control
-        .set_desired_updates(before.policy.control_seq, DesiredUpdates::Paused)
-        .unwrap();
+    assert_eq!(bounded(&f.control, || f.control.status()), before);
+    bounded(&f.control, || {
+        f.control
+            .set_desired_updates(before.policy.control_seq, DesiredUpdates::Paused)
+    });
 }
 
 #[test]
@@ -538,7 +595,7 @@ fn pending_barrier_inventory_and_new_admission_refuse_capacity_without_mutation(
     f.seed_cycles(1, true, std::slice::from_ref(&f.selection));
     let mut conn = raw(&f.root);
     let tx = conn.transaction().unwrap();
-    let policy = f.control.status().unwrap().policy;
+    let policy = bounded(&f.control, || f.control.status()).policy;
     let before = policy.control_seq;
     for n in 0..=MAX_RUNTIME_REFERENCES {
         let barrier = format!("synthetic-barrier-{n:05}");
