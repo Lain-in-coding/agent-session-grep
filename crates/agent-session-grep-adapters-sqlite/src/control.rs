@@ -7703,6 +7703,33 @@ mod control_create_tests {
         }
     }
 
+    fn assert_created_before(
+        store: &SqliteControlStore,
+        creation_end: Instant,
+        check: impl FnOnce(ControlStatus),
+    ) {
+        let previous = runtime_deadline();
+        let previous_busy = RUNTIME_BUSY_ALLOWANCE.with(Cell::get);
+        let effective = SqliteControlStore::effective_runtime_deadline(creation_end);
+        let mut reads = 0;
+        let verify = || -> PortResult<()> {
+            assert_eq!(
+                runtime_deadline(),
+                Some(effective),
+                "creation postcondition must enter its original scope before status"
+            );
+            reads += 1;
+            check(store.status()?);
+            assert_eq!(runtime_deadline(), Some(effective));
+            Ok(())
+        };
+        let result = store.with_runtime_deadline(creation_end, verify);
+        assert_eq!(runtime_deadline(), previous);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), previous_busy);
+        result.unwrap();
+        assert_eq!(reads, 1);
+    }
+
     #[test]
     fn control_create_child_process_entry() {
         let Ok(mode) = std::env::var("ASG_TEST_CONTROL_CREATE_CHILD") else {
@@ -7765,18 +7792,22 @@ mod control_create_tests {
                 assert!(!root.join("control.db.creating.intent").exists());
                 assert!(root.join("control.db.creating.publish").exists());
             }
-            let store = SqliteControlStore::recover_create(
+            let creation_end = Instant::now() + CREATE_BUDGET;
+            let store = SqliteControlStore::recover_create_with_deadline(
                 &root,
                 &id("synthetic-crash-installation"),
                 DesiredUpdates::Paused,
+                creation_end,
             )
             .unwrap();
-            assert_eq!(
-                store.status().unwrap().policy.installation_id,
-                id("synthetic-crash-installation")
-            );
-            assert!(SqliteControlStore::path(&root).exists());
-            assert_clean(&root);
+            assert_created_before(&store, creation_end, |status| {
+                assert_eq!(
+                    status.policy.installation_id,
+                    id("synthetic-crash-installation")
+                );
+                assert!(SqliteControlStore::path(&root).exists());
+                assert_clean(&root);
+            });
         }
     }
 
@@ -7790,17 +7821,21 @@ mod control_create_tests {
         assert!(!root.join("control.db.creating.intent").exists());
         assert!(!root.join("control.db.creating").exists());
         assert_eq!(SqliteControlStore::read_create_intent(&root).unwrap(), None);
-        let store = SqliteControlStore::create(
+        let creation_end = Instant::now() + CREATE_BUDGET;
+        let store = SqliteControlStore::create_with_deadline(
             &root,
             &id("synthetic-retry-installation"),
             DesiredUpdates::Running,
+            creation_end,
         )
         .unwrap();
-        assert_eq!(
-            store.status().unwrap().policy.installation_id,
-            id("synthetic-retry-installation")
-        );
-        assert_clean(&root);
+        assert_created_before(&store, creation_end, |status| {
+            assert_eq!(
+                status.policy.installation_id,
+                id("synthetic-retry-installation")
+            );
+            assert_clean(&root);
+        });
     }
 
     #[test]
@@ -7823,17 +7858,21 @@ mod control_create_tests {
             .is_err()
         );
         assert_eq!(fs::read(&pending).unwrap(), bytes);
-        let store = SqliteControlStore::recover_create(
+        let creation_end = Instant::now() + CREATE_BUDGET;
+        let store = SqliteControlStore::recover_create_with_deadline(
             &root,
             &id("synthetic-crash-installation"),
             DesiredUpdates::Paused,
+            creation_end,
         )
         .unwrap();
-        assert_eq!(
-            store.status().unwrap().policy.installation_id,
-            id("synthetic-crash-installation")
-        );
-        assert_clean(&root);
+        assert_created_before(&store, creation_end, |status| {
+            assert_eq!(
+                status.policy.installation_id,
+                id("synthetic-crash-installation")
+            );
+            assert_clean(&root);
+        });
     }
 
     #[test]
@@ -8279,41 +8318,72 @@ mod control_create_tests {
         private_directory(&root, true).unwrap();
         let installation = id("synthetic-contended-finish");
         let mut holder = None;
-        let store = SqliteControlStore::with_creation_deadline(
-            Instant::now() + Duration::from_secs(30),
-            || {
-                let lease = admit_control_handle(&root, true)?;
-                let lock = ExclusiveGuard::try_acquire(&root, LockKind::ControlCreate)?;
-                let mut hook = |point: u8| -> PortResult<()> {
-                    if point == 4 {
-                        let contended = root.clone();
-                        let (ready, acquired) = std::sync::mpsc::channel();
-                        holder = Some(std::thread::spawn(move || {
-                            let guard =
-                                ExclusiveGuard::try_acquire(&contended, LockKind::ControlCreate)
-                                    .unwrap();
-                            ready.send(()).unwrap();
-                            std::thread::sleep(Duration::from_millis(100));
-                            drop(guard);
-                        }));
-                        acquired.recv_timeout(Duration::from_secs(10)).unwrap();
-                    }
-                    Ok(())
-                };
-                control_create::prepare(
-                    &root,
-                    &installation,
-                    DesiredUpdates::Paused,
-                    lease,
-                    lock,
-                    &mut hook,
-                )
-            },
-        )
+        let creation_end = Instant::now() + CREATE_BUDGET;
+        let store = SqliteControlStore::with_creation_deadline(creation_end, || {
+            let lease = admit_control_handle(&root, true)?;
+            let lock = ExclusiveGuard::try_acquire(&root, LockKind::ControlCreate)?;
+            let mut hook = |point: u8| -> PortResult<()> {
+                if point == 4 {
+                    let contended = root.clone();
+                    let (ready, acquired) = std::sync::mpsc::channel();
+                    holder = Some(std::thread::spawn(move || {
+                        let guard =
+                            ExclusiveGuard::try_acquire(&contended, LockKind::ControlCreate)
+                                .unwrap();
+                        ready.send(()).unwrap();
+                        std::thread::sleep(Duration::from_millis(100));
+                        drop(guard);
+                    }));
+                    acquired.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                Ok(())
+            };
+            control_create::prepare(
+                &root,
+                &installation,
+                DesiredUpdates::Paused,
+                lease,
+                lock,
+                &mut hook,
+            )
+        })
         .expect("a published creation must outlast a concurrent finisher");
         holder.take().unwrap().join().unwrap();
-        assert_eq!(store.status().unwrap().policy.installation_id, installation);
-        assert!(!root.join(CONTROL_CREATE_INTENT).exists());
+        assert_created_before(&store, creation_end, |status| {
+            assert_eq!(status.policy.installation_id, installation);
+            assert!(!root.join(CONTROL_CREATE_INTENT).exists());
+        });
+    }
+
+    #[test]
+    fn creation_postcondition_preserves_an_earlier_parent_scope() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = root(&temp);
+        let installation = id("synthetic-postcondition-parent");
+        let creation_end = Instant::now() + CREATE_BUDGET;
+        let outer_end = creation_end - Duration::from_secs(1);
+        let previous = runtime_deadline();
+        let previous_busy = RUNTIME_BUSY_ALLOWANCE.with(Cell::get);
+        let outer_busy = BUSY_TIMEOUT / 2;
+        let outer = RuntimeDeadlineScope::enter_with_busy(outer_end, outer_busy).unwrap();
+        let store = SqliteControlStore::create_with_deadline(
+            &root,
+            &installation,
+            DesiredUpdates::Paused,
+            creation_end,
+        )
+        .unwrap();
+        assert_created_before(&store, creation_end, |status| {
+            assert_eq!(runtime_deadline(), Some(outer_end));
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), outer_busy);
+            assert_eq!(status.policy.installation_id, installation);
+            assert_clean(&root);
+        });
+        assert_eq!(runtime_deadline(), Some(outer_end));
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), outer_busy);
+        drop(outer);
+        assert_eq!(runtime_deadline(), previous);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), previous_busy);
     }
 
     #[test]
