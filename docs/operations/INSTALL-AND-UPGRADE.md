@@ -399,6 +399,16 @@ discovery coverage, which can take longer under a large history workload.
 When several catalogs share one installation prefix, a catalog other than
 the one that applied the latest program update also uses this fallback.
 
+The managed catalog's SQLite write-ahead log (`asg.db-wal`) may grow while
+readers hold snapshots. Writable catalog connections limit the file retained
+after a reset to 64 MiB; this is not a cap on an active WAL. The worker makes
+one checkpoint attempt at an idle boundary, while paused, or before an
+ordinary stop. It does not wait for readers or change their snapshots, and
+retries at a later boundary when a reader prevents reset. Closing a long
+read lets a later attempt reclaim that space. Copying, flushing and truncating
+the WAL can still take time. Leave SQLite sidecar files in place while ASG is
+using the catalog; source assistant histories are never checkpointed by ASG.
+
 When invoking the same application build outside its installed version
 directory, add `--install-prefix <prefix>`. Otherwise setup derives the prefix
 from the running versioned application. Before catalog creation or host writes,

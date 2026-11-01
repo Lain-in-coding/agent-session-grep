@@ -356,6 +356,13 @@ four native packages or Beta maturity; no provider is promoted here.
   batch. Metadata priority, carried fairness debt, admission checks and the
   original source deadline are preserved; normal probing resumes after the
   first attempt.
+- Managed catalog writers apply a 64 MiB limit to the journal retained after
+  a WAL reset. The background worker attempts a checkpoint at idle and paused
+  boundaries and before an ordinary stop, without waiting for readers.
+  Snapshots already being read remain valid. Continuously overlapping readers
+  can still keep the active WAL above the limit; resetting requires a reader
+  gap. Checkpoint I/O has no fixed wall-time bound, and a failed stop cleanup
+  retains its result while bounded control retries finish.
 - Background updates can maintain complete as-of coverage for plain Claude
   Code and Codex JSONL using current verified source receipts from earlier
   cycles. Full content verification still runs on a schedule; unchanged
