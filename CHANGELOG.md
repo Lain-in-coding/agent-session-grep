@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-These changes form the `0.2.0-beta.8` Managed Beta candidate. That version
+These changes form the `0.2.0-beta.9` Managed Beta candidate. That version
 names the current build under acceptance; no tag or release is implied, and
 the open six-host, native-package, measurement, owner, and publication gates
 remain unfulfilled. Historical `0.1.0` release notes and evidence below remain
@@ -363,6 +363,16 @@ four native packages or Beta maturity; no provider is promoted here.
   can still keep the active WAL above the limit; resetting requires a reader
   gap. Checkpoint I/O has no fixed wall-time bound, and a failed stop cleanup
   retains its result while bounded control retries finish.
+- A background cycle whose final control write is deferred now preserves its
+  real completion result. After the same cycle is confirmed, a still-valid idle
+  result restores the normal pause between polls and the idle checkpoint
+  opportunity, without repeating source publication. New work, latest requests,
+  pause/resume, scope changes and expired verification still take precedence.
+- Uninstall validation keeps fresh and existing control reads within the
+  caller's original deadline. Typed contention now reports a pending cleanup
+  or exhausted deadline instead of being mislabeled as an identity change.
+  Actual installation, journal and maintenance-owner conflicts still refuse
+  cleanup without changing retained files.
 - Background updates can maintain complete as-of coverage for plain Claude
   Code and Codex JSONL using current verified source receipts from earlier
   cycles. Full content verification still runs on a schedule; unchanged
