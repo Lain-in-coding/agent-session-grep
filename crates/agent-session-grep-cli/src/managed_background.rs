@@ -6109,9 +6109,10 @@ mod wal_worker_tests {
     use super::*;
     use agent_session_grep_adapters_sqlite::{
         WriterLease,
+        managed_locks::SharedGuard,
         managed_store::{WalCheckpointOutcome, WalCheckpointReport, WalDeferral},
     };
-    use rusqlite::{Connection, OpenFlags};
+    use rusqlite::{Connection, OpenFlags, types::Value};
     use std::{io::Write, sync::mpsc, thread::JoinHandle};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6434,11 +6435,7 @@ mod wal_worker_tests {
         }
 
         fn checkpoint(&self, expected: WalCheckpointOutcome) -> WalCheckpointReport {
-            let Event::Checkpoint(Ok(report)) = self.next() else {
-                panic!("expected a checkpoint report");
-            };
-            assert_eq!(report.outcome, expected);
-            report
+            checkpoint_report(self.next(), expected)
         }
 
         fn join(mut self) -> PortResult<()> {
@@ -6481,7 +6478,169 @@ mod wal_worker_tests {
         finish_attempts: usize,
         finish_calls: usize,
         sources: BTreeMap<SourceId, SourceDebt>,
-        publication_rows: Vec<Vec<Vec<rusqlite::types::Value>>>,
+        handoff_rows: PublicationRows,
+        publication_rows: PublicationRows,
+        worker_status: WorkerStatus,
+    }
+
+    impl IdleProof {
+        fn assert_checkpoint_unchanged(&self, rows: &PublicationRows, status: &WorkerStatus) {
+            assert_eq!(
+                rows, &self.publication_rows,
+                "checkpoint changed published rows"
+            );
+            assert_eq!(status, &self.worker_status);
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct PublicationRows {
+        receipts: Vec<Vec<Value>>,
+        discoveries: Vec<Vec<Value>>,
+        sources: Vec<Vec<Value>>,
+    }
+
+    impl PublicationRows {
+        fn read(conn: &Connection) -> Self {
+            let [receipts, discoveries, sources] = [
+                "SELECT * FROM source_revision_receipts ORDER BY revision_id",
+                "SELECT * FROM discovery_receipts ORDER BY cycle_seq,selection_id",
+                "SELECT * FROM discovery_sources ORDER BY cycle_seq,selection_id,source_id",
+            ]
+            .map(|sql| {
+                let mut statement = conn.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            });
+            Self {
+                receipts,
+                discoveries,
+                sources,
+            }
+        }
+
+        fn counts(&self) -> (i64, i64, i64) {
+            (
+                self.receipts.len() as i64,
+                self.discoveries.len() as i64,
+                self.sources.len() as i64,
+            )
+        }
+
+        fn handoff(
+            &self,
+            completion: &CompletionSnapshot,
+            sources: &BTreeMap<SourceId, SourceDebt>,
+        ) -> Self {
+            let observed = completion.intent.observed.as_ref().unwrap();
+            let token = &completion.intent.token;
+            assert_eq!(&observed.cycle.token, token);
+            assert!(!observed.cycle.selections.is_empty());
+            let cycle = Value::Integer(token.cycle_seq.get());
+            // Only the original observation's discovery is a handoff invariant.
+            // Retention may collect older unreferenced discoveries at a Busy
+            // boundary too. Keep ALL receipt rows: these fixtures have at most
+            // the two original receipts and neither may disappear or change.
+            let current = Self {
+                receipts: self.receipts.clone(),
+                discoveries: self
+                    .discoveries
+                    .iter()
+                    .filter(|row| row[0] == cycle)
+                    .cloned()
+                    .collect(),
+                sources: self
+                    .sources
+                    .iter()
+                    .filter(|row| row[0] == cycle)
+                    .cloned()
+                    .collect(),
+            };
+            assert_eq!(
+                current.discoveries.len(),
+                observed.cycle.selections.len(),
+                "current discovery parent missing or duplicated"
+            );
+            let mut expected_sources = Vec::new();
+            let mut selections = observed.cycle.selections.iter().collect::<Vec<_>>();
+            selections.sort_by(|left, right| {
+                left.selection
+                    .selection_id
+                    .cmp(&right.selection.selection_id)
+            });
+            for selected in selections {
+                let selection = &selected.selection;
+                let selection_id = Value::Text(selection.selection_id.as_str().into());
+                let parents = current
+                    .discoveries
+                    .iter()
+                    .filter(|row| row[1] == selection_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(parents.len(), 1, "expected current discovery parent");
+                let parent = parents[0];
+                assert_eq!(parent.len(), 11);
+                assert_eq!(
+                    parent[..8],
+                    [
+                        cycle.clone(),
+                        selection_id.clone(),
+                        Value::Integer(selection.revision.get()),
+                        Value::Text(token.worker_boot_id.as_str().into()),
+                        Value::Integer(observed.cycle.policy_epoch.get()),
+                        Value::Integer(observed.cycle.started_control_seq.unwrap().get()),
+                        Value::Text(observed.identity.incarnation.as_str().into()),
+                        Value::Text(selection.root_identity.as_str().into()),
+                    ],
+                    "current discovery ownership changed"
+                );
+                let mut digest = blake3::Hasher::new();
+                digest.update(b"asg-discovery-source-set-v1");
+                for (source, debt) in sources {
+                    let (revision, _, claims) =
+                        debt.verified.as_ref().expect("expected verified source");
+                    if !claims.contains(selection) {
+                        continue;
+                    }
+                    let source_id = Value::Text(source.as_str().into());
+                    let revision_id = Value::Text(revision.as_str().into());
+                    let receipts = current
+                        .receipts
+                        .iter()
+                        .filter(|row| row[0] == revision_id && row[1] == source_id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(receipts.len(), 1, "current discovery receipt missing");
+                    assert_eq!(receipts[0][6], Value::Integer(1));
+                    assert_eq!(receipts[0][9], parent[6]);
+                    for field in [source.as_str(), revision.as_str()] {
+                        digest.update(&(field.len() as u64).to_le_bytes());
+                        digest.update(field.as_bytes());
+                    }
+                    expected_sources.push(vec![
+                        cycle.clone(),
+                        selection_id.clone(),
+                        source_id,
+                        revision_id,
+                    ]);
+                }
+                assert_eq!(
+                    parent[8],
+                    Value::Text(digest.finalize().to_hex().to_string())
+                );
+                assert_eq!(parent[9], Value::Integer(1), "discovery is incomplete");
+            }
+            assert!(!expected_sources.is_empty(), "expected a published source");
+            assert_eq!(
+                current.sources, expected_sources,
+                "current discovery children or receipt references changed"
+            );
+            current
+        }
     }
 
     fn id(value: &str) -> ControlId {
@@ -6568,25 +6727,12 @@ mod wal_worker_tests {
                 .unwrap()
         }
 
-        fn publication_rows(&self) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
-            [
-                "SELECT * FROM source_revision_receipts ORDER BY revision_id",
-                "SELECT * FROM discovery_receipts ORDER BY cycle_seq,selection_id",
-                "SELECT * FROM discovery_sources ORDER BY cycle_seq,selection_id,source_id",
-            ]
-            .into_iter()
-            .map(|sql| {
-                let mut statement = self.idle.prepare(sql).unwrap();
-                let columns = statement.column_count();
-                statement
-                    .query_map([], |row| {
-                        (0..columns).map(|column| row.get(column)).collect()
-                    })
-                    .unwrap()
-                    .collect::<Result<_, _>>()
-                    .unwrap()
-            })
-            .collect()
+        fn publication_rows(&self) -> PublicationRows {
+            PublicationRows::read(&self.idle)
+        }
+
+        fn assert_checkpoint_unchanged(&self, proof: &IdleProof) {
+            proof.assert_checkpoint_unchanged(&self.publication_rows(), &self.status());
         }
 
         fn idle(&self, worker: &Worker) -> IdleProof {
@@ -6697,18 +6843,22 @@ mod wal_worker_tests {
                     ))
                 })
                 .unwrap();
+            let publication_rows = self.publication_rows();
+            let handoff_rows = publication_rows.handoff(&completion, &snapshot.sources);
             let mut proof = IdleProof {
                 completion,
                 cycle,
                 next_cycle: status.next_cycle_seq,
-                publications: self.publications(),
+                publications: publication_rows.counts(),
                 progress,
                 checkpoints: snapshot.checkpoints,
                 busy_boundaries: 0,
                 finish_attempts: 0,
                 finish_calls: 0,
                 sources: snapshot.sources.clone(),
-                publication_rows: self.publication_rows(),
+                handoff_rows,
+                publication_rows,
+                worker_status: status.worker,
             };
             let mut confirmed = false;
             let mut terminal = None;
@@ -6737,10 +6887,11 @@ mod wal_worker_tests {
                     snapshot.sources, proof.sources,
                     "source debt or verification time changed"
                 );
+                let rows = self.publication_rows();
                 assert_eq!(
-                    self.publication_rows(),
-                    proof.publication_rows,
-                    "published rows changed"
+                    rows.handoff(&proof.completion, &proof.sources),
+                    proof.handoff_rows,
+                    "current publication changed during idle handoff"
                 );
                 let attempts = snapshot
                     .finish_attempts
@@ -6782,10 +6933,9 @@ mod wal_worker_tests {
                 assert!(observed_cycle_matches(&original.cycle, &cycle));
                 assert_eq!(cycle.selections, proof.cycle.selections);
                 assert_eq!(progress, proof.progress, "source acknowledgement replayed");
-                assert_eq!(
-                    self.publications(),
-                    proof.publications,
-                    "publication replayed"
+                assert!(
+                    Instant::now() < end,
+                    "idle acknowledgement exceeded test end"
                 );
                 if let Some(terminal) = &terminal {
                     assert_eq!(&cycle, terminal, "terminal completion replayed");
@@ -6803,6 +6953,12 @@ mod wal_worker_tests {
                         assert_eq!(cycle.state, finish_state(proof.completion.intent.finish));
                         assert!(cycle.completed_at_ms.is_some());
                         assert_eq!(proof.finish_attempts, 1);
+                        // Retention is over; the worker is blocked before its
+                        // physical checkpoint. From here ALL three tables and
+                        // status must remain identical, including old rows.
+                        proof.publications = rows.counts();
+                        proof.publication_rows = rows;
+                        proof.worker_status = status.worker;
                         inspect(&event);
                         return proof;
                     }
@@ -6912,6 +7068,14 @@ mod wal_worker_tests {
         }
     }
 
+    fn checkpoint_report(event: Event, expected: WalCheckpointOutcome) -> WalCheckpointReport {
+        let Event::Checkpoint(Ok(report)) = event else {
+            panic!("expected a checkpoint report");
+        };
+        assert_eq!(report.outcome, expected);
+        report
+    }
+
     #[test]
     fn wal_worker_idle_outer_writer_busy_retains_the_same_completion() {
         let fixture = Fixture::new(true);
@@ -6946,12 +7110,10 @@ mod wal_worker_tests {
         assert_eq!(proof.checkpoints, 0);
         assert_eq!(proof.finish_attempts, 1);
         assert!(contender.is_none());
-        let before = fixture.status();
         worker.advance();
         worker.checkpoint(WalCheckpointOutcome::Reset);
         assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
-        assert_eq!(fixture.publications(), proof.publications);
-        assert_eq!(fixture.status(), before);
+        fixture.assert_checkpoint_unchanged(&proof);
         fixture.stop(worker);
     }
 
@@ -7085,6 +7247,136 @@ mod wal_worker_tests {
         idle_close_after_append(true);
     }
 
+    #[test]
+    fn wal_worker_idle_handoff_preserves_current_rows_across_actual_history_collection() {
+        let fixture = Fixture::new(true);
+        for sequence in 0..3 {
+            fixture.append(sequence);
+        }
+        // Keep the real nonblocking maintenance attempt pending until both
+        // observations exist. This is a history guard, not a SQLite snapshot.
+        let history =
+            SharedGuard::try_acquire(fixture.db.parent().unwrap(), LockKind::HistoryReaders)
+                .unwrap();
+        let worker = Worker::start_with_expired_completion(&fixture.db, true);
+        let first = fixture.idle(&worker);
+        assert_eq!(first.publications, (1, 1, 1));
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        fixture.assert_checkpoint_unchanged(&first);
+
+        fixture.append(3);
+        worker.advance_expiring_completion();
+        let end = Instant::now() + Duration::from_secs(20);
+        let event = fixture.observation_event(&worker, end);
+        assert!(matches!(event, Event::Boundary(WorkerBoundary::Busy, _)));
+        assert!(
+            idle_snapshot(&event)
+                .completion
+                .as_ref()
+                .unwrap()
+                .expired_before_completion
+        );
+        let before = fixture.publication_rows();
+        assert_eq!(before.counts(), (2, 2, 2));
+        drop(history);
+
+        let second = fixture.idle_from_before(&worker, event, end, |_| {});
+        assert!(second.busy_boundaries >= 1);
+        assert_eq!(second.checkpoints, 1);
+        assert_eq!(
+            second.publications,
+            (2, 1, 1),
+            "old discovery was not collected"
+        );
+        assert_eq!(second.publication_rows.receipts, before.receipts);
+        assert_eq!(
+            second.publication_rows.discoveries[0][0],
+            Value::Integer(second.completion.intent.token.cycle_seq.get())
+        );
+        assert_ne!(
+            second.completion.intent.token,
+            first.completion.intent.token
+        );
+        assert!(ManagedStore::wal_len(&fixture.db).unwrap().unwrap() > 0);
+        worker.advance();
+        assert_eq!(
+            worker
+                .checkpoint(WalCheckpointOutcome::Reset)
+                .wal_bytes_after,
+            Some(0)
+        );
+        assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
+        fixture.assert_checkpoint_unchanged(&second);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_publication_oracles_reject_current_row_loss_and_equal_count_changes() {
+        let fixture = Fixture::new(true);
+        fixture.append(0);
+        let worker = Worker::start(&fixture.db);
+        let proof = fixture.idle(&worker);
+        let conn = Connection::open(&fixture.db).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        for (sql, same_count) in [
+            ("DELETE FROM discovery_receipts WHERE cycle_seq=?1", false),
+            ("DELETE FROM discovery_sources WHERE cycle_seq=?1", false),
+            (
+                "UPDATE discovery_receipts SET committed_generation=committed_generation+1 WHERE cycle_seq=?1",
+                true,
+            ),
+            (
+                "UPDATE discovery_sources SET revision_id='synthetic-wrong-receipt' WHERE cycle_seq=?1",
+                true,
+            ),
+            (
+                "UPDATE source_revision_receipts SET observed_at_ms=observed_at_ms+1 WHERE cycle_seq=?1",
+                true,
+            ),
+        ] {
+            // Mutate the real synthetic catalog view; never commit a broken
+            // proof or let the worker run while this fault is installed.
+            conn.execute_batch("BEGIN").unwrap();
+            assert_eq!(
+                conn.execute(sql, [proof.completion.intent.token.cycle_seq.get()])
+                    .unwrap(),
+                1
+            );
+            let changed = PublicationRows::read(&conn);
+            if same_count {
+                assert_eq!(changed.counts(), proof.publications);
+            }
+            let handoff = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let current = changed.handoff(&proof.completion, &proof.sources);
+                assert_eq!(current, proof.handoff_rows, "current publication changed");
+            }));
+            let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                proof.assert_checkpoint_unchanged(&changed, &proof.worker_status);
+            }));
+            conn.execute_batch("ROLLBACK").unwrap();
+            assert!(handoff.is_err(), "handoff accepted a changed current fact");
+            assert!(checkpoint.is_err(), "checkpoint accepted changed full rows");
+            fixture.assert_checkpoint_unchanged(&proof);
+        }
+        drop(conn);
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        fixture.assert_checkpoint_unchanged(&proof);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a checkpoint report")]
+    fn wal_worker_checkpoint_oracle_rejects_a_skipped_attempt() {
+        // With the checkpoint omitted, the next boundary is not its report.
+        // Exercise the same classifier used by every real worker assertion.
+        checkpoint_report(
+            Event::Boundary(WorkerBoundary::Idle, None),
+            WalCheckpointOutcome::Reset,
+        );
+    }
+
     fn idle_close_after_append(expire_completion: bool) {
         let fixture = Fixture::new(true);
         for sequence in 0..3 {
@@ -7106,13 +7398,11 @@ mod wal_worker_tests {
             assert_eq!(proof.publications.0, round + 1);
             assert_eq!(proof.checkpoints, round as usize);
             assert!(ManagedStore::wal_len(&fixture.db).unwrap().unwrap() > 0);
-            let before = fixture.status();
             worker.advance();
             let report = worker.checkpoint(WalCheckpointOutcome::Reset);
             assert_eq!(report.wal_bytes_after, Some(0));
             assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
-            assert_eq!(fixture.status(), before);
-            assert_eq!(fixture.publications(), proof.publications);
+            fixture.assert_checkpoint_unchanged(&proof);
             if round == 0 {
                 fixture.append(3);
                 if expire_completion {
