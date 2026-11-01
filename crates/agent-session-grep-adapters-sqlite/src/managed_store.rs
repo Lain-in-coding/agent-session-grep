@@ -1349,6 +1349,8 @@ impl ManagedStore {
                     crate::managed_discovery::OriginalCycleProof::new(control, deadline);
                 let mut conn = self.inner.conn.borrow_mut();
                 let tx = conn.transaction().map_err(storage)?;
+                #[cfg(test)]
+                baseline_deadline_tests::observe_query(&tx, deadline)?;
                 let mut statement = tx
                     .prepare(
                         "SELECT source_id,source_path,provider_id,namespace_id,root_identity
@@ -1731,9 +1733,23 @@ impl ManagedStore {
         };
         {
             let conn = self.inner.conn.borrow();
-            conn.busy_handler(Some(|_| false)).map_err(storage)?;
-            conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
-                .map_err(storage)?;
+            conn.busy_handler(Some(|_attempt| {
+                let retry = false;
+                #[cfg(test)]
+                baseline_deadline_tests::observe_busy(_attempt, retry);
+                retry
+            }))
+            .map_err(storage)?;
+            conn.progress_handler(
+                1000,
+                Some(move || {
+                    let interrupted = Instant::now() >= deadline;
+                    #[cfg(test)]
+                    baseline_deadline_tests::observe_progress(deadline, interrupted);
+                    interrupted
+                }),
+            )
+            .map_err(storage)?;
         }
         let result = operation().and_then(|value| {
             context_deadline(deadline)?;
@@ -2278,6 +2294,202 @@ fn observation_manifest(
         relocation_json: "null".into(),
         operation_digest: digest,
     })
+}
+
+#[cfg(test)]
+mod baseline_deadline_tests {
+    use super::*;
+
+    const FINITE_SQL: &str = "WITH RECURSIVE n(x) AS (
+        VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+        SELECT sum(x) FROM n";
+
+    #[derive(Clone, Copy, Debug)]
+    struct Query {
+        same_connection: bool,
+        busy_timeout: i64,
+        sql_end: Instant,
+        effective_end: Instant,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Observations {
+        connection: *const Connection,
+        query: Option<Query>,
+        query_calls: u32,
+        busy_calls: u32,
+        first_busy_attempt: Option<i32>,
+        retried: bool,
+        progress_calls: u32,
+        progress_end: Option<Instant>,
+        progress_end_changed: bool,
+        interrupted: bool,
+    }
+
+    thread_local! {
+        static OBSERVATIONS: RefCell<Option<Observations>> = const { RefCell::new(None) };
+    }
+
+    struct Recording;
+    impl Recording {
+        fn start(connection: &Connection) -> Self {
+            OBSERVATIONS.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Observations {
+                    connection,
+                    query: None,
+                    query_calls: 0,
+                    busy_calls: 0,
+                    first_busy_attempt: None,
+                    retried: false,
+                    progress_calls: 0,
+                    progress_end: None,
+                    progress_end_changed: false,
+                    interrupted: false,
+                });
+            });
+            Self
+        }
+
+        fn snapshot(&self) -> Observations {
+            OBSERVATIONS.with(|slot| slot.borrow().as_ref().unwrap().clone())
+        }
+    }
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            OBSERVATIONS.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn observe_query(connection: &Connection, sql_end: Instant) -> PortResult<()> {
+        if !OBSERVATIONS.with(|slot| slot.borrow().is_some()) {
+            return Ok(());
+        }
+        let busy_timeout = connection
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .map_err(storage)?;
+        OBSERVATIONS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let observed = slot.as_mut().unwrap();
+            observed.query_calls = observed.query_calls.saturating_add(1);
+            observed.query.get_or_insert(Query {
+                same_connection: std::ptr::eq(connection, observed.connection),
+                busy_timeout,
+                sql_end,
+                effective_end: SqliteControlStore::effective_runtime_deadline(
+                    sql_end + Duration::from_secs(5),
+                ),
+            });
+        });
+        let total: i64 = connection
+            .query_row(FINITE_SQL, [], |row| row.get(0))
+            .map_err(storage)?;
+        assert_eq!(total, 50_005_000);
+        Ok(())
+    }
+
+    pub(super) fn observe_busy(attempt: i32, retry: bool) {
+        OBSERVATIONS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.busy_calls = observed.busy_calls.saturating_add(1);
+                observed.first_busy_attempt.get_or_insert(attempt);
+                observed.retried |= retry;
+            }
+        });
+    }
+
+    pub(super) fn observe_progress(deadline: Instant, interrupted: bool) {
+        OBSERVATIONS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.progress_calls = observed.progress_calls.saturating_add(1);
+                let first = observed.progress_end.get_or_insert(deadline);
+                observed.progress_end_changed |= *first != deadline;
+                observed.interrupted |= interrupted;
+            }
+        });
+    }
+
+    #[test]
+    fn plain_baselines_scope_real_query_and_restore_handlers_after_success_and_busy() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let id = |value| ControlId::parse(value).unwrap();
+        let control =
+            SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running)
+                .unwrap();
+        let preparation_end = Instant::now() + Duration::from_secs(5);
+        let (blocker, store) = control
+            .with_runtime_deadline(preparation_end, || {
+                drop(ManagedStore::create(&catalog, &control, id("catalog"), 1)?);
+                let blocker = Connection::open(&catalog).map_err(storage)?;
+                let mode: String = blocker
+                    .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                    .map_err(storage)?;
+                assert_eq!(mode, "delete");
+                Ok((blocker, ManagedStore::open(&catalog, &control)?))
+            })
+            .unwrap();
+        for blocked in [true, false] {
+            if blocked {
+                blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            }
+            let recording = Recording::start(&store.inner.conn.borrow());
+            let original_end = Instant::now() + Duration::from_secs(1);
+            let requested_end = original_end + Duration::from_secs(5);
+            let probe = requested_end + Duration::from_secs(5);
+            let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+            let result = control.with_runtime_deadline(original_end, || {
+                let result = store.current_plain_baselines(&control, requested_end);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    original_end
+                );
+                result
+            });
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous_end
+            );
+            let observed = recording.snapshot();
+            assert_eq!(observed.query_calls, 1, "{observed:?}");
+            let query = observed.query.expect("the real baseline query was reached");
+            assert!(query.same_connection);
+            assert_eq!(query.busy_timeout, 0, "{observed:?}");
+            assert_eq!(query.sql_end, original_end);
+            assert_eq!(query.effective_end, original_end);
+            assert!(!observed.retried, "{observed:?}");
+            assert!(observed.progress_calls > 0, "{observed:?}");
+            assert_eq!(observed.progress_end, Some(original_end));
+            assert!(!observed.progress_end_changed);
+            assert!(!observed.interrupted);
+            if blocked {
+                assert!(
+                    matches!(result, Err(PortError::WriterBusy(reason)) if reason == "managed catalog is busy")
+                );
+                assert_eq!(observed.busy_calls, 1, "{observed:?}");
+                assert_eq!(observed.first_busy_attempt, Some(0));
+                drop(ExclusiveGuard::try_acquire(&root, LockKind::HistoryReaders).unwrap());
+                blocker.execute_batch("ROLLBACK").unwrap();
+            } else {
+                assert!(result.unwrap().is_empty());
+                assert_eq!(observed.busy_calls, 0, "{observed:?}");
+            }
+            let conn = store.inner.conn.borrow();
+            assert_eq!(
+                conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                BUSY_TIMEOUT_MILLIS as i64
+            );
+            let total: i64 = conn.query_row(FINITE_SQL, [], |row| row.get(0)).unwrap();
+            assert_eq!(total, 50_005_000);
+            assert_eq!(
+                recording.snapshot().progress_calls,
+                observed.progress_calls,
+                "the old deadline callback must be cleared, even before its end"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
