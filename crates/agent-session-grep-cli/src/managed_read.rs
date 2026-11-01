@@ -1535,6 +1535,8 @@ fn prepare(
         let size = frame.bytes.len();
         if size <= request.frame_bytes {
             fitted.replace(Some((response.clone(), frame)));
+            #[cfg(test)]
+            frame_budget_tests::after_fit(&fitted.borrow().as_ref().unwrap().1);
         }
         Ok(size)
     };
@@ -2240,11 +2242,14 @@ fn render_frame(
             crate::mcp::managed_result_frame(id.clone(), payload.clone()).into_bytes()
         }
         RenderTarget::Cli(OutputMode::Json | OutputMode::Jsonl, request_id) => {
+            let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            #[cfg(test)]
+            let duration_ms = frame_budget_tests::duration_ms(duration_ms);
             protocol::success_envelope(
                 request.command,
                 outcome,
                 data,
-                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                duration_ms,
                 &page,
                 &warnings,
                 request_id,
@@ -2278,6 +2283,328 @@ fn render_frame(
         outcome,
         epoch,
     })
+}
+
+#[cfg(test)]
+mod frame_budget_tests {
+    use super::*;
+    use agent_session_grep_adapters_sqlite::{PARSER_SEMANTIC_VERSION, SourceBatch};
+    use agent_session_grep_domain::{EvidenceSpan, MessageEdge, MessagePlacement, MessageRelation};
+    use agent_session_grep_ports::{
+        control::{CanonicalLocator, CycleAdmission, RootKind, ScopeRegion, SelectionRequest},
+        managed::{
+            ObservationState, RevisionId, SelectionProof, SourceBinding, SourceId,
+            SourceObservation,
+        },
+    };
+    use std::cell::RefCell;
+
+    struct DurationState {
+        value: u64,
+        advance_after_complete_fit: bool,
+        measured_complete: Option<Vec<u8>>,
+    }
+    thread_local! {
+        static DURATION: RefCell<Option<DurationState>> = const { RefCell::new(None) };
+    }
+    struct SerializerDuration;
+    impl SerializerDuration {
+        fn fixed(value: u64, advance_after_complete_fit: bool) -> Self {
+            DURATION.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(DurationState {
+                    value,
+                    advance_after_complete_fit,
+                    measured_complete: None,
+                });
+            });
+            Self
+        }
+    }
+    impl Drop for SerializerDuration {
+        fn drop(&mut self) {
+            DURATION.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    pub(super) fn duration_ms(actual: u64) -> u64 {
+        DURATION.with(|slot| slot.borrow().as_ref().map_or(actual, |state| state.value))
+    }
+    pub(super) fn after_fit(frame: &PreparedFrame) {
+        DURATION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(state) = slot.as_mut()
+                && state.advance_after_complete_fit
+                && frame.payload["data"]["truncation"]["truncated"] == false
+                && frame.payload["data"]["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.len() == 12)
+            {
+                state.measured_complete = Some(frame.bytes.clone());
+                state.value = 10;
+                state.advance_after_complete_fit = false;
+            }
+        });
+    }
+
+    struct Fixture {
+        db: PathBuf,
+        session: StableId,
+        messages: Vec<StableId>,
+        _temp: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let histories = temp.path().canonicalize().unwrap();
+            let root = temp.path().join("private");
+            let db = root.join("catalog.db");
+            let id = |name| ControlId::parse(name).unwrap();
+            let entity = |kind, name: &str| StableId::native_checked(kind, name).unwrap();
+            let session = entity(IdKind::Session, "frame-session");
+            let document = entity(IdKind::Document, "frame-document");
+            let control = SqliteControlStore::create(
+                &root,
+                &id("frame-installation"),
+                DesiredUpdates::Running,
+            )
+            .unwrap();
+            let messages = control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(5), || {
+                    let selection = control
+                        .add_selection(
+                            control.status()?.policy.control_seq,
+                            SelectionRequest {
+                                region: ScopeRegion {
+                                    provider: SearchProvider::Claude,
+                                    locator: CanonicalLocator::from_path(&histories)?,
+                                    kind: RootKind::Root,
+                                },
+                                root_identity: Some(id("frame-root")),
+                                now_ms: 1,
+                            },
+                        )?
+                        .value;
+                    let lock = ExclusiveGuard::try_acquire(&root, LockKind::Background)?;
+                    let worker = control.bind_worker(&lock, id("frame-boot"))?;
+                    control.register_worker(control.status()?.policy.control_seq, &worker, 1, 1)?;
+                    let CycleAdmission::Queued(cycle) = control
+                        .queue_cycle(
+                            control.status()?.policy.control_seq,
+                            vec![SelectionRevision {
+                                selection_id: selection.id.clone(),
+                                revision: selection.revision,
+                                root_identity: id("frame-root"),
+                            }],
+                        )?
+                        .value
+                    else {
+                        panic!("fixture cycle was not queued");
+                    };
+                    let cycle = control
+                        .start_cycle(
+                            control.status()?.policy.control_seq,
+                            &worker,
+                            cycle.token.cycle_seq,
+                            2,
+                        )?
+                        .value;
+                    let observation = SourceObservation {
+                        binding: SourceBinding {
+                            source_id: SourceId::parse("frame-source")?,
+                            source_path: CanonicalLocator::from_path(
+                                &histories.join("synthetic.jsonl"),
+                            )?
+                            .as_str()
+                            .into(),
+                            provider: SearchProvider::Claude,
+                            namespace_id: None,
+                            root_identity: "frame-root".into(),
+                        },
+                        revision_id: RevisionId::parse("frame-revision")?,
+                        revision_digest: "a".repeat(64),
+                        parser_version: PARSER_SEMANTIC_VERSION,
+                        state: ObservationState::Complete,
+                        cycle_seq: cycle.token.cycle_seq.get(),
+                        worker_boot_id: "frame-boot".into(),
+                        catalog_incarnation: "frame-catalog".into(),
+                        policy_epoch: cycle.policy_epoch.get(),
+                        started_control_seq: cycle.started_control_seq.unwrap().get(),
+                        observed_at_ms: 3,
+                        committed_at_ms: 4,
+                        selections: vec![SelectionProof {
+                            selection_id: selection.id.as_str().into(),
+                            selection_revision: selection.revision.get(),
+                            root_identity: "frame-root".into(),
+                        }],
+                        repositories: Vec::new(),
+                    };
+                    let mut batch = SourceBatch {
+                        source_path: observation.binding.source_path.clone(),
+                        entries: vec![
+                            (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()],"title":"Synthetic boundary session"})).unwrap(), String::new()),
+                            (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":observation.revision_digest,"len":100000})).unwrap(), String::new()),
+                        ],
+                        placements: Vec::new(),
+                        edges: Vec::new(),
+                        activities: Vec::new(),
+                        usage_events: Vec::new(),
+                        relation_complete: true,
+                        len_bytes: Some(100000),
+                        fingerprint: Some(observation.revision_digest.clone()),
+                        provider_id: Some("claude-code".into()),
+                        resume_claims: Vec::new(),
+                    };
+                    let mut messages = Vec::new();
+                    let mut offset = 0;
+                    for n in 0..12 {
+                        let message = entity(IdKind::Message, &format!("frame-message-{n:02}"));
+                        let text = format!("Turn {n}: {}", "synthetic \"words\" \\\\ ".repeat(48));
+                        let end = offset + text.len() as u64;
+                        batch.entries.push((
+                            message.clone(),
+                            serde_json::to_vec(&json!({"role":"user","text":text})).unwrap(),
+                            text,
+                        ));
+                        let placement = MessagePlacement::new(
+                            session.clone(),
+                            document.clone(),
+                            message.clone(),
+                            n,
+                            false,
+                            Some(EvidenceSpan {
+                                start: offset,
+                                end,
+                            }),
+                        );
+                        offset = end + 1;
+                        if let Some(parent) = messages.last() {
+                            batch.edges.push(MessageEdge {
+                                child_placement_id: placement.id.clone(),
+                                parent_message_id: StableId::clone(parent),
+                                parent_native_id: None,
+                                relation: MessageRelation::Reply,
+                            });
+                        }
+                        batch.placements.push(placement);
+                        messages.push(message);
+                    }
+                    let store = ManagedStore::create(&db, &control, id("frame-catalog"), 1)?;
+                    store.commit_source(&control, &worker, &batch, &observation)?;
+                    Ok(messages)
+                })
+                .unwrap();
+            Self {
+                db,
+                session,
+                messages,
+                _temp: temp,
+            }
+        }
+
+        fn frame(&self, max_bytes: usize) -> PreparedFrame {
+            let args = [
+                "context".to_owned(),
+                self.session.as_str().to_owned(),
+                "--max-bytes".to_owned(),
+                max_bytes.to_string(),
+                "--max-items".to_owned(),
+                "64".to_owned(),
+                "--max-messages".to_owned(),
+                "64".to_owned(),
+            ];
+            let request = parse(&args, 100).unwrap();
+            execute(
+                &self.db,
+                &request,
+                RenderTarget::Cli(OutputMode::Json, Some("frame-boundary")),
+                Instant::now(),
+                None,
+            )
+            .unwrap()
+            .0
+        }
+    }
+
+    fn assert_prefix(frame: &PreparedFrame, expected: &[StableId]) -> Value {
+        assert_eq!(frame.bytes.last(), Some(&b'\n'));
+        let wire: Value = serde_json::from_slice(&frame.bytes).unwrap();
+        assert_eq!(wire["data"], frame.payload["data"]);
+        let messages = wire["data"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), expected.len());
+        for (message, expected) in messages.iter().zip(expected) {
+            assert_eq!(message["message_id"], expected.as_str());
+        }
+        wire
+    }
+
+    #[test]
+    fn robot_context_exact_frame_limit_keeps_all_and_one_less_keeps_maximal_prefix() {
+        let fixture = Fixture::new();
+        let duration = SerializerDuration::fixed(9, false);
+        let complete = fixture.frame(32 * 1024);
+        let full = assert_prefix(&complete, &fixture.messages);
+        assert_eq!(full["outcome"], "success");
+        assert_eq!(full["warnings"], json!([]));
+        assert_eq!(full["meta"]["duration_ms"], 9);
+        assert_eq!(
+            full["data"]["truncation"],
+            json!({"truncated":false,"reason":null})
+        );
+        let n = complete.bytes.len();
+        let exact = fixture.frame(n);
+        assert!(
+            exact.bytes == complete.bytes,
+            "the exact limit must keep the complete measured frame: {} vs {n} bytes",
+            exact.bytes.len()
+        );
+        let short = fixture.frame(n - 1);
+        assert!(short.bytes.len() < n);
+        let prefix = assert_prefix(&short, &fixture.messages[..11]);
+        assert_eq!(prefix["outcome"], "partial");
+        assert_eq!(prefix["warnings"], json!(["response_budget"]));
+        assert_eq!(
+            prefix["data"]["truncation"],
+            json!({"truncated":true,"reason":"max_response_bytes"})
+        );
+        assert_eq!(
+            prefix["data"]["messages"],
+            json!(&full["data"]["messages"].as_array().unwrap()[..11])
+        );
+        // The only larger original prefix is the complete twelve-message
+        // frame measured above, one byte larger than this call permits.
+        drop(duration);
+        assert_eq!(duration_ms(123), 123);
+    }
+
+    #[test]
+    fn robot_context_reuses_saved_frame_after_duration_gains_a_digit() {
+        let fixture = Fixture::new();
+        let duration = SerializerDuration::fixed(9, false);
+        let complete = fixture.frame(32 * 1024);
+        assert_prefix(&complete, &fixture.messages);
+        drop(duration);
+
+        let _duration = SerializerDuration::fixed(9, true);
+        let returned = fixture.frame(complete.bytes.len());
+        let saved = DURATION.with(|slot| {
+            let state = slot.borrow();
+            let state = state.as_ref().unwrap();
+            assert_eq!(state.value, 10, "the clock advanced after the complete fit");
+            assert!(!state.advance_after_complete_fit);
+            state.measured_complete.clone().unwrap()
+        });
+        assert!(saved == complete.bytes, "save the complete nine-ms frame");
+        assert!(
+            returned.bytes == saved,
+            "emit the frame measured at nine: returned {} vs saved {} bytes",
+            returned.bytes.len(),
+            saved.len()
+        );
+        let wire = assert_prefix(&returned, &fixture.messages);
+        assert_eq!(wire["meta"]["duration_ms"], 9);
+        assert_eq!(wire["outcome"], "success");
+        assert_eq!(wire["warnings"], json!([]));
+    }
 }
 
 #[cfg(test)]

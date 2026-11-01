@@ -2409,58 +2409,39 @@ fn context_returns_complete_31k_replay_session_within_32k_robot_frame() {
     );
     let data_bytes = serde_json::to_vec(&complete.0["data"]).unwrap().len();
     eprintln!("replay context: robot frame {frame_bytes} B, data {data_bytes} B");
-    // A Robot frame is the measured frame itself, so the selection margin is
-    // zero; across processes only the digit count of `duration_ms` varies.
-    // `base` is the complete frame without those digits. Each attempt targets
-    // the digits last seen and checks the outcome whichever way they moved: no
-    // frame exceeds its limit, a successful frame is whole, and a partial one
-    // is the Application's prefix with one `response_budget` warning (a halved
-    // retry by the final-frame safety net would add a second).
-    let digits = |frame: &Value| frame["meta"]["duration_ms"].to_string().len();
-    let base = frame_bytes - digits(&complete.0);
-    let attempt = |limit: usize| {
-        let (frame, wire) = context(limit);
-        assert!(wire.len() <= limit, "{} > {limit}", wire.len());
-        if frame["outcome"] == "success" {
-            assert_complete(&(frame.clone(), wire.clone()), limit);
-        } else {
-            assert_eq!(frame["warnings"], json!(["response_budget"]), "{frame}");
-            assert_eq!(
-                frame["data"]["truncation"],
-                json!({"truncated":true,"reason":"max_response_bytes"})
-            );
-            assert_eq!(frame["data"]["messages"].as_array().unwrap().len(), 11);
-        }
-        (frame, wire.len())
-    };
-    // A complete frame exactly at its limit is kept whole.
-    let mut previous = digits(&complete.0);
-    let mut exact = false;
-    for _ in 0..5 {
-        let limit = base + previous;
-        let (frame, bytes) = attempt(limit);
-        previous = digits(&frame);
-        if frame["outcome"] == "success" && bytes == limit {
-            exact = true;
-            break;
-        }
-    }
-    assert!(exact, "no call reproduced a frame exactly at its limit");
-    // One byte short of the frame keeps the largest fitting prefix. Durations
-    // only grow within a call, so a partial frame whose own digits equal the
-    // target proves its complete candidate was exactly one byte over.
-    let mut short = false;
-    for _ in 0..5 {
-        let limit = base + previous - 1;
-        let (frame, _) = attempt(limit);
-        let seen = digits(&frame);
-        if frame["outcome"] == "partial" && seen == previous {
-            short = true;
-            break;
-        }
-        previous = seen;
-    }
-    assert!(short, "no call reproduced a frame one byte over its limit");
+    // Exact N/N-1 boundaries use the module-private serializer-duration seam.
+    // This real process instead has an interval valid for every u64 duration:
+    // a full frame needs at least B+1 bytes; its eleven-message prefix fits B
+    // even with twenty duration digits. No calls need favorable timing.
+    let duration = complete.0["meta"]["duration_ms"].as_u64().unwrap();
+    let base = frame_bytes - duration.to_string().len();
+    let mut minimum_full = complete.0.clone();
+    minimum_full["meta"]["duration_ms"] = json!(0);
+    assert_eq!(
+        serde_json::to_vec(&minimum_full).unwrap().len() + 1,
+        base + 1
+    );
+    let (prefix, wire) = context(base);
+    assert!(wire.len() <= base, "{} > {base}", wire.len());
+    assert!(wire.ends_with('\n'));
+    assert_eq!(prefix["outcome"], "partial", "{prefix}");
+    assert_eq!(prefix["warnings"], json!(["response_budget"]), "{prefix}");
+    assert_eq!(
+        prefix["data"]["truncation"],
+        json!({"truncated":true,"reason":"max_response_bytes"})
+    );
+    let messages = prefix["data"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 11);
+    assert_eq!(
+        messages,
+        &complete.0["data"]["messages"].as_array().unwrap()[..11]
+    );
+    // Measure the actual byte-truncated frame, including its one warning,
+    // envelope and newline; a max_messages frame would have a shorter reason.
+    let mut maximum_prefix = prefix;
+    maximum_prefix["meta"]["duration_ms"] = json!(u64::MAX);
+    let maximum_bytes = serde_json::to_vec(&maximum_prefix).unwrap().len() + 1;
+    assert!(maximum_bytes <= base, "{maximum_bytes} > {base}");
 }
 
 /// Context calls over one MCP session. Call ids are single digits, so the
