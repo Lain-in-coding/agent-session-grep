@@ -33,26 +33,68 @@ fn fixture_phase<T>(
     }
     operation(effective_end)
 }
-fn setup_fixture_with<C, L>(
-    create: impl FnOnce(Instant, Instant) -> Result<C, PortError>,
-    installation_lock: impl FnOnce(Instant, Instant) -> Result<L, PortError>,
-    catalog_prefix: impl FnOnce(&C, &L, Instant, Instant) -> Result<(), PortError>,
-) -> Result<(C, L), PortError> {
-    // Preserve create's original CREATE_BUDGET, separately from lock/setup.
-    let started = Instant::now();
-    let control = fixture_phase(started + Duration::from_secs(30), |end| {
-        create(started, end)
-    })?;
-    let started = Instant::now();
-    let lock = fixture_phase(started + Duration::from_secs(5), |end| {
-        installation_lock(started, end)
-    })?;
-    // This five-second end starts only after creation and the installation lock.
-    let started = Instant::now();
-    fixture_phase(started + Duration::from_secs(5), |end| {
-        catalog_prefix(&control, &lock, started, end)
-    })?;
-    Ok((control, lock))
+#[derive(Clone, Copy, Debug)]
+struct FixturePhase {
+    started: Instant,
+    requested_end: Instant,
+    effective_end: Instant,
+}
+impl FixturePhase {
+    fn new(allowance: Duration) -> Self {
+        let started = Instant::now();
+        let requested_end = started + allowance;
+        Self {
+            started,
+            requested_end,
+            effective_end: SqliteControlStore::effective_runtime_deadline(requested_end),
+        }
+    }
+    fn assert_received(self, received_end: Instant) {
+        assert_eq!(
+            received_end, self.effective_end,
+            "fixture receiving end differs from its original phase"
+        );
+    }
+}
+fn receive_control_create(
+    root: &Path,
+    phase: FixturePhase,
+    received_end: Instant,
+) -> Result<SqliteControlStore, PortError> {
+    phase.assert_received(received_end);
+    SqliteControlStore::create_with_deadline(
+        root,
+        &id("installation"),
+        DesiredUpdates::Running,
+        received_end,
+    )
+}
+fn receive_installation_lock(
+    prefix: &Path,
+    phase: FixturePhase,
+    received_end: Instant,
+) -> ExclusiveGuard {
+    phase.assert_received(received_end);
+    acquire_until(
+        prefix,
+        LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+        received_end,
+    )
+}
+fn receive_catalog_prefix(
+    control: &SqliteControlStore,
+    root: &Path,
+    catalog: &Path,
+    prefix: &Path,
+    installation_lock: &ExclusiveGuard,
+    phase: FixturePhase,
+    received_end: Instant,
+) -> Result<(), PortError> {
+    phase.assert_received(received_end);
+    prepare(control, received_end, |end| {
+        assert_eq!(end, received_end);
+        prepare_catalog_and_prefix(control, root, catalog, prefix, installation_lock, end)
+    })
 }
 fn diagnose_failure<T>(
     reported: &mut bool,
@@ -164,44 +206,45 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_setup_observer(|_, _, _| {})
+    }
+    fn new_with_setup_observer(mut observe: impl FnMut(&str, FixturePhase, Instant)) -> Self {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("data");
         let prefix = temp.path().join("install");
         std::fs::create_dir(&prefix).unwrap();
         let catalog = root.join("catalog.db");
+        // Keep create's original CREATE_BUDGET independent of later setup.
+        let creation = FixturePhase::new(Duration::from_secs(30));
+        let control = fixture_phase(creation.requested_end, |phase_end| {
+            receive_control_create(&root, creation, phase_end)
+        })
+        .unwrap();
+        observe("create", creation, Instant::now());
+        let locking = FixturePhase::new(Duration::from_secs(5));
+        let installation_lock = fixture_phase(locking.requested_end, |phase_end| {
+            Ok(receive_installation_lock(&prefix, locking, phase_end))
+        })
+        .unwrap();
+        observe("installation_lock", locking, Instant::now());
+        // Start this end only after real creation and installation-lock admission.
+        let preparation = FixturePhase::new(Duration::from_secs(5));
         let mut preparation_calls = 0;
-        let (control, installation_lock) = setup_fixture_with(
-            |_, end| {
-                SqliteControlStore::create_with_deadline(
-                    &root,
-                    &id("installation"),
-                    DesiredUpdates::Running,
-                    end,
-                )
-            },
-            |_, end| {
-                Ok(acquire_until(
-                    &prefix,
-                    LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
-                    end,
-                ))
-            },
-            |control, installation_lock, _, preparation_end| {
-                prepare(control, preparation_end, |end| {
-                    preparation_calls += 1;
-                    prepare_catalog_and_prefix(
-                        control,
-                        &root,
-                        &catalog,
-                        &prefix,
-                        installation_lock,
-                        end,
-                    )
-                })
-            },
-        )
+        fixture_phase(preparation.requested_end, |phase_end| {
+            preparation_calls += 1;
+            receive_catalog_prefix(
+                &control,
+                &root,
+                &catalog,
+                &prefix,
+                &installation_lock,
+                preparation,
+                phase_end,
+            )
+        })
         .unwrap();
         assert_eq!(preparation_calls, 1);
+        observe("catalog_prefix", preparation, Instant::now());
         Self {
             _tmp: temp,
             root,
@@ -313,38 +356,24 @@ fn prepare_catalog_and_prefix(
 }
 #[test]
 fn fixture_setup_preserves_original_phase_budgets_and_order() {
-    use std::cell::{Cell, RefCell};
-    let calls = RefCell::new(Vec::new());
-    let previous_finished = Cell::new(Instant::now());
-    let (control, lock) = setup_fixture_with(
-        |started, end| {
-            assert!(started >= previous_finished.get());
-            assert_eq!(end.duration_since(started), Duration::from_secs(30));
-            calls.borrow_mut().push("create");
-            previous_finished.set(Instant::now());
-            Ok(17)
-        },
-        |started, end| {
-            assert!(started >= previous_finished.get());
-            assert_eq!(end.duration_since(started), Duration::from_secs(5));
-            calls.borrow_mut().push("installation_lock");
-            previous_finished.set(Instant::now());
-            Ok(23)
-        },
-        |control, lock, started, end| {
-            assert_eq!((*control, *lock), (17, 23));
-            assert!(started >= previous_finished.get());
-            assert_eq!(end.duration_since(started), Duration::from_secs(5));
-            calls.borrow_mut().push("catalog_prefix");
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert_eq!((control, lock), (17, 23));
-    assert_eq!(
-        *calls.borrow(),
-        ["create", "installation_lock", "catalog_prefix"]
-    );
+    let mut calls = Vec::new();
+    let mut previous_finished = Instant::now();
+    let f = Fixture::new_with_setup_observer(|name, phase, finished| {
+        assert!(phase.started >= previous_finished);
+        assert!(finished >= phase.started);
+        let allowance = if name == "create" { 30 } else { 5 };
+        assert_eq!(
+            phase.requested_end.duration_since(phase.started),
+            Duration::from_secs(allowance)
+        );
+        assert_eq!(phase.effective_end, phase.requested_end);
+        calls.push(name.to_owned());
+        previous_finished = finished;
+    });
+    assert_eq!(calls, ["create", "installation_lock", "catalog_prefix"]);
+    assert!(f.catalog.exists());
+    let probe = end();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
 }
 #[test]
 fn fixture_setup_honors_earlier_outer_end_and_expiry_before_effects() {
@@ -355,26 +384,14 @@ fn fixture_setup_honors_earlier_outer_end_and_expiry_before_effects() {
     let calls = Cell::new(0);
     f.control
         .with_runtime_deadline(outer_end, || {
-            setup_fixture_with(
-                |_, end| {
-                    assert_eq!(end, outer_end);
-                    assert_preparation_end(end);
-                    calls.set(calls.get() + 1);
-                    Ok(())
-                },
-                |_, end| {
-                    assert_eq!(end, outer_end);
-                    assert_preparation_end(end);
-                    calls.set(calls.get() + 1);
-                    Ok(())
-                },
-                |_, _, _, end| {
-                    assert_eq!(end, outer_end);
-                    assert_preparation_end(end);
-                    calls.set(calls.get() + 1);
-                    Ok(())
-                },
-            )?;
+            let nested = Fixture::new_with_setup_observer(|_, phase, _| {
+                assert_eq!(phase.effective_end, outer_end);
+                assert!(phase.requested_end > outer_end);
+                assert_preparation_end(outer_end);
+                calls.set(calls.get() + 1);
+            });
+            assert!(nested.catalog.exists());
+            assert_preparation_end(outer_end);
             Ok(())
         })
         .unwrap();
