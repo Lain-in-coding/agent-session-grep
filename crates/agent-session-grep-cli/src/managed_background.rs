@@ -10776,6 +10776,223 @@ mod control_deadline_tests {
         );
     }
 
+    fn assert_pending_idle_preserves_observation(
+        fixture: &CycleFixture,
+        schedule: &mut SourceScheduleState,
+        boot: &ObservationClock,
+        pending: &mut Option<PendingCycle>,
+    ) {
+        let intent = pending.as_ref().unwrap();
+        let token = intent.token.clone();
+        let outcome = intent.observed.as_ref().unwrap().outcome.clone();
+        assert!(outcome.idle());
+        let next = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        let publications = publication_counts(fixture);
+        let progress = fixture.read_control(|control| control.source_progress_inventory());
+        let cycle = fixture.read_control(|control| control.cycle(token.cycle_seq));
+        assert_eq!(
+            resume_pending(fixture, schedule, boot, pending).unwrap(),
+            outcome
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq,
+            next
+        );
+        assert_eq!(publication_counts(fixture), publications);
+        assert_eq!(
+            fixture.read_control(|control| control.source_progress_inventory()),
+            progress
+        );
+        let terminal = fixture.read_control(|control| control.cycle(token.cycle_seq));
+        assert_eq!(terminal.token, token);
+        assert_eq!(terminal.selections, cycle.selections);
+        assert_eq!(terminal.state, finish_state(outcome.finish()));
+    }
+
+    #[test]
+    fn pending_idle_mixed_plain_and_metadata_produce_only_plain_due_candidates() {
+        let fixture = CycleFixture::new();
+        let plain = fixture.write_source("plain.jsonl", SearchProvider::Claude, "plain original");
+        let surface = fixture._temp.path().join(".workbuddy");
+        std::fs::create_dir(&surface).unwrap();
+        let metadata = surface.join("workbuddy.db");
+        let conn = rusqlite::Connection::open(&metadata).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions(
+                id TEXT PRIMARY KEY, deleted_at INTEGER, transport TEXT, cwd TEXT);
+             INSERT INTO sessions VALUES('synthetic-cloud',NULL,'cloud','synthetic-project');",
+        )
+        .unwrap();
+        drop(conn);
+        let provider = SearchProvider::parse("workbuddy").unwrap();
+        let request = crate::managed_control::source_selection(provider, &metadata).unwrap();
+        assert_eq!(request.region.kind, RootKind::Exact);
+        control_change_before(&fixture.control, fixture.scope_end, |seq| {
+            fixture.control.add_selection(seq, request.clone())
+        })
+        .unwrap();
+        let descriptor = managed_source_discovery::describe(provider, &metadata, true).unwrap();
+        assert_eq!(descriptor.kind, SourceKind::WorkBuddyMetadata);
+        let metadata_before = std::fs::read(&metadata).unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let sources = fixture.sources();
+        let plain_source = sources
+            .iter()
+            .find(|source| Path::new(&source.binding.source_path) == plain)
+            .unwrap();
+        let metadata_source = sources
+            .iter()
+            .find(|source| Path::new(&source.binding.source_path) == metadata)
+            .unwrap();
+        assert_eq!(metadata_source.binding.provider, provider);
+        assert!(metadata_source.latest_receipt.as_ref().unwrap().published);
+        let observed = pending.as_ref().unwrap().observed.as_ref().unwrap();
+        assert!(observed.outcome.idle());
+        assert_eq!(observed.cycle.selections.len(), 2);
+        assert_eq!(
+            observed.outcome.due_candidates,
+            BTreeSet::from([plain_source.binding.source_id.clone()])
+        );
+        // Metadata publishes a complete prerequisite without acquiring the
+        // plain-source full-verification timer. It is owed at generation time.
+        assert!(
+            schedule
+                .sources
+                .contains_key(&metadata_source.binding.source_id)
+        );
+        assert!(schedule.full_due(&metadata_source.binding.source_id, schedule.now()));
+        assert_pending_idle_preserves_observation(&fixture, &mut schedule, &boot, &mut pending);
+        assert!(schedule.full_due(&metadata_source.binding.source_id, schedule.now()));
+        assert_eq!(std::fs::read(metadata).unwrap(), metadata_before);
+    }
+
+    fn pending_shadow_dsh_source(native: &str, text: &str) -> Vec<u8> {
+        let rows = [
+            serde_json::json!({
+                "type":"session","version":4,"id":native,"createdAt":0,
+                "cwd":"/synthetic/project","isSeeded":false,"delegationDepth":0
+            }),
+            serde_json::json!({
+                "type":"user/message","seq":0,"time":1700000000123_u64,
+                "surfaceOp":"append","data":{
+                    "id":format!("{native}-message"),"role":"user",
+                    "content":[{"type":"text","text":text}],"source":{"kind":"user"}
+                }
+            }),
+        ];
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        for row in rows {
+            writeln!(encoder, "{row}").unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn pending_idle_complete_authority_shadow_excludes_the_real_lower_representation() {
+        let fixture = CycleFixture::new();
+        let plain = fixture.write_source("plain.jsonl", SearchProvider::Claude, "plain original");
+        let history = fixture._temp.path().join(".dsh/sessions");
+        let session = history.join("project/synthetic-session");
+        std::fs::create_dir_all(&session).unwrap();
+        let lower = session.join("session.v3.jsonl.zstd");
+        let preferred = session.join("session.v4.jsonl.zstd");
+        let lower_bytes = pending_shadow_dsh_source("synthetic-session", "obsolete shadow");
+        let preferred_bytes = pending_shadow_dsh_source("synthetic-session", "current original");
+        std::fs::write(&lower, &lower_bytes).unwrap();
+        std::fs::write(&preferred, &preferred_bytes).unwrap();
+        let provider = SearchProvider::parse("deepseek-harness").unwrap();
+        let request = crate::managed_control::source_selection(provider, &history).unwrap();
+        let selection = control_change_before(&fixture.control, fixture.scope_end, |seq| {
+            fixture.control.add_selection(seq, request.clone())
+        })
+        .unwrap()
+        .value;
+        let policy =
+            fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+        let lower_id = source_id(
+            &policy,
+            provider,
+            &CanonicalLocator::from_path(&lower).unwrap(),
+        )
+        .unwrap();
+        let discovery = discover(
+            &fixture.control,
+            &policy,
+            &selection,
+            &BTreeMap::new(),
+            fixture.scope_end,
+        )
+        .unwrap();
+        assert!(discovery.complete);
+        assert_eq!(discovery.files.len(), 2);
+        let descriptors = discovery
+            .files
+            .iter()
+            .map(|file| file.descriptor.clone())
+            .collect::<Vec<_>>();
+        let preferred_indices = managed_source_discovery::authoritative_indices(&descriptors);
+        assert_eq!(preferred_indices.len(), 1);
+        assert_eq!(discovery.files[preferred_indices[0]].path, preferred);
+        assert!(discovery.files.iter().any(|file| file.id == lower_id));
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        schedule
+            .prepare(
+                &policy,
+                &ControlId::parse("pending-catalog").unwrap(),
+                fixture.worker().boot_id(),
+            )
+            .unwrap();
+        // This debt belongs to an actual discovered lower representation.
+        // Complete coverage retires it before the due candidates are produced.
+        schedule.register(&lower_id, None).unwrap();
+        assert!(schedule.full_due(&lower_id, schedule.now()));
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let sources = fixture.sources();
+        assert_eq!(sources.len(), 2);
+        assert!(
+            !sources
+                .iter()
+                .any(|source| source.binding.source_id == lower_id)
+        );
+        let plain_id = sources
+            .iter()
+            .find(|source| Path::new(&source.binding.source_path) == plain)
+            .unwrap()
+            .binding
+            .source_id
+            .clone();
+        let active_id = sources
+            .iter()
+            .find(|source| Path::new(&source.binding.source_path) == preferred)
+            .unwrap()
+            .binding
+            .source_id
+            .clone();
+        let observed = pending.as_ref().unwrap().observed.as_ref().unwrap();
+        assert!(observed.outcome.idle());
+        assert_eq!(observed.outcome.due_candidates, BTreeSet::from([plain_id]));
+        assert!(!observed.outcome.due_candidates.contains(&lower_id));
+        assert!(!observed.outcome.due_candidates.contains(&active_id));
+        assert!(!schedule.sources.contains_key(&lower_id));
+        assert!(schedule.full_due(&lower_id, schedule.now()));
+        schedule.invalidate(&active_id);
+        assert!(schedule.full_due(&active_id, schedule.now()));
+        assert_pending_idle_preserves_observation(&fixture, &mut schedule, &boot, &mut pending);
+        assert!(schedule.full_due(&lower_id, schedule.now()));
+        assert!(schedule.full_due(&active_id, schedule.now()));
+        assert_eq!(std::fs::read(lower).unwrap(), lower_bytes);
+        assert_eq!(std::fs::read(preferred).unwrap(), preferred_bytes);
+    }
+
     #[test]
     fn pending_idle_pause_resume_invalidates_an_already_terminal_result() {
         for observed_pause in [false, true] {
