@@ -2515,7 +2515,7 @@ pub fn inspect_catalog_identity(
 
 // Writable catalogs need a pin that permits our SQLite writes but refuses
 // reparse/hardlink aliases and, on Windows, native deletion/rename sharing.
-fn open_catalog_pin(control: &SqliteControlStore, path: &Path) -> PortResult<fs::File> {
+pub(crate) fn open_catalog_pin(control: &SqliteControlStore, path: &Path) -> PortResult<fs::File> {
     control.validate_catalog_file(path)?;
     #[cfg(windows)]
     let file = {

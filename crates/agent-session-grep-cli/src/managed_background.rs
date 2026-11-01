@@ -1042,9 +1042,7 @@ fn checkpoint_at_boundary(
     if !ManagedStore::wal_len(db)?.is_some_and(|bytes| bytes > 0) {
         return Ok(());
     }
-    let report = control.with_runtime_deadline(Instant::now() + CONTROL_BUDGET, || {
-        ManagedStore::checkpoint_wal(db, control, authority)
-    });
+    let report = ManagedStore::checkpoint_wal(db, control, authority, incarnation);
     #[cfg(test)]
     wal_worker_tests::event(wal_worker_tests::Event::Checkpoint(
         report.as_ref().cloned().map_err(failure),
@@ -1093,42 +1091,73 @@ fn finish_worker(
     wal_worker_tests::event(wal_worker_tests::Event::Boundary(WorkerBoundary::Exit(
         exit,
     )));
-    let current =
-        control.with_runtime_deadline(Instant::now() + CONTROL_BUDGET, || control.status())?;
-    if worker_exit(&current) != Some(exit) {
-        // A resumed worker or a changed fence gets a new admission decision.
-        return Ok(false);
-    }
-    let checkpoint_error = if exit == WorkerExit::Stopped && !current.policy.emission_blocked() {
-        // Outside the CAS loop: even a retried stop records only one attempt.
-        match checkpoint_at_boundary(db, control, authority, incarnation) {
-            Ok(()) | Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => None,
-            Err(error) => Some(error),
-        }
-    } else {
-        None
-    };
-    let stopped = control_change(control, |seq| {
-        if worker_exit(&control.status()?).is_none() {
+    // This process-local stop intent outlives a refused cleanup tick. Once the
+    // physical attempt ran, later cadences only recheck intent and clean control.
+    let mut pending = PendingStop::default();
+    loop {
+        let tick = Instant::now();
+        let current =
+            match control.with_runtime_deadline(tick + CONTROL_BUDGET, || control.status()) {
+                Ok(current) => current,
+                Err(PortError::WriterBusy(_)) => {
+                    wait_stop_cleanup(tick);
+                    continue;
+                }
+                Err(error) => return Err(pending.error.unwrap_or(error)),
+            };
+        let current_exit = worker_exit(&current);
+        if current_exit.is_none() {
+            if let Some(error) = pending.error {
+                record_boundary_failure(control, authority, &error)?;
+            }
             return Ok(false);
         }
-        control.stop_worker(seq, authority, app_clock_ms())?;
-        Ok(true)
-    });
-    if matches!(stopped, Ok(false)) {
-        if let Some(error) = checkpoint_error {
-            // Running resumed while the physical attempt was in flight. Keep
-            // that worker alive and report the error like a retention failure.
-            record_boundary_failure(control, authority, &error)?;
+        if !pending.physical_complete {
+            if current_exit != Some(exit) {
+                return Ok(false);
+            }
+            pending.physical_complete = true;
+            if exit == WorkerExit::Stopped && !current.policy.emission_blocked() {
+                // Outside every retry closure, once for this stop intent.
+                pending.error = match checkpoint_at_boundary(db, control, authority, incarnation) {
+                    Ok(()) | Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+            }
         }
-        return Ok(false);
+        let stopped = control_change(control, |seq| {
+            if worker_exit(&control.status()?).is_none() {
+                return Ok(false);
+            }
+            control.stop_worker(seq, authority, app_clock_ms())?;
+            Ok(true)
+        });
+        match stopped {
+            Ok(false) => {
+                if let Some(error) = pending.error {
+                    record_boundary_failure(control, authority, &error)?;
+                }
+                return Ok(false);
+            }
+            Ok(true) => return pending.error.map_or(Ok(true), Err),
+            Err(PortError::WriterBusy(_)) => wait_stop_cleanup(tick),
+            Err(error) => return Err(pending.error.unwrap_or(error)),
+        }
     }
-    // Always attempt cleanup, even after a hard checkpoint failure. Preserve
-    // its original error and never heartbeat after stop_worker records Offline.
-    if let Some(error) = checkpoint_error {
-        return Err(error);
-    }
-    stopped
+}
+
+#[derive(Default)]
+struct PendingStop {
+    physical_complete: bool,
+    error: Option<PortError>,
+}
+
+fn wait_stop_cleanup(tick: Instant) {
+    #[cfg(test)]
+    wal_worker_tests::event(wal_worker_tests::Event::StopCleanupDeferred);
+    std::thread::sleep(CADENCE.saturating_sub(tick.elapsed()));
 }
 
 /// Classify intentional exits before touching the catalog. The caller performs
@@ -5559,6 +5588,7 @@ mod wal_worker_tests {
     pub(super) enum Event {
         Boundary(WorkerBoundary),
         Checkpoint(Result<WalCheckpointReport, BackgroundFailure>),
+        StopCleanupDeferred,
     }
 
     struct Hooks {
@@ -6062,6 +6092,98 @@ mod wal_worker_tests {
         let state = fixture.status();
         assert_eq!(state.state, UpdateState::Offline);
         assert_eq!(state.error, None);
+    }
+    #[test]
+    fn wal_worker_stop_cleanup_busy_keeps_same_boot_and_one_physical_attempt() {
+        for hard_error in [false, true] {
+            for next_intent in ["stop", "running", "fence"] {
+                let fixture = Fixture::new(false);
+                fixture.desired(DesiredUpdates::Stopped);
+                let worker = Worker::start(&fixture.db);
+                worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+                if hard_error {
+                    Connection::open(&fixture.db)
+                        .unwrap()
+                        .pragma_update(None, "application_id", 0)
+                        .unwrap();
+                }
+                let boot = fixture.status().boot_id;
+                worker.advance();
+                if hard_error {
+                    assert!(matches!(
+                        worker.next(),
+                        Event::Checkpoint(Err(BackgroundFailure::Failed))
+                    ));
+                } else {
+                    worker.checkpoint(WalCheckpointOutcome::Reset);
+                }
+                let contender =
+                    Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap()))
+                        .unwrap();
+                contender.execute_batch("BEGIN IMMEDIATE").unwrap();
+                worker.advance();
+                assert!(matches!(worker.next(), Event::StopCleanupDeferred));
+                assert_eq!(fixture.status().boot_id, boot);
+                assert_ne!(fixture.status().state, UpdateState::Offline);
+                contender.execute_batch("ROLLBACK").unwrap();
+                drop(contender);
+                if hard_error && next_intent == "running" {
+                    // Restore the synthetic identity before the resumed poll.
+                    Connection::open(&fixture.db)
+                        .unwrap()
+                        .pragma_update(None, "application_id", 0x41534732_i64)
+                        .unwrap();
+                }
+                match next_intent {
+                    "running" => fixture.desired(DesiredUpdates::Running),
+                    "fence" => {
+                        fixture
+                            .control
+                            .set_maintenance(
+                                fixture.control.status().unwrap().policy.control_seq,
+                                &id("owner"),
+                                MaintenanceFence {
+                                    state: MaintenanceState::Updating,
+                                    owner: Some(id("owner")),
+                                    phase: Some(MaintenancePhase::Quiescing),
+                                },
+                            )
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                worker.advance();
+                if next_intent == "running" {
+                    worker.boundary(WorkerBoundary::Idle);
+                    assert_eq!(fixture.status().boot_id, boot);
+                    assert_eq!(fixture.status().state, UpdateState::Idle);
+                    // No stop attempt is replayed before current work resumes.
+                    fixture.desired(DesiredUpdates::Stopped);
+                    worker.advance();
+                    let next = worker.next();
+                    if matches!(next, Event::Checkpoint(_)) {
+                        worker.advance();
+                        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+                    } else {
+                        assert!(matches!(
+                            next,
+                            Event::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped))
+                        ));
+                    }
+                    worker.advance();
+                    worker.join().unwrap();
+                } else {
+                    let result = worker.join();
+                    if hard_error {
+                        assert!(matches!(result, Err(PortError::SchemaIncompatible(_))));
+                    } else {
+                        result.unwrap();
+                    }
+                    assert_eq!(fixture.status().state, UpdateState::Offline);
+                    assert_eq!(fixture.status().boot_id, boot);
+                }
+            }
+        }
     }
 }
 
