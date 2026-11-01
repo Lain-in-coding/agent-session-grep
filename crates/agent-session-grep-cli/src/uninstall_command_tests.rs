@@ -7,7 +7,40 @@ use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
 use agent_session_grep_launcher::{CurrentPointer, ReleaseMetadata, metadata, verify_installation};
 use agent_session_grep_ports::{SearchProvider, control::*, managed::*};
 use serde_json::json;
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ControlValidationRead {
+    Open,
+    Policy,
+    Status,
+}
+type ControlValidationHook = Box<dyn FnMut(ControlValidationRead) -> Result<(), PortError>>;
+thread_local! {
+    static CONTROL_VALIDATION_HOOK: RefCell<Option<ControlValidationHook>> = const { RefCell::new(None) };
+}
+pub(super) fn before_control_validation(step: ControlValidationRead) -> Result<(), PortError> {
+    CONTROL_VALIDATION_HOOK.with_borrow_mut(|hook| match hook {
+        Some(hook) => hook(step),
+        None => Ok(()),
+    })
+}
+fn with_control_validation_hook<T>(
+    hook: impl FnMut(ControlValidationRead) -> Result<(), PortError> + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<ControlValidationHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONTROL_VALIDATION_HOOK.with_borrow_mut(|hook| *hook = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(CONTROL_VALIDATION_HOOK.with_borrow_mut(|current| current.replace(Box::new(hook))));
+    operation()
+}
 fn id(value: &str) -> ControlId {
     ControlId::parse(value).unwrap()
 }
@@ -499,6 +532,417 @@ fn repeated_private_receipt_never_switches_keep_data_to_default() {
     fixture.preserved();
 }
 #[test]
+fn journal_validation_scopes_every_control_read_to_one_effective_end() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    for nested in [false, true] {
+        let end = deadline();
+        let requested = if nested {
+            end + Duration::from_secs(5)
+        } else {
+            end
+        };
+        let probe = requested + Duration::from_secs(5);
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&reads);
+        let policy = with_control_validation_hook(
+            move |step| {
+                recorded
+                    .borrow_mut()
+                    .push((step, SqliteControlStore::effective_runtime_deadline(probe)));
+                Ok(())
+            },
+            || {
+                if nested {
+                    fixture
+                        .control
+                        .with_runtime_deadline(end, || {
+                            let result = journal.validate(&fixture.control, requested);
+                            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                            Ok(result)
+                        })
+                        .unwrap()
+                } else {
+                    journal.validate(&fixture.control, requested)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(policy.installation_id.as_str(), "uninstall-installation");
+        assert_eq!(
+            *reads.borrow(),
+            [
+                (ControlValidationRead::Open, end),
+                (ControlValidationRead::Policy, end),
+                (ControlValidationRead::Status, end),
+            ]
+        );
+        assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    }
+    fixture.preserved();
+}
+#[test]
+fn journal_validation_shorter_caller_end_restores_later_outer_scope() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    for (mut refusal, expected) in [
+        (None, None),
+        (
+            Some(PortError::WriterBusy("synthetic contention".into())),
+            Some(Reason::ControlCleanupPending),
+        ),
+        (
+            Some(PortError::DeadlineExceeded("synthetic expiry".into())),
+            Some(Reason::Deadline),
+        ),
+    ] {
+        let caller_end = deadline();
+        let outer_end = caller_end + Duration::from_secs(5);
+        let probe_end = outer_end + Duration::from_secs(5);
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&reads);
+        let result = with_control_validation_hook(
+            move |step| {
+                recorded.borrow_mut().push((
+                    step,
+                    SqliteControlStore::effective_runtime_deadline(probe_end),
+                ));
+                if step == ControlValidationRead::Status
+                    && let Some(error) = refusal.take()
+                {
+                    return Err(error);
+                }
+                Ok(())
+            },
+            || {
+                fixture
+                    .control
+                    .with_runtime_deadline(outer_end, || {
+                        let result = journal.validate(&fixture.control, caller_end);
+                        assert_eq!(
+                            SqliteControlStore::effective_runtime_deadline(probe_end),
+                            outer_end
+                        );
+                        Ok(result)
+                    })
+                    .unwrap()
+            },
+        );
+        match expected {
+            Some(expected) => assert!(matches!(result, Err(reason) if reason == expected)),
+            None => assert_eq!(
+                result.unwrap().installation_id.as_str(),
+                "uninstall-installation"
+            ),
+        }
+        assert_eq!(
+            *reads.borrow(),
+            [
+                (ControlValidationRead::Open, caller_end),
+                (ControlValidationRead::Policy, caller_end),
+                (ControlValidationRead::Status, caller_end),
+            ]
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            probe_end
+        );
+    }
+    fixture.preserved();
+}
+#[test]
+fn journal_validation_control_errors_keep_deadline_and_hard_refusals_distinct() {
+    let end = deadline();
+    for now in [
+        end - Duration::from_nanos(1),
+        end,
+        end + Duration::from_nanos(1),
+    ] {
+        assert_eq!(
+            journal_control_error(
+                PortError::WriterBusy("synthetic contention".into()),
+                end,
+                now
+            ),
+            if now >= end {
+                Reason::Deadline
+            } else {
+                Reason::ControlCleanupPending
+            }
+        );
+        assert_eq!(
+            journal_control_error(
+                PortError::DeadlineExceeded("synthetic expiry".into()),
+                end,
+                now
+            ),
+            Reason::Deadline
+        );
+        for hard_error in [
+            PortError::InvalidRequest("synthetic invalid request".into()),
+            PortError::GenerationMismatch("synthetic generation".into()),
+            PortError::Backend("synthetic backend failure".into()),
+            PortError::SourceIo("synthetic source failure".into()),
+            PortError::SchemaIncompatible("synthetic schema".into()),
+            PortError::NotFound("synthetic missing control".into()),
+            PortError::SnapshotChanged("synthetic changed snapshot".into()),
+        ] {
+            assert_eq!(
+                journal_control_error(hard_error, end, now),
+                Reason::IdentityChanged
+            );
+        }
+    }
+}
+#[test]
+fn journal_validation_stops_on_each_control_error_and_restores_the_outer_end() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let steps = [
+        ControlValidationRead::Open,
+        ControlValidationRead::Policy,
+        ControlValidationRead::Status,
+    ];
+    for (index, failed_step) in steps.into_iter().enumerate() {
+        for (injected, expected) in [
+            (
+                PortError::WriterBusy("synthetic contention".into()),
+                Reason::ControlCleanupPending,
+            ),
+            (
+                PortError::DeadlineExceeded("synthetic expiry".into()),
+                Reason::Deadline,
+            ),
+            (
+                PortError::SchemaIncompatible("synthetic schema".into()),
+                Reason::IdentityChanged,
+            ),
+            (
+                PortError::SourceIo("synthetic source failure".into()),
+                Reason::IdentityChanged,
+            ),
+        ] {
+            let end = deadline();
+            let requested = end + Duration::from_secs(5);
+            let mut injected = Some(injected);
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let recorded = Rc::clone(&reads);
+            let result = with_control_validation_hook(
+                move |step| {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(requested),
+                        end
+                    );
+                    recorded.borrow_mut().push(step);
+                    if step == failed_step {
+                        Err(injected.take().expect("one refusal, no retry"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    fixture
+                        .control
+                        .with_runtime_deadline(end, || {
+                            let result = journal.validate(&fixture.control, requested);
+                            assert_eq!(
+                                SqliteControlStore::effective_runtime_deadline(requested),
+                                end
+                            );
+                            Ok(result)
+                        })
+                        .unwrap()
+                },
+            );
+            assert!(matches!(result, Err(reason) if reason == expected));
+            assert_eq!(*reads.borrow(), steps[..=index]);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                requested
+            );
+        }
+    }
+    fixture.preserved();
+}
+#[test]
+fn journal_validation_expired_before_open_has_no_effects() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let paths = [
+        SqliteControlStore::path(&fixture.root),
+        fixture.catalog.clone(),
+        fixture.source.clone(),
+        journal.receipt_path(),
+        journal.root.join("owner.json"),
+    ];
+    let entries = |root: &Path| {
+        let mut names: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+    let data_entries = entries(&fixture.root);
+    let journal_entries = entries(&journal.root);
+    let end = Instant::now();
+    let result = with_control_validation_hook(
+        |_| panic!("expired validation must not open or read control"),
+        || journal.validate(&fixture.control, end),
+    );
+    assert!(matches!(result, Err(Reason::Deadline)));
+    let after: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+    assert_eq!(before, after);
+    assert_eq!(entries(&fixture.root), data_entries);
+    assert_eq!(entries(&journal.root), journal_entries);
+    fixture.preserved();
+}
+#[test]
+fn journal_validation_preserves_a_genuine_control_identity_mismatch() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let other = SqliteControlStore::create_with_deadline(
+        &fixture._temp.path().join("other-control"),
+        &id("synthetic-other-installation"),
+        DesiredUpdates::Paused,
+        deadline(),
+    )
+    .unwrap();
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&reads);
+    let result = with_control_validation_hook(
+        move |step| {
+            recorded.borrow_mut().push(step);
+            Ok(())
+        },
+        || journal.validate(&other, deadline()),
+    );
+    assert!(matches!(result, Err(Reason::IdentityChanged)));
+    assert_eq!(
+        *reads.borrow(),
+        [
+            ControlValidationRead::Open,
+            ControlValidationRead::Policy,
+            ControlValidationRead::Status,
+        ]
+    );
+    assert_eq!(
+        control_status(&other).policy.installation_id.as_str(),
+        "synthetic-other-installation"
+    );
+    fixture.preserved();
+}
+#[test]
+fn journal_validation_preserves_real_maintenance_state_and_owner_conflicts() {
+    let fixture = Fixture::new();
+    let journal = fixture.fenced_journal(true);
+    let installation_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+    let installation = fixture
+        .control
+        .bind_installation(&fixture.prefix, &installation_lock)
+        .unwrap();
+    let policy_lock = lock(&fixture.root, LockKind::PolicyOwner);
+    let bound = fixture.control.bind_control_root(&policy_lock).unwrap();
+    let owner = id(&journal.state.owner.nonce);
+    let other_owner = id("synthetic-other-maintenance-owner");
+    let paths = [
+        SqliteControlStore::path(&fixture.root),
+        journal.receipt_path(),
+        journal.root.join("owner.json"),
+        fixture.source.clone(),
+    ];
+    for replace_owner in [false, true] {
+        let conflicting = MaintenanceFence {
+            state: if replace_owner {
+                MaintenanceState::Uninstalling
+            } else {
+                MaintenanceState::Updating
+            },
+            owner: Some(if replace_owner {
+                other_owner.clone()
+            } else {
+                owner.clone()
+            }),
+            phase: Some(MaintenancePhase::Quiescing),
+        };
+        fixture
+            .control
+            .with_runtime_deadline(deadline(), || {
+                let expected = fixture.control.status()?.policy.control_seq;
+                if replace_owner {
+                    fixture.control.recover_maintenance(
+                        expected,
+                        &other_owner,
+                        &bound,
+                        &installation,
+                        &owner,
+                        conflicting.clone(),
+                    )
+                } else {
+                    fixture.control.begin_maintenance(
+                        expected,
+                        &owner,
+                        &bound,
+                        &installation,
+                        conflicting.clone(),
+                    )
+                }
+            })
+            .unwrap();
+        let original: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        let caller_end = deadline();
+        let outer_end = caller_end + Duration::from_secs(5);
+        let probe_end = outer_end + Duration::from_secs(5);
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&reads);
+        let result = with_control_validation_hook(
+            move |step| {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe_end),
+                    caller_end
+                );
+                recorded.borrow_mut().push(step);
+                Ok(())
+            },
+            || {
+                fixture
+                    .control
+                    .with_runtime_deadline(outer_end, || {
+                        let result = journal.validate(&fixture.control, caller_end);
+                        assert_eq!(
+                            SqliteControlStore::effective_runtime_deadline(probe_end),
+                            outer_end
+                        );
+                        Ok(result)
+                    })
+                    .unwrap()
+            },
+        );
+        assert!(matches!(result, Err(Reason::MaintenanceConflict)));
+        assert_eq!(
+            *reads.borrow(),
+            [
+                ControlValidationRead::Open,
+                ControlValidationRead::Policy,
+                ControlValidationRead::Status,
+            ]
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            probe_end
+        );
+        assert_eq!(
+            control_status(&fixture.control).policy.maintenance,
+            conflicting
+        );
+        let retained: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        assert_eq!(retained, original);
+    }
+    fixture.preserved();
+}
+#[test]
 fn file_changed_after_durable_plan_is_preserved() {
     let fixture = Fixture::new();
     let journal = fixture.fenced_journal(true);
@@ -880,6 +1324,9 @@ fn unexplained_control_rollback_journal_remains_private_and_pending() {
         &root.join("control.db-journal"),
         b"unexplained independently retained image",
     );
+    let original_control = fs::read(SqliteControlStore::path(&root)).unwrap();
+    let original_marker = fs::read(root.join(RETIREMENT_MARKER)).unwrap();
+    let original_receipt = fs::read(journal.receipt_path()).unwrap();
     assert!(matches!(
         terminal_control_plan(
             &journal,
@@ -890,6 +1337,15 @@ fn unexplained_control_rollback_journal_remains_private_and_pending() {
         Err(Reason::ControlCleanupPending)
     ));
     assert!(SqliteControlStore::path(&root).exists());
+    assert_eq!(
+        fs::read(SqliteControlStore::path(&root)).unwrap(),
+        original_control
+    );
+    assert_eq!(
+        fs::read(root.join(RETIREMENT_MARKER)).unwrap(),
+        original_marker
+    );
+    assert_eq!(fs::read(journal.receipt_path()).unwrap(), original_receipt);
     assert_eq!(
         fs::read(root.join("control.db-journal")).unwrap(),
         b"unexplained independently retained image"

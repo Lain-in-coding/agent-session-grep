@@ -429,6 +429,14 @@ fn time(end: Instant) -> Result<(), Reason> {
         Ok(())
     }
 }
+fn journal_control_error(value: PortError, end: Instant, now: Instant) -> Reason {
+    match value {
+        PortError::WriterBusy(_) if now >= end => Reason::Deadline,
+        PortError::WriterBusy(_) => Reason::ControlCleanupPending,
+        PortError::DeadlineExceeded(_) => Reason::Deadline,
+        _ => Reason::IdentityChanged,
+    }
+}
 fn new_id() -> Result<String, CliError> {
     let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).map_err(|_| error(CanonicalCode::Internal))?;
@@ -753,6 +761,7 @@ impl Journal {
         Ok(journal)
     }
     fn validate(&self, control: &SqliteControlStore, end: Instant) -> Result<ReadPolicy, Reason> {
+        let end = SqliteControlStore::effective_runtime_deadline(end);
         self.validate_roots(end)?;
         if RootIdentity::read(&self.prefix).map_err(|_| Reason::IdentityChanged)?
             != self.prefix_identity
@@ -762,22 +771,26 @@ impl Journal {
         {
             return Err(Reason::IdentityChanged);
         }
-        let fresh = SqliteControlStore::open_read_only(
-            self.catalog.parent().ok_or(Reason::IdentityChanged)?,
-            &ControlId::parse(&self.state.owner.installation_id)
-                .map_err(|_| Reason::IdentityChanged)?,
-        )
-        .map_err(|_| Reason::IdentityChanged)?;
-        let policy = fresh
-            .read_policy(RequestIntersection::Selected)
+        let root = self.catalog.parent().ok_or(Reason::IdentityChanged)?;
+        let installation = ControlId::parse(&self.state.owner.installation_id)
             .map_err(|_| Reason::IdentityChanged)?;
-        if policy.installation_id
-            != control
-                .status()
-                .map_err(|_| Reason::IdentityChanged)?
-                .policy
-                .installation_id
-        {
+        // Fresh and existing handles share the original end, including the
+        // status read inside open_read_only. Contention grants no cleanup.
+        let (policy, current_installation) = control
+            .with_runtime_deadline(end, || {
+                #[cfg(test)]
+                tests::before_control_validation(tests::ControlValidationRead::Open)?;
+                let fresh = SqliteControlStore::open_read_only(root, &installation)?;
+                #[cfg(test)]
+                tests::before_control_validation(tests::ControlValidationRead::Policy)?;
+                let policy = fresh.read_policy(RequestIntersection::Selected)?;
+                #[cfg(test)]
+                tests::before_control_validation(tests::ControlValidationRead::Status)?;
+                let current_installation = control.status()?.policy.installation_id;
+                Ok((policy, current_installation))
+            })
+            .map_err(|value| journal_control_error(value, end, Instant::now()))?;
+        if policy.installation_id != current_installation {
             return Err(Reason::IdentityChanged);
         }
         if self.state.report.maintenance_fenced
