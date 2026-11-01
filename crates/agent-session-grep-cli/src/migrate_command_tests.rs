@@ -30,6 +30,99 @@ fn options(source: &Path) -> Options {
 fn inject(point: Fault) {
     INJECTED.with(|slot| slot.set(Some(point)));
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeadlineSite {
+    Entry,
+    ExistingControl,
+    FinishCreate,
+    BeforeCopy,
+    FinalStatus,
+}
+
+struct DeadlineProbe {
+    expected_end: Instant,
+    previous_end: Instant,
+    probe_end: Instant,
+    finish_end: Option<Instant>,
+    seen: [usize; 5],
+}
+
+thread_local! {
+    static DEADLINE_PROBE: std::cell::RefCell<Option<DeadlineProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn save_finish_end(started: Instant, end: Instant) {
+    DEADLINE_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow_mut().as_mut() {
+            assert!(probe.finish_end.is_none(), "finish end must be saved once");
+            let expected = probe.expected_end.min(started + LOCK_BUDGET);
+            assert_eq!(end, expected, "finish retains its original lock cap");
+            probe.finish_end = Some(expected);
+        }
+    });
+}
+
+pub(super) fn observe_deadline(site: DeadlineSite, received: Instant) {
+    DEADLINE_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow_mut().as_mut() {
+            let expected = match site {
+                DeadlineSite::FinishCreate => probe.finish_end.expect("saved finish end"),
+                _ => probe.expected_end,
+            };
+            // Compare the original receiving argument before the real API can
+            // shorten it. An outer scope must not hide a renewed argument.
+            assert_eq!(received, expected, "migration receiving end: {site:?}");
+            let active = match site {
+                DeadlineSite::FinalStatus => probe.expected_end,
+                _ => probe.previous_end,
+            };
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe.probe_end),
+                active,
+                "migration active scope: {site:?}"
+            );
+            probe.seen[site as usize] += 1;
+        }
+    });
+}
+
+fn observe_request<T>(
+    requested: Instant,
+    expected: Instant,
+    operation: impl FnOnce() -> T,
+) -> (T, DeadlineProbe) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEADLINE_PROBE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let probe_end = requested + Duration::from_secs(1);
+    let previous_end = SqliteControlStore::effective_runtime_deadline(probe_end);
+    DEADLINE_PROBE.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(DeadlineProbe {
+            expected_end: expected,
+            previous_end,
+            probe_end,
+            finish_end: None,
+            seen: [0; 5],
+        });
+    });
+    let _reset = Reset;
+    let result = operation();
+    let probe = DEADLINE_PROBE.with(|slot| slot.borrow_mut().take().unwrap());
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe_end),
+        previous_end,
+        "migration must restore the caller scope"
+    );
+    (result, probe)
+}
+
 fn control_creation_bytes(root: &Path, installation: &str, desired: &str) -> Vec<u8> {
     let root_id = RootIdentity::read(root).unwrap().control_id();
     serde_json::to_vec(&json!({
@@ -392,6 +485,70 @@ fn active_wal_and_idle_legacy_reader_survive_with_unchanged_bytes_and_identity()
         .unwrap();
     drop(store);
     assert!(SqliteStore::open_for_write(p(&fixture.destination)).is_err());
+}
+
+#[test]
+fn request_deadline_reaches_real_migration_receivers() {
+    for nested in [false, true] {
+        let fixture = Fixture::new();
+        let caller = SqliteControlStore::create(
+            &fixture.temp.path().join("caller"),
+            &ControlId::parse("migration-caller").unwrap(),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        for repeated in [false, true] {
+            let expected = Instant::now() + TOTAL_BUDGET;
+            let requested = expected + if nested { LOCK_BUDGET } else { Duration::ZERO };
+            let run = || {
+                observe_request(requested, expected, || {
+                    execute(p(&fixture.destination), options(&fixture.source), requested)
+                })
+            };
+            let (result, probe) = if nested {
+                caller
+                    .with_runtime_deadline(expected, || Ok(run()))
+                    .unwrap()
+            } else {
+                run()
+            };
+            assert_eq!(result.unwrap()["recovered"], repeated);
+            assert_eq!(probe.seen[DeadlineSite::Entry as usize], 1);
+            assert_eq!(
+                probe.seen[DeadlineSite::ExistingControl as usize],
+                usize::from(repeated)
+            );
+            assert!(
+                (1..=MAX_LOCK_ATTEMPTS).contains(&probe.seen[DeadlineSite::FinishCreate as usize])
+            );
+            assert!(probe.finish_end.unwrap() <= expected);
+            assert_eq!(probe.seen[DeadlineSite::BeforeCopy as usize], 1);
+            assert_eq!(probe.seen[DeadlineSite::FinalStatus as usize], 1);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                requested
+            );
+        }
+    }
+}
+
+#[test]
+fn expired_migration_request_has_no_receiving_effects() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let source = temp.path().join("absent-source/catalog.db");
+    let destination = temp.path().join("absent-receiver/catalog.db");
+    let expired = Instant::now() - Duration::from_millis(1);
+    let probe_end = end();
+    assert_eq!(
+        code(execute(p(&destination), options(&source), expired)),
+        CanonicalCode::WriterBusy
+    );
+    assert!(!source.parent().unwrap().exists());
+    assert!(!destination.parent().unwrap().exists());
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe_end),
+        probe_end
+    );
 }
 
 #[test]

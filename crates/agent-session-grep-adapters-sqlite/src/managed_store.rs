@@ -394,7 +394,8 @@ pub(crate) struct LegacyActivation<'a> {
 
 impl ManagedStore {
     pub(crate) fn activate_legacy_copy(input: LegacyActivation<'_>) -> PortResult<()> {
-        crate::managed_maintenance::set_sql_deadline(input.connection, input.deadline)?;
+        let deadline = SqliteControlStore::effective_runtime_deadline(input.deadline);
+        crate::managed_maintenance::set_sql_deadline(input.connection, deadline)?;
         let root = input.handles.root_identity();
         let lease_root = input.lease.path().parent().ok_or_else(invalid)?;
         if input.handles.kind() != &LockKind::CatalogHandles
@@ -403,7 +404,13 @@ impl ManagedStore {
         {
             return Err(invalid());
         }
-        let status = input.control.status()?;
+        let status = input.control.with_runtime_deadline(deadline, || {
+            #[cfg(test)]
+            activation_deadline_tests::observe(deadline, true);
+            input.control.status()
+        })?;
+        #[cfg(test)]
+        activation_deadline_tests::observe(deadline, false);
         if status.policy.installation_id != *input.installation
             || status
                 .catalog_incarnation
@@ -2294,6 +2301,74 @@ fn observation_manifest(
         relocation_json: "null".into(),
         operation_digest: digest,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod activation_deadline_tests {
+    use super::*;
+
+    struct Observation {
+        expected: Instant,
+        previous: Instant,
+        probe: Instant,
+        counts: [usize; 2],
+    }
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<Observation>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Recording;
+
+    impl Recording {
+        pub(crate) fn finish(self) -> [usize; 2] {
+            let observed = OBSERVATION.with(|slot| slot.borrow_mut().take().unwrap());
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(observed.probe),
+                observed.previous
+            );
+            observed.counts
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn record(expected: Instant) -> Recording {
+        let probe = expected + Duration::from_secs(10);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        OBSERVATION.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Observation {
+                expected,
+                previous,
+                probe,
+                counts: [0, 0],
+            });
+        });
+        Recording
+    }
+
+    pub(super) fn observe(received: Instant, inside: bool) {
+        OBSERVATION.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(received, observed.expected);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(observed.probe),
+                    if inside {
+                        observed.expected
+                    } else {
+                        observed.previous
+                    },
+                    "activation restores the status scope before catalog COMMIT"
+                );
+                observed.counts[usize::from(!inside)] += 1;
+            }
+        });
+    }
 }
 
 #[cfg(test)]

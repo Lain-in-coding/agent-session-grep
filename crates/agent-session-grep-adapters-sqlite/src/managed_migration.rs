@@ -615,7 +615,12 @@ fn authorize(
     if !control.matches_root(root) {
         return Err(invalid());
     }
-    let status = control.status()?;
+    let read = || {
+        #[cfg(test)]
+        tests::observe_deadline(tests::DeadlineSite::Authorization, request.deadline);
+        control.status()
+    };
+    let status = control.with_runtime_deadline(request.deadline, read)?;
     if status.policy.installation_id != *request.installation
         || status
             .catalog_incarnation
@@ -631,6 +636,8 @@ fn authorize(
     Ok(status.policy.policy_epoch.get())
 }
 fn finish_receipt(request: &LegacyMigrationRequest<'_>) -> MigrationReceipt {
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::Finished, request.deadline);
     MigrationReceipt {
         operation: request.operation.clone(),
         installation: request.installation.clone(),
@@ -667,7 +674,13 @@ pub fn migrate_legacy(
     request: LegacyMigrationRequest<'_>,
     control: &SqliteControlStore,
 ) -> PortResult<MigrationReceipt> {
+    let request = LegacyMigrationRequest {
+        deadline: SqliteControlStore::effective_runtime_deadline(request.deadline),
+        ..request
+    };
     check(request.deadline)?;
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::Entry, request.deadline);
     validate_catalog_path(request.destination)?;
     if !request.destination.is_absolute()
         || request.now_ms < 0
@@ -904,6 +917,81 @@ fn verify_legacy_indexes(conn: &Connection) -> PortResult<()> {
 mod tests {
     use super::*;
     use agent_session_grep_ports::control::DesiredUpdates;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum DeadlineSite {
+        Entry,
+        Authorization,
+        Finished,
+    }
+
+    struct DeadlineProbe {
+        expected_end: Instant,
+        previous_end: Instant,
+        probe_end: Instant,
+        seen: [usize; 3],
+    }
+
+    thread_local! {
+        static DEADLINE_PROBE: std::cell::RefCell<Option<DeadlineProbe>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn observe_deadline(site: DeadlineSite, received: Instant) {
+        DEADLINE_PROBE.with(|slot| {
+            if let Some(probe) = slot.borrow_mut().as_mut() {
+                assert_eq!(
+                    received, probe.expected_end,
+                    "migration receiving end: {site:?}"
+                );
+                let active = match site {
+                    DeadlineSite::Authorization => probe.expected_end,
+                    _ => probe.previous_end,
+                };
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe.probe_end),
+                    active,
+                    "migration active scope: {site:?}"
+                );
+                probe.seen[site as usize] += 1;
+            }
+        });
+    }
+
+    fn observe_request<T>(
+        requested: Instant,
+        expected: Instant,
+        operation: impl FnOnce() -> T,
+    ) -> (T, DeadlineProbe) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                DEADLINE_PROBE.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let probe_end = requested + Duration::from_secs(1);
+        let previous_end = SqliteControlStore::effective_runtime_deadline(probe_end);
+        DEADLINE_PROBE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(DeadlineProbe {
+                expected_end: expected,
+                previous_end,
+                probe_end,
+                seen: [0; 3],
+            });
+        });
+        let _reset = Reset;
+        let result = operation();
+        let probe = DEADLINE_PROBE.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            previous_end,
+            "migration must restore the caller scope"
+        );
+        (result, probe)
+    }
+
     fn end() -> Instant {
         Instant::now() + Duration::from_secs(10)
     }
@@ -944,6 +1032,110 @@ mod tests {
         }
         conn.execute_batch("ALTER TABLE store_metadata DROP COLUMN projection_contract_version; ALTER TABLE store_metadata DROP COLUMN managed_mode; ALTER TABLE store_metadata DROP COLUMN destructive_epoch; PRAGMA application_id=0; PRAGMA user_version=19; COMMIT;").unwrap();
     }
+
+    #[test]
+    fn request_deadline_reaches_real_authorization_and_restores_scope() {
+        for nested in [false, true] {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let source = temp.path().join("legacy.db");
+            legacy(&source);
+            let installation = id("installation");
+            let incarnation = id("incarnation");
+            let operation = id("migration");
+            let control = SqliteControlStore::create(
+                &temp.path().join("managed"),
+                &installation,
+                DesiredUpdates::Paused,
+            )
+            .unwrap();
+            let destination = temp.path().join("managed/catalog.db");
+            let inspected = inspect_legacy(&source, end()).unwrap();
+            for repeated in [false, true] {
+                let expected = end();
+                let requested = expected
+                    + if nested {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::ZERO
+                    };
+                let run = || {
+                    observe_request(requested, expected, || {
+                        let recording =
+                            crate::managed_store::activation_deadline_tests::record(expected);
+                        let result = migrate_legacy(
+                            LegacyMigrationRequest {
+                                source: &source,
+                                destination: &destination,
+                                inspected: &inspected,
+                                installation: &installation,
+                                incarnation: &incarnation,
+                                operation: &operation,
+                                now_ms: 1,
+                                deadline: requested,
+                            },
+                            &control,
+                        );
+                        let counts = recording.finish();
+                        assert_eq!(counts, if repeated { [0, 0] } else { [1, 1] });
+                        result
+                    })
+                };
+                let (result, probe) = if nested {
+                    control
+                        .with_runtime_deadline(expected, || Ok(run()))
+                        .unwrap()
+                } else {
+                    run()
+                };
+                let receipt = result.unwrap();
+                assert_eq!(receipt.operation, operation);
+                assert_eq!(receipt.installation, installation);
+                assert_eq!(receipt.incarnation, incarnation);
+                assert_eq!(probe.seen, [1, 2, 1]);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(requested),
+                    requested
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expired_request_has_no_destination_or_lock_effects() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let source = temp.path().join("legacy.db");
+        legacy(&source);
+        let installation = id("installation");
+        let control = SqliteControlStore::create(
+            &temp.path().join("control"),
+            &installation,
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        let destination = temp.path().join("absent-receiver/catalog.db");
+        let inspected = inspect_legacy(&source, end()).unwrap();
+        let probe_end = end();
+        let result = migrate_legacy(
+            LegacyMigrationRequest {
+                source: &source,
+                destination: &destination,
+                inspected: &inspected,
+                installation: &installation,
+                incarnation: &id("incarnation"),
+                operation: &id("migration"),
+                now_ms: 1,
+                deadline: Instant::now() - Duration::from_millis(1),
+            },
+            &control,
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert!(!destination.parent().unwrap().exists());
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            probe_end
+        );
+    }
+
     #[test]
     fn lost_copy_and_activation_acknowledgements_recover_same_inode_once() {
         for (point, old_managed_schema) in [

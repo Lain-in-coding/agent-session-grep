@@ -16,7 +16,7 @@ use agent_session_grep_adapters_sqlite::{
 };
 use agent_session_grep_ports::{
     PortError, RetrievalMode,
-    control::{ControlId, ControlStore, DesiredUpdates, PolicyEpoch},
+    control::{ControlId, ControlStatus, ControlStore, DesiredUpdates, PolicyEpoch},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -427,8 +427,36 @@ fn fault(point: Fault) -> Result<(), CliError> {
     })
 }
 
+fn open_control(
+    root: &Path,
+    installation: &ControlId,
+    end: Instant,
+) -> Result<SqliteControlStore, CliError> {
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::ExistingControl, end);
+    SqliteControlStore::open_existing_writable_with_deadline(root, installation, end).map_err(port)
+}
+
+fn final_status(control: &SqliteControlStore, end: Instant) -> Result<ControlStatus, CliError> {
+    let read = || {
+        #[cfg(test)]
+        tests::observe_deadline(tests::DeadlineSite::FinalStatus, end);
+        control.status()
+    };
+    control.with_runtime_deadline(end, read).map_err(port)
+}
+
+fn finish_control(control: &SqliteControlStore, end: Instant) -> Result<(), PortError> {
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::FinishCreate, end);
+    control.finish_create_with_deadline(end)
+}
+
 fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
     check(end)?;
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::Entry, end);
     let paths = Paths::inspect(db, &options.source)?;
     // Verify the entire installed package before receiving-root creation. A
     // supplied prefix is never accepted just because its path/label matches.
@@ -579,7 +607,7 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
             if !started {
                 return Err(invalid());
             }
-            SqliteControlStore::open_existing_writable(&paths.root, &installation).map_err(port)?
+            open_control(&paths.root, &installation, end)?
         } else {
             for path in [
                 &paths.destination,
@@ -649,7 +677,11 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
                 .map_err(port)?
             }
         };
-        acquire(end, || control.finish_create())?;
+        let finish_started = Instant::now();
+        let finish_end = end.min(finish_started + LOCK_BUDGET);
+        #[cfg(test)]
+        tests::save_finish_end(finish_started, finish_end);
+        acquire(finish_end, || finish_control(&control, finish_end))?;
         let bound = control.bind_control_root(&owner).map_err(port)?;
         if let (Some(install), Some(lock)) = (&install, &installation_lock) {
             control
@@ -660,6 +692,8 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
     }; // PolicyOwner is released before copying or waiting on destination locks.
     #[cfg(test)]
     fault(Fault::ControlCreated)?;
+    #[cfg(test)]
+    tests::observe_deadline(tests::DeadlineSite::BeforeCopy, end);
     let receipt = migrate_legacy(
         LegacyMigrationRequest {
             source: &paths.source,
@@ -678,7 +712,7 @@ fn execute(db: &str, options: Options, end: Instant) -> Result<Value, CliError> 
     fault(Fault::Activated)?;
     check(end)?;
     paths.validate(root)?;
-    let status = control.status().map_err(port)?;
+    let status = final_status(&control, end)?;
     if receipt.operation != operation
         || receipt.installation != installation
         || receipt.incarnation != incarnation

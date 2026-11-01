@@ -1107,6 +1107,7 @@ impl SqliteControlStore {
         control: &ControlRootGuard<'_>,
         deadline: Instant,
     ) -> PortResult<()> {
+        let deadline = Self::effective_runtime_deadline(deadline);
         if Instant::now() >= deadline {
             return Err(PortError::WriterBusy(
                 "installation binding deadline reached".into(),
@@ -1124,7 +1125,13 @@ impl SqliteControlStore {
         if installation_lock.root_identity() != identity {
             return Err(invalid());
         }
-        let status = self.status()?;
+        let status = self.with_runtime_deadline(deadline, || {
+            #[cfg(test)]
+            control_create_tests::observe_original_status(deadline, true);
+            self.status()
+        })?;
+        #[cfg(test)]
+        control_create_tests::observe_original_status(deadline, false);
         if status.policy.maintenance.state != MaintenanceState::Idle {
             return Err(invalid());
         }
@@ -1511,6 +1518,18 @@ impl SqliteControlStore {
     /// records. This never compares or resets the current policy.
     pub fn finish_create(&self) -> PortResult<()> {
         control_create::finish(self)
+    }
+
+    /// Retire creation records using the original request end for the status
+    /// read only. Record deletion must not acquire a trailing runtime check.
+    pub fn finish_create_with_deadline(&self, deadline: Instant) -> PortResult<()> {
+        let deadline = Self::effective_runtime_deadline(deadline);
+        if Instant::now() >= deadline {
+            return Err(PortError::WriterBusy(
+                "control runtime deadline reached".into(),
+            ));
+        }
+        control_create::finish_with_deadline(self, Some(deadline))
     }
 
     pub fn open_read_only(private_root: &Path, installation: &ControlId) -> PortResult<Self> {
@@ -2145,10 +2164,29 @@ mod control_create {
     /// removed first and the marker last, so every interruption either retains
     /// proof or leaves a marker-only state that still refuses recreation.
     pub(super) fn finish(store: &SqliteControlStore) -> PortResult<()> {
+        finish_with_deadline(store, None)
+    }
+
+    pub(super) fn finish_with_deadline(
+        store: &SqliteControlStore,
+        deadline: Option<Instant>,
+    ) -> PortResult<()> {
         let root = store.private_root.as_path();
         let create_lock = ExclusiveGuard::try_acquire(root, LockKind::ControlCreate)?;
         validate_guard(root, &store.handle_lease, &create_lock)?;
-        let status = store.status()?;
+        let status = match deadline {
+            Some(deadline) => {
+                let status = store.with_runtime_deadline(deadline, || {
+                    #[cfg(test)]
+                    control_create_tests::observe_original_status(deadline, true);
+                    store.status()
+                })?;
+                #[cfg(test)]
+                control_create_tests::observe_original_status(deadline, false);
+                status
+            }
+            None => store.status()?,
+        };
         if exists(&create_lock, INTENT_PENDING)? || exists(&create_lock, MARKER_PENDING)? {
             return Err(corrupt());
         }
@@ -7615,6 +7653,148 @@ mod control_create_tests {
     use std::process::{Command, Stdio};
 
     const CHILD_NAME: &str = "control::control_create_tests::control_create_child_process_entry";
+
+    struct StatusObservation {
+        expected: Instant,
+        previous: Option<Instant>,
+        counts: [usize; 2],
+    }
+
+    thread_local! {
+        static ORIGINAL_STATUS: RefCell<Option<StatusObservation>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe_original_status(received: Instant, inside: bool) {
+        ORIGINAL_STATUS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(
+                    received, observed.expected,
+                    "status must receive the original end"
+                );
+                assert_eq!(
+                    runtime_deadline(),
+                    if inside {
+                        Some(observed.expected)
+                    } else {
+                        observed.previous
+                    },
+                    "only the control read owns the request scope"
+                );
+                observed.counts[usize::from(!inside)] += 1;
+            }
+        });
+    }
+
+    fn with_status_observation<T>(expected: Instant, operation: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ORIGINAL_STATUS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let previous = runtime_deadline();
+        let allowance = RUNTIME_BUSY_ALLOWANCE.with(Cell::get);
+        ORIGINAL_STATUS.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(StatusObservation {
+                expected,
+                previous,
+                counts: [0, 0],
+            });
+        });
+        let _reset = Reset;
+        let result = operation();
+        let observed = ORIGINAL_STATUS.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(observed.counts, [1, 1]);
+        assert_eq!(runtime_deadline(), previous);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), allowance);
+        result
+    }
+
+    #[test]
+    fn explicit_finish_and_prefix_use_original_read_scopes() {
+        for nested in [false, true] {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let root = root(&temp);
+            let installation = id("original-end-installation");
+            CREATE_FAULT.with(|slot| slot.set(Some(4)));
+            assert!(
+                SqliteControlStore::create(&root, &installation, DesiredUpdates::Paused).is_err()
+            );
+            let end = Instant::now() + CREATE_BUDGET;
+            let store =
+                SqliteControlStore::open_existing_writable_with_deadline(&root, &installation, end)
+                    .unwrap();
+            let prefix = temp.path().join("prefix");
+            fs::create_dir(&prefix).unwrap();
+            let install_lock = ExclusiveGuard::try_acquire(
+                &prefix,
+                LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap()),
+            )
+            .unwrap();
+            let policy_lock = ExclusiveGuard::try_acquire(&root, LockKind::PolicyOwner).unwrap();
+            let policy = store.bind_control_root(&policy_lock).unwrap();
+            let before = fs::read(SqliteControlStore::path(&root)).unwrap();
+            let outer = nested
+                .then(|| RuntimeDeadlineScope::enter_with_busy(end, BUSY_TIMEOUT / 2).unwrap());
+            let requested = end
+                + if nested {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                };
+            with_status_observation(end, || store.finish_create_with_deadline(requested)).unwrap();
+            assert_clean(&root);
+            with_status_observation(end, || {
+                store.record_verified_installation_prefix(
+                    &prefix,
+                    &install_lock,
+                    &policy,
+                    requested,
+                )
+            })
+            .unwrap();
+            assert_eq!(fs::read(SqliteControlStore::path(&root)).unwrap(), before);
+            drop(outer);
+            assert!(runtime_deadline().is_none());
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+            assert_eq!(
+                store
+                    .conn
+                    .borrow()
+                    .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+                    .unwrap(),
+                if nested { 0 } else { 250 }
+            );
+        }
+    }
+
+    #[test]
+    fn expired_explicit_finish_preserves_records_and_does_not_acquire_lock() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = root(&temp);
+        let installation = id("expired-finish-installation");
+        CREATE_FAULT.with(|slot| slot.set(Some(4)));
+        assert!(SqliteControlStore::create(&root, &installation, DesiredUpdates::Paused).is_err());
+        let end = Instant::now() + CREATE_BUDGET;
+        let store =
+            SqliteControlStore::open_existing_writable_with_deadline(&root, &installation, end)
+                .unwrap();
+        let intent_path = root.join(CONTROL_CREATE_INTENT);
+        let bytes = fs::read(&intent_path).unwrap();
+        let lock_path = root.join("control-create.lock");
+        fs::remove_file(&lock_path).unwrap();
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            store.finish_create_with_deadline(expired),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert!(!lock_path.exists());
+        assert_eq!(fs::read(&intent_path).unwrap(), bytes);
+        assert!(runtime_deadline().is_none());
+        store.finish_create_with_deadline(end).unwrap();
+        assert_clean(&root);
+    }
 
     fn id(value: &str) -> ControlId {
         ControlId::parse(value).unwrap()
