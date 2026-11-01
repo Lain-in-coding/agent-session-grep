@@ -378,6 +378,494 @@ impl Drop for Harness<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PauseSample {
+    now: Instant,
+    child: Option<u32>,
+    exits: u8,
+}
+
+// Only the pause-retention scenario uses this seam; ordinary until is unchanged.
+trait PauseProbe {
+    fn sample(&self) -> PauseSample;
+    fn tick(&mut self, end: Instant) -> Result<SupervisorState, PortError>;
+    fn start_once(&mut self, end: Instant) -> Result<(), PortError>;
+    fn sleep(&mut self, duration: Duration);
+}
+
+fn pause_end() -> Instant {
+    SqliteControlStore::effective_runtime_deadline(Instant::now() + seconds(15))
+}
+
+fn pause_scope<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    operation: impl FnOnce() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    let probe = end + seconds(30);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let effective = SqliteControlStore::effective_runtime_deadline(end);
+    let result = control.with_runtime_deadline(end, || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            effective
+        );
+        operation()
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    result
+}
+
+fn pause_start_once(control: &SqliteControlStore, end: Instant) -> Result<(), PortError> {
+    pause_scope(control, end, || {
+        let current = control.status()?;
+        control
+            .request_background_start(current.policy.control_seq)
+            .map(|_| ())
+    })
+}
+
+struct LivePause<'a> {
+    supervisor: &'a mut Supervisor,
+    control: &'a SqliteControlStore,
+}
+
+impl PauseProbe for LivePause<'_> {
+    fn sample(&self) -> PauseSample {
+        PauseSample {
+            now: Instant::now(),
+            child: self.supervisor.child_id(),
+            exits: self.supervisor.policy().unexpected_exits(),
+        }
+    }
+
+    fn tick(&mut self, end: Instant) -> Result<SupervisorState, PortError> {
+        // The real tick still computes its own earlier 250 ms control end.
+        pause_scope(self.control, end, || self.supervisor.tick())
+    }
+
+    fn start_once(&mut self, end: Instant) -> Result<(), PortError> {
+        pause_start_once(self.control, end)
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+fn check_pause_sample(sample: PauseSample, end: Instant, pid: u32, phase: &str, calls: usize) {
+    assert!(
+        sample.now < end,
+        "{phase}: pause end expired after {calls} calls: {sample:?}"
+    );
+    assert_eq!(
+        sample.child,
+        Some(pid),
+        "{phase}: child changed: {sample:?}"
+    );
+    assert_eq!(sample.exits, 0, "{phase}: unexpected exit: {sample:?}");
+}
+
+fn paused_before(probe: &mut impl PauseProbe, end: Instant, pid: u32, phase: &str) -> usize {
+    let mut calls = 0;
+    loop {
+        check_pause_sample(probe.sample(), end, pid, phase, calls);
+        let result = probe.tick(end);
+        calls += 1;
+        let after = probe.sample();
+        check_pause_sample(after, end, pid, phase, calls);
+        match result {
+            Ok(SupervisorState::Paused) => return calls,
+            Ok(SupervisorState::Busy) => {
+                probe.sleep(Duration::from_millis(50).min(end - after.now));
+            }
+            other => panic!("{phase}: non-pause result after {calls} calls: {other:?}; {after:?}"),
+        }
+    }
+}
+
+fn pause_start_before(probe: &mut impl PauseProbe, end: Instant, pid: u32) {
+    let mut calls = 0;
+    loop {
+        check_pause_sample(probe.sample(), end, pid, "start request", calls);
+        let result = probe.start_once(end);
+        calls += 1;
+        let after = probe.sample();
+        check_pause_sample(after, end, pid, "start request", calls);
+        match result {
+            Ok(()) => return,
+            Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {
+                probe.sleep(Duration::from_millis(10).min(end - after.now));
+            }
+            error => panic!("start request: nonretryable result after {calls} calls: {error:?}"),
+        }
+    }
+}
+
+fn pause_retention_before(probe: &mut impl PauseProbe, end: Instant, pid: u32) {
+    paused_before(probe, end, pid, "initial pause");
+    let before = probe.sample();
+    check_pause_sample(before, end, pid, "hold", 0);
+    assert!(
+        end - before.now >= seconds(2),
+        "hold: insufficient remaining time"
+    );
+    probe.sleep(seconds(2));
+    check_pause_sample(probe.sample(), end, pid, "hold", 0);
+    paused_before(probe, end, pid, "after hold");
+    pause_start_before(probe, end, pid);
+    paused_before(probe, end, pid, "after start request");
+}
+
+#[derive(Debug)]
+struct PauseStep {
+    result: Result<SupervisorState, PortError>,
+    elapsed: Duration,
+    child: Option<u32>,
+    exits: u8,
+}
+
+impl PauseStep {
+    fn state(state: SupervisorState) -> Self {
+        Self {
+            result: Ok(state),
+            elapsed: Duration::ZERO,
+            child: Some(7),
+            exits: 0,
+        }
+    }
+}
+
+struct ScriptedPause {
+    sample: PauseSample,
+    ticks: std::collections::VecDeque<PauseStep>,
+    starts: std::collections::VecDeque<(Result<(), PortError>, Duration)>,
+    tick_ends: Vec<Instant>,
+    start_ends: Vec<Instant>,
+    sleeps: Vec<Duration>,
+}
+
+impl ScriptedPause {
+    fn new(now: Instant, ticks: impl IntoIterator<Item = PauseStep>) -> Self {
+        Self {
+            sample: PauseSample {
+                now,
+                child: Some(7),
+                exits: 0,
+            },
+            ticks: ticks.into_iter().collect(),
+            starts: Default::default(),
+            tick_ends: Vec::new(),
+            start_ends: Vec::new(),
+            sleeps: Vec::new(),
+        }
+    }
+}
+
+impl PauseProbe for ScriptedPause {
+    fn sample(&self) -> PauseSample {
+        self.sample
+    }
+
+    fn tick(&mut self, end: Instant) -> Result<SupervisorState, PortError> {
+        self.tick_ends.push(end);
+        let step = self.ticks.pop_front().expect("unexpected extra pause poll");
+        self.sample.now += step.elapsed;
+        self.sample.child = step.child;
+        self.sample.exits = step.exits;
+        step.result
+    }
+
+    fn start_once(&mut self, end: Instant) -> Result<(), PortError> {
+        self.start_ends.push(end);
+        let (result, elapsed) = self.starts.pop_front().expect("unexpected extra start CAS");
+        self.sample.now += elapsed;
+        result
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        self.sleeps.push(duration);
+        self.sample.now += duration;
+    }
+}
+
+#[test]
+fn pause_poll_retries_only_busy_and_requires_a_real_paused_observation() {
+    let now = Instant::now();
+    let end = now + seconds(15);
+    let mut probe = ScriptedPause::new(
+        now,
+        [
+            PauseStep::state(SupervisorState::Busy),
+            PauseStep::state(SupervisorState::Paused),
+        ],
+    );
+    assert_eq!(paused_before(&mut probe, end, 7, "synthetic"), 2);
+    assert_eq!(probe.tick_ends, [end, end]);
+    assert_eq!(probe.sleeps, [Duration::from_millis(50)]);
+    assert!(probe.ticks.is_empty());
+
+    for step in [
+        PauseStep::state(SupervisorState::Running),
+        PauseStep {
+            result: Err(PortError::WriterBusy("synthetic tick error".into())),
+            ..PauseStep::state(SupervisorState::Paused)
+        },
+        PauseStep {
+            result: Err(PortError::SchemaIncompatible("synthetic schema".into())),
+            ..PauseStep::state(SupervisorState::Paused)
+        },
+        PauseStep {
+            child: Some(8),
+            ..PauseStep::state(SupervisorState::Paused)
+        },
+        PauseStep {
+            child: None,
+            ..PauseStep::state(SupervisorState::Paused)
+        },
+        PauseStep {
+            exits: 1,
+            ..PauseStep::state(SupervisorState::Paused)
+        },
+    ] {
+        let mut probe = ScriptedPause::new(now, [step, PauseStep::state(SupervisorState::Paused)]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            paused_before(&mut probe, end, 7, "synthetic")
+        }));
+        assert!(result.is_err(), "non-Busy must not wait for a later Paused");
+        assert_eq!(probe.tick_ends, [end]);
+        assert!(probe.sleeps.is_empty());
+        assert_eq!(probe.ticks.len(), 1);
+    }
+}
+
+#[test]
+fn pause_poll_checks_entry_and_result_time_and_caps_busy_waits() {
+    let now = Instant::now();
+    for (end, child, exits) in [
+        (now, Some(7), 0),
+        (now + seconds(1), Some(8), 0),
+        (now + seconds(1), Some(7), 1),
+    ] {
+        let mut probe = ScriptedPause::new(now, [PauseStep::state(SupervisorState::Paused)]);
+        probe.sample.child = child;
+        probe.sample.exits = exits;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                paused_before(&mut probe, end, 7, "entry")
+            }))
+            .is_err()
+        );
+        assert!(probe.tick_ends.is_empty());
+    }
+    let end = now + Duration::from_millis(75);
+    let mut busy = ScriptedPause::new(
+        now,
+        [
+            PauseStep::state(SupervisorState::Busy),
+            PauseStep::state(SupervisorState::Busy),
+        ],
+    );
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            paused_before(&mut busy, end, 7, "persistent busy")
+        }))
+        .is_err()
+    );
+    assert_eq!(busy.tick_ends, [end, end]);
+    assert_eq!(
+        busy.sleeps,
+        [Duration::from_millis(50), Duration::from_millis(25)]
+    );
+    assert_eq!(busy.sample.now, end);
+
+    for elapsed in [Duration::from_millis(75), Duration::from_millis(76)] {
+        let mut late = ScriptedPause::new(
+            now,
+            [PauseStep {
+                elapsed,
+                ..PauseStep::state(SupervisorState::Paused)
+            }],
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                paused_before(&mut late, end, 7, "late paused")
+            }))
+            .is_err()
+        );
+        assert_eq!(late.tick_ends, [end]);
+        assert!(late.sleeps.is_empty());
+    }
+}
+
+#[test]
+fn pause_hold_and_start_share_the_initial_end_without_replaying_success() {
+    let now = Instant::now();
+    let end = now + seconds(15);
+    let mut probe = ScriptedPause::new(
+        now,
+        [
+            PauseStep::state(SupervisorState::Paused),
+            PauseStep::state(SupervisorState::Busy),
+            PauseStep::state(SupervisorState::Paused),
+            PauseStep::state(SupervisorState::Paused),
+        ],
+    );
+    probe.starts.extend([
+        (
+            Err(PortError::WriterBusy("synthetic contention".into())),
+            Duration::ZERO,
+        ),
+        (
+            Err(PortError::GenerationMismatch("synthetic CAS".into())),
+            Duration::ZERO,
+        ),
+        (Ok(()), Duration::from_millis(10)),
+    ]);
+    pause_retention_before(&mut probe, end, 7);
+    assert_eq!(probe.tick_ends, [end; 4]);
+    assert_eq!(probe.start_ends, [end; 3]);
+    assert_eq!(
+        probe.sleeps,
+        [
+            seconds(2),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_millis(10)
+        ]
+    );
+    assert_eq!(probe.sample.now, now + Duration::from_millis(2080));
+    assert!(probe.starts.is_empty() && probe.ticks.is_empty());
+
+    let mut short = ScriptedPause::new(now, [PauseStep::state(SupervisorState::Paused)]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pause_retention_before(&mut short, now + Duration::from_millis(1999), 7)
+        }))
+        .is_err()
+    );
+    assert!(short.sleeps.is_empty() && short.start_ends.is_empty());
+
+    let mut exhausted = ScriptedPause::new(
+        now,
+        [
+            PauseStep::state(SupervisorState::Paused),
+            PauseStep::state(SupervisorState::Paused),
+            PauseStep::state(SupervisorState::Paused),
+        ],
+    );
+    exhausted
+        .starts
+        .push_back((Ok(()), Duration::from_millis(1)));
+    let end = now + Duration::from_millis(2001);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pause_retention_before(&mut exhausted, end, 7)
+        }))
+        .is_err()
+    );
+    assert_eq!(exhausted.tick_ends, [end; 2]);
+    assert_eq!(exhausted.start_ends, [end]);
+    assert_eq!(exhausted.sample.now, end);
+}
+
+#[test]
+fn pause_start_refuses_expiry_and_nonretryable_errors() {
+    let now = Instant::now();
+    for (end, first, expected_calls) in [
+        (now, Ok(()), 0),
+        (
+            now + seconds(1),
+            Err(PortError::Backend("synthetic".into())),
+            1,
+        ),
+    ] {
+        let mut probe = ScriptedPause::new(now, []);
+        probe
+            .starts
+            .extend([(first, Duration::ZERO), (Ok(()), Duration::ZERO)]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pause_start_before(&mut probe, end, 7)
+            }))
+            .is_err()
+        );
+        assert_eq!(probe.start_ends.len(), expected_calls);
+        assert!(probe.sleeps.is_empty());
+    }
+    let mut busy = ScriptedPause::new(now, []);
+    busy.starts.push_back((
+        Err(PortError::WriterBusy("synthetic".into())),
+        Duration::ZERO,
+    ));
+    let end = now + Duration::from_millis(7);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pause_start_before(&mut busy, end, 7)
+        }))
+        .is_err()
+    );
+    assert_eq!(busy.start_ends, [end]);
+    assert_eq!(busy.sleeps, [Duration::from_millis(7)]);
+}
+
+#[test]
+fn pause_scope_preserves_the_earlier_end_and_real_start_effect() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let control = SqliteControlStore::create(
+        &temp.path().join("private"),
+        &id("synthetic-pause-scope"),
+        DesiredUpdates::Paused,
+    )
+    .unwrap();
+    let probe = Instant::now() + seconds(60);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let outer = Instant::now() + seconds(10);
+    control
+        .with_runtime_deadline(outer, || {
+            let end = pause_end();
+            assert_eq!(end, outer);
+            pause_scope(&control, end, || {
+                assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                Ok(())
+            })?;
+            let before = control.status()?;
+            pause_start_once(&control, end)?;
+            let after = control.status()?;
+            assert_eq!(
+                after.restart_request_seq.get(),
+                before.restart_request_seq.get() + 1
+            );
+            assert_eq!(
+                after.policy.control_seq.get(),
+                before.policy.control_seq.get() + 1
+            );
+            assert_eq!(after.desired_updates, DesiredUpdates::Paused);
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    let end = pause_end();
+    assert!(matches!(
+        pause_scope(&control, end, || {
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+            Err::<(), _>(PortError::Backend("synthetic".into()))
+        }),
+        Err(PortError::Backend(_))
+    ));
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+}
+
 struct OwnedProcess(Child);
 impl OwnedProcess {
     fn wait(&mut self) -> std::process::ExitStatus {
@@ -455,13 +943,21 @@ fn real_worker_pause_retains_process_and_stop_releases_both_locks() {
     let mut harness = fixture.supervised();
     let pid = harness.ready();
     fixture.desired(DesiredUpdates::Paused);
-    harness.until(|s, state| state == SupervisorState::Paused && s.child_id() == Some(pid));
-    std::thread::sleep(seconds(2));
-    assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Paused);
-    assert_eq!(harness.supervisor.child_id(), Some(pid));
-    assert_eq!(harness.supervisor.policy().unexpected_exits(), 0);
-    fixture.start_request();
-    assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Paused);
+    let end = pause_end();
+    let control = SqliteControlStore::open_current_writable_with_deadline(
+        fixture.catalog.parent().unwrap(),
+        end,
+    )
+    .unwrap();
+    pause_retention_before(
+        &mut LivePause {
+            supervisor: &mut harness.supervisor,
+            control: &control,
+        },
+        end,
+        pid,
+    );
+    drop(control);
     fixture.desired(DesiredUpdates::Stopped);
     harness.until(|_, state| state == SupervisorState::Finished);
     assert_eq!(harness.supervisor.child_id(), None);
