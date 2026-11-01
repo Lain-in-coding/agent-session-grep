@@ -6386,11 +6386,11 @@ fn sync_discover_finds_sqlite_sourced_opencode() {
         &opencode_root.join("opencode.db"),
         "discover opencode hello",
     );
-    // 旁文件用非 SQLite 内容：若被误当成源，probe 会失败并让 provider 报错，
-    // 断言 found == 1 就会挂。
-    std::fs::write(opencode_root.join("opencode.db-wal"), b"not a database")
+    // No ignored.db exists: these files exercise extension filtering without
+    // making SQLite recover invalid sidecars when it opens opencode.db.
+    std::fs::write(opencode_root.join("ignored.db-wal"), b"not a database")
         .expect("write wal sidecar");
-    std::fs::write(opencode_root.join("opencode.db-shm"), b"not a database")
+    std::fs::write(opencode_root.join("ignored.db-shm"), b"not a database")
         .expect("write shm sidecar");
 
     let out = run_with_home(&db, &home, &["sync", "--discover"]);
