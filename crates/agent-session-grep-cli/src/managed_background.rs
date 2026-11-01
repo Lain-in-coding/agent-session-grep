@@ -11621,49 +11621,128 @@ mod control_deadline_tests {
             .read_control(|control| control.status())
             .policy
             .installation_id;
+        let probe = fixture.scope_end + CONTROL_BUDGET;
+        let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+        let control = fixture
+            .control
+            .with_runtime_deadline(fixture.scope_end, || {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    fixture.scope_end
+                );
+                let control = SqliteControlStore::open_existing_writable(&root, &installation)?;
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    fixture.scope_end
+                );
+                Ok(control)
+            })
+            .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous_end
+        );
         let request = LatestRequest {
             selections: vec![selection_revision(&fixture.selection).unwrap()],
             max_wait_ms: MAX_LATEST_WAIT_MS,
             now_ms: app_clock_ms(),
         };
-        let admitted = Rc::new(Cell::new(false));
+        let attempted = Rc::new(Cell::new(false));
+        let admission_calls = Rc::new(Cell::new(0));
+        let admitted = Rc::new(RefCell::new(None));
         let calls = Rc::new(Cell::new(0));
+        let timing = Rc::new(Cell::new(None::<(Instant, Instant)>));
+        // Fixed slots: hook entry, status result, admission result, outer return.
+        let diagnostics = Rc::new(RefCell::new([None; 4]));
         schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let attempted = attempted.clone();
+            let admission_calls = admission_calls.clone();
             let admitted = admitted.clone();
             let calls = calls.clone();
+            let timing = timing.clone();
+            let diagnostics = diagnostics.clone();
             move |event| {
                 if let ScheduleTestEvent::BeforeIdleHeartbeat(expected) = event {
+                    let (started, end) = timing.get().expect("acceptance clock is installed");
+                    let record = |slot: usize, error: Option<BackgroundFailure>| {
+                        diagnostics.borrow_mut()[slot].get_or_insert((
+                            started.elapsed(),
+                            end.saturating_duration_since(Instant::now()),
+                            error,
+                        ));
+                    };
+                    record(0, None);
                     calls.set(calls.get() + 1);
-                    if !admitted.replace(true) {
-                        let control =
-                            SqliteControlStore::open_existing_writable(&root, &installation)?;
-                        assert_eq!(control.status()?.policy.control_seq, expected);
-                        control.admit_latest(expected, request.clone())?;
+                    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                    if !attempted.replace(true) {
+                        let status = control.status();
+                        record(1, status.as_ref().err().map(failure));
+                        assert_eq!(status?.policy.control_seq, expected);
+                        admission_calls.set(admission_calls.get() + 1);
+                        let admission = control.admit_latest(expected, request.clone());
+                        record(
+                            2,
+                            match &admission {
+                                Ok(change) => match &change.value {
+                                    LatestAdmission::Queued(_) => None,
+                                    LatestAdmission::Blocked(reason) => Some(*reason),
+                                },
+                                Err(error) => Some(failure(error)),
+                            },
+                        );
+                        let LatestAdmission::Queued(barrier) = admission?.value else {
+                            panic!("competing latest must queue: {:?}", diagnostics.borrow());
+                        };
+                        *admitted.borrow_mut() = Some(barrier);
                     }
                 }
                 Ok(())
             }
         });
         let before = publication_counts(&fixture);
-        assert!(
-            accept_idle_boundary(
-                &fixture.db,
-                &fixture.control,
-                &fixture.worker(),
-                &ready,
-                &mut pending,
-                &mut schedule,
-                Instant::now() + CONTROL_BUDGET
-            )
-            .unwrap()
-            .is_none()
+        let worker = fixture.worker();
+        let started = Instant::now();
+        let end = started + CONTROL_BUDGET;
+        timing.set(Some((started, end)));
+        let result = accept_idle_boundary(
+            &fixture.db,
+            &fixture.control,
+            &worker,
+            &ready,
+            &mut pending,
+            &mut schedule,
+            end,
         );
-        assert!(admitted.get());
+        diagnostics.borrow_mut()[3] = Some((
+            started.elapsed(),
+            end.saturating_duration_since(Instant::now()),
+            result.as_ref().err().map(failure),
+        ));
+        assert!(
+            result.as_ref().is_ok_and(Option::is_none),
+            "outer={result:?} hook_calls={} admission_calls={} queued={} \
+             pending={} idle={} phases=[hook_entry,status_result,admit_result,outer_return]={:?}",
+            calls.get(),
+            admission_calls.get(),
+            admitted.borrow().is_some(),
+            pending.is_some(),
+            schedule.closed_idle_at.is_some(),
+            diagnostics.borrow()
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous_end
+        );
+        assert!(attempted.get());
+        assert_eq!(admission_calls.get(), 1);
+        let admitted = admitted.borrow();
+        let barrier = admitted.as_ref().expect("actual queued admission");
         assert_eq!(calls.get(), 1);
         assert!(pending.is_none());
         assert!(schedule.closed_idle_at.is_none());
         assert_eq!(publication_counts(&fixture), before);
         assert!(!schedule.demands.is_empty());
+        assert_eq!(schedule.demands[&barrier.id].barrier, *barrier);
         let windows = schedule
             .demands
             .iter()
