@@ -117,71 +117,107 @@ impl Fixture {
         }
     }
 
+    fn operation<T>(
+        &self,
+        operation: impl FnOnce(Instant) -> Result<T, PortError>,
+    ) -> Result<T, PortError> {
+        // One original fixture-operation end also bounds control admission.
+        // A caller's earlier end must win; the operation is never replayed.
+        let deadline = SqliteControlStore::effective_runtime_deadline(end());
+        self.control
+            .with_runtime_deadline(deadline, || operation(deadline))
+    }
+
     fn create(&self) -> ManagedStore {
-        ManagedStore::create(&self.catalog, &self.control, id("catalog-one"), 1).unwrap()
+        self.operation(|_| ManagedStore::create(&self.catalog, &self.control, id("catalog-one"), 1))
+            .unwrap()
     }
 
     fn observe(&self, revision: &str, binding: Option<&SourceBinding>) -> SourceObservation {
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        let queued = match self
-            .control
-            .queue_cycle(current(&self.control), vec![self.selection.clone()])
-            .unwrap()
-            .value
-        {
-            CycleAdmission::Queued(cycle) => cycle,
-            other => panic!("fixture cycle must be queued: {other:?}"),
-        };
-        let cycle = self
-            .control
-            .start_cycle(current(&self.control), &worker, queued.token.cycle_seq, 2)
-            .unwrap()
-            .value;
-        SourceObservation {
-            binding: binding.cloned().unwrap_or_else(|| SourceBinding {
-                source_id: SourceId::parse("source-one").unwrap(),
-                source_path: self.source.to_str().unwrap().into(),
-                provider: agent_session_grep_ports::SearchProvider::Claude,
-                namespace_id: None,
-                root_identity: "source-root".into(),
-            }),
-            revision_id: RevisionId::parse(revision).unwrap(),
-            revision_digest: self.snapshot.fingerprint.clone(),
-            parser_version: PARSER_SEMANTIC_VERSION,
-            state: ObservationState::Complete,
-            cycle_seq: cycle.token.cycle_seq.get(),
-            worker_boot_id: "boot-one".into(),
-            catalog_incarnation: "catalog-one".into(),
-            policy_epoch: cycle.policy_epoch.get(),
-            started_control_seq: cycle.started_control_seq.unwrap().get(),
-            observed_at_ms: 3,
-            committed_at_ms: 4,
-            selections: vec![SelectionProof {
-                selection_id: self.selection.selection_id.as_str().into(),
-                selection_revision: self.selection.revision.get(),
-                root_identity: self.selection.root_identity.as_str().into(),
-            }],
-            repositories: Vec::new(),
-        }
+        self.operation(|_| {
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))?;
+            let queued = match self
+                .control
+                .queue_cycle(current(&self.control), vec![self.selection.clone()])?
+                .value
+            {
+                CycleAdmission::Queued(cycle) => cycle,
+                other => panic!("fixture cycle must be queued: {other:?}"),
+            };
+            let cycle = self
+                .control
+                .start_cycle(current(&self.control), &worker, queued.token.cycle_seq, 2)?
+                .value;
+            Ok(SourceObservation {
+                binding: binding.cloned().unwrap_or_else(|| SourceBinding {
+                    source_id: SourceId::parse("source-one").unwrap(),
+                    source_path: self.source.to_str().unwrap().into(),
+                    provider: agent_session_grep_ports::SearchProvider::Claude,
+                    namespace_id: None,
+                    root_identity: "source-root".into(),
+                }),
+                revision_id: RevisionId::parse(revision).unwrap(),
+                revision_digest: self.snapshot.fingerprint.clone(),
+                parser_version: PARSER_SEMANTIC_VERSION,
+                state: ObservationState::Complete,
+                cycle_seq: cycle.token.cycle_seq.get(),
+                worker_boot_id: "boot-one".into(),
+                catalog_incarnation: "catalog-one".into(),
+                policy_epoch: cycle.policy_epoch.get(),
+                started_control_seq: cycle.started_control_seq.unwrap().get(),
+                observed_at_ms: 3,
+                committed_at_ms: 4,
+                selections: vec![SelectionProof {
+                    selection_id: self.selection.selection_id.as_str().into(),
+                    selection_revision: self.selection.revision.get(),
+                    root_identity: self.selection.root_identity.as_str().into(),
+                }],
+                repositories: Vec::new(),
+            })
+        })
+        .unwrap()
     }
 
     fn finish(&self, observation: &SourceObservation) {
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        self.control
-            .finish_cycle(
-                current(&self.control),
+        let probe = end() + Duration::from_secs(30);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let mut calls = 0;
+        let mut finish = |deadline| {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                deadline,
+                "fixture finish must enter its operation scope before bind"
+            );
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))?;
+            let before = self.control.status()?.policy.control_seq;
+            calls += 1;
+            let finished = self.control.finish_cycle(
+                before,
                 &worker,
                 CycleSeq::new(observation.cycle_seq).unwrap(),
                 CycleFinish::Partial,
                 5,
-            )
-            .unwrap();
+            )?;
+            assert!(finished.changed);
+            assert_eq!(finished.control_seq.get(), before.get() + 1);
+            assert_eq!(finished.value.state, CycleState::Partial);
+            assert_eq!(finished.value.token.cycle_seq.get(), observation.cycle_seq);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                deadline
+            );
+            Ok::<_, PortError>(())
+        };
+        self.operation(&mut finish).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
     }
 
     fn batch(&self, text: &str) -> SourceBatch {
@@ -251,45 +287,44 @@ impl Fixture {
         repositories: bool,
         parser: u32,
     ) -> (SourceObservation, Publication) {
-        let mut observation = self.observe("revision-one", None);
-        observation.parser_version = parser;
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
-            &observation.binding.source_path,
-            observation.binding.provider.as_str(),
-        );
-        let namespace = store
-            .reserve_namespace(&self.control, &observation, &worker, &legacy)
-            .unwrap();
-        *self.session.borrow_mut() = StableId::native_session_scoped(
-            &agent_session_grep_domain::SessionIdentityNamespace {
-                provider_id: observation.binding.provider.as_str(),
-                installation_namespace: &namespace.input,
-            },
-            "fixture-native",
-        );
-        observation.binding.namespace_id = Some(namespace.namespace_id);
-        if repositories {
-            observation.repositories.push(RepositoryClaim {
-                session_id: self.session.borrow().clone(),
-                slug: "synthetic-repository".into(),
-            });
-        }
-        let publication = store
-            .commit_source_with_context(
+        self.operation(|deadline| {
+            let mut observation = self.observe("revision-one", None);
+            observation.parser_version = parser;
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))?;
+            let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
+                &observation.binding.source_path,
+                observation.binding.provider.as_str(),
+            );
+            let namespace =
+                store.reserve_namespace(&self.control, &observation, &worker, &legacy)?;
+            *self.session.borrow_mut() = StableId::native_session_scoped(
+                &agent_session_grep_domain::SessionIdentityNamespace {
+                    provider_id: observation.binding.provider.as_str(),
+                    installation_namespace: &namespace.input,
+                },
+                "fixture-native",
+            );
+            observation.binding.namespace_id = Some(namespace.namespace_id);
+            if repositories {
+                observation.repositories.push(RepositoryClaim {
+                    session_id: self.session.borrow().clone(),
+                    slug: "synthetic-repository".into(),
+                });
+            }
+            let publication = store.commit_source_with_context(
                 &self.control,
                 &worker,
                 &self.batch("refresh original"),
                 &observation,
                 &Default::default(),
-                SqliteControlStore::effective_runtime_deadline(end()),
-            )
-            .unwrap();
-        self.finish(&observation);
-        (observation, publication)
+                deadline,
+            )?;
+            self.finish(&observation);
+            Ok((observation, publication))
+        })
+        .unwrap()
     }
 
     /// Frozen seed recorded at the installation's previous location. A
@@ -449,19 +484,20 @@ impl Fixture {
         prior: &RevisionRef,
         observation: &SourceObservation,
     ) -> Result<RefreshOutcome, PortError> {
-        let worker = self
-            .control
-            .bind_worker(&self.worker_lock, id("boot-one"))
-            .unwrap();
-        store.refresh_verified_unchanged_source(
-            &self.control,
-            &worker,
-            prior,
-            observation,
-            &self.snapshot,
-            agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES,
-            SqliteControlStore::effective_runtime_deadline(end()),
-        )
+        self.operation(|deadline| {
+            let worker = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot-one"))?;
+            store.refresh_verified_unchanged_source(
+                &self.control,
+                &worker,
+                prior,
+                observation,
+                &self.snapshot,
+                agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES,
+                deadline,
+            )
+        })
     }
 
     fn sql(&self, statement: &str) {
@@ -517,25 +553,55 @@ impl Fixture {
 }
 
 #[test]
+fn fixture_finish_uses_one_operation_end_and_restores_scope() {
+    let f = Fixture::new();
+    let store = f.create();
+    let (first, _) = f.seed(&store, false);
+    let second = f.observe("revision-two", Some(&first.binding));
+    let probe = end() + Duration::from_secs(30);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    // Deliberately outside seed's scope: its outer end must not mask a
+    // missing finish scope. finish checks the exact end before binding and
+    // verifies one mutation, one sequence increment and the original token.
+    f.finish(&second);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    let outer = end();
+    f.control
+        .with_runtime_deadline(outer, || {
+            f.operation(|deadline| {
+                assert_eq!(deadline, outer);
+                assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+                let cycle = f.control.cycle(CycleSeq::new(second.cycle_seq).unwrap())?;
+                assert_eq!(cycle.state, CycleState::Partial);
+                assert_eq!(cycle.completed_at_ms, Some(5));
+                Ok(())
+            })?;
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+}
+
+#[test]
 fn refresh_matches_full_noop_without_touching_facts_fts_generation_or_namespace() {
     let f = Fixture::new();
     let store = f.create();
     let (first, prior) = f.seed(&store, false);
     let second = f.observe("revision-two", Some(&first.binding));
     let baseline = f.tables();
-    let worker = f
-        .control
-        .bind_worker(&f.worker_lock, id("boot-one"))
-        .unwrap();
-    let full = store
-        .commit_source_with_context(
-            &f.control,
-            &worker,
-            &f.batch("refresh original"),
-            &second,
-            &Default::default(),
-            end(),
-        )
+    let full = f
+        .operation(|deadline| {
+            let worker = f.control.bind_worker(&f.worker_lock, id("boot-one"))?;
+            store.commit_source_with_context(
+                &f.control,
+                &worker,
+                &f.batch("refresh original"),
+                &second,
+                &Default::default(),
+                deadline,
+            )
+        })
         .unwrap();
     let full_tables = f.tables();
     // Revert only the disposable synthetic no-op publication. Both paths now
@@ -595,19 +661,18 @@ fn prior_repository_projection_requires_real_full_path_removal() {
         RefreshOutcome::Ineligible(RefreshIneligible::PriorRepositoryProjection),
     );
     assert_eq!(f.tables(), before);
-    let worker = f
-        .control
-        .bind_worker(&f.worker_lock, id("boot-one"))
-        .unwrap();
-    let full = store
-        .commit_source_with_context(
-            &f.control,
-            &worker,
-            &f.batch("refresh original"),
-            &second,
-            &Default::default(),
-            end(),
-        )
+    let full = f
+        .operation(|deadline| {
+            let worker = f.control.bind_worker(&f.worker_lock, id("boot-one"))?;
+            store.commit_source_with_context(
+                &f.control,
+                &worker,
+                &f.batch("refresh original"),
+                &second,
+                &Default::default(),
+                deadline,
+            )
+        })
         .unwrap();
     assert!(full.content_changed && full.destructive);
     assert_eq!(full.required_generation, prior.required_generation + 1);
@@ -655,14 +720,22 @@ fn wrong_attempt_and_revoked_or_paused_input_never_open_a_missing_source() {
         match mode {
             "attempt" => second.started_control_seq = first.started_control_seq,
             "paused" => {
-                f.control
-                    .set_desired_updates(current(&f.control), DesiredUpdates::Paused)
-                    .unwrap();
+                f.operation(|_| {
+                    f.control
+                        .set_desired_updates(current(&f.control), DesiredUpdates::Paused)
+                })
+                .unwrap();
             }
             "revoked" => {
-                f.control
-                    .revoke_selection(current(&f.control), &f.selection.selection_id, None, 8)
-                    .unwrap();
+                f.operation(|_| {
+                    f.control.revoke_selection(
+                        current(&f.control),
+                        &f.selection.selection_id,
+                        None,
+                        8,
+                    )
+                })
+                .unwrap();
             }
             "boot" => second.worker_boot_id = "wrong-boot".into(),
             "root" => second.binding.root_identity = "other-root".into(),
@@ -690,8 +763,7 @@ fn expired_nested_end_wins_and_sqlite_writer_busy_never_falls_back() {
     let second = f.observe("revision-two", Some(&first.binding));
     let before = f.tables();
     let worker = f
-        .control
-        .bind_worker(&f.worker_lock, id("boot-one"))
+        .operation(|_| f.control.bind_worker(&f.worker_lock, id("boot-one")))
         .unwrap();
     let result = f.control.with_runtime_deadline(Instant::now(), || {
         store.refresh_verified_unchanged_source(
@@ -818,22 +890,20 @@ fn recognized_parser_scan_and_kind_misses_preserve_all_tables() {
             _ => unreachable!(),
         };
         let before = f.tables();
-        let worker = f
-            .control
-            .bind_worker(&f.worker_lock, id("boot-one"))
-            .unwrap();
         assert_eq!(
-            store
-                .refresh_verified_unchanged_source(
+            f.operation(|deadline| {
+                let worker = f.control.bind_worker(&f.worker_lock, id("boot-one"))?;
+                store.refresh_verified_unchanged_source(
                     &f.control,
                     &worker,
                     &prior.receipt,
                     &second,
                     &snapshot,
                     agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES,
-                    end(),
+                    deadline,
                 )
-                .unwrap(),
+            })
+            .unwrap(),
             RefreshOutcome::Ineligible(expected),
         );
         assert_eq!(f.tables(), before, "{mode} mutated catalog");
@@ -1054,14 +1124,12 @@ fn lost_ack_reconciliation_keeps_the_committed_refresh_and_direct_content_receip
             .source_current(&refresh.receipt, &f.control, end())
             .unwrap()
     );
-    let worker = f
-        .control
-        .bind_worker(&f.worker_lock, id("boot-one"))
-        .unwrap();
-    store.reconcile_progress(&f.control, &worker).unwrap();
     let progress = f
-        .control
-        .source_progress(&id("source-one"))
+        .operation(|_| {
+            let worker = f.control.bind_worker(&f.worker_lock, id("boot-one"))?;
+            store.reconcile_progress(&f.control, &worker)?;
+            f.control.source_progress(&id("source-one"))
+        })
         .unwrap()
         .unwrap();
     assert_eq!(progress.receipt.unwrap().revision.as_str(), "revision-two");
