@@ -217,6 +217,18 @@ DELETE FROM qualified_session_metadata;
 DELETE FROM metadata_first_user_candidates;
 ";
 
+/// Per-request scratch relations of entity qualification. `qualified_entities`
+/// holds the permitted entity rows of the requested kinds. The catalog has no
+/// (source, session) or (source, document) occurrence index, so one grouped
+/// pass records, per anchor, whether the source holds an occurrence at all and
+/// whether one of them passes this request's qualification. Nothing persists.
+const ENTITY_SCRATCH: &str = "
+CREATE TEMP TABLE IF NOT EXISTS qualified_entities(entity_projection_rowid INTEGER PRIMARY KEY) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS qualified_anchors(axis TEXT NOT NULL,source_id TEXT NOT NULL,anchor TEXT NOT NULL,qualified INTEGER NOT NULL,PRIMARY KEY(axis,source_id,anchor)) WITHOUT ROWID;
+DELETE FROM qualified_entities;
+DELETE FROM qualified_anchors;
+";
+
 /// Keys of the metadata variants still eligible. The catalog's
 /// UNIQUE(source_id,session_id) makes each key appear once.
 const METADATA_FIRST_USER_CANDIDATES: &str = "
@@ -1301,10 +1313,10 @@ pub struct ManagedRead<'a> {
     snapshot: ReadSnapshot,
     deadline: Instant,
     /// Query the qualification tables currently hold. `qualify` and
-    /// `qualify_entities` are full scans of every authorized row; a request
-    /// stream that reuses one query (a paged `list`, for example) must not
-    /// repeat that work per call. Interior mutability keeps the ProjectionRead
-    /// trait signatures unchanged.
+    /// `qualify_entities` scan every authorized occurrence (the latter only
+    /// for the entity kinds its caller reads); a request stream that reuses one
+    /// query (a paged `list`, for example) must not repeat that work per call.
+    /// Interior mutability keeps the ProjectionRead trait signatures unchanged.
     qualified_for: std::cell::RefCell<Option<ProjectionQuery>>,
     /// Captured by the authorized constructor. An explicit test allow-list
     /// alone cannot prove that a barrier's selection revision/root is current.
@@ -2380,7 +2392,8 @@ impl ProjectionRead for ManagedRead<'_> {
         if limit == 0 || limit > 512 {
             return Err(invalid());
         }
-        self.qualify_entities(query)?;
+        // Only session rows join the metadata projection below.
+        self.qualify_entities(query, &[EntityKind::Session])?;
         let expression = safe_fts_query(&fts_tokens_cjk(text));
         self.transaction
             .execute_batch(METADATA_SCRATCH)
@@ -2815,7 +2828,12 @@ impl ProjectionRead for ManagedRead<'_> {
         if limit == 0 || limit > 512 {
             return Err(invalid());
         }
-        self.qualify_entities(query)?;
+        // The enumeration reads session and (unless sessions_only) document rows.
+        if sessions_only {
+            self.qualify_entities(query, &[EntityKind::Session])?;
+        } else {
+            self.qualify_entities(query, &[EntityKind::Session, EntityKind::Document])?;
+        }
         let mut entries = Vec::new();
         let mut after = String::new();
         loop {
@@ -2877,7 +2895,15 @@ impl ProjectionRead for ManagedRead<'_> {
         if repo_limit == 0 || repo_limit > 512 {
             return Err(invalid());
         }
-        self.qualify_entities(query)?;
+        self.qualify_entities(
+            query,
+            &[
+                EntityKind::Session,
+                EntityKind::Document,
+                EntityKind::Usage,
+                EntityKind::Repository,
+            ],
+        )?;
         let catalog_count:i64=self.transaction.query_row("SELECT COUNT(*) FROM(SELECT message_id FROM source_projections p JOIN qualified_projections q USING(projection_rowid) UNION SELECT entity_id FROM source_entity_projections e JOIN qualified_entities q USING(entity_projection_rowid) WHERE kind IN('session','document'))",[],|r|r.get(0)).map_err(sql)?;
         let (placements,claims):(i64,i64)=self.transaction.query_row("SELECT COUNT(DISTINCT o.placement_id),COUNT(*) FROM source_occurrences o JOIN qualified_occurrences q USING(occurrence_rowid)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(sql)?;
         let mut statement=self.transaction.prepare("SELECT e.entity_key,e.payload FROM source_entity_projections e JOIN qualified_entities q USING(entity_projection_rowid) WHERE e.kind='usage_event' ORDER BY e.entity_key,e.payload_digest,e.source_id").map_err(sql)?;
@@ -3352,11 +3378,63 @@ impl ManagedRead<'_> {
         }
         Ok(result)
     }
-    fn qualify_entities(&self, query: &ProjectionQuery) -> PortResult<()> {
+    /// Materialize the permitted entity rows of `kinds` into
+    /// `qualified_entities`, with exactly the outcome `entity_qualifies` gives
+    /// each of those rows. Each kind is one set-based statement over the
+    /// request's qualified occurrences, so the cost no longer grows with the
+    /// entity kinds a caller never reads (reply edges dominate a large
+    /// catalog) and issues no per-row statement.
+    fn qualify_entities(&self, query: &ProjectionQuery, kinds: &[EntityKind]) -> PortResult<()> {
         if self.qualified_for.borrow().as_ref() != Some(query) {
             self.qualify(query)?;
         }
-        self.transaction.execute_batch("CREATE TEMP TABLE IF NOT EXISTS qualified_entities(entity_projection_rowid INTEGER PRIMARY KEY) WITHOUT ROWID; DELETE FROM qualified_entities;").map_err(sql)?;
+        self.check_deadline()?;
+        self.transaction
+            .execute_batch(ENTITY_SCRATCH)
+            .map_err(sql)?;
+        #[cfg(test)]
+        if LEGACY_ENTITY_QUALIFICATION.with(std::cell::Cell::get) {
+            return self.qualify_entities_row_by_row(query);
+        }
+        let mut requested = Vec::new();
+        for kind in kinds {
+            if !requested.contains(kind) {
+                requested.push(*kind);
+            }
+        }
+        for (axis, users) in [
+            (
+                "session_id",
+                &[
+                    EntityKind::Session,
+                    EntityKind::Resume,
+                    EntityKind::Repository,
+                    EntityKind::Usage,
+                ][..],
+            ),
+            ("document_id", &[EntityKind::Document][..]),
+        ] {
+            if requested.iter().any(|kind| users.contains(kind)) {
+                // One grouped pass over authorized occurrences instead of a
+                // correlated scan per entity row: a database-backed source can
+                // hold many sessions and its occurrences are not indexed by them.
+                self.transaction.execute(&format!("INSERT INTO qualified_anchors(axis,source_id,anchor,qualified) SELECT '{axis}',o.source_id,o.{axis},MAX(q.occurrence_rowid IS NOT NULL) FROM source_occurrences o JOIN allowed_sources a ON a.source_id=o.source_id LEFT JOIN qualified_occurrences q ON q.occurrence_rowid=o.occurrence_rowid GROUP BY o.source_id,o.{axis}"),[]).map_err(sql)?;
+            }
+        }
+        for kind in requested {
+            self.check_deadline()?;
+            let (statement, values) = qualified_entity_statement(kind, query)?;
+            self.transaction
+                .execute(&statement, rusqlite::params_from_iter(values))
+                .map_err(sql)?;
+        }
+        *self.qualified_for.borrow_mut() = Some(query.clone());
+        Ok(())
+    }
+    /// The previous row-by-row qualification of every visible entity row. It
+    /// is retained only as the equivalence oracle of `qualify_entities`.
+    #[cfg(test)]
+    fn qualify_entities_row_by_row(&self, query: &ProjectionQuery) -> PortResult<()> {
         let mut statement=self.transaction.prepare("SELECT e.entity_projection_rowid,e.payload,e.source_id,e.entity_id FROM source_entity_projections e JOIN allowed_sources a USING(source_id) JOIN source_revision_receipts r ON r.revision_id=e.revision_id AND r.source_id=e.source_id JOIN source_heads h ON h.source_id=e.source_id WHERE r.published=1 AND h.visible_revision_id IS NOT NULL AND h.update_state!='revoked'").map_err(sql)?;
         let mut rows = statement.query([]).map_err(sql)?;
         while let Some(row) = rows.next().map_err(sql)? {
@@ -3459,6 +3537,505 @@ impl ManagedRead<'_> {
 
 fn graph_not_found() -> PortError {
     PortError::NotFound("managed context not found".into())
+}
+
+#[cfg(test)]
+mod entity_qualification_tests {
+    use super::*;
+    use agent_session_grep_application::{
+        AppRequest, ResponseBudget,
+        managed::{ManagedApp, ManagedRequestContext},
+    };
+    use agent_session_grep_domain::{
+        MessageEdge, MessagePlacement, MessageRelation, TokenSource, ToolActivity,
+        ToolActivityActor, ToolActivityKind, ToolActivityStatus, UsageObservation,
+    };
+    use agent_session_grep_ports::{SearchProvider, SourceResumeClaim};
+    use std::{cell::Cell, time::Duration};
+
+    thread_local! {
+        static STATEMENTS: Cell<usize> = const { Cell::new(0) };
+    }
+    fn trace(event: rusqlite::trace::TraceEvent<'_>) {
+        if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+            STATEMENTS.set(STATEMENTS.get() + 1);
+        }
+    }
+    fn legacy<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LEGACY_ENTITY_QUALIFICATION.set(self.0);
+            }
+        }
+        let _reset = Reset(LEGACY_ENTITY_QUALIFICATION.replace(enabled));
+        run()
+    }
+    fn id(kind: IdKind, name: &str) -> StableId {
+        StableId::native_checked(kind, name).unwrap()
+    }
+    fn catalog() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE store_metadata(singleton INTEGER PRIMARY KEY,active_generation INTEGER NOT NULL,projection_contract_version INTEGER NOT NULL DEFAULT 0,managed_mode INTEGER NOT NULL DEFAULT 0,destructive_epoch INTEGER NOT NULL DEFAULT 0); INSERT INTO store_metadata VALUES(1,0,0,0,0); CREATE TABLE catalog(id TEXT PRIMARY KEY,payload BLOB); BEGIN IMMEDIATE;").unwrap();
+        create_schema(&conn).unwrap();
+        initialize_catalog_in_tx(&conn, "synthetic-install", "synthetic-incarnation", 1).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        conn
+    }
+    fn source(
+        name: &str,
+        provider: SearchProvider,
+        session_name: &str,
+        count: usize,
+    ) -> (SourceObservation, SourceBatch) {
+        let session = id(IdKind::Session, session_name);
+        let document = id(IdKind::Document, name);
+        let o = SourceObservation {
+            binding: SourceBinding {
+                source_id: SourceId::parse(name).unwrap(),
+                source_path: format!("synthetic-{name}"),
+                provider,
+                namespace_id: None,
+                root_identity: "synthetic-root".into(),
+            },
+            revision_id: RevisionId::parse(&format!("revision-{name}")).unwrap(),
+            revision_digest: "synthetic-digest".into(),
+            parser_version: 1,
+            state: ObservationState::Complete,
+            cycle_seq: 1,
+            worker_boot_id: "synthetic-boot".into(),
+            catalog_incarnation: "synthetic-incarnation".into(),
+            policy_epoch: 1,
+            started_control_seq: 1,
+            observed_at_ms: 1,
+            committed_at_ms: 1,
+            selections: vec![SelectionProof {
+                selection_id: format!("selection-{name}"),
+                selection_revision: 1,
+                root_identity: "synthetic-root".into(),
+            }],
+            repositories: vec![RepositoryClaim {
+                session_id: session.clone(),
+                slug: "example.test/team/repo".into(),
+            }],
+        };
+        let mut batch = SourceBatch {
+            source_path: o.binding.source_path.clone(),
+            entries: vec![
+                (session.clone(), encode(&serde_json::json!({"documents":[document.as_str()],"title":format!("needle {session_name}")})).unwrap(), String::new()),
+                (document.clone(), encode(&serde_json::json!({"provider":provider.as_str(),"variant":"synthetic","fingerprint":o.revision_digest,"len":1000000})).unwrap(), String::new()),
+            ],
+            placements: vec![],
+            edges: vec![],
+            activities: vec![],
+            usage_events: vec![],
+            relation_complete: true,
+            len_bytes: Some(1000000),
+            fingerprint: Some(o.revision_digest.clone()),
+            provider_id: Some(provider.as_str().into()),
+            resume_claims: vec![SourceResumeClaim {
+                provider_id: provider.as_str().into(),
+                session_id: session.as_str().into(),
+                provider_session_id: Some(format!("native-{session_name}")),
+                provider_session_id_state: "resolved".into(),
+                original_working_directory: Some("synthetic-directory".into()),
+                original_working_directory_state: "resolved".into(),
+                pair_observed: true,
+            }],
+        };
+        for n in 0..count {
+            let message = id(IdKind::Message, &format!("{session_name}-{n}"));
+            let role = ["user", "assistant", "system", "tool"][n % 4];
+            batch.entries.push((
+                message.clone(),
+                encode(&serde_json::json!({
+                    "role":role,"text":format!("needle {session_name} {n}"),
+                    "timestamp":if n%2==0 {"2026-10-17T01:00:00Z"} else {"2026-10-17T02:00:00Z"}
+                }))
+                .unwrap(),
+                "needle".into(),
+            ));
+            let placement = MessagePlacement::new(
+                session.clone(),
+                document.clone(),
+                message.clone(),
+                n as u32,
+                n % 3 == 1,
+                None,
+            );
+            if n > 0 {
+                batch.edges.push(MessageEdge {
+                    child_placement_id: placement.id.clone(),
+                    parent_message_id: id(IdKind::Message, &format!("{session_name}-{}", n - 1)),
+                    parent_native_id: None,
+                    relation: MessageRelation::Reply,
+                });
+            }
+            batch.placements.push(placement);
+            if n < 2 {
+                batch.activities.push(crate::SourceActivity {
+                    message_id: message.clone(),
+                    activity: ToolActivity {
+                        kind: ToolActivityKind::File,
+                        actor: ToolActivityActor::Main,
+                        name: "Read".into(),
+                        target: Some("synthetic-file".into()),
+                        status: ToolActivityStatus::Success,
+                    },
+                });
+                batch.usage_events.push(crate::SourceUsage {
+                    session_id: session.clone(),
+                    message_id: (n == 1).then_some(message),
+                    usage: UsageObservation {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        token_source: TokenSource::Observed,
+                    },
+                });
+            }
+        }
+        (o, batch)
+    }
+    fn publish(conn: &Connection, o: &SourceObservation, batch: &SourceBatch) {
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let generation: i64 = conn
+            .query_row("SELECT active_generation FROM store_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut publication = publish_source_in_tx(conn, batch, o, generation + 1).unwrap();
+        conn.execute(
+            "UPDATE store_metadata SET active_generation=?1",
+            [publication.required_generation],
+        )
+        .unwrap();
+        finalize_publications_in_tx(conn, std::slice::from_mut(&mut publication)).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    fn read<'a>(conn: &'a Connection, sources: &[SourceObservation]) -> ManagedRead<'a> {
+        ManagedRead::begin(
+            conn,
+            &ReadScope {
+                catalog_incarnation: "synthetic-incarnation".into(),
+                policy_epoch: 1,
+                allowed: sources.iter().map(|o| o.binding.clone()).collect(),
+            },
+            Instant::now() + Duration::from_secs(120),
+        )
+        .unwrap()
+    }
+    fn members(read: &ManagedRead<'_>, kinds: &[EntityKind]) -> Vec<i64> {
+        let kinds =
+            serde_json::to_string(&kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>()).unwrap();
+        read.transaction.prepare("SELECT q.entity_projection_rowid FROM qualified_entities q JOIN source_entity_projections e USING(entity_projection_rowid) WHERE kind IN(SELECT value FROM json_each(?1)) ORDER BY 1").unwrap()
+            .query_map([kinds], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn batched_entities_match_row_oracle_across_filters_and_selections() {
+        let conn = catalog();
+        let specs = [
+            ("a", SearchProvider::Claude, "shared", 8),
+            ("b", SearchProvider::Codex, "other", 5),
+            ("copy", SearchProvider::Claude, "shared", 8),
+            ("empty", SearchProvider::Claude, "empty", 0),
+            ("revoked", SearchProvider::Claude, "revoked", 4),
+            ("deleted", SearchProvider::Codex, "deleted", 4),
+        ];
+        let mut sources = Vec::new();
+        for (name, provider, session, count) in specs {
+            let (o, batch) = source(name, provider, session, count);
+            publish(&conn, &o, &batch);
+            sources.push(o);
+        }
+        conn.execute(
+            "UPDATE source_heads SET update_state='revoked' WHERE source_id='revoked'",
+            [],
+        )
+        .unwrap();
+        let (mut deleted, mut empty) = source("deleted", SearchProvider::Codex, "deleted", 0);
+        deleted.revision_id = RevisionId::parse("deleted-replacement").unwrap();
+        deleted.repositories.clear();
+        empty.entries.clear();
+        empty.resume_claims.clear();
+        publish(&conn, &deleted, &empty);
+        let mut queries = vec![ProjectionQuery::default()];
+        for provider in [SearchProvider::Claude, SearchProvider::Codex] {
+            let mut q = ProjectionQuery::default();
+            q.filters.providers.push(provider);
+            queries.push(q);
+        }
+        for sidechain in [SidechainFacet::MainOnly, SidechainFacet::SubagentOnly] {
+            let mut q = ProjectionQuery::default();
+            q.facets.sidechain = sidechain;
+            queries.push(q);
+        }
+        for slug in ["example.test/team/repo", "example.test/missing"] {
+            let mut q = ProjectionQuery::default();
+            q.filters.repo = Some(slug.into());
+            queries.push(q);
+        }
+        let mut q = ProjectionQuery::default();
+        q.filters.since = parse_search_instant("2026-10-17T01:30:00Z");
+        queries.push(q.clone());
+        q.filters.until = parse_search_instant("2026-10-17T03:00:00Z");
+        q.facets.tool_name = Some("Read".into());
+        q.facets.tool_kind = Some("file".into());
+        queries.push(q);
+        for name in ["shared", "empty", "missing"] {
+            queries.push(ProjectionQuery {
+                session_id: Some(id(IdKind::Session, name)),
+                ..Default::default()
+            });
+        }
+        queries.push(ProjectionQuery {
+            include_system: true,
+            ..Default::default()
+        });
+        let kinds = [
+            EntityKind::Session,
+            EntityKind::Document,
+            EntityKind::Edge,
+            EntityKind::Tool,
+            EntityKind::Usage,
+            EntityKind::Resume,
+            EntityKind::Repository,
+        ];
+        for allowed in [
+            sources.clone(),
+            sources[..2].to_vec(),
+            sources[1..4].to_vec(),
+        ] {
+            let read = read(&conn, &allowed);
+            for q in &queries {
+                for subset in [
+                    &kinds[..],
+                    &[EntityKind::Session][..],
+                    &[EntityKind::Session, EntityKind::Document][..],
+                ] {
+                    legacy(true, || read.qualify_entities(q, subset).unwrap());
+                    let expected = members(&read, subset);
+                    read.qualify_entities(q, subset).unwrap();
+                    assert_eq!(members(&read, subset), expected, "{q:?} {subset:?}");
+                }
+                for limit in [1, 16] {
+                    assert_eq!(
+                        read.query_session_metadata("needle", q, limit).unwrap(),
+                        legacy(true, || read
+                            .query_session_metadata("needle", q, limit)
+                            .unwrap()),
+                        "{q:?}"
+                    );
+                    for sessions_only in [false, true] {
+                        assert_eq!(
+                            read.list(q, sessions_only, limit).unwrap(),
+                            legacy(true, || read.list(q, sessions_only, limit).unwrap()),
+                            "{q:?}"
+                        );
+                    }
+                    assert_eq!(
+                        read.stats(q, limit).unwrap(),
+                        legacy(true, || read.stats(q, limit).unwrap()),
+                        "{q:?}"
+                    );
+                }
+                // Includes ranking, truncation, every proof and Application warnings.
+                let run = || {
+                    let budget = ResponseBudget {
+                        max_items: 2,
+                        max_response_bytes: 8192,
+                        ..Default::default()
+                    };
+                    ManagedApp::new(
+                        &read,
+                        ManagedRequestContext {
+                            intersection: q.clone(),
+                            budget: budget.clone(),
+                            now_ms: 1,
+                            current_repo: None,
+                            deadline_expired: &|| false,
+                        },
+                    )
+                    .unwrap()
+                    .handle(AppRequest::Search {
+                        query: "needle".into(),
+                        filters: q.filters.clone(),
+                        facets: q.facets.clone(),
+                        limit: 2,
+                        cursor: None,
+                        budget,
+                        include_system: q.include_system,
+                        group_by_session: false,
+                        mode: agent_session_grep_ports::RetrievalMode::Lexical,
+                        query_embedding: None,
+                    })
+                    .unwrap()
+                };
+                assert_eq!(run(), legacy(true, run), "{q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_qualification_statement_count_is_constant_on_large_catalog() {
+        let conn = catalog();
+        let mut sources = Vec::new();
+        for n in 0..200 {
+            let (o, batch) = source(
+                &format!("source-{n}"),
+                if n % 2 == 0 {
+                    SearchProvider::Claude
+                } else {
+                    SearchProvider::Codex
+                },
+                &format!("session-{n}"),
+                125,
+            );
+            publish(&conn, &o, &batch);
+            sources.push(o);
+        }
+        let read = read(&conn, &sources);
+        let query = ProjectionQuery::default();
+        read.qualify(&query).unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace),
+        );
+        STATEMENTS.set(0);
+        let before = Instant::now();
+        legacy(true, || {
+            read.qualify_entities(&query, &[EntityKind::Session])
+                .unwrap()
+        });
+        let old_elapsed = before.elapsed();
+        let old_count = STATEMENTS.get();
+        let expected = members(&read, &[EntityKind::Session]);
+        STATEMENTS.set(0);
+        let before = Instant::now();
+        read.qualify_entities(&query, &[EntityKind::Session])
+            .unwrap();
+        let new_elapsed = before.elapsed();
+        let new_count = STATEMENTS.get();
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(members(&read, &[EntityKind::Session]), expected);
+        assert_eq!(expected.len(), 200);
+        // The oracle issues at least one statement per visible entity row, and
+        // this catalog holds more than 200 * 125 of them.
+        assert!(
+            old_count > 200 * 125,
+            "oracle did not exercise the large row loop"
+        );
+        // SQL statement count is deterministic, independent of CPU load,
+        // timer resolution or concurrent tests. Timing is diagnostic only.
+        assert!(
+            new_count <= 7,
+            "batched qualification issued {new_count} statements"
+        );
+        eprintln!(
+            "qualification: 200 sessions / 25000 occurrences; old={old_elapsed:?} ({old_count} statements), new={new_elapsed:?} ({new_count} statements)"
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Routes `qualify_entities` through its retained row-by-row oracle.
+    static LEGACY_ENTITY_QUALIFICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One set-based INSERT of the permitted rows of `kind`. It encodes the
+/// decision `entity_qualifies` makes for a row of that kind: an occurrence at
+/// the row's anchor that passes the request admits it, an anchor whose
+/// occurrences are all filtered out excludes it, and a container without any
+/// occurrence at its anchor falls back to `container_fallback`.
+fn qualified_entity_statement(
+    kind: EntityKind,
+    query: &ProjectionQuery,
+) -> PortResult<(String, Vec<Value>)> {
+    let mut values = vec![Value::from(kind.as_str().to_owned())];
+    let (join, predicate) = match kind {
+        EntityKind::Session
+        | EntityKind::Resume
+        | EntityKind::Repository
+        | EntityKind::Document => {
+            let axis = if kind == EntityKind::Document {
+                "document_id"
+            } else {
+                "session_id"
+            };
+            let fallback = container_fallback(kind, query, &mut values)?;
+            (
+                format!(" LEFT JOIN qualified_anchors x ON x.axis='{axis}' AND x.source_id=e.source_id AND x.anchor=e.entity_id"),
+                format!("(x.qualified=1 OR (x.anchor IS NULL AND {fallback}))"),
+            )
+        }
+        // Anchored on the message; a missing anchor never falls back.
+        EntityKind::Tool => (
+            String::new(),
+            "EXISTS(SELECT 1 FROM source_occurrences o JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=e.source_id AND o.message_id=e.entity_id)".to_owned(),
+        ),
+        // Anchored on its message when it has one, otherwise on its session.
+        EntityKind::Usage => (
+            " LEFT JOIN qualified_anchors x ON x.axis='session_id' AND x.source_id=e.source_id AND x.anchor=e.entity_id".to_owned(),
+            "CASE WHEN json_extract(e.payload,'$.data.message_id.value') IS NULL THEN x.qualified=1 ELSE EXISTS(SELECT 1 FROM source_occurrences o JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=e.source_id AND o.message_id=json_extract(e.payload,'$.data.message_id.value')) END".to_owned(),
+        ),
+        // The child occurrence must pass here; the parent may be any
+        // permitted projection, exactly as the row-by-row rule checks.
+        EntityKind::Edge => (
+            String::new(),
+            "EXISTS(SELECT 1 FROM source_occurrences o JOIN qualified_occurrences q USING(occurrence_rowid) WHERE o.source_id=e.source_id AND o.placement_id=json_extract(e.payload,'$.data.child')) AND EXISTS(SELECT 1 FROM source_projections p JOIN qualified_projections q USING(projection_rowid) WHERE p.message_id=json_extract(e.payload,'$.data.parent.value'))".to_owned(),
+        ),
+    };
+    Ok((
+        format!(
+            "INSERT INTO qualified_entities SELECT e.entity_projection_rowid FROM source_entity_projections e JOIN allowed_sources a ON a.source_id=e.source_id JOIN source_revision_receipts r ON r.revision_id=e.revision_id AND r.source_id=e.source_id JOIN source_heads h ON h.source_id=e.source_id{join} WHERE e.kind=? AND r.published=1 AND h.visible_revision_id IS NOT NULL AND h.update_state!='revoked' AND {predicate}"
+        ),
+        values,
+    ))
+}
+
+/// The metadata-only container rule of `entity_qualifies`: without any
+/// occurrence at its anchor, a container survives only unrestricted time and
+/// occurrence facets, the requested session, provider and repository.
+fn container_fallback(
+    kind: EntityKind,
+    query: &ProjectionQuery,
+    values: &mut Vec<Value>,
+) -> PortResult<String> {
+    // Decide the constant cases before binding, so no placeholder is left over.
+    if query.filters.since.is_some()
+        || query.filters.until.is_some()
+        || !query.facets.is_default()
+        || (query.filters.repo.is_some() && kind != EntityKind::Session)
+    {
+        return Ok("0".into());
+    }
+    let mut clause = String::from("1");
+    if let Some(session) = &query.session_id {
+        clause.push_str(" AND e.entity_id=?");
+        values.push(session.as_str().to_owned().into());
+    }
+    if !query.filters.providers.is_empty() {
+        let providers = serde_json::to_string(
+            &query
+                .filters
+                .providers
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| invalid())?;
+        clause.push_str(" AND (SELECT b.provider_id FROM source_bindings b WHERE b.source_id=e.source_id) IN (SELECT value FROM json_each(?))");
+        values.push(providers.into());
+    }
+    if let Some(repo) = &query.filters.repo {
+        clause.push_str(" AND json_extract(e.payload,'$.data.repo_slug')=?");
+        values.push(repo.clone().into());
+    }
+    Ok(clause)
 }
 fn graph_too_large() -> PortError {
     PortError::WriterBusy(
