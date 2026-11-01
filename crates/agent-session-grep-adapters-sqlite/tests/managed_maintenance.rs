@@ -21,6 +21,81 @@ fn id(v: &str) -> ControlId {
 fn end() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
+fn fixture_phase<T>(
+    requested_end: Instant,
+    operation: impl FnOnce(Instant) -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    let effective_end = SqliteControlStore::effective_runtime_deadline(requested_end);
+    if Instant::now() >= effective_end {
+        return Err(PortError::WriterBusy(
+            "fixture setup deadline reached".into(),
+        ));
+    }
+    operation(effective_end)
+}
+fn setup_fixture_with<C, L>(
+    create: impl FnOnce(Instant, Instant) -> Result<C, PortError>,
+    installation_lock: impl FnOnce(Instant, Instant) -> Result<L, PortError>,
+    catalog_prefix: impl FnOnce(&C, &L, Instant, Instant) -> Result<(), PortError>,
+) -> Result<(C, L), PortError> {
+    // Preserve create's original CREATE_BUDGET, separately from lock/setup.
+    let started = Instant::now();
+    let control = fixture_phase(started + Duration::from_secs(30), |end| {
+        create(started, end)
+    })?;
+    let started = Instant::now();
+    let lock = fixture_phase(started + Duration::from_secs(5), |end| {
+        installation_lock(started, end)
+    })?;
+    // This five-second end starts only after creation and the installation lock.
+    let started = Instant::now();
+    fixture_phase(started + Duration::from_secs(5), |end| {
+        catalog_prefix(&control, &lock, started, end)
+    })?;
+    Ok((control, lock))
+}
+fn diagnose_failure<T>(
+    reported: &mut bool,
+    phase: &str,
+    started: Instant,
+    deadline: Option<Instant>,
+    result: Result<T, PortError>,
+) -> Result<T, PortError> {
+    if let Err(error) = &result
+        && !*reported
+    {
+        *reported = true;
+        let kind = match error {
+            PortError::WriterBusy(_) => "writer_busy",
+            PortError::DeadlineExceeded(_) => "deadline_exceeded",
+            PortError::InvalidRequest(_) => "invalid_request",
+            PortError::GenerationMismatch(_) => "generation_mismatch",
+            PortError::Backend(_) => "backend",
+            PortError::SourceIo(_) => "source_io",
+            PortError::SchemaIncompatible(_) => "schema_incompatible",
+            PortError::NotFound(_) => "not_found",
+            PortError::SnapshotChanged(_) => "snapshot_changed",
+        };
+        let reason = match error {
+            PortError::WriterBusy(message) => match message.as_str() {
+                "control runtime deadline reached" => "control_runtime_deadline",
+                "managed maintenance deadline reached" => "maintenance_deadline",
+                "installation binding deadline reached" => "installation_binding_deadline",
+                _ => "other",
+            },
+            _ => "other",
+        };
+        let now = Instant::now();
+        let effective_end = deadline.map(SqliteControlStore::effective_runtime_deadline);
+        eprintln!(
+            "maintenance_fixture phase={phase} elapsed_ms={} requested_end={deadline:?} \
+             effective_end={effective_end:?} remaining_ms={:?} error={kind} reason={reason}",
+            now.saturating_duration_since(started).as_millis(),
+            effective_end.map(|end| end.saturating_duration_since(now).as_millis()),
+        );
+    }
+    result
+}
 fn assert_preparation_end(end: Instant) {
     assert_eq!(
         SqliteControlStore::effective_runtime_deadline(end + Duration::from_secs(1)),
@@ -89,29 +164,42 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let preparation_end = end();
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("data");
         let prefix = temp.path().join("install");
         std::fs::create_dir(&prefix).unwrap();
-        let control = SqliteControlStore::create_with_deadline(
-            &root,
-            &id("installation"),
-            DesiredUpdates::Running,
-            preparation_end,
-        )
-        .unwrap();
         let catalog = root.join("catalog.db");
-        let installation_lock = acquire_until(
-            &prefix,
-            LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
-            preparation_end,
-        );
         let mut preparation_calls = 0;
-        prepare(&control, preparation_end, |end| {
-            preparation_calls += 1;
-            prepare_catalog_and_prefix(&control, &root, &catalog, &prefix, &installation_lock, end)
-        })
+        let (control, installation_lock) = setup_fixture_with(
+            |_, end| {
+                SqliteControlStore::create_with_deadline(
+                    &root,
+                    &id("installation"),
+                    DesiredUpdates::Running,
+                    end,
+                )
+            },
+            |_, end| {
+                Ok(acquire_until(
+                    &prefix,
+                    LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+                    end,
+                ))
+            },
+            |control, installation_lock, _, preparation_end| {
+                prepare(control, preparation_end, |end| {
+                    preparation_calls += 1;
+                    prepare_catalog_and_prefix(
+                        control,
+                        &root,
+                        &catalog,
+                        &prefix,
+                        installation_lock,
+                        end,
+                    )
+                })
+            },
+        )
         .unwrap();
         assert_eq!(preparation_calls, 1);
         Self {
@@ -151,25 +239,48 @@ impl Fixture {
         .unwrap();
     }
     fn backup(&self) -> agent_session_grep_adapters_sqlite::managed_maintenance::BackupMetadata {
+        let mut reported = [false; 3];
         let outcome = retry_expected_success(|| {
-            let installation = self
-                .control
-                .bind_installation(&self.prefix, &self.installation_lock)?;
-            let catalog = MaintenanceCatalog::open_authorized(
-                &self.control,
-                &installation,
-                &id("owner"),
-                &self.catalog,
-                end(),
+            let started = Instant::now();
+            let installation = diagnose_failure(
+                &mut reported[0],
+                "backup.bind",
+                started,
+                None,
+                self.control
+                    .bind_installation(&self.prefix, &self.installation_lock),
             )?;
-            catalog.create_backup(
-                &self.control,
-                &installation,
-                &id("owner"),
-                &id("backup"),
-                BackupPurpose::BetaRollback,
-                2,
-                end(),
+            let started = Instant::now();
+            let open_end = end();
+            let catalog = diagnose_failure(
+                &mut reported[1],
+                "backup.open",
+                started,
+                Some(open_end),
+                MaintenanceCatalog::open_authorized(
+                    &self.control,
+                    &installation,
+                    &id("owner"),
+                    &self.catalog,
+                    open_end,
+                ),
+            )?;
+            let started = Instant::now();
+            let backup_end = end();
+            diagnose_failure(
+                &mut reported[2],
+                "backup.create",
+                started,
+                Some(backup_end),
+                catalog.create_backup(
+                    &self.control,
+                    &installation,
+                    &id("owner"),
+                    &id("backup"),
+                    BackupPurpose::BetaRollback,
+                    2,
+                    backup_end,
+                ),
             )
         })
         .unwrap();
@@ -199,6 +310,83 @@ fn prepare_catalog_and_prefix(
     control.record_verified_installation_prefix(prefix, installation_lock, &bound, end)?;
     assert_preparation_end(end);
     Ok(())
+}
+#[test]
+fn fixture_setup_preserves_original_phase_budgets_and_order() {
+    use std::cell::{Cell, RefCell};
+    let calls = RefCell::new(Vec::new());
+    let previous_finished = Cell::new(Instant::now());
+    let (control, lock) = setup_fixture_with(
+        |started, end| {
+            assert!(started >= previous_finished.get());
+            assert_eq!(end.duration_since(started), Duration::from_secs(30));
+            calls.borrow_mut().push("create");
+            previous_finished.set(Instant::now());
+            Ok(17)
+        },
+        |started, end| {
+            assert!(started >= previous_finished.get());
+            assert_eq!(end.duration_since(started), Duration::from_secs(5));
+            calls.borrow_mut().push("installation_lock");
+            previous_finished.set(Instant::now());
+            Ok(23)
+        },
+        |control, lock, started, end| {
+            assert_eq!((*control, *lock), (17, 23));
+            assert!(started >= previous_finished.get());
+            assert_eq!(end.duration_since(started), Duration::from_secs(5));
+            calls.borrow_mut().push("catalog_prefix");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((control, lock), (17, 23));
+    assert_eq!(
+        *calls.borrow(),
+        ["create", "installation_lock", "catalog_prefix"]
+    );
+}
+#[test]
+fn fixture_setup_honors_earlier_outer_end_and_expiry_before_effects() {
+    use std::cell::Cell;
+    let f = Fixture::new();
+    let outer_end = end();
+    let probe = outer_end + Duration::from_secs(30);
+    let calls = Cell::new(0);
+    f.control
+        .with_runtime_deadline(outer_end, || {
+            setup_fixture_with(
+                |_, end| {
+                    assert_eq!(end, outer_end);
+                    assert_preparation_end(end);
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_, end| {
+                    assert_eq!(end, outer_end);
+                    assert_preparation_end(end);
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_, _, _, end| {
+                    assert_eq!(end, outer_end);
+                    assert_preparation_end(end);
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 3);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    let expired = fixture_phase(Instant::now(), |_| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    });
+    assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+    assert_eq!(calls.get(), 3);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
 }
 #[test]
 fn fixture_catalog_preparation_missing_scope_or_expired_end_has_no_effects() {
@@ -404,14 +592,23 @@ fn logical_wal_backup_is_bound_and_never_copies_control_pause() {
         .control
         .bind_installation(&f.prefix, &f.installation_lock)
         .unwrap();
-    let restored = prepare_restore(
-        &f.control,
-        &installation,
-        &id("owner"),
-        &id("backup"),
-        &id("fresh_incarnation"),
-        &f.root.join("restore.db"),
-        end(),
+    let started = Instant::now();
+    let restore_end = end();
+    let mut reported = false;
+    let restored = diagnose_failure(
+        &mut reported,
+        "logical_wal.prepare_restore",
+        started,
+        Some(restore_end),
+        prepare_restore(
+            &f.control,
+            &installation,
+            &id("owner"),
+            &id("backup"),
+            &id("fresh_incarnation"),
+            &f.root.join("restore.db"),
+            restore_end,
+        ),
     )
     .unwrap();
     assert!(matches!(restored, RestoreOutcome::Prepared(_)));
