@@ -995,8 +995,18 @@ const LATEST_POLL: Duration = Duration::from_millis(25);
 type AdmissionFault = Box<dyn FnMut(&SqliteControlStore) -> Option<PortError>>;
 
 #[cfg(test)]
+struct AdmissionTiming {
+    now: Box<dyn Fn() -> Instant>,
+    sleep: Box<dyn FnMut(Duration)>,
+}
+
+#[cfg(test)]
 thread_local! {
     static ADMISSION_FAULT: std::cell::RefCell<Option<AdmissionFault>> =
+        const { std::cell::RefCell::new(None) };
+    static ADMISSION_STATUS_FAULT: std::cell::RefCell<Option<AdmissionFault>> =
+        const { std::cell::RefCell::new(None) };
+    static ADMISSION_TIMING: std::cell::RefCell<Option<AdmissionTiming>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1005,6 +1015,31 @@ thread_local! {
 #[cfg(test)]
 fn admission_fault(control: &SqliteControlStore) -> Option<PortError> {
     ADMISSION_FAULT.with(|slot| slot.borrow_mut().as_mut().and_then(|hook| hook(control)))
+}
+
+fn admission_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) =
+        ADMISSION_TIMING.with(|slot| slot.borrow().as_ref().map(|timing| (timing.now)()))
+    {
+        return now;
+    }
+    Instant::now()
+}
+
+fn admission_sleep(duration: Duration) {
+    #[cfg(test)]
+    if ADMISSION_TIMING.with(|slot| {
+        if let Some(timing) = slot.borrow_mut().as_mut() {
+            (timing.sleep)(duration);
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    std::thread::sleep(duration);
 }
 
 fn admit_latest(
@@ -1038,19 +1073,65 @@ fn admit_latest(
     // request's own latest wait; stopping at that end leaves the request
     // deadline for the busy read that follows.
     // Preserve the original three immediate attempts even when the wait is
-    // zero or already elapsed. Only subsequent attempts need a polling delay.
-    let mut immediate_retries = 2;
+    // zero or already elapsed. Subsequent status/CAS calls share the earlier
+    // wait end; a polling sleep does not authorize another attempt past it.
+    let mut immediate_attempts: u8 = 3;
     loop {
         check_deadline(deadline)?;
-        let current = control
-            .with_runtime_deadline(deadline, || control.status())
-            .map_err(private_port)?;
+        let extra_attempt = immediate_attempts == 0;
+        if extra_attempt && admission_now() >= wait_deadline {
+            check_deadline(deadline)?;
+            return Ok((None, Some("busy")));
+        }
+        let attempt_deadline = if extra_attempt {
+            deadline.min(wait_deadline)
+        } else {
+            deadline
+        };
+        let current = match control.with_runtime_deadline(attempt_deadline, || {
+            #[cfg(test)]
+            if let Some(error) = ADMISSION_STATUS_FAULT
+                .with(|slot| slot.borrow_mut().as_mut().and_then(|hook| hook(control)))
+            {
+                return Err(error);
+            }
+            control.status()
+        }) {
+            Ok(status) => status,
+            Err(PortError::WriterBusy(_)) if extra_attempt && admission_now() >= wait_deadline => {
+                // Only the admission wait expired. The original response end
+                // must still permit the ordinary busy/as-of read.
+                check_deadline(deadline)?;
+                return Ok((None, Some("busy")));
+            }
+            Err(error) => return Err(private_port(error)),
+        };
         if current.policy.installation_id != initial.policy.installation_id
             || current.policy.policy_epoch != initial.policy.policy_epoch
         {
             return Ok((None, Some("policy_changed")));
         }
-        match control.with_runtime_deadline(deadline, || {
+        // The policy-only prefix of control::blocked_reason, in the same
+        // priority order. A read may refuse admission without a write lock;
+        // worker advisory decisions and successful admission still belong to CAS.
+        let refusal = match current.desired_updates {
+            DesiredUpdates::Paused => Some(BackgroundFailure::Paused),
+            DesiredUpdates::Stopped => Some(BackgroundFailure::Stopped),
+            DesiredUpdates::Running
+                if current.policy.maintenance.state != MaintenanceState::Idle =>
+            {
+                Some(BackgroundFailure::Upgrading)
+            }
+            DesiredUpdates::Running => None,
+        };
+        if let Some(reason) = refusal {
+            return Ok((None, Some(failure_reason(reason))));
+        }
+        if extra_attempt && admission_now() >= wait_deadline {
+            check_deadline(deadline)?;
+            return Ok((None, Some("busy")));
+        }
+        match control.with_runtime_deadline(attempt_deadline, || {
             #[cfg(test)]
             if let Some(error) = admission_fault(control) {
                 return Err(error);
@@ -1073,15 +1154,16 @@ fn admit_latest(
             Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)) => {}
             Err(error) => return Err(private_port(error)),
         }
-        if immediate_retries > 0 {
-            immediate_retries -= 1;
+        immediate_attempts = immediate_attempts.saturating_sub(1);
+        if immediate_attempts > 0 {
             continue;
         }
-        let remaining = wait_deadline.saturating_duration_since(Instant::now());
+        check_deadline(deadline)?;
+        let remaining = wait_deadline.saturating_duration_since(admission_now());
         if remaining.is_zero() {
             return Ok((None, Some("busy")));
         }
-        std::thread::sleep(LATEST_POLL.min(remaining));
+        admission_sleep(LATEST_POLL.min(remaining));
     }
 }
 
@@ -2279,9 +2361,59 @@ mod transient_read_tests {
 mod latest_admission_tests {
     use super::*;
     use agent_session_grep_ports::control::{
-        CanonicalLocator, RootKind, ScopeRegion, SelectionRequest,
+        CanonicalLocator, MaintenanceFence, MaintenancePhase, RootKind, ScopeRegion,
+        SelectionRequest,
     };
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    struct Hooks;
+    impl Hooks {
+        fn install(
+            fault: AdmissionFault,
+            status: Option<AdmissionFault>,
+            timing: Option<AdmissionTiming>,
+        ) -> Self {
+            ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
+            ADMISSION_STATUS_FAULT.with(|slot| *slot.borrow_mut() = status);
+            ADMISSION_TIMING.with(|slot| *slot.borrow_mut() = timing);
+            Self
+        }
+    }
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = None);
+            ADMISSION_STATUS_FAULT.with(|slot| *slot.borrow_mut() = None);
+            ADMISSION_TIMING.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    struct Clock {
+        now: Rc<Cell<Instant>>,
+        sleeps: Rc<RefCell<Vec<Duration>>>,
+    }
+    impl Clock {
+        fn new(now: Instant) -> Self {
+            Self {
+                now: Rc::new(Cell::new(now)),
+                sleeps: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+        fn timing(&self, overshoot: Duration) -> AdmissionTiming {
+            let read = Rc::clone(&self.now);
+            let advance = Rc::clone(&self.now);
+            let sleeps = Rc::clone(&self.sleeps);
+            AdmissionTiming {
+                now: Box::new(move || read.get()),
+                sleep: Box::new(move |duration| {
+                    sleeps.borrow_mut().push(duration);
+                    advance.set(advance.get() + duration + overshoot);
+                }),
+            }
+        }
+    }
 
     // Field order is drop order: the control store closes before the tempdir.
     struct Fixture {
@@ -2352,7 +2484,7 @@ mod latest_admission_tests {
         wait_ms: u32,
     ) -> (Option<LatestBarrier>, Option<&'static str>) {
         let initial = fixture.control.status().unwrap();
-        ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = Some(hook));
+        let _hooks = Hooks::install(hook, None, None);
         let wait_deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
         let result = admit_latest(
             &fixture.control,
@@ -2362,8 +2494,18 @@ mod latest_admission_tests {
             wait_deadline,
             Instant::now() + Duration::from_secs(60),
         );
-        ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = None);
         result.unwrap()
+    }
+
+    fn no_barrier(fixture: &Fixture) {
+        let connection = rusqlite::Connection::open(SqliteControlStore::path(
+            &fixture.histories.join("private"),
+        ))
+        .unwrap();
+        let count: u32 = connection
+            .query_row("SELECT COUNT(*) FROM barriers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -2426,6 +2568,327 @@ mod latest_admission_tests {
         assert_eq!(blocked, Some("busy"));
         assert!(barrier.is_none());
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn polling_wake_at_or_after_wait_end_never_attempts_a_fourth_cas() {
+        for overshoot in [Duration::ZERO, Duration::from_millis(7)] {
+            let fixture = fixture();
+            let initial = fixture.control.status().unwrap();
+            // SQL runs with generous real deadlines. Only the admission clock
+            // jumps: the third failure leaves exactly 5 ms of virtual wait.
+            let start = Instant::now();
+            let wait_end = start + Duration::from_secs(30);
+            let response_end = wait_end + Duration::from_secs(30);
+            let clock = Clock::new(start);
+            let reads = Rc::new(Cell::new(0));
+            let read_count = Rc::clone(&reads);
+            let status: AdmissionFault = Box::new(move |_| {
+                read_count.set(read_count.get() + 1);
+                None
+            });
+            let calls = Rc::new(Cell::new(0));
+            let seen = Rc::clone(&calls);
+            let now = Rc::clone(&clock.now);
+            let hook: AdmissionFault = Box::new(move |_| {
+                seen.set(seen.get() + 1);
+                if seen.get() == 3 {
+                    now.set(wait_end - Duration::from_millis(5));
+                }
+                // A fourth attempt would really succeed and create a barrier.
+                (seen.get() <= 3).then(|| PortError::GenerationMismatch("synthetic race".into()))
+            });
+            let _hooks = Hooks::install(hook, Some(status), Some(clock.timing(overshoot)));
+            let (barrier, blocked) = admit_latest(
+                &fixture.control,
+                &initial,
+                &[],
+                30_000,
+                wait_end,
+                response_end,
+            )
+            .unwrap();
+            assert_eq!(blocked, Some("busy"));
+            assert!(barrier.is_none());
+            assert_eq!(calls.get(), 3);
+            assert_eq!(reads.get(), 3, "no status read past the wait end");
+            assert_eq!(*clock.sleeps.borrow(), vec![Duration::from_millis(5)]);
+            assert_eq!(clock.now.get(), wait_end + overshoot);
+            no_barrier(&fixture);
+        }
+    }
+
+    #[test]
+    fn extra_status_and_cas_scopes_end_at_wait_expiry_without_hiding_hard_errors() {
+        // Each closure observes the real adapter scope. The fake clock
+        // models SQL returning at its own end, without a wall-clock race.
+        for fail_status in [false, true] {
+            for hard_error in [false, true] {
+                let fixture = fixture();
+                let initial = fixture.control.status().unwrap();
+                let start = Instant::now();
+                let wait_end = start + Duration::from_secs(30);
+                let response_end = wait_end + Duration::from_secs(30);
+                let clock = Clock::new(start);
+                let reads = Rc::new(Cell::new(0));
+                let read_count = Rc::clone(&reads);
+                let now = Rc::clone(&clock.now);
+                let status: AdmissionFault = Box::new(move |_| {
+                    read_count.set(read_count.get() + 1);
+                    let count = read_count.get();
+                    assert!(count <= 4);
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(response_end),
+                        if count <= 3 { response_end } else { wait_end },
+                    );
+                    if fail_status && count == 4 {
+                        now.set(wait_end);
+                        Some(if hard_error {
+                            PortError::SchemaIncompatible("synthetic status error".into())
+                        } else {
+                            PortError::WriterBusy("synthetic status wait expiry".into())
+                        })
+                    } else {
+                        None
+                    }
+                });
+                let calls = Rc::new(Cell::new(0));
+                let seen = Rc::clone(&calls);
+                let now = Rc::clone(&clock.now);
+                let hook: AdmissionFault = Box::new(move |_| {
+                    seen.set(seen.get() + 1);
+                    let count = seen.get();
+                    assert!(count <= 4);
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(response_end),
+                        if count <= 3 { response_end } else { wait_end },
+                    );
+                    if count <= 3 {
+                        Some(PortError::GenerationMismatch("synthetic race".into()))
+                    } else {
+                        now.set(wait_end);
+                        Some(if hard_error {
+                            PortError::SchemaIncompatible("synthetic CAS error".into())
+                        } else {
+                            PortError::WriterBusy("synthetic CAS wait expiry".into())
+                        })
+                    }
+                });
+                let _hooks = Hooks::install(hook, Some(status), Some(clock.timing(Duration::ZERO)));
+                let result = admit_latest(
+                    &fixture.control,
+                    &initial,
+                    &[],
+                    30_000,
+                    wait_end,
+                    response_end,
+                );
+                if hard_error {
+                    assert_eq!(
+                        result.unwrap_err().0.code,
+                        CanonicalCode::SchemaIncompatible
+                    );
+                } else {
+                    let (barrier, blocked) = result.unwrap();
+                    assert_eq!(blocked, Some("busy"));
+                    assert!(barrier.is_none());
+                }
+                assert_eq!(reads.get(), 4);
+                assert_eq!(calls.get(), if fail_status { 3 } else { 4 });
+                assert_eq!(*clock.sleeps.borrow(), vec![LATEST_POLL]);
+                assert_eq!(clock.now.get(), wait_end);
+                // The shorter admission scope is restored before as-of reads.
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(response_end),
+                    response_end,
+                );
+                no_barrier(&fixture);
+            }
+        }
+    }
+
+    #[test]
+    fn extra_status_finishing_at_wait_end_does_not_enter_cas() {
+        let fixture = fixture();
+        let initial = fixture.control.status().unwrap();
+        let start = Instant::now();
+        let wait_end = start + Duration::from_secs(30);
+        let response_end = wait_end + Duration::from_secs(30);
+        let clock = Clock::new(start);
+        let reads = Rc::new(Cell::new(0));
+        let read_count = Rc::clone(&reads);
+        let now = Rc::clone(&clock.now);
+        let status: AdmissionFault = Box::new(move |_| {
+            read_count.set(read_count.get() + 1);
+            if read_count.get() == 4 {
+                now.set(wait_end);
+            }
+            None
+        });
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&calls);
+        let hook: AdmissionFault = Box::new(move |_| {
+            seen.set(seen.get() + 1);
+            (seen.get() <= 3).then(|| PortError::GenerationMismatch("synthetic race".into()))
+        });
+        let _hooks = Hooks::install(hook, Some(status), Some(clock.timing(Duration::ZERO)));
+        let (barrier, blocked) = admit_latest(
+            &fixture.control,
+            &initial,
+            &[],
+            30_000,
+            wait_end,
+            response_end,
+        )
+        .unwrap();
+        assert_eq!(blocked, Some("busy"));
+        assert!(barrier.is_none());
+        assert_eq!(reads.get(), 4);
+        assert_eq!(calls.get(), 3);
+        no_barrier(&fixture);
+    }
+
+    #[test]
+    fn terminal_intent_or_fence_after_a_lost_cas_refuses_before_another_write() {
+        for (desired, maintenance, expected) in [
+            (DesiredUpdates::Paused, MaintenanceState::Idle, "paused"),
+            (DesiredUpdates::Stopped, MaintenanceState::Idle, "stopped"),
+            (
+                DesiredUpdates::Running,
+                MaintenanceState::Updating,
+                "upgrading",
+            ),
+            (
+                DesiredUpdates::Running,
+                MaintenanceState::Recovering,
+                "upgrading",
+            ),
+            (
+                DesiredUpdates::Running,
+                MaintenanceState::Uninstalling,
+                "upgrading",
+            ),
+            (DesiredUpdates::Paused, MaintenanceState::Updating, "paused"),
+            (
+                DesiredUpdates::Stopped,
+                MaintenanceState::Updating,
+                "stopped",
+            ),
+        ] {
+            let fixture = fixture();
+            let initial = fixture.control.status().unwrap();
+            let start = Instant::now();
+            let wait_end = start + Duration::from_secs(30);
+            let response_end = wait_end + Duration::from_secs(30);
+            let clock = Clock::new(start);
+            let calls = Rc::new(Cell::new(0));
+            let seen = Rc::clone(&calls);
+            let selections = initial
+                .policy
+                .selections
+                .iter()
+                .map(|selection| SelectionRevision {
+                    selection_id: selection.id.clone(),
+                    revision: selection.revision,
+                    root_identity: selection.root_identity.clone().unwrap(),
+                })
+                .collect::<Vec<_>>();
+            let hook: AdmissionFault = Box::new(move |control| {
+                seen.set(seen.get() + 1);
+                assert_eq!(seen.get(), 1, "known terminal policy reached a second CAS");
+                if seen.get() == 1 {
+                    if desired != DesiredUpdates::Running {
+                        control
+                            .set_desired_updates(
+                                control.status().unwrap().policy.control_seq,
+                                desired,
+                            )
+                            .unwrap();
+                    }
+                    if maintenance != MaintenanceState::Idle {
+                        let owner = ControlId::parse("unit-latest-maintenance").unwrap();
+                        control
+                            .set_maintenance(
+                                control.status().unwrap().policy.control_seq,
+                                &owner,
+                                MaintenanceFence {
+                                    state: maintenance,
+                                    owner: Some(owner.clone()),
+                                    phase: Some(MaintenancePhase::Quiescing),
+                                },
+                            )
+                            .unwrap();
+                    }
+                    // The real adapter is the oracle for refusal priority;
+                    // the CLI fast path must not reinterpret worker advisory.
+                    let actual = control
+                        .admit_latest(
+                            control.status().unwrap().policy.control_seq,
+                            LatestRequest {
+                                selections: selections.clone(),
+                                max_wait_ms: 30_000,
+                                now_ms: crate::app_clock_ms(),
+                            },
+                        )
+                        .unwrap()
+                        .value;
+                    let LatestAdmission::Blocked(reason) = actual else {
+                        panic!("terminal policy admitted a barrier");
+                    };
+                    assert_eq!(failure_reason(reason), expected);
+                }
+                Some(PortError::WriterBusy("synthetic continuing writer".into()))
+            });
+            let _hooks = Hooks::install(hook, None, Some(clock.timing(Duration::ZERO)));
+            let (barrier, blocked) = admit_latest(
+                &fixture.control,
+                &initial,
+                &[],
+                30_000,
+                wait_end,
+                response_end,
+            )
+            .unwrap();
+            assert_eq!(blocked, Some(expected));
+            assert!(barrier.is_none());
+            assert_eq!(calls.get(), 1, "terminal status needs no second CAS");
+            assert!(clock.sleeps.borrow().is_empty());
+            assert_eq!(
+                fixture.control.status().unwrap().policy.policy_epoch,
+                initial.policy.policy_epoch
+            );
+            no_barrier(&fixture);
+        }
+    }
+
+    #[test]
+    fn nonretryable_admission_error_is_reported_once_without_sleep() {
+        let fixture = fixture();
+        let initial = fixture.control.status().unwrap();
+        let start = Instant::now();
+        let clock = Clock::new(start);
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&calls);
+        let hook: AdmissionFault = Box::new(move |_| {
+            seen.set(seen.get() + 1);
+            Some(PortError::SchemaIncompatible(
+                "synthetic admission failure".into(),
+            ))
+        });
+        let _hooks = Hooks::install(hook, None, Some(clock.timing(Duration::ZERO)));
+        let error = admit_latest(
+            &fixture.control,
+            &initial,
+            &[],
+            30_000,
+            start + Duration::from_secs(30),
+            start + Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(error.0.code, CanonicalCode::SchemaIncompatible);
+        assert_eq!(calls.get(), 1);
+        assert!(clock.sleeps.borrow().is_empty());
+        no_barrier(&fixture);
     }
 
     #[test]
