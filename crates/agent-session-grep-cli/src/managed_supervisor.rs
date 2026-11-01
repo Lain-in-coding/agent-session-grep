@@ -2,8 +2,9 @@
 //! lock; this process owns only the supervisor lock and never signals a PID.
 //! Native managers may use the same policy without duplicating ingestion.
 
+#[cfg(not(test))]
+use agent_session_grep_adapters_sqlite::SqliteControlStore;
 use agent_session_grep_adapters_sqlite::{
-    SqliteControlStore,
     managed_locks::{ExclusiveGuard, LockKind, RootIdentity},
     managed_store::{ManagedStore, validate_catalog_path},
 };
@@ -27,6 +28,8 @@ use std::{
 };
 
 use crate::package_installation::ImagePin;
+#[cfg(test)]
+use integration_deadline_tests::ObservedControl as SqliteControlStore;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEALTHY_RESET: Duration = Duration::from_secs(600);
@@ -915,7 +918,129 @@ fn active_time() -> PortResult<Duration> {
 #[cfg(test)]
 mod integration_deadline_tests {
     use super::*;
+    use agent_session_grep_adapters_sqlite::SqliteControlStore;
+    use agent_session_grep_ports::control::{ControlChange, PurgeJob};
     use rusqlite::Connection;
+    use std::{cell::RefCell, ops::Deref};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ControlCall {
+        ReadOpen,
+        WriteOpen,
+        Status,
+        FailureWrite,
+        PurgeJobs,
+    }
+
+    struct DeadlineTrace {
+        end: Instant,
+        calls: Vec<(ControlCall, Instant)>,
+    }
+
+    thread_local! {
+        static DEADLINE_TRACE: RefCell<Option<DeadlineTrace>> = const { RefCell::new(None) };
+    }
+
+    struct ObserveDeadline;
+
+    impl ObserveDeadline {
+        fn start(end: Instant) -> Self {
+            DEADLINE_TRACE.with(|trace| {
+                assert!(trace.borrow().is_none());
+                *trace.borrow_mut() = Some(DeadlineTrace {
+                    end,
+                    calls: Vec::new(),
+                });
+            });
+            Self
+        }
+
+        fn finish(self) -> Vec<ControlCall> {
+            let trace = DEADLINE_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
+            for (call, end) in &trace.calls {
+                assert_eq!(*end, trace.end, "{call:?} lost the caller's original end");
+            }
+            trace.calls.into_iter().map(|(call, _)| call).collect()
+        }
+    }
+
+    impl Drop for ObserveDeadline {
+        fn drop(&mut self) {
+            DEADLINE_TRACE.with(|trace| *trace.borrow_mut() = None);
+        }
+    }
+
+    fn observe_control_call(call: ControlCall, requested: Option<Instant>) {
+        DEADLINE_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                // An unscoped call returns the later probe, so removing a
+                // with_runtime_deadline cannot pass as the original end.
+                let end = requested.unwrap_or_else(|| {
+                    SqliteControlStore::effective_runtime_deadline(
+                        trace.end + Duration::from_nanos(1),
+                    )
+                });
+                trace.calls.push((call, end));
+            }
+        });
+    }
+
+    // Only this module's test build observes admission arguments and the
+    // actual scope at SQL entry. Every call still reaches the real adapter;
+    // this neither installs a deadline nor changes time or lock behavior.
+    pub(super) struct ObservedControl(SqliteControlStore);
+
+    impl Deref for ObservedControl {
+        type Target = SqliteControlStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ObservedControl {
+        pub(super) fn effective_runtime_deadline(end: Instant) -> Instant {
+            SqliteControlStore::effective_runtime_deadline(end)
+        }
+
+        pub(super) fn open_current_read_only_with_deadline(
+            root: &Path,
+            end: Instant,
+        ) -> PortResult<Self> {
+            observe_control_call(ControlCall::ReadOpen, Some(end));
+            SqliteControlStore::open_current_read_only_with_deadline(root, end).map(Self)
+        }
+
+        pub(super) fn open_existing_writable_with_deadline(
+            root: &Path,
+            installation: &ControlId,
+            end: Instant,
+        ) -> PortResult<Self> {
+            observe_control_call(ControlCall::WriteOpen, Some(end));
+            SqliteControlStore::open_existing_writable_with_deadline(root, installation, end)
+                .map(Self)
+        }
+
+        pub(super) fn status(&self) -> PortResult<ControlStatus> {
+            observe_control_call(ControlCall::Status, None);
+            self.0.status()
+        }
+
+        pub(super) fn purge_jobs(&self) -> PortResult<Vec<PurgeJob>> {
+            observe_control_call(ControlCall::PurgeJobs, None);
+            self.0.purge_jobs()
+        }
+
+        pub(super) fn report_supervisor_failure(
+            &self,
+            expected: ControlSeq,
+            guard: &ExclusiveGuard,
+            failed: bool,
+        ) -> PortResult<ControlChange<()>> {
+            observe_control_call(ControlCall::FailureWrite, None);
+            self.0.report_supervisor_failure(expected, guard, failed)
+        }
+    }
 
     fn fixture_deadline() -> Instant {
         Instant::now() + STARTUP_BUDGET
@@ -1141,20 +1266,33 @@ mod integration_deadline_tests {
         let end = supervisor.startup.as_ref().unwrap().end;
         let root = supervisor.catalog.parent().unwrap();
         let blocker = ExclusiveGuard::try_acquire(root, LockKind::ControlHandles).unwrap();
-        let started = Instant::now();
+        let poll_end = Instant::now() + Duration::from_millis(20);
+        let observed = ObserveDeadline::start(poll_end);
         assert!(matches!(
-            supervisor.spawn_until(started + Duration::from_millis(20)),
+            supervisor.spawn_until(poll_end),
             Err(PortError::WriterBusy(_)),
         ));
-        assert!(started.elapsed() < Duration::from_millis(150));
+        let calls = observed.finish();
+        assert!(
+            calls.is_empty() || calls == [ControlCall::ReadOpen],
+            "{calls:?}"
+        );
         assert_eq!(supervisor.startup.as_ref().unwrap().end, end);
         assert!(supervisor.startup.as_ref().unwrap().application.is_some());
         drop(blocker);
+        let poll_end = Instant::now() + CONTROL_POLL_BUDGET;
+        let observed = ObserveDeadline::start(poll_end);
         assert_eq!(
-            supervisor
-                .tick_until(Instant::now() + CONTROL_POLL_BUDGET)
-                .unwrap(),
+            supervisor.tick_until(poll_end).unwrap(),
             SupervisorState::Finished,
+        );
+        assert_eq!(
+            observed.finish(),
+            [
+                ControlCall::ReadOpen,
+                ControlCall::Status,
+                ControlCall::PurgeJobs
+            ]
         );
         assert!(supervisor.startup.is_none());
         std::fs::write(&image, b"released after stop").unwrap();
@@ -1329,7 +1467,10 @@ mod integration_deadline_tests {
     #[test]
     fn expired_failure_report_refuses_before_control_mutation() {
         let (_temp, supervisor) = fixture();
-        let result = supervisor.report_failure(true, Instant::now());
+        let end = Instant::now();
+        let observed = ObserveDeadline::start(end);
+        let result = supervisor.report_failure(true, end);
+        assert!(observed.finish().is_empty());
         let control =
             SqliteControlStore::open_current_read_only(supervisor.catalog.parent().unwrap())
                 .unwrap();
@@ -1341,23 +1482,36 @@ mod integration_deadline_tests {
     fn failure_report_writer_contention_uses_original_remaining_deadline() {
         let (_temp, supervisor) = fixture();
         let root = supervisor.catalog.parent().unwrap();
+        let before = SqliteControlStore::open_current_read_only(root)
+            .unwrap()
+            .status()
+            .unwrap();
         let writer = Connection::open(SqliteControlStore::path(root)).unwrap();
         writer.busy_timeout(Duration::ZERO).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let started = Instant::now();
-        let result = supervisor.report_failure(true, started + Duration::from_millis(20));
-        let elapsed = started.elapsed();
+        let end = Instant::now() + Duration::from_millis(20);
+        let observed = ObserveDeadline::start(end);
+        let result = supervisor.report_failure(true, end);
+        let calls = observed.finish();
         writer.execute_batch("ROLLBACK").unwrap();
         assert!(matches!(result, Err(PortError::WriterBusy(_))));
-        // Generous scheduler tolerance still distinguishes the old per-call
-        // 250 ms wait from the caller's 20 ms budget on a tiny real database.
-        assert!(elapsed < Duration::from_millis(150), "elapsed: {elapsed:?}");
+        let report_calls = [
+            ControlCall::ReadOpen,
+            ControlCall::Status,
+            ControlCall::WriteOpen,
+            ControlCall::Status,
+            ControlCall::FailureWrite,
+        ];
+        // A preempted call may expire at any boundary. Exact scope equality,
+        // plus a complete successful trace below, detects renewed 250 ms waits.
+        assert!(report_calls.starts_with(&calls), "{calls:?}");
         let control = SqliteControlStore::open_current_read_only(root).unwrap();
-        assert!(!control.status().unwrap().supervisor_failed);
+        assert_eq!(control.status().unwrap(), before);
         drop(control);
-        supervisor
-            .report_failure(true, Instant::now() + Duration::from_secs(1))
-            .unwrap();
+        let end = Instant::now() + Duration::from_secs(1);
+        let observed = ObserveDeadline::start(end);
+        supervisor.report_failure(true, end).unwrap();
+        assert_eq!(observed.finish(), report_calls);
         assert!(
             SqliteControlStore::open_current_read_only(root)
                 .unwrap()
@@ -1382,28 +1536,61 @@ mod integration_deadline_tests {
         let (_temp, mut supervisor) = fixture();
         let root = supervisor.catalog.parent().unwrap().to_path_buf();
         let blocker = ExclusiveGuard::try_acquire(&root, LockKind::ControlHandles).unwrap();
-        let started = Instant::now();
-        let result = supervisor.tick_until(started + Duration::from_millis(20));
-        let elapsed = started.elapsed();
+        let end = Instant::now() + Duration::from_millis(20);
+        let observed = ObserveDeadline::start(end);
+        let result = supervisor.tick_until(end);
+        let calls = observed.finish();
         drop(blocker);
         assert!(matches!(result, Err(PortError::WriterBusy(_))));
-        assert!(elapsed < Duration::from_millis(150), "elapsed: {elapsed:?}");
+        assert!(
+            calls.is_empty() || calls == [ControlCall::ReadOpen],
+            "{calls:?}"
+        );
         assert_eq!(supervisor.child_id(), None);
+        let end = Instant::now() + Duration::from_secs(1);
+        let observed = ObserveDeadline::start(end);
         assert_eq!(
-            supervisor
-                .tick_until(Instant::now() + Duration::from_secs(1))
-                .unwrap(),
+            supervisor.tick_until(end).unwrap(),
             SupervisorState::Finished
         );
+        assert_eq!(
+            observed.finish(),
+            [
+                ControlCall::ReadOpen,
+                ControlCall::Status,
+                ControlCall::PurgeJobs
+            ]
+        );
     }
+
+    #[test]
+    fn expired_spawn_refuses_before_control_read_or_child_creation() {
+        let (_temp, mut supervisor) = fixture();
+        let end = Instant::now();
+        let observed = ObserveDeadline::start(end);
+        assert!(matches!(
+            supervisor.spawn_until(end),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert!(observed.finish().is_empty());
+        assert!(supervisor.child_id().is_none());
+        assert!(!supervisor.catalog.exists());
+    }
+
     #[test]
     fn expired_tick_refuses_before_sampling_or_control_read() {
         let (_temp, mut supervisor) = fixture();
-        let previous_sample = supervisor.last_sample;
+        // Consecutive native clock samples can be equal; use an unmistakable
+        // prior value so removing the entry guard cannot pass by coincidence.
+        let previous_sample = Duration::ZERO;
+        supervisor.last_sample = previous_sample;
+        let end = Instant::now();
+        let observed = ObserveDeadline::start(end);
         assert!(matches!(
-            supervisor.tick_until(Instant::now()),
+            supervisor.tick_until(end),
             Err(PortError::WriterBusy(_))
         ));
+        assert!(observed.finish().is_empty());
         assert_eq!(supervisor.last_sample, previous_sample);
         assert_eq!(supervisor.child_id(), None);
     }
