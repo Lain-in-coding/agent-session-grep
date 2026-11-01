@@ -850,6 +850,8 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 Err(error) => return Err(error),
             };
         let mut idle_completed = None;
+        let mut idle_incarnation = None;
+        let mut idle_ready = None;
         let (state, error) = if current.desired_updates == DesiredUpdates::Paused {
             invalidate_pending_idle(&mut pending_cycle, &mut schedule);
             (UpdateState::Paused, Some(BackgroundFailure::Paused))
@@ -870,51 +872,65 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 &mut pending_cycle,
                 &mut schedule,
             ) {
-                Ok(outcome) => {
-                    let closed_idle = outcome.idle();
-                    idle_completed = if closed_idle {
-                        schedule.closed_idle_at
-                    } else {
-                        None
-                    };
-                    (
-                        if closed_idle {
-                            UpdateState::Idle
-                        } else {
-                            UpdateState::Deferred
-                        },
-                        if closed_idle {
-                            None
-                        } else {
-                            Some(BackgroundFailure::Deferred)
-                        },
-                    )
+                Ok(CycleResult::Idle(ready)) => {
+                    idle_ready = Some(ready);
+                    (UpdateState::Idle, None)
+                }
+                Ok(CycleResult::Work(outcome)) => {
+                    debug_assert!(!outcome.idle());
+                    (UpdateState::Deferred, Some(BackgroundFailure::Deferred))
                 }
                 Err(error) => (failure_state(&error), Some(failure(&error))),
             }
         };
-        // A concurrent pause/stop owns the desired state. Derive the heartbeat
-        // again on every CAS retry so stale activity cannot overwrite it.
-        let boundary = control_change(&control, |seq| {
-            let now = control.status()?;
-            if let Some(exit) = worker_exit(&now) {
-                invalidate_pending_idle(&mut pending_cycle, &mut schedule);
-                return Ok(WorkerBoundary::Exit(exit));
-            }
-            let (state, error) = match now.desired_updates {
-                DesiredUpdates::Paused => {
-                    invalidate_pending_idle(&mut pending_cycle, &mut schedule);
-                    (UpdateState::Paused, Some(BackgroundFailure::Paused))
+        let boundary = if let Some(ready) = idle_ready {
+            #[cfg(test)]
+            wal_worker_tests::idle_ready(&pending_cycle, &schedule);
+            match accept_idle_boundary(
+                db,
+                &control,
+                &authority,
+                &ready,
+                &mut pending_cycle,
+                &mut schedule,
+                Instant::now() + CONTROL_BUDGET,
+            ) {
+                Ok(Some(accepted)) => {
+                    debug_assert!(accepted.outcome.idle());
+                    idle_completed = schedule.closed_idle_at;
+                    idle_incarnation = Some(accepted.incarnation);
+                    Ok(WorkerBoundary::Idle)
                 }
-                _ => (state, error),
-            };
-            control.heartbeat_worker(seq, &authority, state, error, app_clock_ms())?;
-            Ok(match state {
-                UpdateState::Idle => WorkerBoundary::Idle,
-                UpdateState::Paused => WorkerBoundary::Paused,
-                _ => WorkerBoundary::Busy,
-            })
-        });
+                Err(error @ PortError::WriterBusy(_)) => {
+                    #[cfg(test)]
+                    wal_worker_tests::idle_deferred(&pending_cycle, &schedule, &error);
+                    Err(error)
+                }
+                result => {
+                    let (state, error) = match result {
+                        Err(error) => (failure_state(&error), Some(failure(&error))),
+                        _ => (UpdateState::Deferred, Some(BackgroundFailure::Deferred)),
+                    };
+                    record_worker_boundary(
+                        &control,
+                        &authority,
+                        &mut pending_cycle,
+                        &mut schedule,
+                        state,
+                        error,
+                    )
+                }
+            }
+        } else {
+            record_worker_boundary(
+                &control,
+                &authority,
+                &mut pending_cycle,
+                &mut schedule,
+                state,
+                error,
+            )
+        };
         let boundary = match boundary {
             Ok(WorkerBoundary::Exit(exit)) => {
                 if finish_worker(
@@ -957,16 +973,18 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         }
         // All cycle and retention connections are closed at this boundary.
         #[cfg(test)]
-        wal_worker_tests::event(wal_worker_tests::Event::Boundary(boundary));
+        wal_worker_tests::cycle_boundary(boundary, &pending_cycle, &schedule);
         if matches!(boundary, WorkerBoundary::Idle | WorkerBoundary::Paused) {
             match checkpoint_at_boundary(
                 db,
                 &control,
                 &authority,
-                schedule
-                    .identity
-                    .as_ref()
-                    .map(|identity| &identity.incarnation),
+                idle_incarnation.as_ref().or_else(|| {
+                    schedule
+                        .identity
+                        .as_ref()
+                        .map(|identity| &identity.incarnation)
+                }),
             ) {
                 Ok(()) | Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {}
                 Err(error) => {
@@ -974,6 +992,8 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                     record_boundary_failure(&control, &authority, &error)?;
                 }
             }
+            #[cfg(test)]
+            wal_worker_tests::after_idle_checkpoint(&pending_cycle, &schedule);
         }
         rounds = rounds.wrapping_add(1);
         let wait = if let Some(completed) = idle_completed {
@@ -1027,6 +1047,38 @@ enum WorkerBoundary {
     Paused,
     Busy,
     Exit(WorkerExit),
+}
+
+fn record_worker_boundary(
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+    pending: &mut Option<PendingCycle>,
+    schedule: &mut SourceScheduleState,
+    state: UpdateState,
+    error: Option<BackgroundFailure>,
+) -> PortResult<WorkerBoundary> {
+    // Current intent owns every retried heartbeat, including after an idle
+    // candidate was invalidated before its boundary could accept it.
+    control_change(control, |seq| {
+        let now = control.status()?;
+        if let Some(exit) = worker_exit(&now) {
+            invalidate_pending_idle(pending, schedule);
+            return Ok(WorkerBoundary::Exit(exit));
+        }
+        let (state, error) = match now.desired_updates {
+            DesiredUpdates::Paused => {
+                invalidate_pending_idle(pending, schedule);
+                (UpdateState::Paused, Some(BackgroundFailure::Paused))
+            }
+            _ => (state, error),
+        };
+        control.heartbeat_worker(seq, authority, state, error, app_clock_ms())?;
+        Ok(match state {
+            UpdateState::Idle => WorkerBoundary::Idle,
+            UpdateState::Paused => WorkerBoundary::Paused,
+            _ => WorkerBoundary::Busy,
+        })
+    })
 }
 
 fn worker_exit(status: &ControlStatus) -> Option<WorkerExit> {
@@ -1094,9 +1146,10 @@ fn finish_worker(
     incarnation: Option<&ControlId>,
 ) -> PortResult<bool> {
     #[cfg(test)]
-    wal_worker_tests::event(wal_worker_tests::Event::Boundary(WorkerBoundary::Exit(
-        exit,
-    )));
+    wal_worker_tests::event(wal_worker_tests::Event::Boundary(
+        WorkerBoundary::Exit(exit),
+        None,
+    ));
     // This process-local stop intent outlives a refused cleanup tick. Once the
     // physical attempt ran, later cadences only recheck intent and clean control.
     let mut pending = PendingStop::default();
@@ -1424,6 +1477,7 @@ fn discovery_capacity() -> PortError {
     PortError::WriterBusy("managed source discovery capacity exceeded".into())
 }
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 struct PendingCycle {
     token: ObservationToken,
     finish: CycleFinish,
@@ -1431,6 +1485,7 @@ struct PendingCycle {
     completion_confirmed: bool,
 }
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 struct PendingObservation {
     outcome: CycleOutcome,
     identity: ScheduleIdentity,
@@ -1444,6 +1499,24 @@ struct CycleOutcome {
     all_sources_attempted: bool,
     remaining_work: bool,
     due_candidates: BTreeSet<SourceId>,
+}
+
+#[derive(Debug)]
+enum CycleResult {
+    Idle(IdleReady),
+    Work(CycleOutcome),
+}
+
+#[derive(Debug)]
+enum IdleReady {
+    Observed(ObservationToken),
+    Empty,
+}
+
+#[derive(Debug)]
+struct IdlePermit {
+    control_seq: ControlSeq,
+    incarnation: ControlId,
 }
 
 impl CycleOutcome {
@@ -1472,6 +1545,8 @@ fn finish_pending_cycle(
     let Some(intent) = pending.as_mut() else {
         return Ok(());
     };
+    #[cfg(test)]
+    wal_worker_tests::idle_stage(wal_worker_tests::IdleStage::Completion);
     if intent.completion_confirmed {
         return Ok(());
     }
@@ -1490,13 +1565,20 @@ fn finish_pending_cycle(
         }
         if matches!(cycle.state, CycleState::Queued | CycleState::Observing) {
             cycle = control_change_before(control, end, |seq| {
-                control.finish_cycle(
+                let result = control.finish_cycle(
                     seq,
                     authority,
                     intent.token.cycle_seq,
                     intent.finish,
                     app_clock_ms(),
-                )
+                );
+                #[cfg(test)]
+                wal_worker_tests::finish_attempt(
+                    &intent.token,
+                    intent.completion_confirmed,
+                    result.as_ref().map(|_| ()).map_err(failure),
+                );
+                result
             })?
             .value;
         }
@@ -1555,8 +1637,8 @@ fn invalidate_pending_idle(pending: &mut Option<PendingCycle>, schedule: &mut So
     }
 }
 
-/// Completion is already durable. Keep the slot until every bounded current
-/// read succeeds, then consume it once; a Busy result leaves it for next tick.
+/// A valid outcome remains owned until the caller's final heartbeat accepts
+/// it. The returned permit binds the complete read set to that heartbeat CAS.
 fn deliver_pending_idle(
     db: &Path,
     control: &SqliteControlStore,
@@ -1564,7 +1646,7 @@ fn deliver_pending_idle(
     pending: &mut Option<PendingCycle>,
     schedule: &mut SourceScheduleState,
     end: Instant,
-) -> PortResult<Option<CycleOutcome>> {
+) -> PortResult<Option<IdlePermit>> {
     let Some(intent) = pending
         .as_ref()
         .filter(|intent| intent.completion_confirmed)
@@ -1579,6 +1661,8 @@ fn deliver_pending_idle(
         *pending = None;
         return Ok(None);
     }
+    #[cfg(test)]
+    wal_worker_tests::idle_stage(wal_worker_tests::IdleStage::Validation);
     let mut observed_drift = false;
     let valid = control.with_runtime_deadline(end, || {
         #[cfg(test)]
@@ -1620,7 +1704,7 @@ fn deliver_pending_idle(
             )? != observed.identity
         {
             observed_drift = true;
-            return Ok(false);
+            return Ok(None);
         }
         // This read-only facade performs no recovery or source observation.
         let catalog = ManagedStore::open(db, control)?;
@@ -1628,7 +1712,7 @@ fn deliver_pending_idle(
         drop(catalog);
         if !physical_matches {
             observed_drift = true;
-            return Ok(false);
+            return Ok(None);
         }
         #[cfg(test)]
         schedule.hooks.event(ScheduleTestEvent::BeforeIdleDemands)?;
@@ -1645,7 +1729,7 @@ fn deliver_pending_idle(
             )? != observed.identity
         {
             observed_drift = true;
-            return Ok(false);
+            return Ok(None);
         }
         if current.policy.control_seq != runtime.control_seq
             || current.policy.control_seq != after.policy.control_seq
@@ -1660,12 +1744,11 @@ fn deliver_pending_idle(
             .demands
             .values()
             .any(|demand| !demand.retired && now < demand.service_end);
-        let due = observed
-            .outcome
-            .due_candidates
-            .iter()
-            .any(|id| schedule.full_due(id, now));
-        Ok(!demand_owed && !due)
+        let due = idle_due(observed, schedule, now);
+        Ok((!demand_owed && !due).then(|| IdlePermit {
+            control_seq: after.policy.control_seq,
+            incarnation: observed.identity.incarnation.clone(),
+        }))
     });
     // An observed lifecycle/identity change is sticky even when the wrapper's
     // final time check refuses this read-only batch.
@@ -1673,16 +1756,8 @@ fn deliver_pending_idle(
         *pending = None;
     }
     match valid {
-        Ok(true) => {
-            let observed = pending
-                .take()
-                .ok_or_else(invalid)?
-                .observed
-                .ok_or_else(invalid)?;
-            schedule.closed_idle_at = Some(Instant::now());
-            Ok(Some(observed.outcome))
-        }
-        Ok(false) => {
+        Ok(Some(permit)) => Ok(Some(permit)),
+        Ok(None) => {
             *pending = None;
             Ok(None)
         }
@@ -1692,6 +1767,187 @@ fn deliver_pending_idle(
             Err(error)
         }
     }
+}
+
+fn idle_due(observed: &PendingObservation, schedule: &SourceScheduleState, now: Instant) -> bool {
+    observed
+        .outcome
+        .due_candidates
+        .iter()
+        .any(|id| schedule.full_due(id, now))
+}
+
+fn validate_empty_idle(
+    db: &Path,
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+) -> PortResult<Option<IdlePermit>> {
+    authority.validate()?;
+    if RootIdentity::read(root(db)?)?.binding() != authority.root_binding() {
+        return Err(changed());
+    }
+    let current = control.status()?;
+    let runtime = control.background_status()?;
+    if current.desired_updates != DesiredUpdates::Running
+        || current.policy.emission_blocked()
+        || current
+            .policy
+            .selections
+            .iter()
+            .any(|selection| selection.enabled)
+        || authority.installation_id() != &current.policy.installation_id
+        || runtime.worker.boot_id.as_ref() != Some(authority.boot_id())
+        || runtime.worker.state == UpdateState::Offline
+    {
+        return Ok(None);
+    }
+    let catalog = ManagedStore::open(db, control)?;
+    let incarnation = catalog.incarnation().clone();
+    drop(catalog);
+    let after = control.status()?;
+    if current.policy.control_seq != runtime.control_seq
+        || current.policy.control_seq != after.policy.control_seq
+    {
+        return Err(PortError::WriterBusy(
+            "managed empty idle changed during current reads".into(),
+        ));
+    }
+    if current.catalog_incarnation.as_ref() != Some(&incarnation) {
+        return Err(changed());
+    }
+    Ok(Some(IdlePermit {
+        control_seq: after.policy.control_seq,
+        incarnation,
+    }))
+}
+
+#[derive(Debug)]
+struct IdleAccepted {
+    outcome: CycleOutcome,
+    incarnation: ControlId,
+}
+
+fn empty_idle_outcome() -> CycleOutcome {
+    CycleOutcome {
+        catalog_complete: true,
+        all_sources_attempted: true,
+        remaining_work: false,
+        due_candidates: BTreeSet::new(),
+    }
+}
+
+fn accept_idle_boundary(
+    db: &Path,
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+    ready: &IdleReady,
+    pending: &mut Option<PendingCycle>,
+    schedule: &mut SourceScheduleState,
+    end: Instant,
+) -> PortResult<Option<IdleAccepted>> {
+    let accepted = control.with_runtime_deadline(end, || {
+        loop {
+            observation_deadline(end)?;
+            let attempt = (|| {
+                let permit = match ready {
+                    IdleReady::Observed(token) => {
+                        if pending.as_ref().is_none_or(|intent| {
+                            &intent.token != token || !intent.completion_confirmed
+                        }) {
+                            return Err(changed());
+                        }
+                        deliver_pending_idle(db, control, authority, pending, schedule, end)?
+                    }
+                    IdleReady::Empty => {
+                        if pending.is_some() {
+                            return Err(invalid());
+                        }
+                        validate_empty_idle(db, control, authority)?
+                    }
+                };
+                let Some(permit) = permit else {
+                    return Ok(None);
+                };
+                #[cfg(test)]
+                wal_worker_tests::before_idle_heartbeat(pending, schedule, permit.control_seq);
+                #[cfg(test)]
+                schedule
+                    .hooks
+                    .event(ScheduleTestEvent::BeforeIdleHeartbeat(permit.control_seq))?;
+                if pending
+                    .as_ref()
+                    .and_then(|intent| intent.observed.as_ref())
+                    .is_some_and(|observed| idle_due(observed, schedule, schedule.now()))
+                {
+                    *pending = None;
+                    return Ok(None);
+                }
+                control
+                    .heartbeat_worker(
+                        permit.control_seq,
+                        authority,
+                        UpdateState::Idle,
+                        None,
+                        app_clock_ms(),
+                    )
+                    .map_err(|error| match error {
+                        PortError::GenerationMismatch(_) => PortError::WriterBusy(
+                            "managed idle boundary changed during admission".into(),
+                        ),
+                        other => other,
+                    })?;
+                #[cfg(test)]
+                wal_worker_tests::idle_heartbeat_committed(end);
+                #[cfg(test)]
+                schedule
+                    .hooks
+                    .event(ScheduleTestEvent::AfterIdleHeartbeat(end))
+                    .expect("committed heartbeat observer cannot fail");
+                Ok(Some(permit.incarnation))
+            })();
+            match attempt {
+                Err(PortError::WriterBusy(_))
+                    if Instant::now() < end
+                        && (matches!(ready, IdleReady::Empty) || pending.is_some()) =>
+                {
+                    // A changed read set requires the whole validation again.
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(end.saturating_duration_since(Instant::now())),
+                    );
+                }
+                other => break other,
+            }
+        }
+    });
+    let incarnation = match accepted {
+        Ok(Some(incarnation)) => incarnation,
+        Ok(None) => return Ok(None),
+        Err(error @ PortError::WriterBusy(_)) => return Err(error),
+        Err(error) => {
+            invalidate_pending_idle(pending, schedule);
+            return Err(error);
+        }
+    };
+    // No fallible read or deadline check follows the acknowledged heartbeat.
+    // Physical maintenance errors cannot restore an already accepted slot.
+    let outcome = match ready {
+        IdleReady::Observed(_) => {
+            pending
+                .take()
+                .and_then(|intent| intent.observed)
+                .expect("validated observed idle retains its owning slot")
+                .outcome
+        }
+        IdleReady::Empty => empty_idle_outcome(),
+    };
+    schedule.closed_idle_at = Some(schedule.now());
+    #[cfg(test)]
+    wal_worker_tests::idle_stage(wal_worker_tests::IdleStage::Accepted);
+    Ok(Some(IdleAccepted {
+        outcome,
+        incarnation,
+    }))
 }
 
 /// Own the queued token before start can commit without an acknowledgement.
@@ -1732,8 +1988,10 @@ fn run_cycle(
     end: Instant,
     pending: &mut Option<PendingCycle>,
     schedule: &mut SourceScheduleState,
-) -> PortResult<CycleOutcome> {
+) -> PortResult<CycleResult> {
     schedule.closed_idle_at = None;
+    #[cfg(test)]
+    wal_worker_tests::idle_stage(wal_worker_tests::IdleStage::Activity);
     // The same live worker may have reported Busy/Deferred after a refused
     // completion. Restore activity under current intent/fence before finish,
     // whose control admission rejects those advisory states. A pause, stop or
@@ -1755,8 +2013,10 @@ fn run_cycle(
         return Err(error);
     }
     finish_pending_cycle(control, authority, pending, end)?;
-    if let Some(outcome) = deliver_pending_idle(db, control, authority, pending, schedule, end)? {
-        return Ok(outcome);
+    if deliver_pending_idle(db, control, authority, pending, schedule, end)?.is_some() {
+        return Ok(CycleResult::Idle(IdleReady::Observed(
+            pending.as_ref().ok_or_else(invalid)?.token.clone(),
+        )));
     }
     let current = control.with_runtime_deadline(end, || control.status())?;
     if current.desired_updates != DesiredUpdates::Running || current.policy.emission_blocked() {
@@ -1771,13 +2031,7 @@ fn run_cycle(
         .cloned()
         .collect::<Vec<_>>();
     if selections.is_empty() {
-        schedule.closed_idle_at = Some(Instant::now());
-        return Ok(CycleOutcome {
-            catalog_complete: true,
-            all_sources_attempted: true,
-            remaining_work: false,
-            due_candidates: BTreeSet::new(),
-        });
+        return Ok(CycleResult::Idle(IdleReady::Empty));
     }
     // Rotate the first selection as well as processing every candidate. An old
     // root cannot be permanently behind a continuously busy recent root.
@@ -1868,20 +2122,22 @@ fn run_cycle(
         });
     }
     #[cfg(test)]
-    wal_worker_tests::configure_completion(&schedule.hooks);
+    wal_worker_tests::configure_completion(&schedule.hooks, pending, end, result.as_ref().err());
     #[cfg(test)]
     schedule.hooks.event(ScheduleTestEvent::BeforeCompletion)?;
     #[cfg(test)]
     let end = schedule.hooks.completion_end.take().unwrap_or(end);
     finish_pending_cycle(control, authority, pending, end)?;
-    if let Some(outcome) = deliver_pending_idle(db, control, authority, pending, schedule, end)? {
-        return Ok(outcome);
+    if deliver_pending_idle(db, control, authority, pending, schedule, end)?.is_some() {
+        return Ok(CycleResult::Idle(IdleReady::Observed(
+            pending.as_ref().ok_or_else(invalid)?.token.clone(),
+        )));
     }
     // A synchronous non-idle result belongs to this tick; its next cadence
     // keeps the ordinary scheduler's work-conserving behavior.
     result.map(|mut outcome| {
         outcome.remaining_work |= outcome.idle();
-        outcome
+        CycleResult::Work(outcome)
     })
 }
 
@@ -1972,6 +2228,7 @@ enum SourceLane {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 struct ScheduleIdentity {
     installation: ControlId,
     incarnation: ControlId,
@@ -2005,6 +2262,7 @@ impl ScheduleIdentity {
     }
 }
 
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 struct SourceDebt {
     ticket: u64,
     verified: Option<(RevisionId, SourceHint, Vec<SelectionRevision>)>,
@@ -2350,6 +2608,8 @@ enum ScheduleTestEvent<'a> {
     BeforeCompletion,
     BeforeIdleValidation,
     BeforeIdleDemands,
+    BeforeIdleHeartbeat(ControlSeq),
+    AfterIdleHeartbeat(Instant),
 }
 
 #[cfg(test)]
@@ -5854,17 +6114,67 @@ mod wal_worker_tests {
     use rusqlite::{Connection, OpenFlags};
     use std::{io::Write, sync::mpsc, thread::JoinHandle};
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CompletionSnapshot {
+        intent: PendingCycle,
+        original_end: Instant,
+        completion_end: Instant,
+        expired_before_completion: bool,
+        observation_error: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum IdleStage {
+        #[default]
+        Activity,
+        Completion,
+        Validation,
+        Heartbeat,
+        Accepted,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct FinishAttempt {
+        token: ObservationToken,
+        confirmed: bool,
+        result: Result<(), BackgroundFailure>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CycleSnapshot {
+        completion: Option<CompletionSnapshot>,
+        pending: Option<PendingCycle>,
+        closed_idle_at: Option<Instant>,
+        checkpoints: usize,
+        finish_attempts: Vec<FinishAttempt>,
+        sources: BTreeMap<SourceId, SourceDebt>,
+        stage: IdleStage,
+    }
+
     #[derive(Debug)]
     pub(super) enum Event {
-        Boundary(WorkerBoundary),
+        Boundary(WorkerBoundary, Option<Box<CycleSnapshot>>),
         Checkpoint(Result<WalCheckpointReport, BackgroundFailure>),
         StopCleanupDeferred,
+        IdleReady(Box<CycleSnapshot>),
+        BeforeIdleHeartbeat(Box<CycleSnapshot>, ControlSeq),
+        IdleDeferred(Box<CycleSnapshot>, BackgroundFailure),
+        HeartbeatCommitted(Instant),
+        AfterIdleCheckpoint(Box<CycleSnapshot>),
     }
 
     struct Hooks {
         events: mpsc::Sender<Event>,
         advance: mpsc::Receiver<bool>,
         expire_completion_once: bool,
+        completion: Option<CompletionSnapshot>,
+        checkpoints: usize,
+        finish_attempts: Vec<FinishAttempt>,
+        observe_idle_handoff: bool,
+        before_heartbeat_once: bool,
+        committed_once: bool,
+        stage: IdleStage,
+        observe_after_checkpoint: bool,
     }
 
     thread_local! {
@@ -5874,6 +6184,9 @@ mod wal_worker_tests {
     pub(super) fn event(event: Event) {
         HOOKS.with(|hooks| {
             if let Some(hooks) = hooks.borrow_mut().as_mut() {
+                if matches!(event, Event::Checkpoint(_)) {
+                    hooks.checkpoints += 1;
+                }
                 hooks.events.send(event).expect("test worker observer");
                 hooks.expire_completion_once |= hooks
                     .advance
@@ -5883,12 +6196,158 @@ mod wal_worker_tests {
         });
     }
 
-    pub(super) fn configure_completion(schedule: &ScheduleTestHooks) {
+    pub(super) fn cycle_boundary(
+        boundary: WorkerBoundary,
+        pending: &Option<PendingCycle>,
+        schedule: &SourceScheduleState,
+    ) {
+        let snapshot = HOOKS.with(|hooks| {
+            hooks.borrow().as_ref().map(|hooks| {
+                Box::new(CycleSnapshot {
+                    completion: hooks.completion.clone(),
+                    pending: pending.clone(),
+                    closed_idle_at: schedule.closed_idle_at,
+                    checkpoints: hooks.checkpoints,
+                    finish_attempts: hooks.finish_attempts.clone(),
+                    sources: schedule.sources.clone(),
+                    stage: hooks.stage,
+                })
+            })
+        });
+        if snapshot.is_some() {
+            event(Event::Boundary(boundary, snapshot));
+        }
+    }
+
+    fn handoff_snapshot(
+        pending: &Option<PendingCycle>,
+        schedule: &SourceScheduleState,
+    ) -> Option<Box<CycleSnapshot>> {
         HOOKS.with(|hooks| {
-            if let Some(hooks) = hooks.borrow_mut().as_mut()
-                && std::mem::take(&mut hooks.expire_completion_once)
-            {
-                schedule.completion_end.set(Some(Instant::now()));
+            hooks
+                .borrow()
+                .as_ref()
+                .filter(|hooks| hooks.observe_idle_handoff)
+                .map(|hooks| {
+                    Box::new(CycleSnapshot {
+                        completion: hooks.completion.clone(),
+                        pending: pending.clone(),
+                        closed_idle_at: schedule.closed_idle_at,
+                        checkpoints: hooks.checkpoints,
+                        finish_attempts: hooks.finish_attempts.clone(),
+                        sources: schedule.sources.clone(),
+                        stage: hooks.stage,
+                    })
+                })
+        })
+    }
+
+    pub(super) fn idle_ready(pending: &Option<PendingCycle>, schedule: &SourceScheduleState) {
+        if let Some(snapshot) = handoff_snapshot(pending, schedule) {
+            event(Event::IdleReady(snapshot));
+        }
+    }
+
+    pub(super) fn before_idle_heartbeat(
+        pending: &Option<PendingCycle>,
+        schedule: &SourceScheduleState,
+        seq: ControlSeq,
+    ) {
+        idle_stage(IdleStage::Heartbeat);
+        let enabled = HOOKS.with(|hooks| {
+            hooks
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|hooks| std::mem::take(&mut hooks.before_heartbeat_once))
+        });
+        if enabled && let Some(snapshot) = handoff_snapshot(pending, schedule) {
+            event(Event::BeforeIdleHeartbeat(snapshot, seq));
+        }
+    }
+
+    pub(super) fn idle_deferred(
+        pending: &Option<PendingCycle>,
+        schedule: &SourceScheduleState,
+        error: &PortError,
+    ) {
+        if let Some(snapshot) = handoff_snapshot(pending, schedule) {
+            event(Event::IdleDeferred(snapshot, failure(error)));
+        }
+    }
+
+    pub(super) fn idle_heartbeat_committed(end: Instant) {
+        let enabled = HOOKS.with(|hooks| {
+            hooks
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|hooks| std::mem::take(&mut hooks.committed_once))
+        });
+        if enabled {
+            event(Event::HeartbeatCommitted(end));
+        }
+    }
+
+    pub(super) fn after_idle_checkpoint(
+        pending: &Option<PendingCycle>,
+        schedule: &SourceScheduleState,
+    ) {
+        let enabled = HOOKS.with(|hooks| {
+            hooks
+                .borrow()
+                .as_ref()
+                .is_some_and(|hooks| hooks.observe_after_checkpoint)
+        });
+        if enabled && let Some(snapshot) = handoff_snapshot(pending, schedule) {
+            event(Event::AfterIdleCheckpoint(snapshot));
+        }
+    }
+
+    pub(super) fn finish_attempt(
+        token: &ObservationToken,
+        confirmed: bool,
+        result: Result<(), BackgroundFailure>,
+    ) {
+        HOOKS.with(|hooks| {
+            if let Some(hooks) = hooks.borrow_mut().as_mut() {
+                hooks.finish_attempts.push(FinishAttempt {
+                    token: token.clone(),
+                    confirmed,
+                    result,
+                });
+            }
+        });
+    }
+
+    pub(super) fn idle_stage(stage: IdleStage) {
+        HOOKS.with(|hooks| {
+            if let Some(hooks) = hooks.borrow_mut().as_mut() {
+                hooks.stage = stage;
+            }
+        });
+    }
+
+    pub(super) fn configure_completion(
+        schedule: &ScheduleTestHooks,
+        pending: &Option<PendingCycle>,
+        original_end: Instant,
+        error: Option<&PortError>,
+    ) {
+        HOOKS.with(|hooks| {
+            if let Some(hooks) = hooks.borrow_mut().as_mut() {
+                if std::mem::take(&mut hooks.expire_completion_once) {
+                    schedule
+                        .completion_end
+                        .set(Some(Instant::now().min(original_end)));
+                }
+                let completion_end = schedule.completion_end.get().unwrap_or(original_end);
+                hooks.stage = IdleStage::Completion;
+                hooks.completion = pending.as_ref().map(|intent| CompletionSnapshot {
+                    intent: intent.clone(),
+                    original_end,
+                    completion_end,
+                    expired_before_completion: Instant::now() >= completion_end,
+                    observation_error: error.map(|error| format!("{error:?}")),
+                });
             }
         });
     }
@@ -5905,6 +6364,19 @@ mod wal_worker_tests {
         }
 
         fn start_with_expired_completion(db: &Path, expire_completion_once: bool) -> Self {
+            Self::start_configured(db, expire_completion_once, false, false)
+        }
+
+        fn start_handoff(db: &Path, late_ack: bool) -> Self {
+            Self::start_configured(db, true, true, late_ack)
+        }
+
+        fn start_configured(
+            db: &Path,
+            expire_completion_once: bool,
+            observe_idle_handoff: bool,
+            committed_once: bool,
+        ) -> Self {
             let db = db.to_owned();
             let (events_tx, events_rx) = mpsc::channel();
             let (advance_tx, advance_rx) = mpsc::channel();
@@ -5914,6 +6386,14 @@ mod wal_worker_tests {
                         events: events_tx,
                         advance: advance_rx,
                         expire_completion_once,
+                        completion: None,
+                        checkpoints: 0,
+                        finish_attempts: Vec::new(),
+                        observe_idle_handoff,
+                        before_heartbeat_once: observe_idle_handoff,
+                        committed_once,
+                        stage: IdleStage::Activity,
+                        observe_after_checkpoint: committed_once,
                     })
                 });
                 run_child(&db)
@@ -5926,10 +6406,14 @@ mod wal_worker_tests {
         }
 
         fn next(&self) -> Event {
+            self.next_before(Instant::now() + Duration::from_secs(20))
+        }
+
+        fn next_before(&self, end: Instant) -> Event {
             self.events
                 .as_ref()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(end.saturating_duration_since(Instant::now()))
                 .expect("worker must reach the expected boundary")
         }
 
@@ -5944,7 +6428,7 @@ mod wal_worker_tests {
         fn boundary(&self, expected: WorkerBoundary) {
             let actual = self.next();
             assert!(
-                matches!(actual, Event::Boundary(actual) if actual == expected),
+                matches!(actual, Event::Boundary(actual, _) if actual == expected),
                 "expected {expected:?}, got {actual:?}"
             );
         }
@@ -5984,6 +6468,20 @@ mod wal_worker_tests {
         db: PathBuf,
         source: PathBuf,
         _temp: tempfile::TempDir,
+    }
+
+    struct IdleProof {
+        completion: CompletionSnapshot,
+        cycle: ObservationCycle,
+        next_cycle: CycleSeq,
+        publications: (i64, i64, i64),
+        progress: Vec<SourceProgress>,
+        checkpoints: usize,
+        busy_boundaries: usize,
+        finish_attempts: usize,
+        finish_calls: usize,
+        sources: BTreeMap<SourceId, SourceDebt>,
+        publication_rows: Vec<Vec<Vec<rusqlite::types::Value>>>,
     }
 
     fn id(value: &str) -> ControlId {
@@ -6057,6 +6555,309 @@ mod wal_worker_tests {
                 .unwrap()
         }
 
+        fn publications(&self) -> (i64, i64, i64) {
+            self.idle
+                .query_row(
+                    "SELECT
+                     (SELECT count(*) FROM source_revision_receipts),
+                     (SELECT count(*) FROM discovery_receipts),
+                     (SELECT count(*) FROM discovery_sources)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        }
+
+        fn publication_rows(&self) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            [
+                "SELECT * FROM source_revision_receipts ORDER BY revision_id",
+                "SELECT * FROM discovery_receipts ORDER BY cycle_seq,selection_id",
+                "SELECT * FROM discovery_sources ORDER BY cycle_seq,selection_id,source_id",
+            ]
+            .into_iter()
+            .map(|sql| {
+                let mut statement = self.idle.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+
+        fn idle(&self, worker: &Worker) -> IdleProof {
+            let end = Instant::now() + Duration::from_secs(20);
+            let first = self.observation_event(worker, end);
+            self.idle_from_before(worker, first, end, |_| {})
+        }
+
+        fn idle_from(&self, worker: &Worker, first: Event) -> IdleProof {
+            self.idle_from_before(
+                worker,
+                first,
+                Instant::now() + Duration::from_secs(20),
+                |_| {},
+            )
+        }
+
+        fn idle_events(&self, worker: &Worker, inspect: impl FnMut(&Event)) -> IdleProof {
+            let end = Instant::now() + Duration::from_secs(20);
+            let first = self.observation_event(worker, end);
+            self.idle_from_before(worker, first, end, inspect)
+        }
+
+        fn observation_event(&self, worker: &Worker, end: Instant) -> Event {
+            let next = self.control.background_status().unwrap().next_cycle_seq;
+            let rows = self.publication_rows();
+            let progress = self.control.source_progress_inventory().unwrap();
+            for _ in 0..8 {
+                let event = worker.next_before(end);
+                let Event::Boundary(WorkerBoundary::Busy, Some(snapshot)) = &event else {
+                    return event;
+                };
+                if snapshot.pending.is_some() || snapshot.stage != IdleStage::Activity {
+                    return event;
+                }
+                // Before a new observation exists, only a refused activity
+                // heartbeat with no source/cycle effects may advance.
+                let status = self.control.background_status().unwrap();
+                assert_eq!(status.worker.state, UpdateState::Busy);
+                assert_eq!(status.worker.error, Some(BackgroundFailure::Busy));
+                assert_eq!(status.next_cycle_seq, next);
+                assert_eq!(self.publication_rows(), rows);
+                assert_eq!(self.control.source_progress_inventory().unwrap(), progress);
+                assert!(snapshot.closed_idle_at.is_none());
+                worker.advance();
+            }
+            panic!("no observation began within eight preparation events");
+        }
+
+        fn empty_idle_after(&self, worker: &Worker, next: CycleSeq, publications: (i64, i64, i64)) {
+            let end = Instant::now() + Duration::from_secs(20);
+            for _ in 0..8 {
+                let event = worker.next_before(end);
+                let snapshot = idle_snapshot(&event);
+                assert!(snapshot.pending.is_none());
+                assert!(snapshot.completion.is_none());
+                assert_eq!(snapshot.checkpoints, 0);
+                assert_eq!(
+                    self.control.background_status().unwrap().next_cycle_seq,
+                    next
+                );
+                assert_eq!(self.publications(), publications);
+                match &event {
+                    Event::Boundary(WorkerBoundary::Idle, _) => {
+                        assert!(snapshot.closed_idle_at.is_some());
+                        assert_eq!(self.status().state, UpdateState::Idle);
+                        return;
+                    }
+                    Event::Boundary(WorkerBoundary::Busy, _) => {
+                        assert_eq!(snapshot.stage, IdleStage::Activity);
+                        assert_eq!(self.status().error, Some(BackgroundFailure::Busy));
+                    }
+                    Event::IdleDeferred(_, error) => assert_eq!(*error, BackgroundFailure::Busy),
+                    Event::IdleReady(_) => {}
+                    other => panic!("empty idle cannot skip {other:?}"),
+                }
+                assert!(snapshot.closed_idle_at.is_none());
+                worker.advance();
+            }
+            panic!("empty idle was not accepted within eight events");
+        }
+
+        fn idle_from_before(
+            &self,
+            worker: &Worker,
+            first: Event,
+            end: Instant,
+            mut inspect: impl FnMut(&Event),
+        ) -> IdleProof {
+            let snapshot = idle_snapshot(&first);
+            let completion = snapshot
+                .completion
+                .clone()
+                .expect("idle wait requires an actual successful observation");
+            let observed = completion.intent.observed.as_ref().unwrap_or_else(|| {
+                panic!("unconfirmed observation cannot justify an idle wait: {completion:?}")
+            });
+            assert!(observed.outcome.idle(), "non-idle work must not be skipped");
+            assert_eq!(completion.intent.finish, observed.outcome.finish());
+            let token = completion.intent.token.clone();
+            let (status, cycle, progress) = self
+                .control
+                .with_runtime_deadline(end, || {
+                    Ok((
+                        self.control.background_status()?,
+                        self.control.cycle(token.cycle_seq)?,
+                        self.control.source_progress_inventory()?,
+                    ))
+                })
+                .unwrap();
+            let mut proof = IdleProof {
+                completion,
+                cycle,
+                next_cycle: status.next_cycle_seq,
+                publications: self.publications(),
+                progress,
+                checkpoints: snapshot.checkpoints,
+                busy_boundaries: 0,
+                finish_attempts: 0,
+                finish_calls: 0,
+                sources: snapshot.sources.clone(),
+                publication_rows: self.publication_rows(),
+            };
+            let mut confirmed = false;
+            let mut terminal = None;
+            let mut event = first;
+            // These are test event advances, not a retry budget for production.
+            // Busy is admissible only while this exact observed idle survives.
+            for _ in 0..16 {
+                if let Event::HeartbeatCommitted(original_end) = event {
+                    assert!(original_end <= end);
+                    inspect(&event);
+                    worker.advance();
+                    event = worker.next_before(end);
+                    continue;
+                }
+                let snapshot = idle_snapshot(&event);
+                assert_eq!(
+                    snapshot.completion.as_ref(),
+                    Some(&proof.completion),
+                    "idle wait changed or replayed its original observation"
+                );
+                assert_eq!(
+                    snapshot.checkpoints, proof.checkpoints,
+                    "checkpoint ran before the acknowledged idle"
+                );
+                assert_eq!(
+                    snapshot.sources, proof.sources,
+                    "source debt or verification time changed"
+                );
+                assert_eq!(
+                    self.publication_rows(),
+                    proof.publication_rows,
+                    "published rows changed"
+                );
+                let attempts = snapshot
+                    .finish_attempts
+                    .iter()
+                    .filter(|attempt| attempt.token == token)
+                    .collect::<Vec<_>>();
+                if confirmed {
+                    assert_eq!(
+                        attempts.len(),
+                        proof.finish_calls,
+                        "finish invoked after confirmation"
+                    );
+                }
+                let mut completed = false;
+                for attempt in &attempts {
+                    assert!(!attempt.confirmed, "finish invoked after confirmation");
+                    assert!(!completed, "finish invoked after its committed result");
+                    match attempt.result {
+                        Ok(()) => completed = true,
+                        Err(BackgroundFailure::Busy | BackgroundFailure::SourceChanged) => {}
+                        other => panic!("unexpected finish failure: {other:?}"),
+                    }
+                }
+                proof.finish_calls = attempts.len();
+                proof.finish_attempts = usize::from(completed);
+                let (status, cycle, progress) = self
+                    .control
+                    .with_runtime_deadline(end, || {
+                        Ok((
+                            self.control.background_status()?,
+                            self.control.cycle(token.cycle_seq)?,
+                            self.control.source_progress_inventory()?,
+                        ))
+                    })
+                    .unwrap();
+                let original = proof.completion.intent.observed.as_ref().unwrap();
+                assert_eq!(status.next_cycle_seq, proof.next_cycle);
+                assert_eq!(status.worker.boot_id.as_ref(), Some(&token.worker_boot_id));
+                assert!(observed_cycle_matches(&original.cycle, &cycle));
+                assert_eq!(cycle.selections, proof.cycle.selections);
+                assert_eq!(progress, proof.progress, "source acknowledgement replayed");
+                assert_eq!(
+                    self.publications(),
+                    proof.publications,
+                    "publication replayed"
+                );
+                if let Some(terminal) = &terminal {
+                    assert_eq!(&cycle, terminal, "terminal completion replayed");
+                } else if cycle.completed_at_ms.is_some() {
+                    assert_eq!(cycle.state, finish_state(proof.completion.intent.finish));
+                    terminal = Some(cycle.clone());
+                }
+                match &event {
+                    Event::Boundary(WorkerBoundary::Idle, _) => {
+                        assert_eq!(snapshot.stage, IdleStage::Accepted);
+                        assert!(snapshot.pending.is_none(), "idle did not consume the slot");
+                        assert!(snapshot.closed_idle_at.is_some());
+                        assert_eq!(status.worker.state, UpdateState::Idle);
+                        assert_eq!(status.worker.error, None);
+                        assert_eq!(cycle.state, finish_state(proof.completion.intent.finish));
+                        assert!(cycle.completed_at_ms.is_some());
+                        assert_eq!(proof.finish_attempts, 1);
+                        inspect(&event);
+                        return proof;
+                    }
+                    Event::Boundary(WorkerBoundary::Busy, _) => {
+                        assert!(matches!(
+                            snapshot.stage,
+                            IdleStage::Completion | IdleStage::Validation | IdleStage::Activity
+                        ));
+                        assert_eq!(status.worker.state, UpdateState::Busy);
+                        assert_eq!(status.worker.error, Some(BackgroundFailure::Busy));
+                        proof.busy_boundaries += 1;
+                    }
+                    Event::IdleDeferred(_, error) => {
+                        assert!(matches!(
+                            snapshot.stage,
+                            IdleStage::Validation | IdleStage::Heartbeat
+                        ));
+                        assert_eq!(*error, BackgroundFailure::Busy);
+                        proof.busy_boundaries += 1;
+                    }
+                    Event::IdleReady(_) | Event::BeforeIdleHeartbeat(..) => {
+                        assert!(matches!(
+                            snapshot.stage,
+                            IdleStage::Validation | IdleStage::Heartbeat
+                        ));
+                        assert!(snapshot.pending.as_ref().unwrap().completion_confirmed);
+                    }
+                    other => panic!("idle wait cannot skip {other:?}"),
+                }
+                assert!(snapshot.closed_idle_at.is_none());
+                let pending = snapshot
+                    .pending
+                    .as_ref()
+                    .expect("Busy lost the exact pending observation");
+                let mut expected = proof.completion.intent.clone();
+                expected.completion_confirmed = pending.completion_confirmed;
+                assert_eq!(pending, &expected, "Busy changed the saved idle");
+                assert!(!confirmed || pending.completion_confirmed);
+                confirmed = pending.completion_confirmed;
+                if confirmed {
+                    assert!(terminal.is_some());
+                } else {
+                    assert!(cycle.state == CycleState::Observing || terminal.is_some());
+                }
+                inspect(&event);
+                assert!(
+                    Instant::now() < end,
+                    "idle acknowledgement exceeded test end"
+                );
+                worker.advance();
+                event = worker.next_before(end);
+            }
+            panic!("saved idle was not acknowledged within sixteen events");
+        }
+
         fn append(&self, sequence: usize) {
             let record = serde_json::json!({
                 "type":"user","uuid":format!("message-{sequence}"),"sessionId":"wal-session",
@@ -6101,15 +6902,209 @@ mod wal_worker_tests {
         }
     }
 
+    fn idle_snapshot(event: &Event) -> &CycleSnapshot {
+        match event {
+            Event::Boundary(_, Some(snapshot))
+            | Event::IdleReady(snapshot)
+            | Event::BeforeIdleHeartbeat(snapshot, _)
+            | Event::IdleDeferred(snapshot, _) => snapshot,
+            other => panic!("expected an exact observed idle snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_worker_idle_outer_writer_busy_retains_the_same_completion() {
+        let fixture = Fixture::new(true);
+        fixture.append(0);
+        let worker = Worker::start_handoff(&fixture.db, false);
+        let mut contender = None;
+        let mut blocked = false;
+        let mut deferred = 0;
+        let proof = fixture.idle_events(&worker, |event| match event {
+            Event::BeforeIdleHeartbeat(_, seq) => {
+                assert_eq!(
+                    fixture.control.background_status().unwrap().control_seq,
+                    *seq
+                );
+                let writer =
+                    Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap()))
+                        .unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                contender = Some(writer);
+                blocked = true;
+            }
+            Event::IdleDeferred(_, BackgroundFailure::Busy) => {
+                deferred += 1;
+                if let Some(writer) = contender.take() {
+                    writer.execute_batch("ROLLBACK").unwrap();
+                }
+            }
+            _ => {}
+        });
+        assert!(blocked);
+        assert!(deferred >= 1);
+        assert_eq!(proof.checkpoints, 0);
+        assert_eq!(proof.finish_attempts, 1);
+        assert!(contender.is_none());
+        let before = fixture.status();
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
+        assert_eq!(fixture.publications(), proof.publications);
+        assert_eq!(fixture.status(), before);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_empty_idle_outer_busy_never_invents_a_cycle() {
+        for add_selection in [false, true] {
+            let fixture = Fixture::new(false);
+            let worker = Worker::start_handoff(&fixture.db, false);
+            let Event::IdleReady(initial) = worker.next() else {
+                panic!("expected empty idle readiness");
+            };
+            assert!(initial.pending.is_none());
+            assert!(initial.completion.is_none());
+            let next = fixture.control.background_status().unwrap().next_cycle_seq;
+            let publications = fixture.publications();
+            worker.advance();
+            assert!(matches!(worker.next(), Event::BeforeIdleHeartbeat(..)));
+            let writer =
+                Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap())).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            worker.advance();
+            let Event::IdleDeferred(deferred, BackgroundFailure::Busy) = worker.next() else {
+                panic!("expected a refused empty heartbeat");
+            };
+            assert!(deferred.pending.is_none());
+            assert!(deferred.completion.is_none());
+            assert_eq!(deferred.checkpoints, 0);
+            assert_eq!(
+                fixture.control.background_status().unwrap().next_cycle_seq,
+                next
+            );
+            assert_eq!(fixture.publications(), publications);
+            writer.execute_batch("ROLLBACK").unwrap();
+            drop(writer);
+            if add_selection {
+                fixture.append(0);
+                let request = crate::managed_control::source_selection(
+                    SearchProvider::Claude,
+                    &fixture.source,
+                )
+                .unwrap();
+                control_change_before(
+                    &fixture.control,
+                    Instant::now() + Duration::from_secs(5),
+                    |seq| fixture.control.add_selection(seq, request.clone()),
+                )
+                .unwrap();
+                worker.advance();
+                let proof = fixture.idle_events(&worker, |_| {});
+                assert!(proof.next_cycle > next);
+                assert_eq!(proof.publications.0, 1);
+                assert_eq!(proof.checkpoints, 0);
+            } else {
+                worker.advance();
+                fixture.empty_idle_after(&worker, next, publications);
+            }
+            worker.advance();
+            worker.checkpoint(WalCheckpointOutcome::Reset);
+            fixture.stop(worker);
+        }
+    }
+
+    #[test]
+    fn wal_worker_accepted_idle_checkpoint_results_never_restore_the_slot() {
+        for hard_error in [false, true] {
+            let fixture = Fixture::new(true);
+            fixture.append(0);
+            let reader = (!hard_error).then(|| fixture.pin());
+            let worker = Worker::start_handoff(&fixture.db, true);
+            let proof = fixture.idle_events(&worker, |_| {});
+            if hard_error {
+                Connection::open(&fixture.db)
+                    .unwrap()
+                    .pragma_update(None, "application_id", 0_i64)
+                    .unwrap();
+            }
+            worker.advance();
+            if hard_error {
+                assert!(matches!(
+                    worker.next(),
+                    Event::Checkpoint(Err(BackgroundFailure::Failed))
+                ));
+                // Restore only this synthetic corruption before the next poll.
+                Connection::open(&fixture.db)
+                    .unwrap()
+                    .pragma_update(None, "application_id", 0x41534732_i64)
+                    .unwrap();
+            } else {
+                worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::Sqlite));
+                reader.as_ref().unwrap().execute_batch("COMMIT").unwrap();
+            }
+            worker.advance();
+            let Event::AfterIdleCheckpoint(after) = worker.next() else {
+                panic!("expected the completed maintenance boundary");
+            };
+            assert!(after.pending.is_none());
+            assert_eq!(after.checkpoints, proof.checkpoints + 1);
+            assert_eq!(fixture.publication_rows(), proof.publication_rows);
+            assert_eq!(
+                fixture.control.background_status().unwrap().next_cycle_seq,
+                proof.next_cycle
+            );
+            // Fence excludes the independent stop checkpoint, so joining also
+            // proves no second physical attempt of this accepted idle remains.
+            fixture
+                .control
+                .set_maintenance(
+                    fixture.control.status().unwrap().policy.control_seq,
+                    &id("maintenance-owner"),
+                    MaintenanceFence {
+                        state: MaintenanceState::Updating,
+                        owner: Some(id("maintenance-owner")),
+                        phase: Some(MaintenancePhase::Quiescing),
+                    },
+                )
+                .unwrap();
+            worker.advance();
+            worker.boundary(WorkerBoundary::Exit(WorkerExit::Fenced));
+            worker.advance();
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn wal_worker_idle_close_after_append_resets_with_foreign_idle_reader() {
+        idle_close_after_append(false);
+    }
+
+    #[test]
+    fn wal_worker_idle_wait_follows_expired_completion_without_republication() {
+        idle_close_after_append(true);
+    }
+
+    fn idle_close_after_append(expire_completion: bool) {
         let fixture = Fixture::new(true);
         for sequence in 0..3 {
             fixture.append(sequence);
         }
-        let worker = Worker::start(&fixture.db);
+        let worker = Worker::start_with_expired_completion(&fixture.db, expire_completion);
+        let mut previous_cycle = None;
         for round in 0..2 {
-            worker.boundary(WorkerBoundary::Idle);
+            let proof = fixture.idle(&worker);
+            if expire_completion {
+                assert!(proof.completion.expired_before_completion);
+                assert!(proof.busy_boundaries >= 1);
+                assert!(proof.completion.completion_end <= proof.completion.original_end);
+            }
+            if let Some(previous) = previous_cycle {
+                assert!(proof.completion.intent.token.cycle_seq > previous);
+            }
+            previous_cycle = Some(proof.completion.intent.token.cycle_seq);
+            assert_eq!(proof.publications.0, round + 1);
+            assert_eq!(proof.checkpoints, round as usize);
             assert!(ManagedStore::wal_len(&fixture.db).unwrap().unwrap() > 0);
             let before = fixture.status();
             worker.advance();
@@ -6117,9 +7112,14 @@ mod wal_worker_tests {
             assert_eq!(report.wal_bytes_after, Some(0));
             assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
             assert_eq!(fixture.status(), before);
+            assert_eq!(fixture.publications(), proof.publications);
             if round == 0 {
                 fixture.append(3);
-                worker.advance();
+                if expire_completion {
+                    worker.advance_expiring_completion();
+                } else {
+                    worker.advance();
+                }
             }
         }
         let rows: i64 = fixture
@@ -6128,7 +7128,7 @@ mod wal_worker_tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(rows >= 2);
+        assert_eq!(rows, 2);
         fixture.stop(worker);
     }
 
@@ -6137,28 +7137,21 @@ mod wal_worker_tests {
         let fixture = Fixture::new(true);
         fixture.append(0);
         let worker = Worker::start_with_expired_completion(&fixture.db, true);
-        worker.boundary(WorkerBoundary::Busy);
-        let count = |table: &str| {
-            fixture
-                .idle
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap()
+        let first = worker.next();
+        let Event::Boundary(WorkerBoundary::Busy, Some(snapshot)) = &first else {
+            panic!("expected deterministic completion expiry, got {first:?}");
         };
-        let before = (
-            count("source_revision_receipts"),
-            count("discovery_receipts"),
+        assert!(
+            snapshot
+                .completion
+                .as_ref()
+                .unwrap()
+                .expired_before_completion
         );
-        worker.advance();
-        worker.boundary(WorkerBoundary::Idle);
-        assert_eq!(
-            (
-                count("source_revision_receipts"),
-                count("discovery_receipts")
-            ),
-            before
-        );
+        assert!(!snapshot.pending.as_ref().unwrap().completion_confirmed);
+        let proof = fixture.idle_from(&worker, first);
+        assert!(proof.busy_boundaries >= 1);
+        assert_eq!(proof.checkpoints, 0);
         worker.advance();
         assert_eq!(
             worker
@@ -6174,7 +7167,17 @@ mod wal_worker_tests {
         let fixture = Fixture::new(true);
         fixture.append(0);
         let worker = Worker::start_with_expired_completion(&fixture.db, true);
-        worker.boundary(WorkerBoundary::Busy);
+        let Event::Boundary(WorkerBoundary::Busy, Some(initial)) = worker.next() else {
+            panic!("expected the original completion to expire");
+        };
+        assert!(
+            initial
+                .completion
+                .as_ref()
+                .unwrap()
+                .expired_before_completion
+        );
+        let original = initial.pending.as_ref().unwrap().token.clone();
         let next = fixture.control.background_status().unwrap().next_cycle_seq;
         fixture.desired(DesiredUpdates::Paused);
         worker.advance();
@@ -6183,7 +7186,18 @@ mod wal_worker_tests {
         worker.checkpoint(WalCheckpointOutcome::Reset);
         fixture.desired(DesiredUpdates::Running);
         worker.advance_expiring_completion();
-        worker.boundary(WorkerBoundary::Busy);
+        let first = worker.next();
+        let Event::Boundary(WorkerBoundary::Busy, Some(resumed_snapshot)) = &first else {
+            panic!("expected the resumed completion to expire, got {first:?}");
+        };
+        assert!(
+            resumed_snapshot
+                .completion
+                .as_ref()
+                .unwrap()
+                .expired_before_completion
+        );
+        assert_ne!(resumed_snapshot.pending.as_ref().unwrap().token, original);
         let resumed = fixture.control.background_status().unwrap().next_cycle_seq;
         assert!(resumed > next);
         let receipts: i64 = fixture
@@ -6192,8 +7206,9 @@ mod wal_worker_tests {
                 row.get(0)
             })
             .unwrap();
-        worker.advance();
-        worker.boundary(WorkerBoundary::Idle);
+        let proof = fixture.idle_from(&worker, first);
+        assert!(proof.busy_boundaries >= 1);
+        assert_eq!(proof.checkpoints, 1);
         assert_eq!(
             fixture.control.background_status().unwrap().next_cycle_seq,
             resumed
@@ -6538,7 +7553,7 @@ mod wal_worker_tests {
                     } else {
                         assert!(matches!(
                             next,
-                            Event::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped))
+                            Event::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped), _)
                         ));
                     }
                     worker.advance();
@@ -6887,6 +7902,7 @@ mod control_deadline_tests {
                     &mut pending,
                     schedule,
                 )
+                .and_then(|result| self.accept_cycle(result, &mut pending, schedule))
             });
             assert!(
                 pending.is_none(),
@@ -6898,6 +7914,28 @@ mod control_deadline_tests {
             let cycle =
                 self.read_control(|control| control.cycle(CycleSeq::new(next.get() - 1).unwrap()));
             (result, cycle)
+        }
+
+        fn accept_cycle(
+            &self,
+            result: CycleResult,
+            pending: &mut Option<PendingCycle>,
+            schedule: &mut SourceScheduleState,
+        ) -> PortResult<CycleOutcome> {
+            match result {
+                CycleResult::Idle(ready) => accept_idle_boundary(
+                    &self.db,
+                    &self.control,
+                    &self.worker(),
+                    &ready,
+                    pending,
+                    schedule,
+                    Instant::now() + CONTROL_BUDGET,
+                )?
+                .map(|accepted| accepted.outcome)
+                .ok_or_else(changed),
+                CycleResult::Work(outcome) => Ok(outcome),
+            }
         }
 
         fn head_claims(&self) -> i64 {
@@ -7385,9 +8423,15 @@ mod control_deadline_tests {
             ..SourceScheduleState::default()
         };
 
-        let (outcome, _) = fixture.ordinary(&mut schedule, &boot);
-
-        assert!(outcome.unwrap().catalog_complete);
+        let (outcome, cycle) = fixture.ordinary(&mut schedule, &boot);
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.catalog_complete,
+            "outcome={outcome:?}, cycle={cycle:?}, refusals={:?}, published={}, committed={}",
+            schedule.hooks.epoch_refusals.borrow(),
+            published.get(),
+            committed.get()
+        );
         assert!(published.get());
         assert!(committed.get());
         assert!(
@@ -10333,6 +11377,7 @@ mod control_deadline_tests {
             pending,
             schedule,
         )
+        .and_then(|result| fixture.accept_cycle(result, pending, schedule))
     }
 
     fn publication_counts(fixture: &CycleFixture) -> (i64, i64, i64) {
@@ -10347,6 +11392,345 @@ mod control_deadline_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
+    }
+
+    fn observed_ready(
+        fixture: &CycleFixture,
+        schedule: &mut SourceScheduleState,
+        boot: &ObservationClock,
+    ) -> (IdleReady, Option<PendingCycle>) {
+        let mut pending = expired_completion(fixture, schedule, boot);
+        let CycleResult::Idle(ready) = run_cycle(
+            &fixture.db,
+            &fixture.control,
+            &fixture.worker(),
+            boot,
+            1,
+            fixture.scope_end,
+            &mut pending,
+            schedule,
+        )
+        .unwrap() else {
+            panic!("expected an observed idle candidate");
+        };
+        assert!(pending.as_ref().unwrap().completion_confirmed);
+        assert!(schedule.closed_idle_at.is_none());
+        (ready, pending)
+    }
+
+    #[test]
+    fn pending_idle_outer_busy_revalidates_lifecycle_identity_latest_and_due() {
+        for change in [
+            "pause-resume",
+            "stop",
+            "fence",
+            "revoke",
+            "boot",
+            "incarnation",
+            "latest",
+            "due",
+        ] {
+            let fixture = CycleFixture::new();
+            fixture.write_source(
+                "source.jsonl",
+                SearchProvider::Claude,
+                "outer idle original",
+            );
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            let (ready, mut pending) = observed_ready(&fixture, &mut schedule, &boot);
+            let saved = pending.clone();
+            let worker = fixture.worker();
+            let writer =
+                rusqlite::Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap()))
+                    .unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(matches!(
+                accept_idle_boundary(
+                    &fixture.db,
+                    &fixture.control,
+                    &worker,
+                    &ready,
+                    &mut pending,
+                    &mut schedule,
+                    Instant::now() + CONTROL_BUDGET
+                ),
+                Err(PortError::WriterBusy(_))
+            ));
+            assert_eq!(pending, saved);
+            writer.execute_batch("ROLLBACK").unwrap();
+            drop(writer);
+            let next = fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq;
+            let publications = publication_counts(&fixture);
+            let before_progress =
+                fixture.read_control(|control| control.source_progress_inventory());
+            match change {
+                "pause-resume" | "stop" => {
+                    let desired = if change == "stop" {
+                        DesiredUpdates::Stopped
+                    } else {
+                        DesiredUpdates::Paused
+                    };
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.set_desired_updates(seq, desired)
+                    })
+                    .unwrap();
+                    if change == "pause-resume" {
+                        control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                            fixture
+                                .control
+                                .set_desired_updates(seq, DesiredUpdates::Running)
+                        })
+                        .unwrap();
+                    }
+                }
+                "fence" => {
+                    let owner = ControlId::parse("idle-owner").unwrap();
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.set_maintenance(
+                            seq,
+                            &owner,
+                            MaintenanceFence {
+                                state: MaintenanceState::Updating,
+                                owner: Some(owner.clone()),
+                                phase: Some(MaintenancePhase::Quiescing),
+                            },
+                        )
+                    })
+                    .unwrap();
+                }
+                "revoke" => {
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture
+                            .control
+                            .revoke_selection(seq, &fixture.selection.id, None, 2)
+                    })
+                    .unwrap();
+                }
+                "boot" => {
+                    let replacement = fixture
+                        .control
+                        .bind_worker(
+                            &fixture.worker_lock,
+                            ControlId::parse("replacement-boot").unwrap(),
+                        )
+                        .unwrap();
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture
+                            .control
+                            .register_worker(seq, &replacement, std::process::id(), 2)
+                    })
+                    .unwrap();
+                }
+                "incarnation" => {
+                    rusqlite::Connection::open(&fixture.db)
+                        .unwrap()
+                        .execute(
+                            "UPDATE catalog_meta SET catalog_incarnation='changed-idle-catalog'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "latest" => {
+                    let request = LatestRequest {
+                        selections: vec![selection_revision(&fixture.selection).unwrap()],
+                        max_wait_ms: MAX_LATEST_WAIT_MS,
+                        now_ms: app_clock_ms(),
+                    };
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.admit_latest(seq, request.clone())
+                    })
+                    .unwrap();
+                }
+                "due" => {
+                    schedule.hooks.now = Some(Rc::new(Cell::new(FULL_VERIFICATION_INTERVAL)));
+                }
+                _ => unreachable!(),
+            }
+            let progress = fixture.read_control(|control| control.source_progress_inventory());
+            assert_eq!(
+                progress
+                    .iter()
+                    .map(|source| (
+                        &source.source_id,
+                        &source.receipt,
+                        &source.last_observation,
+                        source.last_attempt_at_ms
+                    ))
+                    .collect::<Vec<_>>(),
+                before_progress
+                    .iter()
+                    .map(|source| (
+                        &source.source_id,
+                        &source.receipt,
+                        &source.last_observation,
+                        source.last_attempt_at_ms
+                    ))
+                    .collect::<Vec<_>>(),
+                "{change}: policy invalidation must preserve the original observation"
+            );
+            let expected_next = fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq;
+            assert!(expected_next >= next);
+            let result = accept_idle_boundary(
+                &fixture.db,
+                &fixture.control,
+                &worker,
+                &ready,
+                &mut pending,
+                &mut schedule,
+                Instant::now() + CONTROL_BUDGET,
+            );
+            assert!(
+                result.as_ref().is_ok_and(Option::is_none),
+                "{change}: {result:?}"
+            );
+            assert!(
+                pending
+                    .as_ref()
+                    .is_none_or(|intent| intent.observed.is_none()),
+                "{change}"
+            );
+            assert!(schedule.closed_idle_at.is_none());
+            assert_eq!(publication_counts(&fixture), publications);
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress_inventory()),
+                progress
+            );
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.background_status())
+                    .next_cycle_seq,
+                expected_next
+            );
+        }
+    }
+
+    #[test]
+    fn pending_idle_outer_cas_conflict_revalidates_new_latest() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "outer cas original");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let (ready, mut pending) = observed_ready(&fixture, &mut schedule, &boot);
+        let root = fixture.db.parent().unwrap().to_owned();
+        let installation = fixture
+            .read_control(|control| control.status())
+            .policy
+            .installation_id;
+        let request = LatestRequest {
+            selections: vec![selection_revision(&fixture.selection).unwrap()],
+            max_wait_ms: MAX_LATEST_WAIT_MS,
+            now_ms: app_clock_ms(),
+        };
+        let admitted = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let admitted = admitted.clone();
+            let calls = calls.clone();
+            move |event| {
+                if let ScheduleTestEvent::BeforeIdleHeartbeat(expected) = event {
+                    calls.set(calls.get() + 1);
+                    if !admitted.replace(true) {
+                        let control =
+                            SqliteControlStore::open_existing_writable(&root, &installation)?;
+                        assert_eq!(control.status()?.policy.control_seq, expected);
+                        control.admit_latest(expected, request.clone())?;
+                    }
+                }
+                Ok(())
+            }
+        });
+        let before = publication_counts(&fixture);
+        assert!(
+            accept_idle_boundary(
+                &fixture.db,
+                &fixture.control,
+                &fixture.worker(),
+                &ready,
+                &mut pending,
+                &mut schedule,
+                Instant::now() + CONTROL_BUDGET
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(admitted.get());
+        assert_eq!(calls.get(), 1);
+        assert!(pending.is_none());
+        assert!(schedule.closed_idle_at.is_none());
+        assert_eq!(publication_counts(&fixture), before);
+        assert!(!schedule.demands.is_empty());
+        let windows = schedule
+            .demands
+            .iter()
+            .map(|(id, demand)| (id.clone(), demand.service_end))
+            .collect::<BTreeMap<_, _>>();
+        schedule
+            .update_demands(
+                fixture.read_control(|control| control.latest_demands()),
+                &fixture.read_control(|control| control.read_policy(RequestIntersection::Selected)),
+                schedule.now(),
+            )
+            .unwrap();
+        for (id, end) in windows {
+            assert_eq!(schedule.demands[&id].service_end, end);
+        }
+    }
+
+    #[test]
+    fn pending_idle_outer_late_heartbeat_ok_is_consumed_without_another_read() {
+        let fixture = CycleFixture::new();
+        fixture.write_source(
+            "source.jsonl",
+            SearchProvider::Claude,
+            "late acknowledged original",
+        );
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let (ready, mut pending) = observed_ready(&fixture, &mut schedule, &boot);
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let calls = Rc::new(Cell::new(0));
+        let end = Instant::now() + CONTROL_BUDGET;
+        schedule.hooks = scheduler_hooks(elapsed.clone(), {
+            let elapsed = elapsed.clone();
+            let calls = calls.clone();
+            move |event| {
+                if let ScheduleTestEvent::AfterIdleHeartbeat(original_end) = event {
+                    assert_eq!(original_end, end);
+                    calls.set(calls.get() + 1);
+                    elapsed.set(Duration::from_secs(1));
+                }
+                Ok(())
+            }
+        });
+        let before = publication_counts(&fixture);
+        let accepted = accept_idle_boundary(
+            &fixture.db,
+            &fixture.control,
+            &fixture.worker(),
+            &ready,
+            &mut pending,
+            &mut schedule,
+            end,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(accepted.outcome.idle());
+        assert_eq!(calls.get(), 1);
+        assert!(schedule.closed_idle_at.unwrap() > end);
+        assert!(pending.is_none());
+        assert_eq!(publication_counts(&fixture), before);
+        assert_eq!(
+            fixture
+                .read_control(|control| control.background_status())
+                .worker
+                .state,
+            UpdateState::Idle
+        );
     }
 
     #[test]
@@ -11433,7 +12817,8 @@ mod control_deadline_tests {
                 control.heartbeat_worker(seq, &worker, state, Some(BackgroundFailure::Busy), 4)
             })
             .unwrap();
-            let outcome = run_cycle(
+            let mut schedule = SourceScheduleState::default();
+            let result = run_cycle(
                 &fixture.db,
                 control,
                 &worker,
@@ -11441,9 +12826,12 @@ mod control_deadline_tests {
                 0,
                 fixture_end,
                 &mut pending,
-                &mut SourceScheduleState::default(),
+                &mut schedule,
             )
             .unwrap();
+            let outcome = fixture
+                .accept_cycle(result, &mut pending, &mut schedule)
+                .unwrap();
             assert!(outcome.idle(), "{outcome:?}");
             assert_eq!(outcome.finish(), CycleFinish::Committed);
             let finished = control
@@ -11466,7 +12854,7 @@ mod control_deadline_tests {
                     .unwrap()
                     .worker
                     .state,
-                UpdateState::Running
+                UpdateState::Idle
             );
             assert_eq!(
                 control
@@ -11523,7 +12911,8 @@ mod control_deadline_tests {
             )
         })
         .unwrap();
-        let outcome = run_cycle(
+        let mut schedule = SourceScheduleState::default();
+        let result = run_cycle(
             &fixture.db,
             control,
             &worker,
@@ -11531,9 +12920,12 @@ mod control_deadline_tests {
             0,
             fixture.scope_end,
             &mut pending,
-            &mut SourceScheduleState::default(),
+            &mut schedule,
         )
         .unwrap();
+        let outcome = fixture
+            .accept_cycle(result, &mut pending, &mut schedule)
+            .unwrap();
         assert!(outcome.idle(), "{outcome:?}");
         assert_eq!(outcome.finish(), CycleFinish::Committed);
         let aborted = control.cycle(queued.token.cycle_seq).unwrap();
