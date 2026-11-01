@@ -9,7 +9,7 @@ use crate::{
 use agent_session_grep_adapters_sqlite::{
     PARSER_SEMANTIC_VERSION, SourceBatch, SqliteControlStore, capture_with_deadline,
     control::LockedWorkerAuthority,
-    managed_locks::{ExclusiveGuard, LockKind},
+    managed_locks::{ExclusiveGuard, LockKind, RootIdentity},
     managed_refresh::RefreshOutcome,
     managed_store::{BackgroundSource, ManagedStore},
     open_snapshot_source_with_deadline, verify_snapshot_with_deadline,
@@ -818,6 +818,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         // schema/identity failures still terminate and remain visible.
         match quiesce_before(&control, Instant::now() + CONTROL_BUDGET) {
             Ok(Some(exit)) => {
+                invalidate_pending_idle(&mut pending_cycle, &mut schedule);
                 if finish_worker(
                     db,
                     &control,
@@ -850,6 +851,7 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
             };
         let mut idle_completed = None;
         let (state, error) = if current.desired_updates == DesiredUpdates::Paused {
+            invalidate_pending_idle(&mut pending_cycle, &mut schedule);
             (UpdateState::Paused, Some(BackgroundFailure::Paused))
         } else {
             // One cycle runs about five sequential control changes before
@@ -896,10 +898,14 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         let boundary = control_change(&control, |seq| {
             let now = control.status()?;
             if let Some(exit) = worker_exit(&now) {
+                invalidate_pending_idle(&mut pending_cycle, &mut schedule);
                 return Ok(WorkerBoundary::Exit(exit));
             }
             let (state, error) = match now.desired_updates {
-                DesiredUpdates::Paused => (UpdateState::Paused, Some(BackgroundFailure::Paused)),
+                DesiredUpdates::Paused => {
+                    invalidate_pending_idle(&mut pending_cycle, &mut schedule);
+                    (UpdateState::Paused, Some(BackgroundFailure::Paused))
+                }
                 _ => (state, error),
             };
             control.heartbeat_worker(seq, &authority, state, error, app_clock_ms())?;
@@ -1421,21 +1427,31 @@ fn discovery_capacity() -> PortError {
 struct PendingCycle {
     token: ObservationToken,
     finish: CycleFinish,
+    observed: Option<PendingObservation>,
+    completion_confirmed: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+struct PendingObservation {
+    outcome: CycleOutcome,
+    identity: ScheduleIdentity,
+    cycle: ObservationCycle,
+    restart_request_seq: ControlSeq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CycleOutcome {
     catalog_complete: bool,
     all_sources_attempted: bool,
     remaining_work: bool,
+    due_candidates: BTreeSet<SourceId>,
 }
 
 impl CycleOutcome {
-    fn idle(self) -> bool {
+    fn idle(&self) -> bool {
         self.catalog_complete && !self.remaining_work
     }
 
-    fn finish(self) -> CycleFinish {
+    fn finish(&self) -> CycleFinish {
         if self.catalog_complete && self.all_sources_attempted {
             CycleFinish::Committed
         } else {
@@ -1453,16 +1469,27 @@ fn finish_pending_cycle(
     pending: &mut Option<PendingCycle>,
     end: Instant,
 ) -> PortResult<()> {
-    let Some(intent) = pending.as_ref() else {
+    let Some(intent) = pending.as_mut() else {
         return Ok(());
     };
+    if intent.completion_confirmed {
+        return Ok(());
+    }
     control.with_runtime_deadline(end, || {
-        let cycle = control.cycle(intent.token.cycle_seq)?;
+        let mut cycle = control.cycle(intent.token.cycle_seq)?;
         if cycle.token != intent.token || intent.token.worker_boot_id != *authority.boot_id() {
             return Err(changed());
         }
+        if let Some(observed) = &intent.observed
+            && (!observed_cycle_matches(&observed.cycle, &cycle)
+                || intent.finish != observed.outcome.finish()
+                || observed.cycle.started_control_seq.is_none()
+                || observed.cycle.started_at_ms.is_none())
+        {
+            return Err(changed());
+        }
         if matches!(cycle.state, CycleState::Queued | CycleState::Observing) {
-            control_change_before(control, end, |seq| {
+            cycle = control_change_before(control, end, |seq| {
                 control.finish_cycle(
                     seq,
                     authority,
@@ -1470,12 +1497,201 @@ fn finish_pending_cycle(
                     intent.finish,
                     app_clock_ms(),
                 )
-            })?;
+            })?
+            .value;
+        }
+        if let Some(observed) = &intent.observed {
+            if cycle.state == CycleState::Aborted {
+                intent.observed = None;
+            } else if !observed_cycle_matches(&observed.cycle, &cycle)
+                || cycle.state != finish_state(intent.finish)
+                || cycle.started_control_seq.is_none()
+                || cycle.started_at_ms.is_none()
+                || cycle.completed_at_ms.is_none()
+            {
+                return Err(changed());
+            }
         }
         Ok(())
     })?;
-    *pending = None;
+    if intent.observed.is_some() {
+        intent.completion_confirmed = true;
+    } else {
+        *pending = None;
+    }
     Ok(())
+}
+
+fn finish_state(finish: CycleFinish) -> CycleState {
+    match finish {
+        CycleFinish::Committed => CycleState::Committed,
+        CycleFinish::Partial => CycleState::Partial,
+        CycleFinish::Aborted => CycleState::Aborted,
+    }
+}
+
+fn observed_cycle_matches(observed: &ObservationCycle, current: &ObservationCycle) -> bool {
+    observed.token == current.token
+        && observed.policy_epoch == current.policy_epoch
+        && observed.admitted_control_seq == current.admitted_control_seq
+        && observed.started_control_seq == current.started_control_seq
+        && observed.started_at_ms == current.started_at_ms
+        && observed
+            .selections
+            .iter()
+            .map(|selection| &selection.selection)
+            .eq(current
+                .selections
+                .iter()
+                .map(|selection| &selection.selection))
+}
+
+fn invalidate_pending_idle(pending: &mut Option<PendingCycle>, schedule: &mut SourceScheduleState) {
+    schedule.closed_idle_at = None;
+    if let Some(intent) = pending
+        && intent.observed.take().is_some()
+    {
+        intent.finish = CycleFinish::Aborted;
+    }
+}
+
+/// Completion is already durable. Keep the slot until every bounded current
+/// read succeeds, then consume it once; a Busy result leaves it for next tick.
+fn deliver_pending_idle(
+    db: &Path,
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+    pending: &mut Option<PendingCycle>,
+    schedule: &mut SourceScheduleState,
+    end: Instant,
+) -> PortResult<Option<CycleOutcome>> {
+    let Some(intent) = pending
+        .as_ref()
+        .filter(|intent| intent.completion_confirmed)
+    else {
+        return Ok(None);
+    };
+    let Some(observed) = intent.observed.as_ref() else {
+        *pending = None;
+        return Ok(None);
+    };
+    if !observed.outcome.idle() {
+        *pending = None;
+        return Ok(None);
+    }
+    let mut observed_drift = false;
+    let valid = control.with_runtime_deadline(end, || {
+        #[cfg(test)]
+        schedule
+            .hooks
+            .event(ScheduleTestEvent::BeforeIdleValidation)?;
+        authority.validate()?;
+        if RootIdentity::read(root(db)?)?.binding() != authority.root_binding() {
+            return Err(changed());
+        }
+        let current = control.status()?;
+        let runtime = control.background_status()?;
+        let terminal = control.cycle(intent.token.cycle_seq)?;
+        if !observed_cycle_matches(&observed.cycle, &terminal)
+            || terminal.state != finish_state(intent.finish)
+            || intent.finish != observed.outcome.finish()
+            || terminal.completed_at_ms.is_none()
+        {
+            return Err(changed());
+        }
+        if current.desired_updates != DesiredUpdates::Running
+            || current.policy.emission_blocked()
+            || current.restart_request_seq != observed.restart_request_seq
+            || current.catalog_incarnation.as_ref() != Some(&observed.identity.incarnation)
+            || runtime.worker.boot_id.as_ref() != Some(authority.boot_id())
+            || runtime.worker.state == UpdateState::Offline
+            || authority.boot_id() != &observed.identity.worker_boot
+            || authority.installation_id() != &current.policy.installation_id
+            || observed.cycle.selections.len() != observed.identity.selections.len()
+            || observed
+                .cycle
+                .selections
+                .iter()
+                .any(|selection| !observed.identity.selections.contains(&selection.selection))
+            || ScheduleIdentity::new(
+                &current.policy,
+                &observed.identity.incarnation,
+                authority.boot_id(),
+            )? != observed.identity
+        {
+            observed_drift = true;
+            return Ok(false);
+        }
+        // This read-only facade performs no recovery or source observation.
+        let catalog = ManagedStore::open(db, control)?;
+        let physical_matches = catalog.incarnation() == &observed.identity.incarnation;
+        drop(catalog);
+        if !physical_matches {
+            observed_drift = true;
+            return Ok(false);
+        }
+        #[cfg(test)]
+        schedule.hooks.event(ScheduleTestEvent::BeforeIdleDemands)?;
+        let demands = control.latest_demands()?;
+        let after = control.status()?;
+        if after.desired_updates != DesiredUpdates::Running
+            || after.policy.emission_blocked()
+            || after.restart_request_seq != observed.restart_request_seq
+            || after.catalog_incarnation != current.catalog_incarnation
+            || ScheduleIdentity::new(
+                &after.policy,
+                &observed.identity.incarnation,
+                authority.boot_id(),
+            )? != observed.identity
+        {
+            observed_drift = true;
+            return Ok(false);
+        }
+        if current.policy.control_seq != runtime.control_seq
+            || current.policy.control_seq != after.policy.control_seq
+        {
+            return Err(PortError::WriterBusy(
+                "managed idle validation changed during current reads".into(),
+            ));
+        }
+        let now = schedule.now();
+        schedule.update_demands(demands, &current.policy, now)?;
+        let demand_owed = schedule
+            .demands
+            .values()
+            .any(|demand| !demand.retired && now < demand.service_end);
+        let due = observed
+            .outcome
+            .due_candidates
+            .iter()
+            .any(|id| schedule.full_due(id, now));
+        Ok(!demand_owed && !due)
+    });
+    // An observed lifecycle/identity change is sticky even when the wrapper's
+    // final time check refuses this read-only batch.
+    if observed_drift {
+        *pending = None;
+    }
+    match valid {
+        Ok(true) => {
+            let observed = pending
+                .take()
+                .ok_or_else(invalid)?
+                .observed
+                .ok_or_else(invalid)?;
+            schedule.closed_idle_at = Some(Instant::now());
+            Ok(Some(observed.outcome))
+        }
+        Ok(false) => {
+            *pending = None;
+            Ok(None)
+        }
+        Err(error @ PortError::WriterBusy(_)) => Err(error),
+        Err(error) => {
+            *pending = None;
+            Err(error)
+        }
+    }
 }
 
 /// Own the queued token before start can commit without an acknowledgement.
@@ -1494,6 +1710,8 @@ fn start_cycle_with_pending(
     *pending = Some(PendingCycle {
         token: queued.token.clone(),
         finish: CycleFinish::Aborted,
+        observed: None,
+        completion_confirmed: false,
     });
     control_change_before(control, end, |seq| {
         let cycle = start(seq)?;
@@ -1515,24 +1733,37 @@ fn run_cycle(
     pending: &mut Option<PendingCycle>,
     schedule: &mut SourceScheduleState,
 ) -> PortResult<CycleOutcome> {
+    schedule.closed_idle_at = None;
     // The same live worker may have reported Busy/Deferred after a refused
     // completion. Restore activity under current intent/fence before finish,
     // whose control admission rejects those advisory states. A pause, stop or
     // maintenance fence is a permanent refusal for this attempt: report it
     // immediately instead of retrying the heartbeat until the caller deadline,
     // which would consume the whole observation budget on every cadence.
-    control_change_before(control, end, |seq| {
+    let activity = control_change_before(control, end, |seq| {
         let current = control.status()?;
-        if current.desired_updates != DesiredUpdates::Running
-            || current.policy.maintenance.state != MaintenanceState::Idle
-        {
+        if current.desired_updates != DesiredUpdates::Running || current.policy.emission_blocked() {
+            invalidate_pending_idle(pending, schedule);
             return Err(changed());
         }
         control.heartbeat_worker(seq, authority, UpdateState::Running, None, app_clock_ms())
-    })?;
+    });
+    if let Err(error) = activity {
+        if !matches!(error, PortError::WriterBusy(_)) {
+            invalidate_pending_idle(pending, schedule);
+        }
+        return Err(error);
+    }
     finish_pending_cycle(control, authority, pending, end)?;
-    let policy = control
-        .with_runtime_deadline(end, || control.read_policy(RequestIntersection::Selected))?;
+    if let Some(outcome) = deliver_pending_idle(db, control, authority, pending, schedule, end)? {
+        return Ok(outcome);
+    }
+    let current = control.with_runtime_deadline(end, || control.status())?;
+    if current.desired_updates != DesiredUpdates::Running || current.policy.emission_blocked() {
+        invalidate_pending_idle(pending, schedule);
+        return Err(changed());
+    }
+    let policy = current.policy;
     let mut selections = policy
         .selections
         .iter()
@@ -1545,6 +1776,7 @@ fn run_cycle(
             catalog_complete: true,
             all_sources_attempted: true,
             remaining_work: false,
+            due_candidates: BTreeSet::new(),
         });
     }
     // Rotate the first selection as well as processing every candidate. An old
@@ -1625,17 +1857,32 @@ fn run_cycle(
         schedule,
         epoch_plan_allowed,
     );
-    schedule.closed_idle_at = result
-        .as_ref()
-        .ok()
-        .filter(|outcome| outcome.idle())
-        .map(|_| Instant::now());
-    pending.as_mut().ok_or_else(invalid)?.finish = match &result {
-        Ok(outcome) => outcome.finish(),
-        Err(_) => CycleFinish::Aborted,
-    };
+    let intent = pending.as_mut().ok_or_else(invalid)?;
+    if let Ok(outcome) = &result {
+        intent.finish = outcome.finish();
+        intent.observed = Some(PendingObservation {
+            outcome: outcome.clone(),
+            identity: schedule.identity.clone().ok_or_else(invalid)?,
+            cycle,
+            restart_request_seq: current.restart_request_seq,
+        });
+    }
+    #[cfg(test)]
+    wal_worker_tests::configure_completion(&schedule.hooks);
+    #[cfg(test)]
+    schedule.hooks.event(ScheduleTestEvent::BeforeCompletion)?;
+    #[cfg(test)]
+    let end = schedule.hooks.completion_end.take().unwrap_or(end);
     finish_pending_cycle(control, authority, pending, end)?;
-    result
+    if let Some(outcome) = deliver_pending_idle(db, control, authority, pending, schedule, end)? {
+        return Ok(outcome);
+    }
+    // A synchronous non-idle result belongs to this tick; its next cadence
+    // keeps the ordinary scheduler's work-conserving behavior.
+    result.map(|mut outcome| {
+        outcome.remaining_work |= outcome.idle();
+        outcome
+    })
 }
 
 struct RootState<'a> {
@@ -1724,7 +1971,7 @@ enum SourceLane {
     Verification,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ScheduleIdentity {
     installation: ControlId,
     incarnation: ControlId,
@@ -1732,6 +1979,30 @@ struct ScheduleIdentity {
     parser: u32,
     epoch: PolicyEpoch,
     selections: Vec<SelectionRevision>,
+}
+
+impl ScheduleIdentity {
+    fn new(
+        policy: &ReadPolicy,
+        incarnation: &ControlId,
+        worker_boot: &ControlId,
+    ) -> PortResult<Self> {
+        let mut selections = policy
+            .selections
+            .iter()
+            .filter(|selection| selection.enabled)
+            .map(selection_revision)
+            .collect::<PortResult<Vec<_>>>()?;
+        selections.sort_by(|a, b| a.selection_id.cmp(&b.selection_id));
+        Ok(Self {
+            installation: policy.installation_id.clone(),
+            incarnation: incarnation.clone(),
+            worker_boot: worker_boot.clone(),
+            parser: PARSER_SEMANTIC_VERSION,
+            epoch: policy.policy_epoch,
+            selections,
+        })
+    }
 }
 
 struct SourceDebt {
@@ -1776,21 +2047,7 @@ impl SourceScheduleState {
         incarnation: &ControlId,
         worker_boot: &ControlId,
     ) -> PortResult<()> {
-        let mut selections = policy
-            .selections
-            .iter()
-            .filter(|selection| selection.enabled)
-            .map(selection_revision)
-            .collect::<PortResult<Vec<_>>>()?;
-        selections.sort_by(|a, b| a.selection_id.cmp(&b.selection_id));
-        let identity = ScheduleIdentity {
-            installation: policy.installation_id.clone(),
-            incarnation: incarnation.clone(),
-            worker_boot: worker_boot.clone(),
-            parser: PARSER_SEMANTIC_VERSION,
-            epoch: policy.policy_epoch,
-            selections,
-        };
+        let identity = ScheduleIdentity::new(policy, incarnation, worker_boot)?;
         if self.identity.as_ref() != Some(&identity) {
             self.sources.clear();
             self.next_ticket = 0;
@@ -2053,6 +2310,7 @@ struct ScheduleTestHooks {
     // Typed refusals in call order. Recording never fails, so it adds no
     // early return between cycle start and completion.
     epoch_refusals: RefCell<Vec<(EpochSite, crate::update_state::EpochRefusal)>>,
+    completion_end: std::cell::Cell<Option<Instant>>,
 }
 
 /// Where the worker asked for an epoch permit.
@@ -2089,6 +2347,9 @@ enum ScheduleTestEvent<'a> {
     AfterDiscoveryPublication {
         epoch: bool,
     },
+    BeforeCompletion,
+    BeforeIdleValidation,
+    BeforeIdleDemands,
 }
 
 #[cfg(test)]
@@ -4566,16 +4827,24 @@ fn observe_cycle(
         })
         .map(|source| source.binding.source_id.clone())
         .collect::<BTreeSet<_>>();
-    let due = scheduler.state.sources.iter().any(|(id, _)| {
-        !matches!(
-            absent.get(id.as_str()),
-            Some(ObservationOutcome::Attempted {
-                published: true,
-                ..
-            })
-        ) && (shared.get(id.as_str()).is_some_and(plain_source) || known_plain.contains(id))
-            && scheduler.state.full_due(id, now)
-    });
+    let due_candidates = scheduler
+        .state
+        .sources
+        .keys()
+        .filter(|id| {
+            !matches!(
+                absent.get(id.as_str()),
+                Some(ObservationOutcome::Attempted {
+                    published: true,
+                    ..
+                })
+            ) && (shared.get(id.as_str()).is_some_and(plain_source) || known_plain.contains(*id))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let due = due_candidates
+        .iter()
+        .any(|id| scheduler.state.full_due(id, now));
     let latest_owed = shared.values().any(|source| {
         let prior = baselines
             .get(&source.id)
@@ -4645,6 +4914,7 @@ fn observe_cycle(
         catalog_complete,
         all_sources_attempted,
         remaining_work: due || latest_owed || other_demand || remaining_scope || !catalog_complete,
+        due_candidates,
     })
 }
 
@@ -5593,7 +5863,8 @@ mod wal_worker_tests {
 
     struct Hooks {
         events: mpsc::Sender<Event>,
-        advance: mpsc::Receiver<()>,
+        advance: mpsc::Receiver<bool>,
+        expire_completion_once: bool,
     }
 
     thread_local! {
@@ -5602,9 +5873,9 @@ mod wal_worker_tests {
 
     pub(super) fn event(event: Event) {
         HOOKS.with(|hooks| {
-            if let Some(hooks) = hooks.borrow().as_ref() {
+            if let Some(hooks) = hooks.borrow_mut().as_mut() {
                 hooks.events.send(event).expect("test worker observer");
-                hooks
+                hooks.expire_completion_once |= hooks
                     .advance
                     .recv_timeout(Duration::from_secs(20))
                     .expect("test boundary release");
@@ -5612,14 +5883,28 @@ mod wal_worker_tests {
         });
     }
 
+    pub(super) fn configure_completion(schedule: &ScheduleTestHooks) {
+        HOOKS.with(|hooks| {
+            if let Some(hooks) = hooks.borrow_mut().as_mut()
+                && std::mem::take(&mut hooks.expire_completion_once)
+            {
+                schedule.completion_end.set(Some(Instant::now()));
+            }
+        });
+    }
+
     struct Worker {
         events: Option<mpsc::Receiver<Event>>,
-        advance: Option<mpsc::Sender<()>>,
+        advance: Option<mpsc::Sender<bool>>,
         thread: Option<JoinHandle<PortResult<()>>>,
     }
 
     impl Worker {
         fn start(db: &Path) -> Self {
+            Self::start_with_expired_completion(db, false)
+        }
+
+        fn start_with_expired_completion(db: &Path, expire_completion_once: bool) -> Self {
             let db = db.to_owned();
             let (events_tx, events_rx) = mpsc::channel();
             let (advance_tx, advance_rx) = mpsc::channel();
@@ -5628,6 +5913,7 @@ mod wal_worker_tests {
                     *hooks.borrow_mut() = Some(Hooks {
                         events: events_tx,
                         advance: advance_rx,
+                        expire_completion_once,
                     })
                 });
                 run_child(&db)
@@ -5648,7 +5934,11 @@ mod wal_worker_tests {
         }
 
         fn advance(&self) {
-            self.advance.as_ref().unwrap().send(()).unwrap();
+            self.advance.as_ref().unwrap().send(false).unwrap();
+        }
+
+        fn advance_expiring_completion(&self) {
+            self.advance.as_ref().unwrap().send(true).unwrap();
         }
 
         fn boundary(&self, expected: WorkerBoundary) {
@@ -5839,6 +6129,86 @@ mod wal_worker_tests {
             })
             .unwrap();
         assert!(rows >= 2);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_deferred_completion_delivers_one_idle_checkpoint() {
+        let fixture = Fixture::new(true);
+        fixture.append(0);
+        let worker = Worker::start_with_expired_completion(&fixture.db, true);
+        worker.boundary(WorkerBoundary::Busy);
+        let count = |table: &str| {
+            fixture
+                .idle
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let before = (
+            count("source_revision_receipts"),
+            count("discovery_receipts"),
+        );
+        worker.advance();
+        worker.boundary(WorkerBoundary::Idle);
+        assert_eq!(
+            (
+                count("source_revision_receipts"),
+                count("discovery_receipts")
+            ),
+            before
+        );
+        worker.advance();
+        assert_eq!(
+            worker
+                .checkpoint(WalCheckpointOutcome::Reset)
+                .wal_bytes_after,
+            Some(0)
+        );
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_paused_outer_tick_discards_saved_idle_before_resume() {
+        let fixture = Fixture::new(true);
+        fixture.append(0);
+        let worker = Worker::start_with_expired_completion(&fixture.db, true);
+        worker.boundary(WorkerBoundary::Busy);
+        let next = fixture.control.background_status().unwrap().next_cycle_seq;
+        fixture.desired(DesiredUpdates::Paused);
+        worker.advance();
+        worker.boundary(WorkerBoundary::Paused);
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        fixture.desired(DesiredUpdates::Running);
+        worker.advance_expiring_completion();
+        worker.boundary(WorkerBoundary::Busy);
+        let resumed = fixture.control.background_status().unwrap().next_cycle_seq;
+        assert!(resumed > next);
+        let receipts: i64 = fixture
+            .idle
+            .query_row("SELECT count(*) FROM source_revision_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        worker.advance();
+        worker.boundary(WorkerBoundary::Idle);
+        assert_eq!(
+            fixture.control.background_status().unwrap().next_cycle_seq,
+            resumed
+        );
+        assert_eq!(
+            fixture
+                .idle
+                .query_row("SELECT count(*) FROM source_revision_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            receipts
+        );
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
         fixture.stop(worker);
     }
 
@@ -6093,6 +6463,7 @@ mod wal_worker_tests {
         assert_eq!(state.state, UpdateState::Offline);
         assert_eq!(state.error, None);
     }
+
     #[test]
     fn wal_worker_stop_cleanup_busy_keeps_same_boot_and_one_physical_attempt() {
         for hard_error in [false, true] {
@@ -6588,6 +6959,7 @@ mod control_deadline_tests {
             source_phase: Cell::new(SourceAttemptPhase::Prepare),
             on_event: Some(RefCell::new(Box::new(hook))),
             epoch_refusals: RefCell::default(),
+            completion_end: Cell::new(None),
         }
     }
 
@@ -9919,6 +10291,891 @@ mod control_deadline_tests {
         assert!(unrelated_stable);
     }
 
+    fn expired_completion(
+        fixture: &CycleFixture,
+        schedule: &mut SourceScheduleState,
+        boot: &ObservationClock,
+    ) -> Option<PendingCycle> {
+        let mut pending = None;
+        schedule.hooks.completion_end.set(Some(Instant::now()));
+        let result = run_cycle(
+            &fixture.db,
+            &fixture.control,
+            &fixture.worker(),
+            boot,
+            0,
+            fixture.scope_end,
+            &mut pending,
+            schedule,
+        );
+        schedule.hooks.completion_end.set(None);
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        let intent = pending.as_ref().unwrap();
+        assert!(intent.observed.is_some());
+        assert!(!intent.completion_confirmed);
+        assert!(schedule.closed_idle_at.is_none());
+        pending
+    }
+
+    fn resume_pending(
+        fixture: &CycleFixture,
+        schedule: &mut SourceScheduleState,
+        boot: &ObservationClock,
+        pending: &mut Option<PendingCycle>,
+    ) -> PortResult<CycleOutcome> {
+        run_cycle(
+            &fixture.db,
+            &fixture.control,
+            &fixture.worker(),
+            boot,
+            1,
+            fixture.scope_end,
+            pending,
+            schedule,
+        )
+    }
+
+    fn publication_counts(fixture: &CycleFixture) -> (i64, i64, i64) {
+        rusqlite::Connection::open(&fixture.db)
+            .unwrap()
+            .query_row(
+                "SELECT
+                 (SELECT count(*) FROM source_revision_receipts),
+                 (SELECT count(*) FROM discovery_receipts),
+                 (SELECT count(*) FROM discovery_sources)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn pending_idle_quiet_baseline_expired_finish_returns_once_through_run_cycle() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("quiet.jsonl", SearchProvider::Claude, "quiet baseline");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(
+            fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        let source = fixture.sources().pop().unwrap();
+        let id = source.binding.source_id.clone();
+        let debt = &schedule.sources[&id];
+        let original_debt = (debt.ticket, debt.last_full_verified, debt.owed, debt.dirty);
+        let progress = fixture.read_control(|control| control.source_progress_inventory());
+        let publications = Rc::new(Cell::new(0));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let publications = publications.clone();
+            move |event| {
+                match event {
+                    ScheduleTestEvent::BeforeAttempt(..) | ScheduleTestEvent::Published(..) => {
+                        panic!("quiet recovery cannot reread or republish a source");
+                    }
+                    ScheduleTestEvent::AfterDiscoveryPublication { .. } => {
+                        publications.set(publications.get() + 1);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let original = pending
+            .as_ref()
+            .unwrap()
+            .observed
+            .as_ref()
+            .unwrap()
+            .outcome
+            .clone();
+        let token = pending.as_ref().unwrap().token.clone();
+        assert!(original.idle());
+        assert!(!original.all_sources_attempted);
+        assert_eq!(original.finish(), CycleFinish::Partial);
+        let next = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        let counts = publication_counts(&fixture);
+        let lower = Instant::now();
+        let outcome = resume_pending(&fixture, &mut schedule, &boot, &mut pending).unwrap();
+        let upper = Instant::now();
+        assert_eq!(outcome, original);
+        assert!(pending.is_none());
+        assert_eq!(
+            fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq,
+            next
+        );
+        assert_eq!(
+            fixture
+                .read_control(|control| control.cycle(token.cycle_seq))
+                .state,
+            CycleState::Partial
+        );
+        assert_eq!(publication_counts(&fixture), counts);
+        assert_eq!(publications.get(), 1);
+        assert_eq!(fixture.sources()[0].latest_receipt, source.latest_receipt);
+        assert_eq!(
+            fixture.read_control(|control| control.source_progress_inventory()),
+            progress
+        );
+        let debt = &schedule.sources[&id];
+        assert_eq!(
+            (debt.ticket, debt.last_full_verified, debt.owed, debt.dirty),
+            original_debt
+        );
+        let delivered = schedule.closed_idle_at.unwrap();
+        assert!(lower <= delivered && delivered <= upper);
+        assert_eq!(
+            CADENCE
+                .saturating_sub((delivered + Duration::from_millis(1)).duration_since(delivered)),
+            CADENCE - Duration::from_millis(1)
+        );
+        assert_eq!(
+            CADENCE.saturating_sub((delivered + CADENCE).duration_since(delivered)),
+            Duration::ZERO
+        );
+        assert!(
+            deliver_pending_idle(
+                &fixture.db,
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                &mut schedule,
+                fixture.scope_end
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_idle_busy_after_confirmation_retains_result_and_never_refinishes() {
+        for at_demands in [false, true] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("quiet.jsonl", SearchProvider::Claude, "quiet baseline");
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            assert!(
+                fixture
+                    .production_cycle(&mut schedule, &boot)
+                    .0
+                    .unwrap()
+                    .idle()
+            );
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            let token = pending.as_ref().unwrap().token.clone();
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), move |event| {
+                if matches!(event, ScheduleTestEvent::BeforeIdleDemands) == at_demands
+                    && matches!(
+                        event,
+                        ScheduleTestEvent::BeforeIdleValidation
+                            | ScheduleTestEvent::BeforeIdleDemands
+                    )
+                {
+                    return Err(PortError::WriterBusy("synthetic delivery busy".into()));
+                }
+                Ok(())
+            });
+            assert!(matches!(
+                resume_pending(&fixture, &mut schedule, &boot, &mut pending),
+                Err(PortError::WriterBusy(_))
+            ));
+            assert!(pending.as_ref().unwrap().completion_confirmed);
+            let terminal = fixture.read_control(|control| control.cycle(token.cycle_seq));
+            let counts = publication_counts(&fixture);
+            let before = fixture
+                .read_control(|control| control.status())
+                .policy
+                .control_seq;
+            schedule.hooks = ScheduleTestHooks::default();
+            assert!(matches!(
+                deliver_pending_idle(
+                    &fixture.db,
+                    &fixture.control,
+                    &fixture.worker(),
+                    &mut pending,
+                    &mut schedule,
+                    Instant::now()
+                ),
+                Err(PortError::WriterBusy(_))
+            ));
+            assert!(pending.as_ref().unwrap().completion_confirmed);
+            finish_pending_cycle(
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                fixture.scope_end,
+            )
+            .unwrap();
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.status())
+                    .policy
+                    .control_seq,
+                before
+            );
+            assert!(
+                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                    .unwrap()
+                    .idle()
+            );
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(token.cycle_seq)),
+                terminal
+            );
+            assert_eq!(publication_counts(&fixture), counts);
+        }
+    }
+
+    #[test]
+    fn pending_idle_exact_terminal_mismatch_never_refinishes_or_delivers() {
+        for mismatch in [
+            "partial-committed",
+            "committed-partial",
+            "aborted",
+            "token",
+            "epoch",
+            "admission",
+            "start",
+            "start-time",
+            "selection",
+            "missing-start",
+        ] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("source.jsonl", SearchProvider::Claude, "terminal source");
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            let intent = pending.as_mut().unwrap();
+            let token = intent.token.clone();
+            let finish = match mismatch {
+                "committed-partial" => CycleFinish::Partial,
+                "aborted" => CycleFinish::Aborted,
+                _ => CycleFinish::Committed,
+            };
+            control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                fixture.control.finish_cycle(
+                    seq,
+                    &fixture.worker(),
+                    token.cycle_seq,
+                    finish,
+                    app_clock_ms(),
+                )
+            })
+            .unwrap();
+            let observed = intent.observed.as_mut().unwrap();
+            match mismatch {
+                "partial-committed" => {
+                    intent.finish = CycleFinish::Partial;
+                    observed.outcome.all_sources_attempted = false;
+                }
+                "token" => intent.token.worker_boot_id = ControlId::parse("foreign").unwrap(),
+                "epoch" => {
+                    observed.cycle.policy_epoch =
+                        PolicyEpoch::new(observed.cycle.policy_epoch.get() + 1).unwrap()
+                }
+                "admission" => {
+                    observed.cycle.admitted_control_seq =
+                        ControlSeq::new(observed.cycle.admitted_control_seq.get() + 1).unwrap()
+                }
+                "start" => {
+                    observed.cycle.started_control_seq = Some(
+                        ControlSeq::new(observed.cycle.started_control_seq.unwrap().get() + 1)
+                            .unwrap(),
+                    )
+                }
+                "start-time" => {
+                    observed.cycle.started_at_ms = Some(observed.cycle.started_at_ms.unwrap() + 1)
+                }
+                "selection" => {
+                    observed.cycle.selections[0].selection.root_identity =
+                        ControlId::parse("foreign-root").unwrap()
+                }
+                "missing-start" => observed.cycle.started_control_seq = None,
+                _ => {}
+            }
+            let before = fixture.read_control(|control| control.status());
+            let terminal = fixture.read_control(|control| control.cycle(token.cycle_seq));
+            let result = finish_pending_cycle(
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                fixture.scope_end,
+            );
+            if mismatch == "aborted" {
+                assert!(result.is_ok());
+                assert!(pending.is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(PortError::SnapshotChanged(_))),
+                    "{mismatch}"
+                );
+            }
+            assert!(schedule.closed_idle_at.is_none());
+            assert_eq!(fixture.read_control(|control| control.status()), before);
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(token.cycle_seq)),
+                terminal
+            );
+        }
+    }
+
+    #[test]
+    fn pending_idle_late_latest_uses_new_subset_without_renewing_service_end() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "late request");
+        let other_root = fixture._temp.path().join("other-history");
+        std::fs::create_dir(&other_root).unwrap();
+        std::fs::write(
+            other_root.join("other.jsonl"),
+            synthetic_record(SearchProvider::Claude, "other", "other source"),
+        )
+        .unwrap();
+        let request =
+            crate::managed_control::source_selection(SearchProvider::Claude, &other_root).unwrap();
+        control_change_before(&fixture.control, fixture.scope_end, |seq| {
+            fixture.control.add_selection(seq, request.clone())
+        })
+        .unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(
+            fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let old = pending.as_ref().unwrap().token.clone();
+        let request = LatestRequest {
+            selections: vec![selection_revision(&fixture.selection).unwrap()],
+            max_wait_ms: MAX_LATEST_WAIT_MS,
+            now_ms: app_clock_ms(),
+        };
+        let LatestAdmission::Queued(barrier) =
+            control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                fixture.control.admit_latest(seq, request.clone())
+            })
+            .unwrap()
+            .value
+        else {
+            panic!("synthetic latest admission failed");
+        };
+        assert!(!fixture.latest(&barrier));
+        let policy =
+            fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+        schedule
+            .update_demands(
+                fixture.read_control(|control| control.latest_demands()),
+                &policy,
+                schedule.now(),
+            )
+            .unwrap();
+        let service_end = schedule.demands[&barrier.id].service_end;
+        assert!(!schedule.demands[&barrier.id].queued_considered);
+        assert!(
+            !resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                .unwrap()
+                .idle()
+        );
+        let served = fixture.read_control(|control| control.cycle(barrier.required_cycle_seq));
+        assert!(served.token.cycle_seq > old.cycle_seq);
+        assert!(served.started_control_seq.unwrap() > barrier.admission_control_seq);
+        assert_eq!(served.selections.len(), 1);
+        assert_eq!(
+            served.selections[0].selection.selection_id,
+            fixture.selection.id
+        );
+        assert_eq!(schedule.demands[&barrier.id].service_end, service_end);
+        assert!(schedule.demands[&barrier.id].retired);
+        assert!(fixture.latest(&barrier));
+    }
+
+    #[test]
+    fn pending_idle_due_crossing_and_dirty_debt_resume_source_work() {
+        for reason in ["elapsed", "dirty", "owed", "unverified"] {
+            let fixture = CycleFixture::new();
+            fixture.write_source(
+                "source.jsonl",
+                SearchProvider::Claude,
+                "verification source",
+            );
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            assert!(
+                fixture
+                    .production_cycle(&mut schedule, &boot)
+                    .0
+                    .unwrap()
+                    .idle()
+            );
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            let id = fixture.sources()[0].binding.source_id.clone();
+            let debt = schedule.sources.get_mut(&id).unwrap();
+            let previous = debt.last_full_verified;
+            match reason {
+                "elapsed" => {
+                    debt.last_full_verified = Some(Instant::now() - FULL_VERIFICATION_INTERVAL)
+                }
+                "dirty" => debt.dirty = true,
+                "owed" => debt.owed = true,
+                "unverified" => debt.last_full_verified = None,
+                _ => unreachable!(),
+            }
+            let old = pending.as_ref().unwrap().token.cycle_seq;
+            assert!(
+                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                    .unwrap()
+                    .idle()
+            );
+            let receipt = fixture.sources()[0].latest_receipt.clone().unwrap();
+            assert!(receipt.cycle_seq > old.get(), "{reason}");
+            assert!(schedule.sources[&id].last_full_verified > previous);
+        }
+    }
+
+    #[test]
+    fn pending_idle_ignores_debt_outside_original_plain_candidates() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "candidate source");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(
+            fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        for name in ["metadata", "exact", "removed", "shadow"] {
+            schedule
+                .register(&SourceId::parse(name).unwrap(), None)
+                .unwrap();
+        }
+        let next = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        assert!(
+            resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                .unwrap()
+                .idle()
+        );
+        assert_eq!(
+            fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq,
+            next
+        );
+    }
+
+    #[test]
+    fn pending_idle_pause_resume_invalidates_an_already_terminal_result() {
+        for observed_pause in [false, true] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("source.jsonl", SearchProvider::Claude, "lifecycle source");
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            finish_pending_cycle(
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                fixture.scope_end,
+            )
+            .unwrap();
+            let before = fixture.read_control(|control| control.status());
+            let old = pending.as_ref().unwrap().token.cycle_seq;
+            control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                fixture
+                    .control
+                    .set_desired_updates(seq, DesiredUpdates::Paused)
+            })
+            .unwrap();
+            if observed_pause {
+                invalidate_pending_idle(&mut pending, &mut schedule);
+            }
+            control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                fixture
+                    .control
+                    .set_desired_updates(seq, DesiredUpdates::Running)
+            })
+            .unwrap();
+            let after = fixture.read_control(|control| control.status());
+            assert_eq!(before.policy.policy_epoch, after.policy.policy_epoch);
+            assert!(after.restart_request_seq > before.restart_request_seq);
+            assert!(
+                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                    .unwrap()
+                    .idle()
+            );
+            assert!(
+                fixture
+                    .read_control(|control| control.background_status())
+                    .next_cycle_seq
+                    .get()
+                    > old.get() + 1
+            );
+        }
+    }
+
+    #[test]
+    fn pending_idle_current_lifecycle_and_identity_always_win() {
+        for change in [
+            "pause",
+            "stop",
+            "maintenance",
+            "revoke",
+            "scope",
+            "parser",
+            "incarnation",
+            "boot",
+        ] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("source.jsonl", SearchProvider::Claude, "identity source");
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            finish_pending_cycle(
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                fixture.scope_end,
+            )
+            .unwrap();
+            let before = publication_counts(&fixture);
+            match change {
+                "pause" | "stop" => {
+                    let desired = if change == "pause" {
+                        DesiredUpdates::Paused
+                    } else {
+                        DesiredUpdates::Stopped
+                    };
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.set_desired_updates(seq, desired)
+                    })
+                    .unwrap();
+                }
+                "maintenance" => {
+                    let owner = ControlId::parse("owner").unwrap();
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.set_maintenance(
+                            seq,
+                            &owner,
+                            MaintenanceFence {
+                                state: MaintenanceState::Updating,
+                                owner: Some(owner.clone()),
+                                phase: Some(MaintenancePhase::Quiescing),
+                            },
+                        )
+                    })
+                    .unwrap();
+                }
+                "revoke" => {
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture
+                            .control
+                            .revoke_selection(seq, &fixture.selection.id, None, 2)
+                    })
+                    .unwrap();
+                }
+                "scope" => {
+                    let new_root = fixture._temp.path().join("new-root");
+                    std::fs::create_dir(&new_root).unwrap();
+                    let request =
+                        crate::managed_control::source_selection(SearchProvider::Claude, &new_root)
+                            .unwrap();
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture.control.add_selection(seq, request.clone())
+                    })
+                    .unwrap();
+                }
+                "parser" => {
+                    pending
+                        .as_mut()
+                        .unwrap()
+                        .observed
+                        .as_mut()
+                        .unwrap()
+                        .identity
+                        .parser += 1
+                }
+                "incarnation" => {
+                    rusqlite::Connection::open(&fixture.db)
+                        .unwrap()
+                        .execute(
+                            "UPDATE catalog_meta SET catalog_incarnation='replacement'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "boot" => {
+                    let worker = fixture
+                        .control
+                        .bind_worker(&fixture.worker_lock, ControlId::parse("new-boot").unwrap())
+                        .unwrap();
+                    control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                        fixture
+                            .control
+                            .register_worker(seq, &worker, std::process::id(), 2)
+                    })
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = deliver_pending_idle(
+                &fixture.db,
+                &fixture.control,
+                &fixture.worker(),
+                &mut pending,
+                &mut schedule,
+                fixture.scope_end,
+            );
+            assert!(
+                result.as_ref().is_ok_and(Option::is_none),
+                "{change}: {result:?}"
+            );
+            assert!(pending.is_none());
+            assert!(schedule.closed_idle_at.is_none());
+            assert_eq!(publication_counts(&fixture), before);
+        }
+    }
+
+    #[test]
+    fn pending_idle_retired_and_expired_demands_do_not_block_delivery() {
+        for retired in [false, true] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("source.jsonl", SearchProvider::Claude, "retired demand");
+            let boot = ObservationClock::new(Instant::now());
+            let mut schedule = SourceScheduleState::default();
+            assert!(
+                fixture
+                    .production_cycle(&mut schedule, &boot)
+                    .0
+                    .unwrap()
+                    .idle()
+            );
+            let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+            let (_, barrier) = fixture.queued();
+            let policy =
+                fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+            schedule
+                .update_demands(
+                    fixture.read_control(|control| control.latest_demands()),
+                    &policy,
+                    schedule.now(),
+                )
+                .unwrap();
+            let demand = schedule.demands.get_mut(&barrier.id).unwrap();
+            demand.retired = retired;
+            if !retired {
+                demand.service_end = Instant::now();
+            }
+            let end = demand.service_end;
+            let next = fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq;
+            assert!(
+                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                    .unwrap()
+                    .idle()
+            );
+            assert_eq!(schedule.demands[&barrier.id].service_end, end);
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.background_status())
+                    .next_cycle_seq,
+                next
+            );
+            assert!(!fixture.latest(&barrier));
+        }
+    }
+
+    #[test]
+    fn pending_idle_exact_observation_and_confirmed_absence_keep_their_candidate_scope() {
+        let fixture = CycleFixture::new();
+        let path = fixture.write_source("source.jsonl", SearchProvider::Claude, "absence source");
+        let mut boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+        let mut schedule = SourceScheduleState::default();
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        assert!(
+            pending
+                .as_ref()
+                .unwrap()
+                .observed
+                .as_ref()
+                .unwrap()
+                .outcome
+                .all_sources_attempted
+        );
+        assert!(
+            resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                .unwrap()
+                .idle()
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        boot.started -= Duration::from_secs(6);
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let observed = pending.as_ref().unwrap().observed.as_ref().unwrap();
+        assert!(observed.outcome.idle());
+        assert!(observed.outcome.due_candidates.is_empty());
+        assert!(
+            resume_pending(&fixture, &mut schedule, &boot, &mut pending)
+                .unwrap()
+                .idle()
+        );
+        assert_eq!(
+            fixture.sources()[0].latest_receipt.as_ref().unwrap().digest,
+            "confirmed_absent"
+        );
+    }
+
+    #[test]
+    fn pending_idle_mixed_current_reads_keep_confirmed_slot_for_a_new_snapshot() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "coherent source");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        let actor = SqliteControlStore::open_existing_writable(
+            fixture.db.parent().unwrap(),
+            &fixture
+                .read_control(|control| control.status())
+                .policy
+                .installation_id,
+        )
+        .unwrap();
+        let revision = selection_revision(&fixture.selection).unwrap();
+        let called = Rc::new(Cell::new(false));
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let called = called.clone();
+            move |event| {
+                if matches!(event, ScheduleTestEvent::BeforeIdleDemands) && !called.replace(true) {
+                    control_change_before(
+                        &actor,
+                        Instant::now() + Duration::from_secs(3),
+                        |seq| {
+                            actor.admit_latest(
+                                seq,
+                                LatestRequest {
+                                    selections: vec![revision.clone()],
+                                    max_wait_ms: 1000,
+                                    now_ms: app_clock_ms(),
+                                },
+                            )
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            resume_pending(&fixture, &mut schedule, &boot, &mut pending),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert!(pending.as_ref().unwrap().completion_confirmed);
+        schedule.hooks = ScheduleTestHooks::default();
+        assert!(resume_pending(&fixture, &mut schedule, &boot, &mut pending).is_ok());
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn pending_idle_synchronous_pause_is_never_delivered_as_success() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "synchronous source");
+        let actor = SqliteControlStore::open_existing_writable(
+            fixture.db.parent().unwrap(),
+            &fixture
+                .read_control(|control| control.status())
+                .policy
+                .installation_id,
+        )
+        .unwrap();
+        let mut schedule = SourceScheduleState {
+            hooks: scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), move |event| {
+                if matches!(event, ScheduleTestEvent::BeforeCompletion) {
+                    control_change_before(
+                        &actor,
+                        Instant::now() + Duration::from_secs(3),
+                        |seq| actor.set_desired_updates(seq, DesiredUpdates::Paused),
+                    )?;
+                }
+                Ok(())
+            }),
+            ..Default::default()
+        };
+        let mut pending = None;
+        let result = resume_pending(
+            &fixture,
+            &mut schedule,
+            &ObservationClock::new(Instant::now()),
+            &mut pending,
+        )
+        .unwrap();
+        assert!(!result.idle());
+        assert!(schedule.closed_idle_at.is_none());
+        assert!(pending.is_none());
+        let next = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        assert_eq!(
+            fixture
+                .read_control(|control| control.cycle(CycleSeq::new(next.get() - 1).unwrap()))
+                .state,
+            CycleState::Aborted
+        );
+    }
+
+    #[test]
+    fn pending_idle_without_saved_result_starts_an_ordinary_new_poll() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("source.jsonl", SearchProvider::Claude, "restart source");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        assert!(
+            fixture
+                .production_cycle(&mut schedule, &boot)
+                .0
+                .unwrap()
+                .idle()
+        );
+        let before = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        let mut restarted = SourceScheduleState::default();
+        let result = resume_pending(&fixture, &mut restarted, &boot, &mut None).unwrap();
+        assert!(result.idle());
+        assert!(result.all_sources_attempted);
+        assert!(
+            fixture
+                .read_control(|control| control.background_status())
+                .next_cycle_seq
+                > before
+        );
+        assert!(
+            fixture.sources()[0]
+                .latest_receipt
+                .as_ref()
+                .unwrap()
+                .cycle_seq
+                >= before.get()
+        );
+    }
+
     #[test]
     fn pending_cycle_busy_completion_recovers_same_worker_before_next_cycle() {
         for state in [
@@ -9935,6 +11192,8 @@ mod control_deadline_tests {
             let mut pending = Some(PendingCycle {
                 token: cycle.token.clone(),
                 finish: CycleFinish::Partial,
+                observed: None,
+                completion_confirmed: false,
             });
             let contender =
                 rusqlite::Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap()))
@@ -10085,6 +11344,8 @@ mod control_deadline_tests {
             let mut pending = Some(PendingCycle {
                 token: cycle.token.clone(),
                 finish: CycleFinish::Committed,
+                observed: None,
+                completion_confirmed: false,
             });
             let owner = ControlId::parse("pending-maintenance").unwrap();
             control_change_before(control, fixture.scope_end, |seq| match change {
@@ -10182,6 +11443,8 @@ mod control_deadline_tests {
             let mut pending = Some(PendingCycle {
                 token: foreign.clone(),
                 finish: CycleFinish::Partial,
+                observed: None,
+                completion_confirmed: false,
             });
             let before = control.status().unwrap();
             let original = control.cycle(cycle.token.cycle_seq).unwrap();
@@ -10205,6 +11468,8 @@ mod control_deadline_tests {
             let mut pending = Some(PendingCycle {
                 token: cycle.token.clone(),
                 finish: CycleFinish::Partial,
+                observed: None,
+                completion_confirmed: false,
             });
             assert!(matches!(
                 finish_pending_cycle(
@@ -10260,6 +11525,8 @@ mod control_deadline_tests {
             let mut pending = Some(PendingCycle {
                 token: cycle.token.clone(),
                 finish: CycleFinish::Committed,
+                observed: None,
+                completion_confirmed: false,
             });
             finish_pending_cycle(control, &worker, &mut pending, fixture.scope_end).unwrap();
             assert!(pending.is_none());
