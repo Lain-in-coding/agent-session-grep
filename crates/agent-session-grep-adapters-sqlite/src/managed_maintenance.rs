@@ -2571,6 +2571,7 @@ fn open_read_write(path: &Path, deadline: Instant) -> PortResult<Connection> {
     set_sql_deadline(&conn, deadline)?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
         .map_err(sql)?;
+    crate::managed_store::apply_journal_size_limit(&conn, sql)?;
     Ok(conn)
 }
 
@@ -3392,6 +3393,19 @@ mod recovery_deadline_tests {
 
     fn id(value: &str) -> ControlId {
         ControlId::parse(value).unwrap()
+    }
+
+    #[test]
+    fn maintenance_writer_sets_catalog_journal_limit() {
+        let fixture = crate::managed_store::wal_tests::Fixture::new();
+        let conn =
+            open_read_write(&fixture.catalog, Instant::now() + Duration::from_secs(2)).unwrap();
+        let (limit, synchronous, autocheckpoint, _) =
+            crate::managed_store::wal_tests::pragmas(&conn);
+        assert_eq!(
+            (limit, synchronous, autocheckpoint),
+            (crate::managed_store::JOURNAL_SIZE_LIMIT_BYTES, 2, 1000)
+        );
     }
 
     #[test]

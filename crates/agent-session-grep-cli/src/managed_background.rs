@@ -780,26 +780,30 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
     control_change_before(&control, startup_end, |seq| {
         control.register_worker(seq, &authority, std::process::id(), app_clock_ms())
     })?;
-    if quiesce_before(&control, &authority, startup_end)? {
+    if let Some(exit) = quiesce_before(&control, startup_end)?
+        && finish_worker(db, &control, &authority, exit, None)?
+    {
         return Ok(());
     }
-    let initialized = control_change_before(&control, startup_end, |_| {
-        // Recheck before EVERY retried catalog admission: a fence arriving
-        // after PID registration is intentional shutdown, not catalog Busy
-        // that should consume the entire startup deadline.
-        let current = control.status()?;
-        if current.desired_updates == DesiredUpdates::Stopped
-            || current.policy.maintenance.state != MaintenanceState::Idle
-        {
-            control.stop_worker(current.policy.control_seq, &authority, app_clock_ms())?;
-            return Ok(true);
+    loop {
+        let initialized = control_change_before(&control, startup_end, |_| {
+            // Recheck before EVERY retried catalog admission: a fence arriving
+            // after PID registration is intentional shutdown, not catalog Busy
+            // that should consume the entire startup deadline.
+            let current = control.status()?;
+            if let Some(exit) = worker_exit(&current) {
+                return Ok(Some(exit));
+            }
+            let catalog = ManagedStore::open(db, &control)?;
+            catalog.reconcile_progress(&control, &authority)?;
+            Ok(None)
+        })?;
+        let Some(exit) = initialized else {
+            break;
+        };
+        if finish_worker(db, &control, &authority, exit, None)? {
+            return Ok(());
         }
-        let catalog = ManagedStore::open(db, &control)?;
-        catalog.reconcile_progress(&control, &authority)?;
-        Ok(false)
-    })?;
-    if initialized {
-        return Ok(());
     }
     let boot = ObservationClock::at_startup(Instant::now());
     let mut rounds = 0_u64;
@@ -812,9 +816,23 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         // A contended short control operation is a deferred cadence, not an
         // unexpected process exit. The next cadence is a new bounded attempt;
         // schema/identity failures still terminate and remain visible.
-        match quiesce_if_requested(&control, &authority) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+        match quiesce_before(&control, Instant::now() + CONTROL_BUDGET) {
+            Ok(Some(exit)) => {
+                if finish_worker(
+                    db,
+                    &control,
+                    &authority,
+                    exit,
+                    schedule
+                        .identity
+                        .as_ref()
+                        .map(|identity| &identity.incarnation),
+                )? {
+                    return Ok(());
+                }
+                continue;
+            }
+            Ok(None) => {}
             Err(PortError::WriterBusy(_)) => {
                 std::thread::sleep(CADENCE.saturating_sub(tick.elapsed()));
                 continue;
@@ -875,30 +893,45 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
         };
         // A concurrent pause/stop owns the desired state. Derive the heartbeat
         // again on every CAS retry so stale activity cannot overwrite it.
-        let stopped = control_change(&control, |seq| {
+        let boundary = control_change(&control, |seq| {
             let now = control.status()?;
-            if now.desired_updates == DesiredUpdates::Stopped
-                || now.policy.maintenance.state != MaintenanceState::Idle
-            {
-                control.stop_worker(seq, &authority, app_clock_ms())?;
-                return Ok(true);
+            if let Some(exit) = worker_exit(&now) {
+                return Ok(WorkerBoundary::Exit(exit));
             }
             let (state, error) = match now.desired_updates {
                 DesiredUpdates::Paused => (UpdateState::Paused, Some(BackgroundFailure::Paused)),
                 _ => (state, error),
             };
             control.heartbeat_worker(seq, &authority, state, error, app_clock_ms())?;
-            Ok(false)
+            Ok(match state {
+                UpdateState::Idle => WorkerBoundary::Idle,
+                UpdateState::Paused => WorkerBoundary::Paused,
+                _ => WorkerBoundary::Busy,
+            })
         });
-        match stopped {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+        let boundary = match boundary {
+            Ok(WorkerBoundary::Exit(exit)) => {
+                if finish_worker(
+                    db,
+                    &control,
+                    &authority,
+                    exit,
+                    schedule
+                        .identity
+                        .as_ref()
+                        .map(|identity| &identity.incarnation),
+                )? {
+                    return Ok(());
+                }
+                continue;
+            }
+            Ok(boundary) => boundary,
             Err(PortError::WriterBusy(_)) => {
                 std::thread::sleep(CADENCE.saturating_sub(tick.elapsed()));
                 continue;
             }
             Err(error) => return Err(error),
-        }
+        };
         if current.desired_updates == DesiredUpdates::Running
             && (history_pending || rounds.is_multiple_of(16))
         {
@@ -911,22 +944,30 @@ pub(crate) fn run_child(db: &Path) -> PortResult<()> {
                 Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => true,
                 Err(error) => {
                     idle_completed = None;
-                    let reason = failure(&error);
-                    match control_change(&control, |seq| {
-                        control.heartbeat_worker(
-                            seq,
-                            &authority,
-                            failure_state(&error),
-                            Some(reason),
-                            app_clock_ms(),
-                        )
-                    }) {
-                        Ok(_) | Err(PortError::WriterBusy(_)) => {}
-                        Err(error) => return Err(error),
-                    }
+                    record_boundary_failure(&control, &authority, &error)?;
                     true
                 }
             };
+        }
+        // All cycle and retention connections are closed at this boundary.
+        #[cfg(test)]
+        wal_worker_tests::event(wal_worker_tests::Event::Boundary(boundary));
+        if matches!(boundary, WorkerBoundary::Idle | WorkerBoundary::Paused) {
+            match checkpoint_at_boundary(
+                db,
+                &control,
+                &authority,
+                schedule
+                    .identity
+                    .as_ref()
+                    .map(|identity| &identity.incarnation),
+            ) {
+                Ok(()) | Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => {}
+                Err(error) => {
+                    idle_completed = None;
+                    record_boundary_failure(&control, &authority, &error)?;
+                }
+            }
         }
         rounds = rounds.wrapping_add(1);
         let wait = if let Some(completed) = idle_completed {
@@ -968,34 +1009,132 @@ fn retain_runtime_history(
     }
 }
 
-/// Maintenance requires releasing this worker's catalog and lifecycle handles.
-/// Only the runtime summary is stopped; desired pause and the owner's fence
-/// remain intact so the supervisor can distinguish intentional exit from crash.
-fn quiesce_if_requested(
-    control: &SqliteControlStore,
-    authority: &LockedWorkerAuthority<'_>,
-) -> PortResult<bool> {
-    quiesce_before(control, authority, Instant::now() + CONTROL_BUDGET)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerExit {
+    Stopped,
+    Fenced,
 }
 
-fn quiesce_before(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerBoundary {
+    Idle,
+    Paused,
+    Busy,
+    Exit(WorkerExit),
+}
+
+fn worker_exit(status: &ControlStatus) -> Option<WorkerExit> {
+    if status.policy.maintenance.state != MaintenanceState::Idle {
+        Some(WorkerExit::Fenced)
+    } else if status.desired_updates == DesiredUpdates::Stopped {
+        Some(WorkerExit::Stopped)
+    } else {
+        None
+    }
+}
+
+fn checkpoint_at_boundary(
+    db: &Path,
     control: &SqliteControlStore,
     authority: &LockedWorkerAuthority<'_>,
-    end: Instant,
-) -> PortResult<bool> {
-    control_change_before(control, end, |seq| {
+    incarnation: Option<&ControlId>,
+) -> PortResult<()> {
+    if !ManagedStore::wal_len(db)?.is_some_and(|bytes| bytes > 0) {
+        return Ok(());
+    }
+    let report = control.with_runtime_deadline(Instant::now() + CONTROL_BUDGET, || {
+        ManagedStore::checkpoint_wal(db, control, authority)
+    });
+    #[cfg(test)]
+    wal_worker_tests::event(wal_worker_tests::Event::Checkpoint(
+        report.as_ref().cloned().map_err(failure),
+    ));
+    let report = report?;
+    if let (Some(expected), Some(actual)) = (incarnation, report.incarnation.as_ref())
+        && expected != actual
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+/// Use retention's failure reporting, respecting concurrent user intent on
+/// every CAS retry. A physical checkpoint never rewrites a completed cycle.
+fn record_boundary_failure(
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+    error: &PortError,
+) -> PortResult<()> {
+    match control_change(control, |seq| {
         let current = control.status()?;
-        if current.desired_updates == DesiredUpdates::Stopped
-            || current.policy.maintenance.state != MaintenanceState::Idle
-        {
-            // The catalog image/rows are untouched. Ending only the control
-            // worker summary is sufficient for an intentional fenced exit.
-            control.stop_worker(seq, authority, app_clock_ms())?;
-            Ok(true)
-        } else {
-            Ok(false)
+        let state = match current.desired_updates {
+            DesiredUpdates::Stopped => UpdateState::Stopped,
+            DesiredUpdates::Paused => UpdateState::Paused,
+            _ if current.policy.maintenance.state != MaintenanceState::Idle => {
+                UpdateState::Upgrading
+            }
+            _ => failure_state(error),
+        };
+        control.heartbeat_worker(seq, authority, state, Some(failure(error)), app_clock_ms())
+    }) {
+        Ok(_) | Err(PortError::WriterBusy(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn finish_worker(
+    db: &Path,
+    control: &SqliteControlStore,
+    authority: &LockedWorkerAuthority<'_>,
+    exit: WorkerExit,
+    incarnation: Option<&ControlId>,
+) -> PortResult<bool> {
+    #[cfg(test)]
+    wal_worker_tests::event(wal_worker_tests::Event::Boundary(WorkerBoundary::Exit(
+        exit,
+    )));
+    let current =
+        control.with_runtime_deadline(Instant::now() + CONTROL_BUDGET, || control.status())?;
+    if worker_exit(&current) != Some(exit) {
+        // A resumed worker or a changed fence gets a new admission decision.
+        return Ok(false);
+    }
+    let checkpoint_error = if exit == WorkerExit::Stopped && !current.policy.emission_blocked() {
+        // Outside the CAS loop: even a retried stop records only one attempt.
+        match checkpoint_at_boundary(db, control, authority, incarnation) {
+            Ok(()) | Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_)) => None,
+            Err(error) => Some(error),
         }
-    })
+    } else {
+        None
+    };
+    let stopped = control_change(control, |seq| {
+        if worker_exit(&control.status()?).is_none() {
+            return Ok(false);
+        }
+        control.stop_worker(seq, authority, app_clock_ms())?;
+        Ok(true)
+    });
+    if matches!(stopped, Ok(false)) {
+        if let Some(error) = checkpoint_error {
+            // Running resumed while the physical attempt was in flight. Keep
+            // that worker alive and report the error like a retention failure.
+            record_boundary_failure(control, authority, &error)?;
+        }
+        return Ok(false);
+    }
+    // Always attempt cleanup, even after a hard checkpoint failure. Preserve
+    // its original error and never heartbeat after stop_worker records Offline.
+    if let Some(error) = checkpoint_error {
+        return Err(error);
+    }
+    stopped
+}
+
+/// Classify intentional exits before touching the catalog. The caller performs
+/// physical maintenance once, then records the stopped summary outside retries.
+fn quiesce_before(control: &SqliteControlStore, end: Instant) -> PortResult<Option<WorkerExit>> {
+    control_change_before(control, end, |_| Ok(worker_exit(&control.status()?)))
 }
 
 fn failure(error: &PortError) -> BackgroundFailure {
@@ -5407,6 +5546,526 @@ fn acknowledge(
 }
 
 #[cfg(test)]
+mod wal_worker_tests {
+    use super::*;
+    use agent_session_grep_adapters_sqlite::{
+        WriterLease,
+        managed_store::{WalCheckpointOutcome, WalCheckpointReport, WalDeferral},
+    };
+    use rusqlite::{Connection, OpenFlags};
+    use std::{io::Write, sync::mpsc, thread::JoinHandle};
+
+    #[derive(Debug)]
+    pub(super) enum Event {
+        Boundary(WorkerBoundary),
+        Checkpoint(Result<WalCheckpointReport, BackgroundFailure>),
+    }
+
+    struct Hooks {
+        events: mpsc::Sender<Event>,
+        advance: mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static HOOKS: RefCell<Option<Hooks>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn event(event: Event) {
+        HOOKS.with(|hooks| {
+            if let Some(hooks) = hooks.borrow().as_ref() {
+                hooks.events.send(event).expect("test worker observer");
+                hooks
+                    .advance
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("test boundary release");
+            }
+        });
+    }
+
+    struct Worker {
+        events: Option<mpsc::Receiver<Event>>,
+        advance: Option<mpsc::Sender<()>>,
+        thread: Option<JoinHandle<PortResult<()>>>,
+    }
+
+    impl Worker {
+        fn start(db: &Path) -> Self {
+            let db = db.to_owned();
+            let (events_tx, events_rx) = mpsc::channel();
+            let (advance_tx, advance_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                HOOKS.with(|hooks| {
+                    *hooks.borrow_mut() = Some(Hooks {
+                        events: events_tx,
+                        advance: advance_rx,
+                    })
+                });
+                run_child(&db)
+            });
+            Self {
+                events: Some(events_rx),
+                advance: Some(advance_tx),
+                thread: Some(thread),
+            }
+        }
+
+        fn next(&self) -> Event {
+            self.events
+                .as_ref()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .expect("worker must reach the expected boundary")
+        }
+
+        fn advance(&self) {
+            self.advance.as_ref().unwrap().send(()).unwrap();
+        }
+
+        fn boundary(&self, expected: WorkerBoundary) {
+            let actual = self.next();
+            assert!(
+                matches!(actual, Event::Boundary(actual) if actual == expected),
+                "expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        fn checkpoint(&self, expected: WalCheckpointOutcome) -> WalCheckpointReport {
+            let Event::Checkpoint(Ok(report)) = self.next() else {
+                panic!("expected a checkpoint report");
+            };
+            assert_eq!(report.outcome, expected);
+            report
+        }
+
+        fn join(mut self) -> PortResult<()> {
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("worker did not panic")
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            // Closing both channels releases a boundary on assertion failure.
+            self.events.take();
+            self.advance.take();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    struct Fixture {
+        // This foreign idle reader stays open until every worker has exited.
+        idle: Connection,
+        control: SqliteControlStore,
+        db: PathBuf,
+        source: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    fn id(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    impl Fixture {
+        fn new(selected: bool) -> Self {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let private = temp.path().join("private");
+            let db = private.join("catalog.db");
+            let source = temp.path().join("source.jsonl");
+            std::fs::write(&source, []).unwrap();
+            let control = SqliteControlStore::create(
+                &private,
+                &id("wal-installation"),
+                DesiredUpdates::Running,
+            )
+            .unwrap();
+            if selected {
+                let selection =
+                    crate::managed_control::source_selection(SearchProvider::Claude, &source)
+                        .unwrap();
+                control_change_before(&control, Instant::now() + Duration::from_secs(5), |seq| {
+                    control.add_selection(seq, selection.clone())
+                })
+                .unwrap();
+            }
+            drop(ManagedStore::create(&db, &control, id("wal-catalog"), 1).unwrap());
+            let idle = Self::open_reader(&db);
+            let fixture = Self {
+                idle,
+                control,
+                db,
+                source,
+                _temp: temp,
+            };
+            let conn = Connection::open(&fixture.db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE wal_worker_fixture(proof TEXT, body BLOB);
+                INSERT INTO wal_worker_fixture VALUES('initial',zeroblob(4096));",
+            )
+            .unwrap();
+            drop(conn);
+            fixture
+        }
+
+        fn open_reader(db: &Path) -> Connection {
+            let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+            conn
+        }
+
+        fn desired(&self, desired: DesiredUpdates) {
+            control_change_before(
+                &self.control,
+                Instant::now() + Duration::from_secs(5),
+                |seq| self.control.set_desired_updates(seq, desired),
+            )
+            .unwrap();
+        }
+
+        fn status(&self) -> WorkerStatus {
+            self.control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(2), || {
+                    Ok(self.control.background_status()?.worker)
+                })
+                .unwrap()
+        }
+
+        fn append(&self, sequence: usize) {
+            let record = serde_json::json!({
+                "type":"user","uuid":format!("message-{sequence}"),"sessionId":"wal-session",
+                "timestamp":"2026-01-01T00:00:00Z",
+                "message":{"role":"user","content":format!("synthetic wal message {sequence}")}
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.source)
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        fn grow(&self, proof: &str) {
+            let conn = Connection::open(&self.db).unwrap();
+            conn.execute(
+                "INSERT INTO wal_worker_fixture VALUES(?1,zeroblob(16384))",
+                [proof],
+            )
+            .unwrap();
+        }
+
+        fn pin(&self) -> Connection {
+            let reader = Self::open_reader(&self.db);
+            reader.execute_batch("BEGIN").unwrap();
+            reader
+                .query_row("SELECT count(*) FROM wal_worker_fixture", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            reader
+        }
+
+        fn stop(&self, worker: Worker) {
+            // Called while the worker is parked at the preceding event.
+            self.desired(DesiredUpdates::Stopped);
+            worker.advance();
+            worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+            worker.advance();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn wal_worker_idle_close_after_append_resets_with_foreign_idle_reader() {
+        let fixture = Fixture::new(true);
+        for sequence in 0..3 {
+            fixture.append(sequence);
+        }
+        let worker = Worker::start(&fixture.db);
+        for round in 0..2 {
+            worker.boundary(WorkerBoundary::Idle);
+            assert!(ManagedStore::wal_len(&fixture.db).unwrap().unwrap() > 0);
+            let before = fixture.status();
+            worker.advance();
+            let report = worker.checkpoint(WalCheckpointOutcome::Reset);
+            assert_eq!(report.wal_bytes_after, Some(0));
+            assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
+            assert_eq!(fixture.status(), before);
+            if round == 0 {
+                fixture.append(3);
+                worker.advance();
+            }
+        }
+        let rows: i64 = fixture
+            .idle
+            .query_row("SELECT count(*) FROM source_revision_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(rows >= 2);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_stop_defers_pinned_snapshot_then_restart_idle_resets() {
+        let fixture = Fixture::new(false);
+        let reader = fixture.pin();
+        let before: i64 = reader
+            .query_row("SELECT count(*) FROM wal_worker_fixture", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        fixture.grow("later");
+        fixture.desired(DesiredUpdates::Stopped);
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        worker.advance();
+        let deferred = worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::Sqlite));
+        assert!(deferred.checkpointed_frames < deferred.log_frames);
+        worker.advance();
+        worker.join().unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM wal_worker_fixture", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+        assert_eq!(fixture.status().state, UpdateState::Offline);
+        reader.execute_batch("COMMIT").unwrap();
+        fixture.desired(DesiredUpdates::Running);
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Idle);
+        worker.advance();
+        assert_eq!(
+            worker
+                .checkpoint(WalCheckpointOutcome::Reset)
+                .wal_bytes_after,
+            Some(0)
+        );
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_fenced_quiesce_never_attempts_checkpoint() {
+        let fixture = Fixture::new(false);
+        fixture
+            .control
+            .set_maintenance(
+                fixture.control.status().unwrap().policy.control_seq,
+                &id("owner"),
+                MaintenanceFence {
+                    state: MaintenanceState::Updating,
+                    owner: Some(id("owner")),
+                    phase: Some(MaintenancePhase::Quiescing),
+                },
+            )
+            .unwrap();
+        let bytes = ManagedStore::wal_len(&fixture.db).unwrap();
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Fenced));
+        worker.advance();
+        // Any checkpoint would park on a second event instead of joining.
+        worker.join().unwrap();
+        assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), bytes);
+        assert_eq!(fixture.status().state, UpdateState::Offline);
+    }
+
+    #[test]
+    fn wal_worker_resumed_running_vetoes_a_stale_stop_before_checkpoint() {
+        let fixture = Fixture::new(false);
+        fixture.desired(DesiredUpdates::Stopped);
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        fixture.desired(DesiredUpdates::Running);
+        worker.advance();
+        // No stop checkpoint or Offline summary occurs after the resume.
+        worker.boundary(WorkerBoundary::Idle);
+        assert_eq!(fixture.status().state, UpdateState::Idle);
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_resumed_running_vetoes_a_stale_stop_after_checkpoint() {
+        let fixture = Fixture::new(false);
+        fixture.desired(DesiredUpdates::Stopped);
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        fixture.desired(DesiredUpdates::Running);
+        worker.advance();
+        worker.boundary(WorkerBoundary::Idle);
+        assert_eq!(fixture.status().state, UpdateState::Idle);
+        assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), Some(0));
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_concurrent_fence_vetoes_stop_checkpoint() {
+        for emission in [false, true] {
+            let fixture = Fixture::new(emission);
+            fixture.desired(DesiredUpdates::Stopped);
+            let worker = Worker::start(&fixture.db);
+            worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+            if emission {
+                let selection = fixture.control.status().unwrap().policy.selections[0].clone();
+                control_change_before(
+                    &fixture.control,
+                    Instant::now() + Duration::from_secs(5),
+                    |seq| {
+                        fixture
+                            .control
+                            .revoke_selection(seq, &selection.id, None, app_clock_ms())
+                    },
+                )
+                .unwrap();
+            } else {
+                fixture
+                    .control
+                    .set_maintenance(
+                        fixture.control.status().unwrap().policy.control_seq,
+                        &id("owner"),
+                        MaintenanceFence {
+                            state: MaintenanceState::Updating,
+                            owner: Some(id("owner")),
+                            phase: Some(MaintenancePhase::Quiescing),
+                        },
+                    )
+                    .unwrap();
+            }
+            let bytes = ManagedStore::wal_len(&fixture.db).unwrap();
+            worker.advance();
+            if !emission {
+                worker.boundary(WorkerBoundary::Exit(WorkerExit::Fenced));
+                worker.advance();
+            }
+            worker.join().unwrap();
+            assert_eq!(ManagedStore::wal_len(&fixture.db).unwrap(), bytes);
+            assert_eq!(fixture.status().state, UpdateState::Offline);
+        }
+    }
+
+    #[test]
+    fn wal_worker_paused_ticks_attempt_once_and_skip_empty_wal() {
+        let fixture = Fixture::new(false);
+        let reader = fixture.pin();
+        fixture.grow("pinned");
+        fixture.desired(DesiredUpdates::Paused);
+        let worker = Worker::start(&fixture.db);
+        for _ in 0..2 {
+            worker.boundary(WorkerBoundary::Paused);
+            let before = fixture.status();
+            worker.advance();
+            worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::Sqlite));
+            assert_eq!(fixture.status(), before);
+            worker.advance();
+        }
+        worker.boundary(WorkerBoundary::Paused);
+        reader.execute_batch("COMMIT").unwrap();
+        worker.advance();
+        assert_eq!(
+            worker
+                .checkpoint(WalCheckpointOutcome::Reset)
+                .wal_bytes_after,
+            Some(0)
+        );
+        worker.advance();
+        worker.boundary(WorkerBoundary::Paused);
+        worker.advance();
+        // A zero-byte WAL skips checkpoint, so the very next event is a tick.
+        worker.boundary(WorkerBoundary::Paused);
+        fixture.stop(worker);
+    }
+
+    #[test]
+    fn wal_worker_busy_cycles_do_not_attempt_checkpoint() {
+        let fixture = Fixture::new(true);
+        fixture.append(0);
+        let lease = WriterLease::try_acquire(fixture.db.parent().unwrap()).unwrap();
+        let worker = Worker::start(&fixture.db);
+        for _ in 0..2 {
+            worker.boundary(WorkerBoundary::Busy);
+            worker.advance();
+        }
+        worker.boundary(WorkerBoundary::Busy);
+        fixture.desired(DesiredUpdates::Stopped);
+        worker.advance();
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::WriterLease));
+        worker.advance();
+        worker.join().unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn wal_worker_overlapping_readers_report_growth_and_repeated_deferral() {
+        let fixture = Fixture::new(false);
+        fixture.desired(DesiredUpdates::Paused);
+        let mut reader = fixture.pin();
+        fixture.grow("first");
+        let worker = Worker::start(&fixture.db);
+        let mut sizes = Vec::new();
+        for turn in 0..3 {
+            worker.boundary(WorkerBoundary::Paused);
+            worker.advance();
+            let report = worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::Sqlite));
+            assert!(report.checkpointed_frames < report.log_frames);
+            sizes.push(report.wal_bytes_after.unwrap());
+            if turn < 2 {
+                let next = fixture.pin();
+                reader.execute_batch("COMMIT").unwrap();
+                reader = next;
+                fixture.grow("overlap");
+                worker.advance();
+            }
+        }
+        assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
+        fixture.desired(DesiredUpdates::Stopped);
+        worker.advance();
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Deferred(WalDeferral::Sqlite));
+        worker.advance();
+        worker.join().unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn wal_worker_stop_error_cleans_up_before_returning_original_error() {
+        let fixture = Fixture::new(false);
+        fixture.desired(DesiredUpdates::Stopped);
+        let worker = Worker::start(&fixture.db);
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        let writer = Connection::open(&fixture.db).unwrap();
+        writer.pragma_update(None, "application_id", 0).unwrap();
+        drop(writer);
+        worker.advance();
+        assert!(matches!(
+            worker.next(),
+            Event::Checkpoint(Err(BackgroundFailure::Failed))
+        ));
+        worker.advance();
+        assert!(matches!(
+            worker.join(),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        let state = fixture.status();
+        assert_eq!(state.state, UpdateState::Offline);
+        assert_eq!(state.error, None);
+    }
+}
+
+#[cfg(test)]
 mod control_deadline_tests {
     use super::*;
     use crate::update_state::EpochRefusal;
@@ -6274,10 +6933,10 @@ mod control_deadline_tests {
         drop(held);
     }
 
+    type ProbeAttemptTrace = Rc<RefCell<Vec<(SourceId, Option<SourceLane>)>>>;
+
     /// Probe and attempt events in call order; a probe carries no lane.
-    fn probe_attempt_trace(
-        trace: &Rc<RefCell<Vec<(SourceId, Option<SourceLane>)>>>,
-    ) -> ScheduleTestHooks {
+    fn probe_attempt_trace(trace: &ProbeAttemptTrace) -> ScheduleTestHooks {
         let trace = trace.clone();
         scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), move |event| {
             match event {

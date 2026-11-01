@@ -705,6 +705,7 @@ fn run_claimed(
     set_sql_deadline(&conn, deadline)?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")
         .map_err(sql)?;
+    crate::managed_store::apply_journal_size_limit(&conn, sql)?;
     // A purge invocation can also finish a crashed revoke's drain. Settlement
     // is emission-only proof; a blocked cleanup is still never called clean.
     for intent in control
@@ -1532,4 +1533,51 @@ fn backup_directory_is_accounted(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
+    use crate::managed_store::{
+        JOURNAL_SIZE_LIMIT_BYTES,
+        wal_tests::{Fixture, id, take_pragmas},
+    };
+
+    #[test]
+    fn purge_writer_sets_catalog_journal_limit() {
+        let fixture = Fixture::new();
+        let selection = fixture.select();
+        fixture
+            .control
+            .revoke_selection(
+                fixture.control.status().unwrap().policy.control_seq,
+                &selection.id,
+                None,
+                2,
+            )
+            .unwrap();
+        let guard = ExclusiveGuard::try_acquire(&fixture.root, purge_lock_kind().unwrap()).unwrap();
+        let owner = fixture
+            .control
+            .bind_purge_owner(&guard, id("purge"))
+            .unwrap();
+        take_pragmas();
+        let report = run(
+            &fixture.control,
+            &fixture.catalog,
+            &owner,
+            None,
+            3,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(report.catalog, PurgeStage::Complete);
+        let readbacks = take_pragmas();
+        assert_eq!(readbacks.len(), 1);
+        let (limit, synchronous, autocheckpoint, _) = readbacks[0];
+        assert_eq!(
+            (limit, synchronous, autocheckpoint),
+            (JOURNAL_SIZE_LIMIT_BYTES, 2, 1000)
+        );
+    }
 }

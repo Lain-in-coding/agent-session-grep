@@ -45,6 +45,77 @@ enum DiscoveryPublication {
 
 pub(crate) const APPLICATION_ID: i64 = 0x41534732;
 
+/// Limit the file retained after a WAL reset, not a WAL pinned by readers.
+pub(crate) const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalDeferral {
+    /// A maintenance/emission fence, or a busy control read at admission.
+    Fence,
+    CatalogHandles,
+    WriterLease,
+    Sqlite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalCheckpointOutcome {
+    Reset,
+    Deferred(WalDeferral),
+    NotApplicable,
+}
+
+/// Physical checkpoint observations only; none of these fields publish proof.
+#[derive(Clone, Debug)]
+pub struct WalCheckpointReport {
+    pub outcome: WalCheckpointOutcome,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+    /// Absent if admission stopped before the catalog identity was read.
+    pub incarnation: Option<ControlId>,
+    pub wal_bytes_before: Option<u64>,
+    pub wal_bytes_after: Option<u64>,
+    /// Includes I/O, whose wall time is not bounded by the zero busy timeout.
+    pub elapsed: Duration,
+}
+
+fn checkpoint_storage(error: rusqlite::Error) -> PortError {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy) => {
+            PortError::WriterBusy("managed catalog checkpoint is busy".into())
+        }
+        Some(ErrorCode::DatabaseLocked) => {
+            PortError::Backend("managed checkpoint connection is locked".into())
+        }
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
+            PortError::Backend("managed checkpoint storage is corrupt".into())
+        }
+        _ => PortError::Backend("managed checkpoint storage unavailable".into()),
+    }
+}
+
+pub(crate) fn apply_journal_size_limit(
+    conn: &Connection,
+    map_error: fn(rusqlite::Error) -> PortError,
+) -> PortResult<()> {
+    let limit = JOURNAL_SIZE_LIMIT_BYTES;
+    #[cfg(test)]
+    let limit = wal_tests::LIMIT.with(|value| value.get()).unwrap_or(limit);
+    conn.pragma_update(None, "journal_size_limit", limit)
+        .map_err(map_error)?;
+    let actual: i64 = conn
+        .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
+        .map_err(map_error)?;
+    if actual != limit {
+        return Err(PortError::Backend(
+            "managed catalog journal limit was not applied".into(),
+        ));
+    }
+    #[cfg(test)]
+    wal_tests::record_pragmas(conn);
+    Ok(())
+}
+
 /// Match the database and intent using ordinary file names, never Win32 alias
 /// trimming, device names or alternate streams. Check before any filesystem I/O.
 pub fn validate_catalog_path(path: &Path) -> PortResult<()> {
@@ -435,6 +506,94 @@ impl ManagedStore {
 
     pub fn open_for_write(path: &Path, control: &SqliteControlStore) -> PortResult<Self> {
         Self::open_existing(path, control, true)
+    }
+
+    /// Try one physical reset at a boundary with no caller-owned catalog
+    /// connection. Background authority is required, but Running intent is not.
+    /// Every catalog lock is tried once; control reads use the caller's scope.
+    pub fn checkpoint_wal(
+        path: &Path,
+        control: &SqliteControlStore,
+        authority: &crate::control::LockedWorkerAuthority<'_>,
+    ) -> PortResult<WalCheckpointReport> {
+        let started = Instant::now();
+        validate_catalog_path(path)?;
+        control.validate_catalog_file(path)?;
+        let mut report = WalCheckpointReport {
+            outcome: WalCheckpointOutcome::NotApplicable,
+            log_frames: -1,
+            checkpointed_frames: -1,
+            incarnation: None,
+            wal_bytes_before: None,
+            wal_bytes_after: None,
+            elapsed: Duration::ZERO,
+        };
+        let handles = match SharedGuard::try_acquire(
+            path.parent().ok_or_else(invalid)?,
+            LockKind::CatalogHandles,
+        ) {
+            Ok(handles) => Some(handles),
+            Err(PortError::WriterBusy(_)) => {
+                report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::CatalogHandles);
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            let Some(handles) = handles.as_ref() else {
+                return Ok(());
+            };
+            let policy = match admission(control, handles.root_identity()) {
+                Ok(policy) => policy,
+                Err(PortError::WriterBusy(_)) => {
+                    report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::Fence);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if !authority.is_bound_to(control)
+                || authority.installation_id() != &policy.installation_id
+            {
+                return Err(invalid());
+            }
+            authority.validate()?;
+            let lease = match WriterLease::try_acquire(control.private_root()) {
+                Ok(lease) => lease,
+                Err(PortError::WriterBusy(_)) => {
+                    report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::WriterLease);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let checkpoint = checkpoint_catalog(path, control, &policy, &mut report);
+            // The dedicated connection has already closed. Never retain a
+            // lease or catalog handle while doing the post-close file checks.
+            drop(lease);
+            checkpoint
+        })();
+        drop(handles);
+        result?;
+        control.validate_catalog_file(path)?;
+        control.validate_live_root()?;
+        report.wal_bytes_after = Self::wal_len(path)?;
+        report.elapsed = started.elapsed();
+        Ok(report)
+    }
+
+    /// Missing sidecars are normal after SQLite closes its last connection.
+    pub fn wal_len(path: &Path) -> PortResult<Option<u64>> {
+        validate_catalog_path(path)?;
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        match std::fs::symlink_metadata(Path::new(&wal)) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                Ok(Some(metadata.len()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(PortError::Backend(
+                "managed checkpoint sidecar unavailable".into(),
+            )),
+        }
     }
 
     fn open_existing(
@@ -1851,39 +2010,148 @@ fn admission(control: &SqliteControlStore, root: RootIdentity) -> PortResult<Rea
 const BUSY_TIMEOUT_MILLIS: u64 = 250;
 
 fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
+    connect_with(
+        path,
+        writable,
+        Duration::from_millis(BUSY_TIMEOUT_MILLIS),
+        storage,
+    )
+}
+
+fn connect_with(
+    path: &Path,
+    writable: bool,
+    busy_timeout: Duration,
+    map_error: fn(rusqlite::Error) -> PortError,
+) -> PortResult<Connection> {
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
     let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(storage)?;
-    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MILLIS))
-        .map_err(storage)?;
+        .map_err(map_error)?;
+    conn.busy_timeout(busy_timeout).map_err(map_error)?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
-        .map_err(storage)?;
+        .map_err(map_error)?;
+    if writable {
+        apply_journal_size_limit(&conn, map_error)?;
+    }
     SqliteStore::register_scalar_functions(&conn)?;
     Ok(conn)
 }
 fn identity(conn: &Connection, installation: &ControlId) -> PortResult<ControlId> {
+    identity_with(conn, installation, storage)
+}
+
+fn identity_with(
+    conn: &Connection,
+    installation: &ControlId,
+    map_error: fn(rusqlite::Error) -> PortError,
+) -> PortResult<ControlId> {
     let application_id: i64 = conn
         .query_row("PRAGMA application_id", [], |r| r.get(0))
-        .map_err(storage)?;
+        .map_err(map_error)?;
     if application_id != APPLICATION_ID {
         return Err(incompatible());
     }
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .map_err(storage)?;
+        .map_err(map_error)?;
     if version != SCHEMA_VERSION {
         return Err(incompatible());
     }
-    crate::managed_source_context::validate_schema(conn)?;
-    let (actual,incarnation):(String,String)=conn.query_row("SELECT installation_id,catalog_incarnation FROM catalog_meta CROSS JOIN store_metadata WHERE catalog_meta.singleton=1 AND store_metadata.singleton=1 AND managed_mode=1 AND projection_contract_version=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(storage)?;
+    crate::managed_source_context::validate_schema(conn).map_err(|error| {
+        // The shared validator predates the checkpoint error taxonomy. Recover
+        // a storage result code immediately, before another SQL operation can
+        // replace it; semantic schema mismatches retain their typed error.
+        // SAFETY: this borrowed connection remains live on the calling thread.
+        // The SQLite accessor only reads its last error and retains no pointer.
+        let code = unsafe { rusqlite::ffi::sqlite3_extended_errcode(conn.handle()) };
+        match code & 0xff {
+            rusqlite::ffi::SQLITE_BUSY
+            | rusqlite::ffi::SQLITE_LOCKED
+            | rusqlite::ffi::SQLITE_IOERR
+            | rusqlite::ffi::SQLITE_FULL
+            | rusqlite::ffi::SQLITE_CANTOPEN
+            | rusqlite::ffi::SQLITE_READONLY
+            | rusqlite::ffi::SQLITE_PROTOCOL
+            | rusqlite::ffi::SQLITE_CORRUPT
+            | rusqlite::ffi::SQLITE_NOTADB => map_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            )),
+            _ => error,
+        }
+    })?;
+    let (actual,incarnation):(String,String)=conn.query_row("SELECT installation_id,catalog_incarnation FROM catalog_meta CROSS JOIN store_metadata WHERE catalog_meta.singleton=1 AND store_metadata.singleton=1 AND managed_mode=1 AND projection_contract_version=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(map_error)?;
     if actual != installation.as_str() {
         return Err(incompatible());
     }
     ControlId::parse(&incarnation).map_err(|_| incompatible())
+}
+
+fn checkpoint_catalog(
+    path: &Path,
+    control: &SqliteControlStore,
+    policy: &ReadPolicy,
+    report: &mut WalCheckpointReport,
+) -> PortResult<()> {
+    let opened = (|| {
+        // Install the zero timeout before even the connection pragmas can
+        // touch the schema. No ordinary open/recovery or retry loop runs here.
+        let conn = connect_with(path, true, Duration::ZERO, checkpoint_storage)?;
+        {
+            let tx = conn.unchecked_transaction().map_err(checkpoint_storage)?;
+            // Pin and read the schema with the checkpoint error mapping before
+            // the shared schema validator runs under this same read snapshot.
+            tx.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(checkpoint_storage)?;
+            report.incarnation = Some(identity_with(
+                &tx,
+                &policy.installation_id,
+                checkpoint_storage,
+            )?);
+            tx.commit().map_err(checkpoint_storage)?;
+        }
+        Ok(conn)
+    })();
+    let conn = match opened {
+        Ok(conn) => conn,
+        Err(PortError::WriterBusy(_)) => {
+            report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::Sqlite);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    // Keep root validation outside the SQL deferral path.
+    control.validate_live_root()?;
+    report.wal_bytes_before = ManagedStore::wal_len(path)?;
+    let counts = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(checkpoint_storage);
+    let (busy, log, checkpointed): (i64, i64, i64) = match counts {
+        Ok(counts) => counts,
+        Err(PortError::WriterBusy(_)) => {
+            report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::Sqlite);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    report.log_frames = log;
+    report.checkpointed_frames = checkpointed;
+    report.outcome = if busy != 0 {
+        WalCheckpointOutcome::Deferred(WalDeferral::Sqlite)
+    } else if log == -1 {
+        WalCheckpointOutcome::NotApplicable
+    } else {
+        WalCheckpointOutcome::Reset
+    };
+    Ok(())
 }
 
 fn observation_manifest(
@@ -1930,4 +2198,541 @@ fn observation_manifest(
         relocation_json: "null".into(),
         operation_digest: digest,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod wal_tests {
+    use super::*;
+    use agent_session_grep_ports::control::{
+        MaintenanceFence, MaintenancePhase, RootKind, ScopeRegion, SelectionRequest,
+    };
+
+    thread_local! {
+        pub(super) static LIMIT: Cell<Option<i64>> = const { Cell::new(None) };
+        static PRAGMAS: RefCell<Vec<(i64, i64, i64, i64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_pragmas(conn: &Connection) {
+        PRAGMAS.with(|records| records.borrow_mut().push(pragmas(conn)));
+    }
+
+    pub(crate) fn take_pragmas() -> Vec<(i64, i64, i64, i64)> {
+        PRAGMAS.with(|records| std::mem::take(&mut *records.borrow_mut()))
+    }
+
+    pub(crate) fn pragmas(conn: &Connection) -> (i64, i64, i64, i64) {
+        let value = |key| {
+            conn.pragma_query_value(None, key, |row| row.get(0))
+                .unwrap()
+        };
+        (
+            value("journal_size_limit"),
+            value("synchronous"),
+            value("wal_autocheckpoint"),
+            value("busy_timeout"),
+        )
+    }
+
+    pub(crate) fn id(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) control: SqliteControlStore,
+        worker_lock: ExclusiveGuard,
+        pub(crate) catalog: PathBuf,
+        pub(crate) root: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let root = temp.path().join("private");
+            let control =
+                SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running)
+                    .unwrap();
+            let catalog = root.join("catalog.db");
+            drop(ManagedStore::create(&catalog, &control, id("catalog"), 1).unwrap());
+            let worker_lock = ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap();
+            Self {
+                control,
+                worker_lock,
+                catalog,
+                root,
+                _temp: temp,
+            }
+        }
+
+        fn checkpoint(&self) -> PortResult<WalCheckpointReport> {
+            let authority = self
+                .control
+                .bind_worker(&self.worker_lock, id("boot"))
+                .unwrap();
+            self.control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(2), || {
+                    ManagedStore::checkpoint_wal(&self.catalog, &self.control, &authority)
+                })
+        }
+
+        fn reader(&self) -> Connection {
+            let conn = connect(&self.catalog, false).unwrap();
+            conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+            conn
+        }
+
+        fn seed(&self) -> Connection {
+            let conn = connect(&self.catalog, true).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE wal_fixture(id INTEGER PRIMARY KEY, proof TEXT, body BLOB);
+                INSERT INTO wal_fixture VALUES(1,'proof-one',zeroblob(4096));",
+            )
+            .unwrap();
+            conn
+        }
+
+        pub(crate) fn select(&self) -> agent_session_grep_ports::control::Selection {
+            self.control
+                .add_selection(
+                    self.control.status().unwrap().policy.control_seq,
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Claude,
+                            locator: CanonicalLocator::from_path(
+                                &self._temp.path().join("source.jsonl"),
+                            )
+                            .unwrap(),
+                            kind: RootKind::Exact,
+                        },
+                        root_identity: Some(id("source-root")),
+                        now_ms: 1,
+                    },
+                )
+                .unwrap()
+                .value
+        }
+
+        fn desired(&self, desired: DesiredUpdates) {
+            self.control
+                .set_desired_updates(self.control.status().unwrap().policy.control_seq, desired)
+                .unwrap();
+        }
+    }
+
+    fn snapshot(conn: &Connection) -> (i64, String) {
+        conn.query_row("SELECT count(*),min(proof) FROM wal_fixture", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn wal_checkpoint_preserves_pinned_rows_then_resets_after_reader_gap() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let reader = fixture.reader();
+        reader.execute_batch("BEGIN").unwrap();
+        let before = snapshot(&reader);
+        writer
+            .execute_batch(
+                "INSERT INTO wal_fixture SELECT 2,'proof-two',zeroblob(4096);
+            UPDATE wal_fixture SET proof='proof-new' WHERE id=1;",
+            )
+            .unwrap();
+        let bytes = ManagedStore::wal_len(&fixture.catalog).unwrap();
+        let report = fixture.checkpoint().unwrap();
+        assert_eq!(
+            report.outcome,
+            WalCheckpointOutcome::Deferred(WalDeferral::Sqlite)
+        );
+        assert!(report.checkpointed_frames < report.log_frames);
+        assert_eq!(report.wal_bytes_before, bytes);
+        assert_eq!(report.wal_bytes_after, bytes);
+        assert_eq!(snapshot(&reader), before);
+        reader.execute_batch("COMMIT").unwrap();
+        let report = fixture.checkpoint().unwrap();
+        assert_eq!(report.outcome, WalCheckpointOutcome::Reset);
+        assert_eq!(report.incarnation, Some(id("catalog")));
+        assert_eq!(report.wal_bytes_after, Some(0));
+        assert_eq!(snapshot(&fixture.reader()), (2, "proof-new".into()));
+        assert_eq!(
+            reader
+                .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            reader
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_sqlite_writer_contention_uses_zero_busy_timeout() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let _idle = fixture.reader();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE wal_fixture SET proof='uncommitted';")
+            .unwrap();
+        PRAGMAS.with(|values| values.borrow_mut().clear());
+        let report = fixture.checkpoint().unwrap();
+        assert_eq!(
+            report.outcome,
+            WalCheckpointOutcome::Deferred(WalDeferral::Sqlite)
+        );
+        assert!(report.log_frames >= 0);
+        assert_eq!(report.log_frames, report.checkpointed_frames);
+        assert_eq!(
+            PRAGMAS.with(|values| values.borrow().clone()),
+            [(JOURNAL_SIZE_LIMIT_BYTES, 2, 1000, 0)]
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn wal_checkpoint_gate_contention_does_not_open_catalog() {
+        let fixture = Fixture::new();
+        let _idle = fixture.reader();
+        for gate in [WalDeferral::CatalogHandles, WalDeferral::WriterLease] {
+            let handles = (gate == WalDeferral::CatalogHandles).then(|| {
+                ExclusiveGuard::try_acquire(&fixture.root, LockKind::CatalogHandles).unwrap()
+            });
+            let lease = (gate == WalDeferral::WriterLease)
+                .then(|| WriterLease::try_acquire(&fixture.root).unwrap());
+            PRAGMAS.with(|values| values.borrow_mut().clear());
+            let report = fixture.checkpoint().unwrap();
+            assert_eq!(report.outcome, WalCheckpointOutcome::Deferred(gate));
+            assert_eq!((report.log_frames, report.checkpointed_frames), (-1, -1));
+            assert!(report.incarnation.is_none());
+            assert!(PRAGMAS.with(|values| values.borrow().is_empty()));
+            drop(lease);
+            drop(handles);
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_fence_and_emission_refuse_before_open() {
+        for emission in [false, true] {
+            let fixture = Fixture::new();
+            let _idle = fixture.reader();
+            if emission {
+                let selection = fixture.select();
+                fixture
+                    .control
+                    .revoke_selection(
+                        fixture.control.status().unwrap().policy.control_seq,
+                        &selection.id,
+                        None,
+                        2,
+                    )
+                    .unwrap();
+            } else {
+                fixture
+                    .control
+                    .set_maintenance(
+                        fixture.control.status().unwrap().policy.control_seq,
+                        &id("owner"),
+                        MaintenanceFence {
+                            state: MaintenanceState::Updating,
+                            owner: Some(id("owner")),
+                            phase: Some(MaintenancePhase::Quiescing),
+                        },
+                    )
+                    .unwrap();
+            }
+            PRAGMAS.with(|values| values.borrow_mut().clear());
+            assert_eq!(
+                fixture.checkpoint().unwrap().outcome,
+                WalCheckpointOutcome::Deferred(WalDeferral::Fence)
+            );
+            assert!(PRAGMAS.with(|values| values.borrow().is_empty()));
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_accepts_paused_and_stopped_without_recovery() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let _idle = fixture.reader();
+        for desired in [DesiredUpdates::Paused, DesiredUpdates::Stopped] {
+            fixture.desired(desired);
+            writer
+                .execute("UPDATE wal_fixture SET body=zeroblob(8192)", [])
+                .unwrap();
+            assert_eq!(
+                fixture.checkpoint().unwrap().outcome,
+                WalCheckpointOutcome::Reset
+            );
+            assert_eq!(ManagedStore::wal_len(&fixture.catalog).unwrap(), Some(0));
+            assert_eq!(fixture.control.status().unwrap().desired_updates, desired);
+        }
+    }
+
+    #[test]
+    fn wal_limit_applies_to_first_commit_after_automatic_checkpoint_and_reset() {
+        struct Limit;
+        impl Drop for Limit {
+            fn drop(&mut self) {
+                LIMIT.with(|value| value.set(None));
+            }
+        }
+        LIMIT.with(|value| value.set(Some(256 * 1024)));
+        let _limit = Limit;
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let reader = fixture.reader();
+        reader.execute_batch("BEGIN").unwrap();
+        snapshot(&reader);
+        writer
+            .execute_batch(
+                "WITH RECURSIVE rows(n) AS (SELECT 2 UNION ALL SELECT n+1 FROM rows WHERE n<1100)
+            INSERT INTO wal_fixture SELECT n,'bulk',zeroblob(4096) FROM rows;",
+            )
+            .unwrap();
+        let pinned = ManagedStore::wal_len(&fixture.catalog).unwrap().unwrap();
+        assert!(pinned > 256 * 1024 && pinned < 6 * 1024 * 1024);
+        reader.execute_batch("COMMIT").unwrap();
+        // The first post-gap commit completes the default autocheckpoint.
+        // Its successor starts the reset and applies this connection's limit.
+        writer
+            .execute("UPDATE wal_fixture SET proof='gap' WHERE id=1", [])
+            .unwrap();
+        writer
+            .execute("UPDATE wal_fixture SET proof='reset' WHERE id=1", [])
+            .unwrap();
+        assert!(ManagedStore::wal_len(&fixture.catalog).unwrap().unwrap() <= 256 * 1024);
+        assert_eq!(snapshot(&reader).0, 1100);
+    }
+
+    #[test]
+    fn wal_limit_is_connection_local_and_present_on_all_store_writers() {
+        PRAGMAS.with(|values| values.borrow_mut().clear());
+        let fixture = Fixture::new();
+        assert_eq!(
+            PRAGMAS.with(|values| values.borrow().clone()),
+            [(JOURNAL_SIZE_LIMIT_BYTES, 2, 1000, 250)]
+        );
+        let writer = ManagedStore::open_for_write(&fixture.catalog, &fixture.control).unwrap();
+        assert_eq!(
+            pragmas(&writer.inner.conn.borrow()),
+            (JOURNAL_SIZE_LIMIT_BYTES, 2, 1000, 250)
+        );
+        drop(writer);
+        let reader = fixture.reader();
+        assert_eq!(pragmas(&reader), (-1, 2, 1000, 250));
+        PRAGMAS.with(|values| values.borrow_mut().clear());
+        fixture.checkpoint().unwrap();
+        assert_eq!(
+            PRAGMAS.with(|values| values.borrow().clone()),
+            [(JOURNAL_SIZE_LIMIT_BYTES, 2, 1000, 0)]
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_rejects_identity_and_authority_mismatches() {
+        for change in [
+            "PRAGMA application_id=0",
+            "PRAGMA user_version=1",
+            "UPDATE catalog_meta SET installation_id='foreign'",
+            "DROP TRIGGER source_publication_context_immutable",
+        ] {
+            let fixture = Fixture::new();
+            let conn = connect(&fixture.catalog, true).unwrap();
+            conn.execute_batch(change).unwrap();
+            let before = std::fs::read(&fixture.catalog).unwrap();
+            assert!(matches!(
+                fixture.checkpoint(),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+        }
+        let fixture = Fixture::new();
+        let foreign = Fixture::new();
+        let authority = foreign
+            .control
+            .bind_worker(&foreign.worker_lock, id("foreign-boot"))
+            .unwrap();
+        assert!(matches!(
+            ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority),
+            Err(PortError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            ManagedStore::checkpoint_wal(&foreign.catalog, &fixture.control, &authority),
+            Err(PortError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn wal_checkpoint_rejects_authority_after_control_retirement() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let _idle = fixture.reader();
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        assert!(authority.validate().is_ok());
+        // Existence invalidates control admission without reading marker data.
+        std::fs::write(
+            fixture
+                .root
+                .join(crate::managed_control_lifetime::RETIREMENT_PENDING_MARKER),
+            b"synthetic retirement",
+        )
+        .unwrap();
+        let before = std::fs::read(&fixture.catalog).unwrap();
+        let wal = ManagedStore::wal_len(&fixture.catalog).unwrap();
+        take_pragmas();
+        assert!(matches!(
+            authority.validate(),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert!(matches!(
+            ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert!(take_pragmas().is_empty());
+        assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+        assert_eq!(ManagedStore::wal_len(&fixture.catalog).unwrap(), wal);
+        drop(writer);
+    }
+
+    #[test]
+    fn wal_checkpoint_keeps_the_bound_physical_root() {
+        let fixture = Fixture::new();
+        let retained = fixture._temp.path().join("retained-private");
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        #[cfg(windows)]
+        {
+            // Live root handles deny deletion/rename on Windows.
+            assert!(std::fs::rename(&fixture.root, &retained).is_err());
+            assert!(authority.validate().is_ok());
+            assert!(fixture.checkpoint().is_ok());
+        }
+        #[cfg(unix)]
+        {
+            std::fs::rename(&fixture.root, &retained).unwrap();
+            let replacement = SqliteControlStore::create(
+                &fixture.root,
+                &id("replacement"),
+                DesiredUpdates::Running,
+            )
+            .unwrap();
+            drop(
+                ManagedStore::create(&fixture.catalog, &replacement, id("replacement-catalog"), 2)
+                    .unwrap(),
+            );
+            let before = std::fs::read(&fixture.catalog).unwrap();
+            assert!(authority.validate().is_err());
+            assert!(matches!(
+                ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority),
+                Err(PortError::InvalidRequest(_))
+            ));
+            assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_delete_mode_is_unchanged_and_not_applicable() {
+        let fixture = Fixture::new();
+        let conn = connect(&fixture.catalog, true).unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        let before = std::fs::read(&fixture.catalog).unwrap();
+        let report = fixture.checkpoint().unwrap();
+        assert_eq!(report.outcome, WalCheckpointOutcome::NotApplicable);
+        assert_eq!((report.log_frames, report.checkpointed_frames), (-1, -1));
+        assert_eq!(report.wal_bytes_after, None);
+        assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+    }
+
+    #[test]
+    fn wal_checkpoint_sql_error_mapping_preserves_storage_failures() {
+        use rusqlite::ffi;
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_LOCKED,
+            ffi::SQLITE_IOERR,
+            ffi::SQLITE_IOERR_FSYNC,
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_CANTOPEN,
+            ffi::SQLITE_READONLY,
+            ffi::SQLITE_PROTOCOL,
+            ffi::SQLITE_CORRUPT,
+            ffi::SQLITE_NOTADB,
+        ] {
+            let error =
+                checkpoint_storage(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+            if code == ffi::SQLITE_BUSY {
+                assert!(matches!(error, PortError::WriterBusy(_)));
+            } else {
+                assert!(matches!(error, PortError::Backend(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_corrupt_file_is_a_storage_error() {
+        let fixture = Fixture::new();
+        std::fs::write(&fixture.catalog, b"synthetic invalid database").unwrap();
+        let before = std::fs::read(&fixture.catalog).unwrap();
+        assert!(matches!(fixture.checkpoint(), Err(PortError::Backend(_))));
+        assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+    }
+
+    #[test]
+    fn wal_checkpoint_releases_all_catalog_resources_on_return() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let idle = fixture.reader();
+        drop(writer);
+        fixture.checkpoint().unwrap();
+        let writer = connect(&fixture.catalog, true).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE; ROLLBACK").unwrap();
+        let handles = ExclusiveGuard::try_acquire(&fixture.root, LockKind::CatalogHandles).unwrap();
+        let lease = WriterLease::try_acquire(&fixture.root).unwrap();
+        drop(lease);
+        drop(handles);
+        drop(idle);
+    }
+
+    #[test]
+    fn wal_checkpoint_error_and_deferral_release_owned_resources() {
+        let fixture = Fixture::new();
+        let writer = fixture.seed();
+        let idle = fixture.reader();
+        idle.execute_batch("BEGIN").unwrap();
+        snapshot(&idle);
+        writer
+            .execute("UPDATE wal_fixture SET proof='later'", [])
+            .unwrap();
+        assert_eq!(
+            fixture.checkpoint().unwrap().outcome,
+            WalCheckpointOutcome::Deferred(WalDeferral::Sqlite)
+        );
+        idle.execute_batch("COMMIT").unwrap();
+        for invalid_identity in [false, true] {
+            if invalid_identity {
+                writer.pragma_update(None, "application_id", 0).unwrap();
+                assert!(matches!(
+                    fixture.checkpoint(),
+                    Err(PortError::SchemaIncompatible(_))
+                ));
+            }
+            writer.execute_batch("BEGIN EXCLUSIVE; ROLLBACK").unwrap();
+            let handles =
+                ExclusiveGuard::try_acquire(&fixture.root, LockKind::CatalogHandles).unwrap();
+            let lease = WriterLease::try_acquire(&fixture.root).unwrap();
+            drop(lease);
+            drop(handles);
+        }
+    }
 }
