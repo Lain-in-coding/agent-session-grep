@@ -50,7 +50,33 @@ impl Fixture {
         let control =
             SqliteControlStore::create(&root, &id("history-installation"), DesiredUpdates::Paused)
                 .unwrap();
-        drop(ManagedStore::create(&catalog, &control, id("history-catalog"), 1).unwrap());
+        // Catalog preparation finishes before retention starts its own clock.
+        let preparation_end = deadline();
+        let probe_end = preparation_end + Duration::from_secs(5);
+        let mut create_calls = 0;
+        let mut create = || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                preparation_end
+            );
+            create_calls += 1;
+            let store = ManagedStore::create(&catalog, &control, id("history-catalog"), 1)?;
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                preparation_end
+            );
+            Ok::<_, PortError>(store)
+        };
+        drop(
+            control
+                .with_runtime_deadline(preparation_end, &mut create)
+                .unwrap(),
+        );
+        assert_eq!(create_calls, 1);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            probe_end
+        );
         drop(control);
         let conn = Connection::open(&catalog).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")

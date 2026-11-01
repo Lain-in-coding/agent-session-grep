@@ -7,8 +7,9 @@ use agent_session_grep_adapters_sqlite::{
 };
 use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
 use agent_session_grep_ports::{PortError, SearchProvider, control::*, managed::*};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -51,6 +52,69 @@ fn binding() -> CacheBinding {
     )
     .unwrap()
 }
+struct InsertTrace<'a> {
+    root: &'a Path,
+    index: usize,
+    now_ms: i64,
+    started: Instant,
+    end: Instant,
+    phases: Vec<(&'static str, Duration, Instant)>,
+    insert_result: Option<InsertOutcome>,
+    read_result: Option<Result<(), String>>,
+}
+impl<'a> InsertTrace<'a> {
+    fn new(root: &'a Path, index: usize, now_ms: i64, end: Instant) -> Self {
+        Self {
+            root,
+            index,
+            now_ms,
+            started: Instant::now(),
+            end,
+            phases: Vec::with_capacity(8),
+            insert_result: None,
+            read_result: None,
+        }
+    }
+    fn record(&mut self, name: &'static str) {
+        self.phases.push((
+            name,
+            self.started.elapsed(),
+            SqliteControlStore::effective_runtime_deadline(self.end + Duration::from_secs(5)),
+        ));
+    }
+}
+impl Drop for InsertTrace<'_> {
+    fn drop(&mut self) {
+        if matches!(&self.read_result, Some(Ok(()))) {
+            return;
+        }
+        // Only after the operation returns or unwinds; never retry insertion
+        // or let this independent read authorize the original result.
+        let path = ManagedCache::path(self.root);
+        let rows_after_failure = if path.exists() {
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(|conn| {
+                conn.busy_timeout(Duration::ZERO)?;
+                conn.query_row(
+                    "SELECT count(*),coalesce(sum(size_bytes),0) FROM result_sets",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+            })
+        } else {
+            Ok((0, 0))
+        };
+        eprintln!(
+            "cache insert diagnostic index={} now_ms={} end={:?} insert={:?} read={:?} post_failure_rows={:?} phases={:?}",
+            self.index,
+            self.now_ms,
+            self.end,
+            self.insert_result,
+            self.read_result,
+            rows_after_failure,
+            self.phases,
+        );
+    }
+}
 struct Fixture {
     root: PathBuf,
     db: PathBuf,
@@ -59,6 +123,7 @@ struct Fixture {
     observation: SourceObservation,
     selection: ControlId,
     end: Instant,
+    insert_calls: Cell<usize>,
     // Connections and OS guards must close before Windows temp cleanup.
     _temp: tempfile::TempDir,
 }
@@ -151,6 +216,7 @@ impl Fixture {
             observation,
             selection: selection.id,
             end,
+            insert_calls: Cell::new(0),
         };
         f.bounded(|| {
             let store = ManagedStore::create(&f.db, &f.control, id("catalog-one"), 1).unwrap();
@@ -310,58 +376,118 @@ impl Fixture {
             .collect()
     }
     fn insert(&self, now: i64) -> CacheCursor {
-        let cache = ManagedCache::at(&self.root, &self.control).unwrap();
-        let store = ManagedStore::open(&self.db, &self.control).unwrap();
-        store
-            .with_read(
-                &self.control,
-                RequestIntersection::Selected,
-                deadline(),
-                |r| {
-                    Ok(
-                        match cache.insert(
-                            &self.control,
-                            r,
-                            CacheInsert {
-                                binding: &binding(),
-                                candidates: &Self::candidates(r),
-                                next_offset: 1,
-                                truncated: true,
-                                now_ms: now,
-                                deadline: deadline(),
-                            },
-                        ) {
-                            InsertOutcome::Stored(c) => c,
-                            other => panic!("insert: {other:?}"),
-                        },
-                    )
-                },
-            )
-            .unwrap()
+        let end = deadline();
+        let probe = end + Duration::from_secs(5);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let expected = SqliteControlStore::effective_runtime_deadline(end);
+        let index = self.insert_calls.get() + 1;
+        self.insert_calls.set(index);
+        let mut trace = InsertTrace::new(&self.root, index, now, end);
+        let mut operation = || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                expected
+            );
+            trace.record("cache_at");
+            let cache = ManagedCache::at(&self.root, &self.control).unwrap();
+            trace.record("store_open");
+            let store = ManagedStore::open(&self.db, &self.control).unwrap();
+            trace.record("with_read");
+            let result = store.with_read(&self.control, RequestIntersection::Selected, end, |r| {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    expected
+                );
+                trace.record("callback");
+                let binding = binding();
+                let candidates = Self::candidates(r);
+                trace.record("candidates");
+                let request = CacheInsert {
+                    binding: &binding,
+                    candidates: &candidates,
+                    next_offset: 1,
+                    truncated: true,
+                    now_ms: now,
+                    deadline: end,
+                };
+                assert_eq!(request.deadline, end);
+                trace.record("insert");
+                let outcome = cache.insert(&self.control, r, request);
+                trace.record("insert_return");
+                trace.insert_result = Some(outcome.clone());
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    expected
+                );
+                Ok(match outcome {
+                    InsertOutcome::Stored(c) => c,
+                    other => panic!("insert: {other:?}"),
+                })
+            });
+            trace.record("with_read_return");
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                expected
+            );
+            result
+        };
+        let result = self.control.with_runtime_deadline(end, &mut operation);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        trace.record("request_return");
+        trace.read_result = Some(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}")),
+        );
+        result.unwrap()
     }
     fn page(&self, cursor: &str, now: i64) -> std::result::Result<CachePage, CacheError> {
-        let cache = ManagedCache::at(&self.root, &self.control).unwrap();
-        let store = ManagedStore::open(&self.db, &self.control).unwrap();
-        store
-            .with_read(
-                &self.control,
-                RequestIntersection::Selected,
-                deadline(),
-                |r| {
-                    Ok(cache.page(
-                        &self.control,
-                        r,
-                        CachePageRequest {
-                            binding: &binding(),
-                            cursor,
-                            limit: 2,
-                            now_ms: now,
-                            deadline: deadline(),
-                        },
-                    ))
-                },
-            )
-            .unwrap()
+        let end = deadline();
+        let probe = end + Duration::from_secs(5);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let expected = SqliteControlStore::effective_runtime_deadline(end);
+        let result = self.control.with_runtime_deadline(end, || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                expected
+            );
+            let cache = ManagedCache::at(&self.root, &self.control).unwrap();
+            let store = ManagedStore::open(&self.db, &self.control).unwrap();
+            let result = store.with_read(&self.control, RequestIntersection::Selected, end, |r| {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    expected
+                );
+                let request = CachePageRequest {
+                    binding: &binding(),
+                    cursor,
+                    limit: 2,
+                    now_ms: now,
+                    deadline: end,
+                };
+                assert_eq!(request.deadline, end);
+                let page = cache.page(&self.control, r, request);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    expected
+                );
+                Ok(page)
+            });
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                expected
+            );
+            result
+        });
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        result.unwrap()
     }
     fn scalar(&self, sql: &str) -> i64 {
         Connection::open(ManagedCache::path(&self.root))
@@ -369,6 +495,26 @@ impl Fixture {
             .query_row(sql, [], |r| r.get(0))
             .unwrap()
     }
+}
+
+#[test]
+fn fixture_cache_requests_restore_a_later_outer_scope() {
+    let f = Fixture::new();
+    let outer = Instant::now() + Duration::from_secs(10);
+    let probe = outer + Duration::from_secs(5);
+    f.control
+        .with_runtime_deadline(outer, || {
+            let cursor = f.insert(100);
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            let page = f.page(cursor.as_str(), 101).unwrap();
+            assert_eq!(page.candidates.len(), 2);
+            assert_eq!(f.insert_calls.get(), 1);
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(f.scalar("SELECT count(*) FROM result_sets"), 1);
 }
 
 #[test]
