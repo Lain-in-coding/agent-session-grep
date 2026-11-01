@@ -388,6 +388,17 @@ select `workbuddy.db` separately or explicitly select the whole WorkBuddy
 surface when both are intended. Setup does not change global trust or an
 existing desired pause/update state.
 
+Completing setup from an installed package lets background discovery reuse
+verified observations from earlier cycles. This requires the catalog's data
+root to record a verified installation binding. `setup --host`,
+`path install`, `autostart enable` and `migrate --install-prefix` establish
+that binding after verifying the installation; recovery and update only
+validate it. Catalog-only setup (no `--host`) records none. Its worker
+requires observations from the current cycle to establish complete
+discovery coverage, which can take longer under a large history workload.
+When several catalogs share one installation prefix, a catalog other than
+the one that applied the latest program update also uses this fallback.
+
 When invoking the same application build outside its installed version
 directory, add `--install-prefix <prefix>`. Otherwise setup derives the prefix
 from the running versioned application. Before catalog creation or host writes,
