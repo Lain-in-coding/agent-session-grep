@@ -12114,10 +12114,130 @@ mod control_deadline_tests {
                 _ => unreachable!(),
             }
             let old = pending.as_ref().unwrap().token.cycle_seq;
+            let original_pending = pending.clone();
+            let diagnostic_started = Instant::now();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observed_events = events.clone();
+            schedule.hooks.on_event = Some(RefCell::new(Box::new(move |event| {
+                let detail = match event {
+                    ScheduleTestEvent::Planned => "planned".into(),
+                    ScheduleTestEvent::BeforeProbe(_, end) => format!(
+                        "before_probe remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                    ScheduleTestEvent::BeforeAttempt(_, end, lane) => format!(
+                        "before_attempt lane={lane:?} remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                    ScheduleTestEvent::BeforeParse(_, end) => format!(
+                        "before_parse remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                    ScheduleTestEvent::Published(_, end) => format!(
+                        "published remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                    ScheduleTestEvent::SourceFailed {
+                        phase,
+                        error,
+                        revisit,
+                        remaining,
+                        ..
+                    } => format!(
+                        "source_failed phase={phase:?} error={error:?} \
+                         revisit={revisit} remaining={remaining:?}"
+                    ),
+                    ScheduleTestEvent::AfterAdmissionFailure(_, _, error) => {
+                        format!("admission_failed error={error:?}")
+                    }
+                    ScheduleTestEvent::AfterAttempt(_, lane) => {
+                        format!("after_attempt lane={lane:?}")
+                    }
+                    ScheduleTestEvent::AfterNotScheduled(_) => "not_scheduled".into(),
+                    ScheduleTestEvent::Finalizing => "finalizing".into(),
+                    ScheduleTestEvent::BeforeDiscoveryPublication { epoch } => {
+                        format!("before_discovery_publication epoch={epoch}")
+                    }
+                    ScheduleTestEvent::AfterDiscoveryPublication { epoch } => {
+                        format!("after_discovery_publication epoch={epoch}")
+                    }
+                    ScheduleTestEvent::BeforeCompletion => "before_completion".into(),
+                    ScheduleTestEvent::BeforeIdleValidation => "before_idle_validation".into(),
+                    ScheduleTestEvent::BeforeIdleDemands => "before_idle_demands".into(),
+                    ScheduleTestEvent::BeforeIdleHeartbeat(seq) => {
+                        format!("before_idle_heartbeat seq={seq:?}")
+                    }
+                    ScheduleTestEvent::AfterIdleHeartbeat(end) => format!(
+                        "after_idle_heartbeat remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                };
+                observed_events
+                    .borrow_mut()
+                    .push((diagnostic_started.elapsed(), detail));
+                Ok(())
+            })));
+            let result = run_cycle(
+                &fixture.db,
+                &fixture.control,
+                &fixture.worker(),
+                &boot,
+                1,
+                fixture.scope_end,
+                &mut pending,
+                &mut schedule,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "reason={reason} phase=run_cycle error={error:?} elapsed={:?} \
+                     original_end_remaining={:?} original_pending={original_pending:?} \
+                     pending={pending:?} source_phase={:?} events={:?}",
+                    diagnostic_started.elapsed(),
+                    fixture.scope_end.saturating_duration_since(Instant::now()),
+                    schedule.hooks.source_phase.get(),
+                    events.borrow()
+                )
+            });
+            let outcome = match result {
+                CycleResult::Idle(ready) => {
+                    let worker = fixture.worker();
+                    let accept_end = Instant::now() + CONTROL_BUDGET;
+                    accept_idle_boundary(
+                        &fixture.db,
+                        &fixture.control,
+                        &worker,
+                        &ready,
+                        &mut pending,
+                        &mut schedule,
+                        accept_end,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "reason={reason} phase=accept_idle_boundary error={error:?} \
+                             elapsed={:?} original_end_remaining={:?} \
+                             accept_end_remaining={:?} ready={ready:?} \
+                             original_pending={original_pending:?} pending={pending:?} events={:?}",
+                            diagnostic_started.elapsed(),
+                            fixture.scope_end.saturating_duration_since(Instant::now()),
+                            accept_end.saturating_duration_since(Instant::now()),
+                            events.borrow()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reason={reason} phase=accept_idle_boundary invalidated \
+                             ready={ready:?} pending={pending:?} events={:?}",
+                            events.borrow()
+                        )
+                    })
+                    .outcome
+                }
+                CycleResult::Work(outcome) => outcome,
+            };
             assert!(
-                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
-                    .unwrap()
-                    .idle()
+                outcome.idle(),
+                "reason={reason} outcome={outcome:?} pending={pending:?} events={:?}",
+                events.borrow()
             );
             let receipt = fixture.sources()[0].latest_receipt.clone().unwrap();
             assert!(receipt.cycle_seq > old.get(), "{reason}");
