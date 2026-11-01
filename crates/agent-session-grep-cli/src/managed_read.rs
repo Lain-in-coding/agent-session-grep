@@ -2288,16 +2288,56 @@ fn render_frame(
 #[cfg(test)]
 mod frame_budget_tests {
     use super::*;
-    use agent_session_grep_adapters_sqlite::{PARSER_SEMANTIC_VERSION, SourceBatch};
-    use agent_session_grep_domain::{EvidenceSpan, MessageEdge, MessagePlacement, MessageRelation};
+    use agent_session_grep_adapters_sqlite::{
+        PARSER_SEMANTIC_VERSION, SourceActivity, SourceBatch,
+    };
+    use agent_session_grep_domain::{
+        EvidenceSpan, MessageEdge, MessagePlacement, MessageRelation, ToolActivity,
+        ToolActivityActor, ToolActivityKind, ToolActivityStatus,
+    };
     use agent_session_grep_ports::{
+        SourceResumeClaim,
         control::{CanonicalLocator, CycleAdmission, RootKind, ScopeRegion, SelectionRequest},
         managed::{
-            ObservationState, RevisionId, SelectionProof, SourceBinding, SourceId,
+            ObservationState, RepositoryClaim, RevisionId, SelectionProof, SourceBinding, SourceId,
             SourceObservation,
         },
     };
     use std::cell::RefCell;
+
+    // Keep the original E2E replay's roles, byte lengths, escaping and tool turns.
+    const REPLAY_SHAPE: [(&str, usize, usize, usize, bool); 12] = [
+        ("user", 370, 0, 0, false),
+        ("assistant", 131, 0, 0, false),
+        ("assistant", 39, 0, 0, false),
+        ("user", 2767, 384, 0, true),
+        ("assistant", 81, 0, 0, false),
+        ("user", 906, 34, 0, false),
+        ("assistant", 45, 0, 0, false),
+        ("assistant", 86, 0, 0, false),
+        ("user", 5439, 388, 37, true),
+        ("assistant", 679, 2, 0, false),
+        ("assistant", 36, 0, 0, false),
+        ("user", 1716, 170, 0, true),
+    ];
+
+    fn synthetic_text(seed: usize, bytes: usize, quotes: usize, backslashes: usize) -> String {
+        const WORDS: [&str; 8] = [
+            "alpha ", "bravo ", "carrot ", "delta ", "ember ", "fable ", "garden ", "harbor ",
+        ];
+        let mut text = WORDS
+            .iter()
+            .cycle()
+            .skip(seed)
+            .flat_map(|word| word.bytes())
+            .take(bytes)
+            .collect::<Vec<_>>();
+        let specials = quotes + backslashes;
+        for n in 0..specials {
+            text[n * bytes / specials] = if n < quotes { b'"' } else { b'\\' };
+        }
+        String::from_utf8(text).unwrap()
+    }
 
     struct DurationState {
         value: u64,
@@ -2349,7 +2389,9 @@ mod frame_budget_tests {
     struct Fixture {
         db: PathBuf,
         session: StableId,
+        document: StableId,
         messages: Vec<StableId>,
+        placements: Vec<String>,
         _temp: tempfile::TempDir,
     }
     impl Fixture {
@@ -2360,15 +2402,15 @@ mod frame_budget_tests {
             let db = root.join("catalog.db");
             let id = |name| ControlId::parse(name).unwrap();
             let entity = |kind, name: &str| StableId::native_checked(kind, name).unwrap();
-            let session = entity(IdKind::Session, "frame-session");
-            let document = entity(IdKind::Document, "frame-document");
+            let session = entity(IdKind::Session, "00000000-0000-4000-8000-00000000c0de");
+            let document = entity(IdKind::Document, "00000000-0000-4000-8000-00000000d0c5");
             let control = SqliteControlStore::create(
                 &root,
                 &id("frame-installation"),
                 DesiredUpdates::Running,
             )
             .unwrap();
-            let messages = control
+            let (messages, placements) = control
                 .with_runtime_deadline(Instant::now() + Duration::from_secs(5), || {
                     let selection = control
                         .add_selection(
@@ -2410,7 +2452,7 @@ mod frame_budget_tests {
                         .value;
                     let observation = SourceObservation {
                         binding: SourceBinding {
-                            source_id: SourceId::parse("frame-source")?,
+                            source_id: SourceId::parse("PRIVATE_SOURCE_SENTINEL")?,
                             source_path: CanonicalLocator::from_path(
                                 &histories.join("synthetic.jsonl"),
                             )?
@@ -2420,8 +2462,10 @@ mod frame_budget_tests {
                             namespace_id: None,
                             root_identity: "frame-root".into(),
                         },
-                        revision_id: RevisionId::parse("frame-revision")?,
-                        revision_digest: "a".repeat(64),
+                        revision_id: RevisionId::parse("replay-receipt")?,
+                        revision_digest:
+                            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                                .into(),
                         parser_version: PARSER_SEMANTIC_VERSION,
                         state: ObservationState::Complete,
                         cycle_seq: cycle.token.cycle_seq.get(),
@@ -2436,47 +2480,64 @@ mod frame_budget_tests {
                             selection_revision: selection.revision.get(),
                             root_identity: "frame-root".into(),
                         }],
-                        repositories: Vec::new(),
+                        repositories: vec![RepositoryClaim {
+                            session_id: session.clone(),
+                            slug: "example.test/team/project".into(),
+                        }],
                     };
                     let mut batch = SourceBatch {
                         source_path: observation.binding.source_path.clone(),
                         entries: vec![
-                            (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()],"title":"Synthetic boundary session"})).unwrap(), String::new()),
-                            (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":observation.revision_digest,"len":100000})).unwrap(), String::new()),
+                            (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()],"title":"Synthetic replay session"})).unwrap(), String::new()),
+                            (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":observation.revision_digest,"len":1000000})).unwrap(), String::new()),
                         ],
                         placements: Vec::new(),
                         edges: Vec::new(),
                         activities: Vec::new(),
                         usage_events: Vec::new(),
                         relation_complete: true,
-                        len_bytes: Some(100000),
+                        len_bytes: Some(1000000),
                         fingerprint: Some(observation.revision_digest.clone()),
                         provider_id: Some("claude-code".into()),
-                        resume_claims: Vec::new(),
+                        resume_claims: vec![SourceResumeClaim {
+                            session_id: session.as_str().into(),
+                            provider_id: "claude-code".into(),
+                            provider_session_id: Some("NATIVE_RESUME_SENTINEL".into()),
+                            provider_session_id_state: "resolved".into(),
+                            original_working_directory: Some("PRIVATE_CWD_SENTINEL".into()),
+                            original_working_directory_state: "resolved".into(),
+                            pair_observed: true,
+                        }],
                     };
-                    let mut messages = Vec::new();
-                    let mut offset = 0;
-                    for n in 0..12 {
-                        let message = entity(IdKind::Message, &format!("frame-message-{n:02}"));
-                        let text = format!("Turn {n}: {}", "synthetic \"words\" \\\\ ".repeat(48));
-                        let end = offset + text.len() as u64;
+                    let (mut messages, mut placements) = (Vec::new(), Vec::new());
+                    let mut offset = 0u64;
+                    for (n, (role, bytes, quotes, backslashes, tool)) in
+                        REPLAY_SHAPE.into_iter().enumerate()
+                    {
+                        let message = entity(
+                            IdKind::Message,
+                            &format!("00000000-0000-4000-8000-0000000000{n:02}"),
+                        );
+                        let text = synthetic_text(n, bytes, quotes, backslashes);
+                        let timestamp = format!("2026-10-17T12:{n:02}:00.000Z");
                         batch.entries.push((
                             message.clone(),
-                            serde_json::to_vec(&json!({"role":"user","text":text})).unwrap(),
-                            text,
+                            serde_json::to_vec(&json!({"role":role,"text":text,"timestamp":timestamp}))
+                                .unwrap(),
+                            text.clone(),
                         ));
                         let placement = MessagePlacement::new(
                             session.clone(),
                             document.clone(),
                             message.clone(),
-                            n,
+                            n as u32,
                             false,
                             Some(EvidenceSpan {
                                 start: offset,
-                                end,
+                                end: offset + bytes as u64,
                             }),
                         );
-                        offset = end + 1;
+                        offset += bytes as u64 + 1;
                         if let Some(parent) = messages.last() {
                             batch.edges.push(MessageEdge {
                                 child_placement_id: placement.id.clone(),
@@ -2485,18 +2546,33 @@ mod frame_budget_tests {
                                 relation: MessageRelation::Reply,
                             });
                         }
+                        if tool {
+                            batch.activities.push(SourceActivity {
+                                message_id: message.clone(),
+                                activity: ToolActivity {
+                                    kind: ToolActivityKind::Command,
+                                    actor: ToolActivityActor::Main,
+                                    name: "SyntheticTool".into(),
+                                    target: Some(format!("synthetic-target-{n}")),
+                                    status: ToolActivityStatus::Success,
+                                },
+                            });
+                        }
+                        placements.push(placement.id.as_str().to_owned());
                         batch.placements.push(placement);
                         messages.push(message);
                     }
                     let store = ManagedStore::create(&db, &control, id("frame-catalog"), 1)?;
                     store.commit_source(&control, &worker, &batch, &observation)?;
-                    Ok(messages)
+                    Ok((messages, placements))
                 })
                 .unwrap();
             Self {
                 db,
                 session,
+                document,
                 messages,
+                placements,
                 _temp: temp,
             }
         }
@@ -2525,14 +2601,77 @@ mod frame_budget_tests {
         }
     }
 
-    fn assert_prefix(frame: &PreparedFrame, expected: &[StableId]) -> Value {
+    fn assert_prefix(frame: &PreparedFrame, fixture: &Fixture, count: usize) -> Value {
         assert_eq!(frame.bytes.last(), Some(&b'\n'));
         let wire: Value = serde_json::from_slice(&frame.bytes).unwrap();
         assert_eq!(wire["data"], frame.payload["data"]);
-        let messages = wire["data"]["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), expected.len());
-        for (message, expected) in messages.iter().zip(expected) {
+        let data = &wire["data"];
+        assert_eq!(data["session_id"], fixture.session.as_str());
+        assert_eq!(
+            data["session"]["documents"],
+            json!([fixture.document.as_str()])
+        );
+        assert_eq!(data["branch_leaf"], fixture.messages[11].as_str());
+        assert_eq!(data["branch_leaf_placement_id"], fixture.placements[11]);
+        let messages = data["messages"].as_array().unwrap();
+        let evidence = data["evidence"].as_array().unwrap();
+        let provenance = data["provenance"].as_array().unwrap();
+        assert_eq!(messages.len(), count);
+        assert_eq!(evidence.len(), count);
+        assert_eq!(provenance.len(), count + 1);
+        assert_eq!(provenance[0]["entity_id"], fixture.session.as_str());
+        let mut offset = 0u64;
+        for (n, message) in messages.iter().enumerate() {
+            let expected = &fixture.messages[n];
+            let (role, bytes, quotes, backslashes, _) = REPLAY_SHAPE[n];
             assert_eq!(message["message_id"], expected.as_str());
+            assert_eq!(message["placement_id"], fixture.placements[n]);
+            let payload = &message["payload"];
+            assert_eq!(payload["role"], role);
+            assert_eq!(
+                payload["text"],
+                synthetic_text(n, bytes, quotes, backslashes)
+            );
+            assert_eq!(
+                payload["timestamp"],
+                format!("2026-10-17T12:{n:02}:00.000Z")
+            );
+            assert_eq!(evidence[n]["message_id"], expected.as_str());
+            assert_eq!(evidence[n]["occurrence_id"], fixture.placements[n]);
+            assert_eq!(evidence[n]["source_document_id"], fixture.document.as_str());
+            assert_eq!(evidence[n]["precision"], "byte");
+            assert_eq!(evidence[n]["byte_start"], offset);
+            assert_eq!(evidence[n]["byte_end"], offset + bytes as u64);
+            assert_eq!(provenance[n + 1]["entity_id"], expected.as_str());
+            assert_eq!(provenance[n + 1]["message_id"], expected.as_str());
+            assert_eq!(provenance[n + 1]["placement_id"], fixture.placements[n]);
+            assert_eq!(provenance[n + 1]["document_id"], fixture.document.as_str());
+            assert_eq!(provenance[n + 1]["precision"], "byte");
+            offset += bytes as u64 + 1;
+        }
+        let tools = data["tool_activities"].as_array().unwrap();
+        let expected_tools = [3, 8, 11]
+            .into_iter()
+            .filter(|&n| n < count)
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), expected_tools.len());
+        for n in expected_tools {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["message_id"] == fixture.messages[n].as_str())
+                .expect("each retained tool turn has its original activity");
+            assert_eq!(tool["kind"], json!(ToolActivityKind::Command));
+            assert_eq!(tool["actor"], json!(ToolActivityActor::Main));
+            assert_eq!(tool["name"], "SyntheticTool");
+            assert_eq!(tool["target"], format!("synthetic-target-{n}"));
+            assert_eq!(tool["status"], json!(ToolActivityStatus::Success));
+        }
+        if count == 12 {
+            assert!(
+                (30 * 1024..32 * 1024).contains(&frame.bytes.len()),
+                "original replay frame shape drifted: {} bytes",
+                frame.bytes.len()
+            );
         }
         wire
     }
@@ -2542,7 +2681,7 @@ mod frame_budget_tests {
         let fixture = Fixture::new();
         let duration = SerializerDuration::fixed(9, false);
         let complete = fixture.frame(32 * 1024);
-        let full = assert_prefix(&complete, &fixture.messages);
+        let full = assert_prefix(&complete, &fixture, 12);
         assert_eq!(full["outcome"], "success");
         assert_eq!(full["warnings"], json!([]));
         assert_eq!(full["meta"]["duration_ms"], 9);
@@ -2559,7 +2698,7 @@ mod frame_budget_tests {
         );
         let short = fixture.frame(n - 1);
         assert!(short.bytes.len() < n);
-        let prefix = assert_prefix(&short, &fixture.messages[..11]);
+        let prefix = assert_prefix(&short, &fixture, 11);
         assert_eq!(prefix["outcome"], "partial");
         assert_eq!(prefix["warnings"], json!(["response_budget"]));
         assert_eq!(
@@ -2570,6 +2709,21 @@ mod frame_budget_tests {
             prefix["data"]["messages"],
             json!(&full["data"]["messages"].as_array().unwrap()[..11])
         );
+        assert_eq!(
+            prefix["data"]["evidence"],
+            json!(&full["data"]["evidence"].as_array().unwrap()[..11])
+        );
+        assert_eq!(
+            prefix["data"]["provenance"],
+            json!(&full["data"]["provenance"].as_array().unwrap()[..12])
+        );
+        let full_tools = full["data"]["tool_activities"].as_array().unwrap();
+        let expected_tools = full_tools
+            .iter()
+            .filter(|tool| tool["message_id"] != fixture.messages[11].as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(prefix["data"]["tool_activities"], json!(expected_tools));
         // The only larger original prefix is the complete twelve-message
         // frame measured above, one byte larger than this call permits.
         drop(duration);
@@ -2581,7 +2735,7 @@ mod frame_budget_tests {
         let fixture = Fixture::new();
         let duration = SerializerDuration::fixed(9, false);
         let complete = fixture.frame(32 * 1024);
-        assert_prefix(&complete, &fixture.messages);
+        assert_prefix(&complete, &fixture, 12);
         drop(duration);
 
         let _duration = SerializerDuration::fixed(9, true);
@@ -2600,7 +2754,7 @@ mod frame_budget_tests {
             returned.bytes.len(),
             saved.len()
         );
-        let wire = assert_prefix(&returned, &fixture.messages);
+        let wire = assert_prefix(&returned, &fixture, 12);
         assert_eq!(wire["meta"]["duration_ms"], 9);
         assert_eq!(wire["outcome"], "success");
         assert_eq!(wire["warnings"], json!([]));
