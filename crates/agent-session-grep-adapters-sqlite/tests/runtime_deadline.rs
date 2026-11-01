@@ -74,47 +74,56 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
+        // Synthetic initialization has one bounded end. The runtime deadline
+        // tests below start their own clocks after this scope has been restored;
+        // a slow setup read must not exhaust an implicit 250 ms fallback.
+        let setup_end = Instant::now() + Duration::from_secs(30);
         let root = temp.path().join("private");
         let selected_root = temp.path().join("synthetic-selected");
         std::fs::create_dir(&selected_root).unwrap();
-        let control = SqliteControlStore::create(
+        let control = SqliteControlStore::create_with_deadline(
             &root,
             &id("synthetic-installation"),
             DesiredUpdates::Running,
+            setup_end,
         )
         .unwrap();
-        let selected = control
-            .add_selection(
-                ControlSeq::new(0).unwrap(),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Codex,
-                        locator: CanonicalLocator::from_path(&selected_root).unwrap(),
-                        kind: RootKind::Root,
+        let (selected, background) = control
+            .with_runtime_deadline(setup_end, || {
+                let selected = control.add_selection(
+                    ControlSeq::new(0).unwrap(),
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Codex,
+                            locator: CanonicalLocator::from_path(&selected_root)?,
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(id("synthetic-root")),
+                        now_ms: 1,
                     },
-                    root_identity: Some(id("synthetic-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let background = loop {
-            match ExclusiveGuard::try_acquire(&root, LockKind::Background) {
-                Ok(guard) => break guard,
-                Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
-                    std::thread::yield_now()
+                )?;
+                let lock_end = setup_end.min(Instant::now() + Duration::from_secs(1));
+                let background = loop {
+                    match ExclusiveGuard::try_acquire(&root, LockKind::Background) {
+                        Ok(guard) => break guard,
+                        Err(PortError::WriterBusy(_)) if Instant::now() < lock_end => {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                {
+                    let worker = control.bind_worker(&background, id("synthetic-boot"))?;
+                    control.register_worker(
+                        selected.control_seq,
+                        &worker,
+                        std::process::id(),
+                        2,
+                    )?;
                 }
-                Err(error) => panic!("synthetic guard acquisition failed: {error:?}"),
-            }
-        };
-        {
-            let worker = control
-                .bind_worker(&background, id("synthetic-boot"))
-                .unwrap();
-            control
-                .register_worker(selected.control_seq, &worker, std::process::id(), 2)
-                .unwrap();
-        }
+                Ok((selected, background))
+            })
+            .unwrap();
         let selection = SelectionRevision {
             selection_id: selected.value.id,
             revision: selected.value.revision,
