@@ -1429,14 +1429,23 @@ fn run_cycle(
     })?;
     // A short eligibility check only chooses the plan. Release its permit
     // before any root/source observation; publication must acquire a new one.
-    let epoch_plan_allowed = boot
+    let epoch_plan = boot
         .epoch_permit(
             control,
             end,
             #[cfg(test)]
             &schedule.hooks,
         )
-        .is_ok();
+        .map(drop);
+    #[cfg(test)]
+    if let Err(reason) = epoch_plan {
+        schedule
+            .hooks
+            .epoch_refusals
+            .borrow_mut()
+            .push((EpochSite::Plan, reason));
+    }
+    let epoch_plan_allowed = epoch_plan.is_ok();
     let result = observe_cycle(
         db,
         control,
@@ -1873,6 +1882,19 @@ struct ScheduleTestHooks {
     epoch_lock_prefix: Option<PathBuf>,
     source_phase: std::cell::Cell<SourceAttemptPhase>,
     on_event: Option<RefCell<ScheduleEventHook>>,
+    // Typed refusals in call order. Recording never fails, so it adds no
+    // early return between cycle start and completion.
+    epoch_refusals: RefCell<Vec<(EpochSite, crate::update_state::EpochRefusal)>>,
+}
+
+/// Where the worker asked for an epoch permit.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpochSite {
+    /// The short eligibility check that chooses the cycle plan.
+    Plan,
+    /// The fresh permit before an epoch discovery commit.
+    Commit,
 }
 
 #[cfg(test)]
@@ -2224,6 +2246,46 @@ impl<'a> CycleSchedule<'a> {
             return Some(ScheduledTurn::Attempt(id, SourceLane::Active));
         }
         debt.map(|(id, lane)| ScheduledTurn::Attempt(id, lane))
+    }
+
+    /// Whether `next(now)` would serve an Active attempt, after it retires
+    /// expired turns, without changing any state. It applies the same rules:
+    /// no queued metadata, an unexpired Active turn this slice has not served,
+    /// and Active credit left or no unexpired Cold/Verification debt.
+    fn ready_active(&self, now: Instant) -> bool {
+        if !self.queues[SourceLane::Metadata as usize].is_empty() {
+            return false;
+        }
+        let (queues, turns) = (&self.queues, &self.turns);
+        let live = move |lane: SourceLane| {
+            queues[lane as usize]
+                .iter()
+                .filter(move |(_, id)| now < turns[id].original_end)
+        };
+        let lanes = [
+            SourceLane::Active,
+            SourceLane::Cold,
+            SourceLane::Verification,
+        ];
+        // `next` opens a new slice on its budget or cadence, and again when
+        // every remaining turn was already served in the current slice.
+        let mut slice = self.slice;
+        if self.slice_attempts >= SOURCE_SLICE_ATTEMPTS
+            || now.saturating_duration_since(self.slice_started) >= CADENCE
+        {
+            slice = slice.wrapping_add(1);
+        }
+        if lanes
+            .iter()
+            .flat_map(|&lane| live(lane))
+            .all(|(_, id)| turns[id].last_slice == Some(slice))
+        {
+            slice = slice.wrapping_add(1);
+        }
+        let ready =
+            |lane: SourceLane| live(lane).any(|(_, id)| turns[id].last_slice != Some(slice));
+        let debt = ready(SourceLane::Cold) || ready(SourceLane::Verification);
+        ready(SourceLane::Active) && (self.state.active_attempts < 2 || !debt)
     }
 
     fn started(&mut self, id: &SourceId, lane: SourceLane) -> PortResult<()> {
@@ -3588,6 +3650,8 @@ fn observe_cycle(
     let mut published_sources = BTreeMap::<usize, BTreeSet<SourceId>>::new();
     let mut independent_probe_failures = BTreeSet::new();
     let mut next_demand_poll = None;
+    // Set when this cycle's first source attempt starts.
+    let mut attempt_started = false;
     #[cfg(test)]
     scheduler.state.hooks.event(ScheduleTestEvent::Planned)?;
     loop {
@@ -3633,7 +3697,17 @@ fn observe_cycle(
                 }
             }
         }
-        for id in scheduler.probe_batch(now) {
+        // Registration already queued every source whose enumeration hint
+        // changed. Until this cycle's first attempt starts, serve a ready
+        // Active turn before the probe batch, which can admit up to
+        // SOURCE_HINT_BATCH other sources first. Probing resumes after it with
+        // unchanged budgets, window and rotation.
+        let probes = if !attempt_started && scheduler.ready_active(now) {
+            Vec::new()
+        } else {
+            scheduler.probe_batch(now)
+        };
+        for id in probes {
             let group = shared.get(id.as_str()).ok_or_else(invalid)?;
             #[cfg(test)]
             scheduler
@@ -3730,6 +3804,7 @@ fn observe_cycle(
             continue;
         }
         scheduler.started(&id, lane)?;
+        attempt_started = true;
         if let Some(source) = missing.get(&id) {
             let outcome = observe_missing_source(
                 db,
@@ -4194,17 +4269,24 @@ fn observe_cycle(
                         // The installation lock precedes the catalog writer and
                         // lives through epoch publication. No lock spans the
                         // source observation interval.
-                        let permit = if epoch_candidate {
+                        let attempt = epoch_candidate.then(|| {
                             boot.epoch_permit(
                                 control,
                                 root.original_end,
                                 #[cfg(test)]
                                 &scheduler.state.hooks,
                             )
-                            .ok()
-                        } else {
-                            None
-                        };
+                        });
+                        #[cfg(test)]
+                        if let Some(Err(reason)) = attempt.as_ref() {
+                            scheduler
+                                .state
+                                .hooks
+                                .epoch_refusals
+                                .borrow_mut()
+                                .push((EpochSite::Commit, *reason));
+                        }
+                        let permit = attempt.and_then(Result::ok);
                         if epoch_candidate && permit.is_none() && !all_exact {
                             complete = false;
                             // A baseline is not this cycle's receipt. Preserve
@@ -5327,6 +5409,7 @@ fn acknowledge(
 #[cfg(test)]
 mod control_deadline_tests {
     use super::*;
+    use crate::update_state::EpochRefusal;
     use agent_session_grep_ports::managed::{ProjectionQuery, ProjectionRead};
     use std::{cell::Cell, io::Write, rc::Rc};
 
@@ -5723,6 +5806,7 @@ mod control_deadline_tests {
             epoch_lock_prefix: None,
             source_phase: Cell::new(SourceAttemptPhase::Prepare),
             on_event: Some(RefCell::new(Box::new(hook))),
+            epoch_refusals: RefCell::default(),
         }
     }
 
@@ -5826,6 +5910,14 @@ mod control_deadline_tests {
         assert_eq!(after.cycle_seq, second_cycle.token.cycle_seq.get());
         assert_exact_discovery(&fixture, &second_cycle);
         assert_eq!(std::fs::read(path).unwrap(), original);
+        // Planning refuses each cycle; an exact plan never asks at commit.
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [
+                (EpochSite::Plan, EpochRefusal::Unverified),
+                (EpochSite::Plan, EpochRefusal::Unverified),
+            ]
+        );
     }
 
     #[test]
@@ -5869,6 +5961,10 @@ mod control_deadline_tests {
         });
         schedule.hooks.epoch_lock_prefix = Some(prefix.clone());
         let (refused, cycle) = fixture.ordinary(&mut schedule, &boot);
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Commit, EpochRefusal::Busy)]
+        );
         assert!(!refused.unwrap().catalog_complete);
         assert_eq!(cycle.state, CycleState::Partial);
         let selection = &cycle.selections[0];
@@ -5947,6 +6043,10 @@ mod control_deadline_tests {
 
         let (refused, cycle) = fixture.production_cycle(&mut schedule, &boot);
 
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Commit, EpochRefusal::Busy)]
+        );
         assert!(!refused.unwrap().catalog_complete);
         assert_eq!(cycle.state, CycleState::Partial);
         let selection = &cycle.selections[0];
@@ -6078,6 +6178,10 @@ mod control_deadline_tests {
 
         assert!(outcome.unwrap().all_sources_attempted);
         assert!(exact.get());
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Commit, EpochRefusal::Busy)]
+        );
         assert!(cycle.selections[0].discovery_complete);
         assert_exact_discovery(&fixture, &cycle);
         drop(lock.borrow_mut().take());
@@ -6133,7 +6237,279 @@ mod control_deadline_tests {
         assert!(outcome.unwrap().catalog_complete);
         assert!(published.get());
         assert!(committed.get());
+        assert!(
+            schedule.hooks.epoch_refusals.borrow().is_empty(),
+            "a granted permit records nothing"
+        );
         drop(acquire_installation_lock(&prefix, fixture.scope_end).unwrap());
+    }
+
+    #[test]
+    fn scheduler_plan_refusal_under_a_held_installation_lock_is_recorded_once() {
+        use crate::update_state::acquire_installation_lock;
+
+        let fixture = CycleFixture::new();
+        fixture.write_source("planned.jsonl", SearchProvider::Claude, "plannedexact");
+        let prefix = fixture._temp.path().join("installation");
+        crate::native_autostart::platform::create_private_directory(&prefix).unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let held = acquire_installation_lock(&prefix, fixture.scope_end).unwrap();
+        let mut schedule = SourceScheduleState {
+            hooks: ScheduleTestHooks {
+                epoch_lock_prefix: Some(prefix),
+                ..ScheduleTestHooks::default()
+            },
+            ..SourceScheduleState::default()
+        };
+
+        let (outcome, cycle) = fixture.production_cycle(&mut schedule, &boot);
+
+        assert!(outcome.unwrap().all_sources_attempted);
+        assert_exact_discovery(&fixture, &cycle);
+        // An exact plan never asks again at commit.
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Plan, EpochRefusal::Busy)]
+        );
+        drop(held);
+    }
+
+    /// Probe and attempt events in call order; a probe carries no lane.
+    fn probe_attempt_trace(
+        trace: &Rc<RefCell<Vec<(SourceId, Option<SourceLane>)>>>,
+    ) -> ScheduleTestHooks {
+        let trace = trace.clone();
+        scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), move |event| {
+            match event {
+                ScheduleTestEvent::BeforeProbe(id, _) => {
+                    trace.borrow_mut().push((id.clone(), None))
+                }
+                ScheduleTestEvent::BeforeAttempt(id, _, lane) => {
+                    trace.borrow_mut().push((id.clone(), Some(lane)));
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+
+    fn source_id_named(fixture: &CycleFixture, name: &str) -> SourceId {
+        fixture
+            .sources()
+            .into_iter()
+            .find(|source| source.binding.source_path.ends_with(name))
+            .unwrap()
+            .binding
+            .source_id
+    }
+
+    #[test]
+    fn scheduler_dirty_carry_over_is_served_before_the_cycles_first_probe_batch() {
+        for exact in [false, true] {
+            let fixture = CycleFixture::new();
+            let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "carriedbase");
+            fixture.write_source("aging.jsonl", SearchProvider::Claude, "agingbase");
+            let boot = if exact {
+                ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified)
+            } else {
+                ObservationClock::new(Instant::now())
+            };
+            let mut schedule = SourceScheduleState::default();
+            let (first, _) = fixture.production_cycle(&mut schedule, &boot);
+            assert!(first.unwrap().all_sources_attempted);
+            let hot_id = source_id_named(&fixture, "hot.jsonl");
+            // Dirtied after its last service in cycle N.
+            append_record(&hot, SearchProvider::Claude, "carried", "carriedappend");
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            schedule.hooks = probe_attempt_trace(&trace);
+            // Cycle N's probe window must not hide the first batch of N+1.
+            schedule.next_probe = None;
+
+            let (second, _) = fixture.production_cycle(&mut schedule, &boot);
+
+            assert!(second.unwrap().catalog_complete, "exact={exact}");
+            let order = trace.borrow();
+            assert_eq!(
+                order.first(),
+                Some(&(hot_id, Some(SourceLane::Active))),
+                "exact={exact}: the carried attempt precedes every probe: {order:?}"
+            );
+            assert!(
+                order[1..].iter().any(|(_, lane)| lane.is_none()),
+                "exact={exact}: probing resumes after the first attempt: {order:?}"
+            );
+            assert_eq!(fixture.hits("carriedappend"), 1);
+            let refusals = schedule.hooks.epoch_refusals.borrow();
+            if exact {
+                assert_eq!(*refusals, [(EpochSite::Plan, EpochRefusal::Unverified)]);
+            } else {
+                assert!(refusals.is_empty(), "granted permits record nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_carried_two_active_credit_keeps_debt_and_probe_batch_first() {
+        let fixture = CycleFixture::new();
+        let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "creditbase");
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::new(Instant::now());
+        let (first, _) = fixture.production_cycle(&mut schedule, &boot);
+        assert!(first.unwrap().all_sources_attempted);
+        let hot_id = source_id_named(&fixture, "hot.jsonl");
+        append_record(&hot, SearchProvider::Claude, "credit", "creditappend");
+        fixture.write_source("cold.jsonl", SearchProvider::Claude, "colddebt");
+        // The state a cycle leaves after two Active attempts while debt was
+        // still owed; active_attempts survives rollover unchanged.
+        schedule.active_attempts = 2;
+        schedule.next_probe = None;
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        schedule.hooks = probe_attempt_trace(&trace);
+
+        let (second, _) = fixture.production_cycle(&mut schedule, &boot);
+
+        assert!(second.unwrap().catalog_complete);
+        let order = trace.borrow();
+        let attempts = order
+            .iter()
+            .filter_map(|(id, lane)| lane.map(|lane| (id.clone(), lane)))
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2, "{order:?}");
+        assert_eq!(
+            attempts[0].1,
+            SourceLane::Cold,
+            "debt goes first: {order:?}"
+        );
+        assert_eq!(attempts[1], (hot_id.clone(), SourceLane::Active));
+        // Without a ready Active turn the probe batch keeps its place.
+        assert_eq!(order.first(), Some(&(hot_id, None)), "{order:?}");
+    }
+
+    #[test]
+    fn scheduler_pause_or_epoch_change_fails_the_carried_attempt_at_admission() {
+        for change in ["pause", "revoke"] {
+            let fixture = CycleFixture::new();
+            let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "revokedbase");
+            let mut schedule = SourceScheduleState::default();
+            let boot = ObservationClock::new(Instant::now());
+            let (first, _) = fixture.production_cycle(&mut schedule, &boot);
+            assert!(first.unwrap().all_sources_attempted);
+            let hot_id = source_id_named(&fixture, "hot.jsonl");
+            append_record(&hot, SearchProvider::Claude, "revoked", "revokedappend");
+            let receipts = || -> i64 {
+                rusqlite::Connection::open(&fixture.db)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM source_revision_receipts", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            let before = receipts();
+            let installation =
+                fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+            let control = SqliteControlStore::open_existing_writable(
+                fixture.db.parent().unwrap(),
+                &installation.installation_id,
+            )
+            .unwrap();
+            let selection = fixture.selection.id.clone();
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            schedule.next_probe = None;
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let trace = trace.clone();
+                move |event| {
+                    match event {
+                        ScheduleTestEvent::BeforeProbe(..) => trace.borrow_mut().push("probe"),
+                        ScheduleTestEvent::BeforeParse(..) => trace.borrow_mut().push("parse"),
+                        ScheduleTestEvent::BeforeAttempt(id, _, lane) => {
+                            assert_eq!((id, lane), (&hot_id, SourceLane::Active));
+                            trace.borrow_mut().push("attempt");
+                            control_change(&control, |seq| match change {
+                                "pause" => control
+                                    .set_desired_updates(seq, DesiredUpdates::Paused)
+                                    .map(|_| ()),
+                                _ => control
+                                    .revoke_selection(seq, &selection, None, 4)
+                                    .map(|_| ()),
+                            })
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            });
+
+            let (refused, cycle) = fixture.production_cycle(&mut schedule, &boot);
+
+            assert!(
+                matches!(refused, Err(PortError::SnapshotChanged(_))),
+                "{change}: {refused:?}"
+            );
+            assert_eq!(cycle.state, CycleState::Aborted, "{change}");
+            assert_eq!(
+                *trace.borrow(),
+                ["attempt"],
+                "{change}: no capture or parse"
+            );
+            assert_eq!(receipts(), before, "{change}");
+        }
+    }
+
+    #[test]
+    fn scheduler_ready_active_matches_next_across_carried_credit_and_expiry() {
+        let mut state = SourceScheduleState::default();
+        let end = Instant::now() + Duration::from_secs(30);
+        let ids = ["hot-a", "hot-b", "hot-c", "cold-a"].map(|id| SourceId::parse(id).unwrap());
+        let lanes = [
+            SourceLane::Active,
+            SourceLane::Active,
+            SourceLane::Active,
+            SourceLane::Cold,
+        ];
+        {
+            let mut cycle = CycleSchedule::new(&mut state);
+            for (id, lane) in ids.iter().zip(lanes) {
+                cycle.add(id, None, lane, end, false).unwrap();
+            }
+            for served in &ids[..2] {
+                assert!(cycle.ready_active(Instant::now()));
+                let Some(ScheduledTurn::Attempt(id, SourceLane::Active)) =
+                    cycle.next(Instant::now())
+                else {
+                    panic!("ready Active turn was not served");
+                };
+                assert_eq!(&id, served);
+                cycle.started(&id, SourceLane::Active).unwrap();
+            }
+            // Two Active attempts while Cold debt is owed: credit is spent.
+            assert!(!cycle.ready_active(Instant::now()));
+            assert!(matches!(
+                cycle.next(Instant::now()),
+                Some(ScheduledTurn::Attempt(_, SourceLane::Cold))
+            ));
+            // End the cycle with that debt unserved.
+            while cycle.next(end).is_some() {}
+        }
+        assert_eq!(state.active_attempts, 2);
+        let mut cycle = CycleSchedule::new(&mut state);
+        for (id, lane) in ids.iter().zip(lanes) {
+            cycle.add(id, None, lane, end + CADENCE, false).unwrap();
+        }
+        // The carried credit keeps the first turn of the next cycle as debt.
+        assert!(!cycle.ready_active(Instant::now()));
+        let Some(ScheduledTurn::Attempt(id, lane)) = cycle.next(Instant::now()) else {
+            panic!("owed debt was not served");
+        };
+        assert_eq!((&id, lane), (&ids[3], SourceLane::Cold));
+        cycle.started(&id, lane).unwrap();
+        assert!(cycle.ready_active(Instant::now()));
+        assert!(matches!(
+            cycle.next(Instant::now()),
+            Some(ScheduledTurn::Attempt(_, SourceLane::Active))
+        ));
+        // Expired Active work is retired by next, never served as ready.
+        assert!(!cycle.ready_active(end + CADENCE));
     }
 
     #[test]
