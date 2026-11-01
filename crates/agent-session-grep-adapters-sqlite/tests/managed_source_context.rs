@@ -1536,18 +1536,22 @@ struct FacadeFixture {
 }
 impl FacadeFixture {
     fn new(provider: SearchProvider) -> Self {
-        let setup_end = deadline();
+        Self::new_with_setup_observer(provider, |_, _| {})
+    }
+    fn new_with_setup_observer(
+        provider: SearchProvider,
+        observe_setup: impl FnOnce(Instant, Instant),
+    ) -> Self {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("owned-private");
         let catalog = root.join("catalog.db");
         let surface = CanonicalLocator::from_path(temp.path()).unwrap();
-        let control = SqliteControlStore::create_with_deadline(
-            &root,
-            &cid("installation"),
-            DesiredUpdates::Running,
-            setup_end,
-        )
-        .unwrap();
+        let control =
+            SqliteControlStore::create(&root, &cid("installation"), DesiredUpdates::Running)
+                .unwrap();
+        let creation_finished = Instant::now();
+        let setup_end = deadline();
+        observe_setup(creation_finished, setup_end);
         let (selection, lock, cycle) = prepare(&control, setup_end, |end| {
             assert_preparation_end(end);
             let selection = control
@@ -1663,6 +1667,44 @@ impl FacadeFixture {
     fn scalar(&self, sql: &str) -> i64 {
         scalar(&Connection::open(&self.catalog).unwrap(), sql)
     }
+}
+#[test]
+fn facade_fixture_creation_precedes_setup_and_restores_outer_scope() {
+    let calls = std::cell::Cell::new(0);
+    let f = FacadeFixture::new_with_setup_observer(
+        SearchProvider::Claude,
+        |creation_finished, setup_end| {
+            calls.set(calls.get() + 1);
+            assert!(setup_end >= creation_finished + Duration::from_secs(10));
+            let probe = setup_end + Duration::from_secs(30);
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+        },
+    );
+    assert_eq!(calls.get(), 1);
+    let outer = deadline();
+    let probe = outer + Duration::from_secs(30);
+    f.control
+        .with_runtime_deadline(outer, || {
+            let nested = FacadeFixture::new_with_setup_observer(
+                SearchProvider::Claude,
+                |creation_finished, setup_end| {
+                    calls.set(calls.get() + 1);
+                    assert!(setup_end >= creation_finished + Duration::from_secs(10));
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(setup_end),
+                        outer
+                    );
+                },
+            );
+            assert_eq!(calls.get(), 2);
+            assert_preparation_end(outer);
+            let status = nested.control.status()?;
+            assert_eq!(status.policy.selections, vec![nested.selection.clone()]);
+            assert_eq!(status.desired_updates, DesiredUpdates::Running);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
 }
 #[test]
 fn facade_fixture_preparation_keeps_one_end_and_restores_outer_scope() {
