@@ -988,11 +988,31 @@ fn relevant_providers(
     Ok(providers)
 }
 
+/// Poll interval shared by latest admission retries and the latest wait loop.
+const LATEST_POLL: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+type AdmissionFault = Box<dyn FnMut(&SqliteControlStore) -> Option<PortError>>;
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_FAULT: std::cell::RefCell<Option<AdmissionFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only hook run after each status validation and before the real CAS,
+/// so a test can lose that race deterministically instead of timing a writer.
+#[cfg(test)]
+fn admission_fault(control: &SqliteControlStore) -> Option<PortError> {
+    ADMISSION_FAULT.with(|slot| slot.borrow_mut().as_mut().and_then(|hook| hook(control)))
+}
+
 fn admit_latest(
     control: &SqliteControlStore,
     initial: &ControlStatus,
     providers: &[SearchProvider],
     wait: u32,
+    wait_deadline: Instant,
     deadline: Instant,
 ) -> Result<(Option<LatestBarrier>, Option<&'static str>), CliError> {
     let mut selections = Vec::new();
@@ -1013,7 +1033,14 @@ fn admit_latest(
     if selections.is_empty() {
         return Ok((None, Some("scope_unverified")));
     }
-    for _ in 0..3 {
+    // A worker heartbeat advances control_seq between the status read and the
+    // CAS, so a lost race is contention, never a refusal. Retry it through the
+    // request's own latest wait; stopping at that end leaves the request
+    // deadline for the busy read that follows.
+    // Preserve the original three immediate attempts even when the wait is
+    // zero or already elapsed. Only subsequent attempts need a polling delay.
+    let mut immediate_retries = 2;
+    loop {
         check_deadline(deadline)?;
         let current = control
             .with_runtime_deadline(deadline, || control.status())
@@ -1024,6 +1051,10 @@ fn admit_latest(
             return Ok((None, Some("policy_changed")));
         }
         match control.with_runtime_deadline(deadline, || {
+            #[cfg(test)]
+            if let Some(error) = admission_fault(control) {
+                return Err(error);
+            }
             control.admit_latest(
                 current.policy.control_seq,
                 LatestRequest {
@@ -1042,8 +1073,16 @@ fn admit_latest(
             Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)) => {}
             Err(error) => return Err(private_port(error)),
         }
+        if immediate_retries > 0 {
+            immediate_retries -= 1;
+            continue;
+        }
+        let remaining = wait_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok((None, Some("busy")));
+        }
+        std::thread::sleep(LATEST_POLL.min(remaining));
     }
-    Ok((None, Some("busy")))
 }
 
 #[derive(Clone, Copy)]
@@ -1157,12 +1196,12 @@ fn execute(
     // Both ordinary disclosure and latest admission have the same provider
     // relevance. Project/time predicates cannot exclude unknown new sources.
     let providers = relevant_providers(&store, &control, request, deadline)?;
+    let wait_deadline = started + Duration::from_millis(u64::from(request.latest.unwrap_or(0)));
     let (barrier, blocked) = if let Some(wait) = request.latest {
-        admit_latest(&control, &status, &providers, wait, deadline)?
+        admit_latest(&control, &status, &providers, wait, wait_deadline, deadline)?
     } else {
         (None, None)
     };
-    let wait_deadline = started + Duration::from_millis(u64::from(request.latest.unwrap_or(0)));
     let result = loop {
         check_deadline(deadline)?;
         let current = transient(&control, deadline, || {
@@ -1337,7 +1376,7 @@ fn execute(
             break result?;
         }
         let remaining = wait_deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(Duration::from_millis(25).min(remaining));
+        std::thread::sleep(LATEST_POLL.min(remaining));
     };
     drop(store);
     let current = transient(&control, deadline, || {
@@ -2233,5 +2272,203 @@ mod transient_read_tests {
         // allow one more attempt, never a wait to the request deadline.
         assert!(attempts <= 3, "fenced refusal retried {attempts} times");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod latest_admission_tests {
+    use super::*;
+    use agent_session_grep_ports::control::{
+        CanonicalLocator, RootKind, ScopeRegion, SelectionRequest,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    // Field order is drop order: the control store closes before the tempdir.
+    struct Fixture {
+        // Held for the whole test: a live worker owns the Background lock.
+        _lock: ExclusiveGuard,
+        control: SqliteControlStore,
+        histories: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    fn select(control: &SqliteControlStore, root: &Path, name: &str) {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let path = path.canonicalize().unwrap();
+        control
+            .add_selection(
+                control.status().unwrap().policy.control_seq,
+                SelectionRequest {
+                    region: ScopeRegion {
+                        provider: SearchProvider::Claude,
+                        locator: CanonicalLocator::from_path(&path).unwrap(),
+                        kind: RootKind::Root,
+                    },
+                    root_identity: Some(RootIdentity::read(&path).unwrap().control_id()),
+                    now_ms: crate::app_clock_ms(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// A registered worker and one selected root: an uncontended latest
+    /// admission queues a barrier.
+    fn fixture() -> Fixture {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let control = SqliteControlStore::create(
+            &root,
+            &ControlId::parse("unit-latest-installation").unwrap(),
+            DesiredUpdates::Running,
+        )
+        .unwrap();
+        select(&control, temp.path(), "history");
+        let lock = ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap();
+        {
+            let worker = control
+                .bind_worker(&lock, ControlId::parse("unit-latest-boot").unwrap())
+                .unwrap();
+            control
+                .register_worker(
+                    control.status().unwrap().policy.control_seq,
+                    &worker,
+                    std::process::id(),
+                    crate::app_clock_ms(),
+                )
+                .unwrap();
+        }
+        Fixture {
+            _lock: lock,
+            control,
+            histories: temp.path().to_path_buf(),
+            _temp: temp,
+        }
+    }
+
+    fn admit(
+        fixture: &Fixture,
+        hook: AdmissionFault,
+        wait_ms: u32,
+    ) -> (Option<LatestBarrier>, Option<&'static str>) {
+        let initial = fixture.control.status().unwrap();
+        ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = Some(hook));
+        let wait_deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
+        let result = admit_latest(
+            &fixture.control,
+            &initial,
+            &[],
+            wait_ms,
+            wait_deadline,
+            Instant::now() + Duration::from_secs(60),
+        );
+        ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = None);
+        result.unwrap()
+    }
+
+    #[test]
+    fn admission_outlasts_more_than_three_lost_cas_races() {
+        let fixture = fixture();
+        let calls = Rc::new(Cell::new(0_u32));
+        let seen = Rc::clone(&calls);
+        // Heartbeats win the race six times in a row, then the real CAS runs.
+        let hook: AdmissionFault = Box::new(move |_: &SqliteControlStore| {
+            seen.set(seen.get() + 1);
+            match seen.get() {
+                n @ 1..=6 if n % 2 == 1 => {
+                    Some(PortError::GenerationMismatch("synthetic heartbeat".into()))
+                }
+                1..=6 => Some(PortError::WriterBusy("synthetic heartbeat".into())),
+                _ => None,
+            }
+        });
+        let (barrier, blocked) = admit(&fixture, hook, 30_000);
+        assert_eq!(blocked, None);
+        assert!(
+            barrier.is_some(),
+            "the seventh attempt queues a real barrier"
+        );
+        // The barrier retains the requested service window, not the client's
+        // remaining wait after contention, as the CLI barrier suites require.
+        assert_eq!(barrier.unwrap().requested_wait_ms, 30_000);
+        // Every attempt re-read and re-validated status before its CAS.
+        assert_eq!(calls.get(), 7);
+    }
+
+    #[test]
+    fn zero_wait_keeps_three_immediate_admission_attempts() {
+        let fixture = fixture();
+        let calls = Rc::new(Cell::new(0_u32));
+        let seen = Rc::clone(&calls);
+        // No wait remains: two lost races, then the third attempt queues.
+        let hook: AdmissionFault = Box::new(move |_: &SqliteControlStore| {
+            seen.set(seen.get() + 1);
+            match seen.get() {
+                1 => Some(PortError::GenerationMismatch("synthetic heartbeat".into())),
+                2 => Some(PortError::WriterBusy("synthetic heartbeat".into())),
+                _ => None,
+            }
+        });
+        let (barrier, blocked) = admit(&fixture, hook, 0);
+        assert_eq!(blocked, None);
+        assert!(barrier.is_some(), "the third immediate attempt queues");
+        assert_eq!(barrier.unwrap().requested_wait_ms, 0);
+        assert_eq!(calls.get(), 3);
+        // Lasting contention with no wait left answers busy only after the
+        // same three immediate attempts.
+        let calls = Rc::new(Cell::new(0_u32));
+        let seen = Rc::clone(&calls);
+        let hook: AdmissionFault = Box::new(move |_: &SqliteControlStore| {
+            seen.set(seen.get() + 1);
+            Some(PortError::WriterBusy("synthetic lasting writer".into()))
+        });
+        let (barrier, blocked) = admit(&fixture, hook, 0);
+        assert_eq!(blocked, Some("busy"));
+        assert!(barrier.is_none());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn lasting_writer_contention_answers_busy_at_the_wait_end_without_spinning() {
+        let fixture = fixture();
+        let calls = Rc::new(Cell::new(0_u32));
+        let seen = Rc::clone(&calls);
+        let hook: AdmissionFault = Box::new(move |_: &SqliteControlStore| {
+            seen.set(seen.get() + 1);
+            Some(PortError::WriterBusy("synthetic lasting writer".into()))
+        });
+        let wait_ms = 200;
+        let wait = Duration::from_millis(u64::from(wait_ms));
+        // The helper starts its wait later, so this bounds its end from below.
+        let floor = Instant::now() + wait;
+        let (barrier, blocked) = admit(&fixture, hook, wait_ms);
+        assert_eq!(blocked, Some("busy"));
+        assert!(barrier.is_none());
+        // Busy is returned only once the monotonic clock reached the wait end.
+        assert!(Instant::now() >= floor, "busy before the wait end");
+        // Three immediate attempts, then one per poll interval (sleep never
+        // returns early): about eleven in 200 ms; a spin would take thousands.
+        let polls = u32::try_from(wait.as_millis() / LATEST_POLL.as_millis()).unwrap();
+        assert!(calls.get() <= 4 * polls, "spun {} attempts", calls.get());
+    }
+
+    #[test]
+    fn policy_change_during_retries_still_answers_policy_changed() {
+        let fixture = fixture();
+        let histories = fixture.histories.clone();
+        let calls = Rc::new(Cell::new(0_u32));
+        let seen = Rc::clone(&calls);
+        // The race is lost to a selection change that bumps the policy epoch.
+        let hook: AdmissionFault = Box::new(move |control: &SqliteControlStore| {
+            seen.set(seen.get() + 1);
+            (seen.get() == 1).then(|| {
+                select(control, &histories, "second");
+                PortError::GenerationMismatch("synthetic selection change".into())
+            })
+        });
+        let (barrier, blocked) = admit(&fixture, hook, 30_000);
+        assert_eq!(blocked, Some("policy_changed"));
+        assert!(barrier.is_none());
+        assert_eq!(calls.get(), 1, "the retry re-read status before any CAS");
     }
 }

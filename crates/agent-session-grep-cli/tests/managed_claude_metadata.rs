@@ -211,11 +211,11 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    // Production `--latest` admits once and returns on the first reason other
-    // than timeout, so a transient worker Busy, Deferred or SourceChanged ends
-    // that request early. Re-admit a fresh request for only those reasons,
-    // inside one original end; this proves eventual correctness only, never the
-    // contended latest success rate. Any other reason fails at once.
+    // One `--latest` request waits out admission contention and a live worker
+    // Busy or Deferred advisory within its own wait, so either reason here is
+    // a defect. SourceChanged still ends its barrier; only that reason
+    // re-admits a fresh request inside one original end. Any other reason
+    // fails at once.
     let latest_end = Instant::now() + Duration::from_secs(10);
     let mut attempts = 0_u32;
     let mut transient: Vec<String> = Vec::new();
@@ -249,7 +249,7 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
             break search;
         }
         let reason = freshness["reason"].as_str().unwrap_or("missing").to_owned();
-        if !matches!(reason.as_str(), "busy" | "deferred" | "source_changed") {
+        if reason != "source_changed" {
             diagnose_latest_failure(&db);
             panic!(
                 "synthetic metadata latest failed: attempts={attempts}, \
