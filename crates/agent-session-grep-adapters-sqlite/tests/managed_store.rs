@@ -25,6 +25,32 @@ fn id(s: &str) -> ControlId {
 fn current(c: &SqliteControlStore) -> ControlSeq {
     c.status().unwrap().policy.control_seq
 }
+fn prepare<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    operation: impl FnOnce() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    let active_end = SqliteControlStore::effective_runtime_deadline(end);
+    let probe = end + Duration::from_secs(5);
+    let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = control.with_runtime_deadline(end, || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            active_end
+        );
+        let result = operation();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            active_end
+        );
+        result
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous_end
+    );
+    result
+}
 fn entity(kind: IdKind) -> StableId {
     StableId::native_checked(kind, "shared-fixture").unwrap()
 }
@@ -57,43 +83,46 @@ impl Fixture {
         let control =
             SqliteControlStore::create(&root, &id("fixture-installation"), DesiredUpdates::Running)
                 .unwrap();
-        let selected = control
-            .add_selection(
-                current(&control),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: CanonicalLocator::from_path(temp.path()).unwrap(),
-                        kind: RootKind::Root,
+        let preparation_end = Instant::now() + Duration::from_secs(5);
+        let (selected, worker_lock, cycle) = prepare(&control, preparation_end, || {
+            let selected = control
+                .add_selection(
+                    current(&control),
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Claude,
+                            locator: CanonicalLocator::from_path(temp.path()).unwrap(),
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(id("source-root")),
+                        now_ms: 1,
                     },
-                    root_identity: Some(id("source-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap()
-            .value;
-        let worker_lock = acquire(&root, LockKind::Background);
-        let worker = control.bind_worker(&worker_lock, id("boot-one")).unwrap();
-        control
-            .register_worker(current(&control), &worker, 1, 1)
-            .unwrap();
-        let revision = SelectionRevision {
-            selection_id: selected.id.clone(),
-            revision: selected.revision,
-            root_identity: id("source-root"),
-        };
-        let cycle = match control
-            .queue_cycle(current(&control), vec![revision])
-            .unwrap()
-            .value
-        {
-            CycleAdmission::Queued(c) => c,
-            _ => panic!("expected cycle"),
-        };
-        let cycle = control
-            .start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)
-            .unwrap()
-            .value;
+                )?
+                .value;
+            let worker_lock = acquire(&root, LockKind::Background);
+            let worker = control.bind_worker(&worker_lock, id("boot-one"))?;
+            control.register_worker(current(&control), &worker, 1, 1)?;
+            let revision = SelectionRevision {
+                selection_id: selected.id.clone(),
+                revision: selected.revision,
+                root_identity: id("source-root"),
+            };
+            let cycle = match control
+                .queue_cycle(current(&control), vec![revision])?
+                .value
+            {
+                CycleAdmission::Queued(c) => c,
+                _ => panic!("expected cycle"),
+            };
+            let token = cycle.token.clone();
+            let cycle = control
+                .start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)?
+                .value;
+            assert_eq!(cycle.token, token);
+            drop(worker);
+            Ok((selected, worker_lock, cycle))
+        })
+        .unwrap();
         let observation = SourceObservation {
             binding: SourceBinding {
                 source_id: SourceId::parse("source-one").unwrap(),
@@ -120,7 +149,6 @@ impl Fixture {
             }],
             repositories: Vec::new(),
         };
-        drop(worker);
         Self {
             _temp: temp,
             root,
@@ -131,7 +159,13 @@ impl Fixture {
         }
     }
     fn create(&self) -> ManagedStore {
-        ManagedStore::create(&self.catalog, &self.control, id("catalog-one"), 1).unwrap()
+        self.create_with_deadline(Instant::now() + Duration::from_secs(5))
+            .unwrap()
+    }
+    fn create_with_deadline(&self, end: Instant) -> Result<ManagedStore, PortError> {
+        prepare(&self.control, end, || {
+            ManagedStore::create(&self.catalog, &self.control, id("catalog-one"), 1)
+        })
     }
     fn batch(&self, text: &str) -> SourceBatch {
         SourceBatch {
@@ -149,6 +183,110 @@ impl Fixture {
             .query_row(sql, [], |r| r.get(0))
             .unwrap()
     }
+}
+
+#[test]
+fn fixture_preparation_keeps_one_cycle_and_restores_the_callers_end() {
+    let f = Fixture::new();
+    let outer_end = Instant::now() + Duration::from_secs(5);
+    let requested_end = outer_end + Duration::from_secs(5);
+    let probe = requested_end + Duration::from_secs(5);
+    let before = prepare(&f.control, outer_end, || {
+        let status = f.control.status()?;
+        assert_eq!(status.policy.control_seq.get(), 4);
+        assert_eq!(status.policy.policy_epoch.get(), 1);
+        assert_eq!(status.policy.selections.len(), 1);
+        let background = f.control.background_status()?;
+        assert_eq!(background.next_cycle_seq.get(), 2);
+        let cycle = f.control.cycle(CycleSeq::new(f.observation.cycle_seq)?)?;
+        assert_eq!(cycle.state, CycleState::Observing);
+        assert_eq!(cycle.token.worker_boot_id, id("boot-one"));
+        assert_eq!(
+            cycle.started_control_seq.unwrap().get(),
+            f.observation.started_control_seq
+        );
+        Ok((status, background, cycle))
+    })
+    .unwrap();
+    let store = f
+        .control
+        .with_runtime_deadline(outer_end, || {
+            let store = f.create_with_deadline(requested_end)?;
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                outer_end
+            );
+            Ok(store)
+        })
+        .unwrap();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(f.scalar("SELECT count(*) FROM catalog_meta"), 1);
+    assert_eq!(f.scalar("SELECT count(*) FROM index_batches"), 0);
+    assert!(matches!(
+        f.create_with_deadline(requested_end),
+        Err(PortError::WriterBusy(reason)) if reason == "writer lease is already held"
+    ));
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    drop(store);
+    let after = prepare(&f.control, requested_end, || {
+        Ok((
+            f.control.status()?,
+            f.control.background_status()?,
+            f.control.cycle(CycleSeq::new(f.observation.cycle_seq)?)?,
+        ))
+    })
+    .unwrap();
+    assert_eq!(after, before, "create must not replay control preparation");
+}
+
+#[test]
+fn fixture_preparation_refuses_expiry_and_does_not_retry_or_leak_a_scope() {
+    let f = Fixture::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    let probe = end + Duration::from_secs(5);
+    let mut calls = 0;
+    let refused = prepare(&f.control, end, || {
+        calls += 1;
+        let _ = f.control.status()?;
+        Err::<(), _>(PortError::WriterBusy("synthetic fixture refusal".into()))
+    });
+    assert!(
+        matches!(refused, Err(PortError::WriterBusy(reason)) if reason == "synthetic fixture refusal")
+    );
+    assert_eq!(calls, 1, "a failed preparation must not be retried");
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    let files = || {
+        let mut names = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = files();
+    assert!(matches!(
+        f.create_with_deadline(Instant::now() - Duration::from_millis(1)),
+        Err(PortError::WriterBusy(reason)) if reason == "control runtime deadline reached"
+    ));
+    assert_eq!(files(), before, "expired create must leave no intent or DB");
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = prepare::<()>(&f.control, end, || {
+            calls += 1;
+            panic!("synthetic fixture preparation unwind");
+        });
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(calls, 2);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(
+        prepare(&f.control, end, || f.control.status())
+            .unwrap()
+            .policy
+            .control_seq
+            .get(),
+        4
+    );
 }
 
 #[test]

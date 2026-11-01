@@ -61,6 +61,32 @@ fn acquire(root: &Path, kind: LockKind) -> ExclusiveGuard {
 fn entity(kind: IdKind) -> StableId {
     StableId::native_checked(kind, "shared-purge-fixture").unwrap()
 }
+fn create_catalog(
+    catalog: &Path,
+    control: &SqliteControlStore,
+    fixture_end: Instant,
+) -> Result<ManagedStore, PortError> {
+    let active_end = SqliteControlStore::effective_runtime_deadline(fixture_end);
+    let probe = fixture_end + Duration::from_secs(5);
+    let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = control.with_runtime_deadline(fixture_end, || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            active_end
+        );
+        let result = ManagedStore::create(catalog, control, id("catalog"), 1);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            active_end
+        );
+        result
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous_end
+    );
+    result
+}
 struct Fixture {
     root: PathBuf,
     catalog: PathBuf,
@@ -106,7 +132,7 @@ impl Fixture {
         };
         let selection_a = select(&source_a);
         let selection_b = select(&source_b);
-        let store = ManagedStore::create(&catalog, &control, id("catalog"), 1).unwrap();
+        let store = create_catalog(&catalog, &control, fixture_end).unwrap();
         drop(store);
         let background = acquire(&root, LockKind::Background);
         let worker = control
@@ -252,6 +278,76 @@ impl Fixture {
             .unwrap()
     }
 }
+#[test]
+fn fixture_create_uses_its_existing_end_once_and_restores_admission_after_refusal() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().join("private");
+    let catalog = root.join("catalog.db");
+    let control =
+        SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running).unwrap();
+    let fixture_end = Instant::now() + Duration::from_secs(30);
+    let outer_end = fixture_end - Duration::from_secs(5);
+    let probe = fixture_end + Duration::from_secs(5);
+    let before = control
+        .with_runtime_deadline(fixture_end, || control.status())
+        .unwrap();
+    let files = || {
+        let mut names = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let files_before = files();
+    assert!(matches!(
+        create_catalog(
+            &catalog,
+            &control,
+            Instant::now() - Duration::from_millis(1)
+        ),
+        Err(PortError::WriterBusy(reason)) if reason == "control runtime deadline reached"
+    ));
+    assert_eq!(files(), files_before);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    let store = control
+        .with_runtime_deadline(outer_end, || {
+            let store = create_catalog(&catalog, &control, fixture_end)?;
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                outer_end
+            );
+            Ok(store)
+        })
+        .unwrap();
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert!(matches!(
+        create_catalog(&catalog, &control, fixture_end),
+        Err(PortError::WriterBusy(reason)) if reason == "writer lease is already held"
+    ));
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    drop(store);
+    let conn = Connection::open(&catalog).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM catalog_meta", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM index_batches", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let after = control
+        .with_runtime_deadline(fixture_end, || control.status())
+        .unwrap();
+    assert_eq!(after, before, "catalog admission must not mutate control");
+    drop(create_catalog(&catalog, &control, fixture_end).unwrap());
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+}
+
 #[test]
 fn paused_purge_removes_withdrawn_source_preserves_shared_allowed_original_and_deny() {
     let f = Fixture::new();
