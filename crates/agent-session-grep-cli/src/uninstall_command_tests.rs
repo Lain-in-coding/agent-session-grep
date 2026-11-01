@@ -1134,16 +1134,63 @@ fn new_inventory_binding_is_checked_and_legacy_remains_unclassified() {
 #[test]
 fn pending_purge_retains_keep_data_policy_jobs_and_catalog() {
     let fixture = Fixture::new();
-    let selection = control_status(&fixture.control).policy.selections[0]
-        .id
-        .clone();
-    let sequence = control_status(&fixture.control).policy.control_seq;
-    fixture
+    // Prepare the pending job once under one explicit end. This scope must
+    // finish before the journal and cleanup start their existing budgets.
+    let preparation_end = deadline();
+    let probe_end = preparation_end + Duration::from_secs(5);
+    let mut revoke_calls = 0;
+    let mut prepare = || -> Result<(ReadPolicy, Vec<PurgeJob>), PortError> {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        let status = fixture.control.status()?;
+        let selection = &status.policy.selections[0];
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        revoke_calls += 1;
+        let revoked =
+            fixture
+                .control
+                .revoke_selection(status.policy.control_seq, &selection.id, None, 50)?;
+        assert!(revoked.changed);
+        assert_eq!(
+            revoked.control_seq.get(),
+            status.policy.control_seq.get() + 1
+        );
+        assert_eq!(
+            revoked.policy_epoch.get(),
+            status.policy.policy_epoch.get() + 1
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        let policy = fixture.control.status()?.policy;
+        let jobs = fixture.control.purge_jobs()?;
+        assert_eq!(policy.control_seq, revoked.control_seq);
+        assert_eq!(policy.policy_epoch, revoked.policy_epoch);
+        assert_eq!(policy.revocations, [revoked.value.intent]);
+        assert_eq!(jobs, [revoked.value.purge_job]);
+        assert_eq!(jobs[0].state, PurgeState::Pending);
+        assert_eq!(jobs[0].attempts.get(), 0);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            preparation_end
+        );
+        Ok((policy, jobs))
+    };
+    let (before, jobs) = fixture
         .control
-        .revoke_selection(sequence, &selection, None, 50)
+        .with_runtime_deadline(preparation_end, &mut prepare)
         .unwrap();
-    let before = control_status(&fixture.control).policy;
-    let jobs = fixture.control.purge_jobs().unwrap();
+    assert_eq!(revoke_calls, 1);
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe_end),
+        probe_end
+    );
     let mut journal = fixture.fenced_journal(true);
     cleanup_data(&fixture.control, &mut journal, None, deadline()).unwrap();
     let after = control_status(&fixture.control).policy;
