@@ -8582,7 +8582,153 @@ mod control_deadline_tests {
         drop(conn);
         drop(lock.borrow_mut().take());
         schedule.hooks = ScheduleTestHooks::default();
-        let (repaid, repaid_cycle) = fixture.production_cycle(&mut schedule, &boot);
+        fn error_class(error: &PortError) -> &'static str {
+            match error {
+                PortError::WriterBusy(_) => "writer_busy",
+                PortError::DeadlineExceeded(_) => "deadline_exceeded",
+                PortError::InvalidRequest(_) => "invalid_request",
+                PortError::GenerationMismatch(_) => "generation_mismatch",
+                PortError::Backend(_) => "backend",
+                PortError::SourceIo(_) => "source_io",
+                PortError::SchemaIncompatible(_) => "schema_incompatible",
+                PortError::NotFound(_) => "not_found",
+                PortError::SnapshotChanged(_) => "snapshot_changed",
+            }
+        }
+        let diagnostic_started = Instant::now();
+        let events = Rc::new(RefCell::new(([None; 16], 0_usize)));
+        let observed_events = events.clone();
+        schedule.hooks.on_event = Some(RefCell::new(Box::new(move |event| {
+            let (kind, error) = match event {
+                ScheduleTestEvent::Planned => ("planned", None),
+                ScheduleTestEvent::BeforeAttempt(..) => ("before_attempt", None),
+                ScheduleTestEvent::Published(..) => ("published", None),
+                ScheduleTestEvent::SourceFailed { error, .. } => {
+                    ("source_failed", Some(error_class(error)))
+                }
+                ScheduleTestEvent::Finalizing => ("finalizing", None),
+                ScheduleTestEvent::BeforeDiscoveryPublication { .. } => ("before_discovery", None),
+                ScheduleTestEvent::AfterDiscoveryPublication { .. } => ("after_discovery", None),
+                ScheduleTestEvent::BeforeCompletion => ("before_completion", None),
+                ScheduleTestEvent::BeforeIdleValidation => ("before_idle_validation", None),
+                ScheduleTestEvent::BeforeIdleDemands => ("before_idle_demands", None),
+                ScheduleTestEvent::BeforeIdleHeartbeat(_) => ("before_idle_heartbeat", None),
+                ScheduleTestEvent::AfterIdleHeartbeat(_) => ("after_idle_heartbeat", None),
+                _ => ("other_source_event", None),
+            };
+            let mut events = observed_events.borrow_mut();
+            let slot = events.1;
+            if slot < events.0.len() {
+                events.0[slot] = Some((diagnostic_started.elapsed(), kind, error));
+            }
+            events.1 = slot.saturating_add(1);
+            Ok(())
+        })));
+        let pending_state = |pending: &Option<PendingCycle>| {
+            pending.as_ref().map(|intent| {
+                (
+                    intent.token.clone(),
+                    intent.observed.is_some(),
+                    intent.completion_confirmed,
+                )
+            })
+        };
+        // Expand only this repayment, preserving production_cycle's call order.
+        let worker = fixture.worker();
+        let mut pending = None;
+        let scope_probe = fixture.scope_end + CONTROL_BUDGET;
+        let previous_end = SqliteControlStore::effective_runtime_deadline(scope_probe);
+        let mut run_trace = None;
+        let mut accept_ends = None;
+        let mut accept_trace = None;
+        let repaid = fixture
+            .control
+            .with_runtime_deadline(fixture.scope_end, || {
+                let run = run_cycle(
+                    &fixture.db,
+                    &fixture.control,
+                    &worker,
+                    &boot,
+                    0,
+                    fixture.scope_end,
+                    &mut pending,
+                    &mut schedule,
+                );
+                let (kind, error) = match &run {
+                    Ok(CycleResult::Idle(IdleReady::Observed(_))) => ("idle_observed", None),
+                    Ok(CycleResult::Idle(IdleReady::Empty)) => ("idle_empty", None),
+                    Ok(CycleResult::Work(_)) => ("work", None),
+                    Err(error) => ("error", Some(error_class(error))),
+                };
+                run_trace = Some((
+                    diagnostic_started.elapsed(),
+                    kind,
+                    error,
+                    pending_state(&pending),
+                ));
+                match run? {
+                    CycleResult::Idle(ready) => {
+                        let worker = fixture.worker();
+                        let requested_end = Instant::now() + CONTROL_BUDGET;
+                        accept_ends = Some((
+                            requested_end,
+                            SqliteControlStore::effective_runtime_deadline(requested_end),
+                        ));
+                        let accepted = accept_idle_boundary(
+                            &fixture.db,
+                            &fixture.control,
+                            &worker,
+                            &ready,
+                            &mut pending,
+                            &mut schedule,
+                            requested_end,
+                        );
+                        let (kind, error) = match &accepted {
+                            Ok(Some(_)) => ("some", None),
+                            Ok(None) => ("none", None),
+                            Err(error) => ("error", Some(error_class(error))),
+                        };
+                        accept_trace = Some((
+                            diagnostic_started.elapsed(),
+                            kind,
+                            error,
+                            pending_state(&pending),
+                        ));
+                        accepted?
+                            .map(|accepted| accepted.outcome)
+                            .ok_or_else(changed)
+                    }
+                    CycleResult::Work(outcome) => Ok(outcome),
+                }
+            });
+        let restored = SqliteControlStore::effective_runtime_deadline(scope_probe) == previous_end;
+        if !repaid
+            .as_ref()
+            .is_ok_and(|outcome| outcome.catalog_complete)
+            || pending.is_some()
+            || !restored
+        {
+            eprintln!(
+                "scheduler_repayment run={run_trace:?} accept_ends={accept_ends:?} \
+                 accept={accept_trace:?} outer_error={:?} pending={:?} restored={restored} \
+                 outer_end={:?} remaining={:?} elapsed={:?} events={:?}",
+                repaid.as_ref().err().map(error_class),
+                pending_state(&pending),
+                fixture.scope_end,
+                fixture.scope_end.saturating_duration_since(Instant::now()),
+                diagnostic_started.elapsed(),
+                events.borrow(),
+            );
+        }
+        assert!(
+            pending.is_none(),
+            "production completion must acknowledge its cycle"
+        );
+        let next = fixture
+            .read_control(|control| control.background_status())
+            .next_cycle_seq;
+        let repaid_cycle =
+            fixture.read_control(|control| control.cycle(CycleSeq::new(next.get() - 1).unwrap()));
         assert!(repaid.unwrap().catalog_complete);
         assert_eq!(repaid_cycle.selections[0].observed_count, 1);
         let sources = fixture.sources();
