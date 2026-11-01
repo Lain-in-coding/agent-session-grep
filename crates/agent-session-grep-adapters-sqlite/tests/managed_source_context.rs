@@ -1,7 +1,10 @@
 //! Synthetic admitted source metadata and private catalogs; no provider/source I/O.
 use agent_session_grep_adapters_sqlite::{
-    SCHEMA_VERSION, SourceBatch, SqliteControlStore, SqliteStore, managed,
+    SCHEMA_VERSION, SourceBatch, SqliteControlStore, SqliteStore,
+    control::LockedWorkerAuthority,
+    managed,
     managed_history::{HistoryDependencies, HistoryLimits, prune_in_tx},
+    managed_locks::{ExclusiveGuard, LockKind},
     managed_source_context as context,
     managed_store::ManagedStore,
 };
@@ -13,6 +16,32 @@ use rusqlite::{Connection, params};
 use std::time::{Duration, Instant};
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+fn assert_preparation_end(end: Instant) {
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(end + Duration::from_secs(1)),
+        end
+    );
+}
+fn prepare<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    operation: impl FnOnce(Instant) -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    let probe = end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    let result = control.with_runtime_deadline(end, || {
+        assert_preparation_end(end);
+        let result = operation(end);
+        assert_preparation_end(end);
+        result
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    result
 }
 fn cid(s: &str) -> ControlId {
     ControlId::parse(s).unwrap()
@@ -1507,60 +1536,64 @@ struct FacadeFixture {
 }
 impl FacadeFixture {
     fn new(provider: SearchProvider) -> Self {
-        use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
+        let setup_end = deadline();
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("owned-private");
         let catalog = root.join("catalog.db");
         let surface = CanonicalLocator::from_path(temp.path()).unwrap();
-        let control =
-            SqliteControlStore::create(&root, &cid("installation"), DesiredUpdates::Running)
-                .unwrap();
-        let selection = control
-            .add_selection(
-                control.status().unwrap().policy.control_seq,
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider,
-                        locator: surface.clone(),
-                        kind: RootKind::Root,
+        let control = SqliteControlStore::create_with_deadline(
+            &root,
+            &cid("installation"),
+            DesiredUpdates::Running,
+            setup_end,
+        )
+        .unwrap();
+        let (selection, lock, cycle) = prepare(&control, setup_end, |end| {
+            assert_preparation_end(end);
+            let selection = control
+                .add_selection(
+                    control.status()?.policy.control_seq,
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider,
+                            locator: surface.clone(),
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(cid("physical-root")),
+                        now_ms: 1,
                     },
-                    root_identity: Some(cid("physical-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap()
-            .value;
-        let lock = ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap();
-        let cycle = {
-            let worker = control.bind_worker(&lock, cid("boot")).unwrap();
-            control
-                .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
-                .unwrap();
-            let queued = control
-                .queue_cycle(
-                    control.status().unwrap().policy.control_seq,
-                    vec![SelectionRevision {
-                        selection_id: selection.id.clone(),
-                        revision: selection.revision,
-                        root_identity: cid("physical-root"),
-                    }],
-                )
-                .unwrap()
+                )?
                 .value;
-            let cycle = match queued {
-                CycleAdmission::Queued(c) => c,
-                _ => panic!("synthetic cycle was not admitted"),
+            let lock = ExclusiveGuard::try_acquire(&root, LockKind::Background)?;
+            let cycle = {
+                let worker = control.bind_worker(&lock, cid("boot"))?;
+                control.register_worker(control.status()?.policy.control_seq, &worker, 1, 1)?;
+                let queued = control
+                    .queue_cycle(
+                        control.status()?.policy.control_seq,
+                        vec![SelectionRevision {
+                            selection_id: selection.id.clone(),
+                            revision: selection.revision,
+                            root_identity: cid("physical-root"),
+                        }],
+                    )?
+                    .value;
+                let cycle = match queued {
+                    CycleAdmission::Queued(c) => c,
+                    _ => panic!("synthetic cycle was not admitted"),
+                };
+                control
+                    .start_cycle(
+                        control.status()?.policy.control_seq,
+                        &worker,
+                        cycle.token.cycle_seq,
+                        2,
+                    )?
+                    .value
             };
-            control
-                .start_cycle(
-                    control.status().unwrap().policy.control_seq,
-                    &worker,
-                    cycle.token.cycle_seq,
-                    2,
-                )
-                .unwrap()
-                .value
-        };
+            Ok((selection, lock, cycle))
+        })
+        .unwrap();
         Self {
             _temp: temp,
             root,
@@ -1572,6 +1605,32 @@ impl FacadeFixture {
             cycle,
             provider,
         }
+    }
+    fn prepare_store(
+        &self,
+        end: Instant,
+    ) -> Result<(ManagedStore, LockedWorkerAuthority<'_>), PortError> {
+        prepare(&self.control, end, |end| self.prepare_store_in_scope(end))
+    }
+    fn prepare_store_in_scope(
+        &self,
+        end: Instant,
+    ) -> Result<(ManagedStore, LockedWorkerAuthority<'_>), PortError> {
+        assert_preparation_end(end);
+        let store = ManagedStore::create(&self.catalog, &self.control, cid("incarnation"), 1)?;
+        let worker = self.control.bind_worker(&self.lock, cid("boot"))?;
+        assert_preparation_end(end);
+        Ok((store, worker))
+    }
+    fn prepare_pause(&self, end: Instant) -> Result<(), PortError> {
+        prepare(&self.control, end, |end| {
+            assert_preparation_end(end);
+            self.control.set_desired_updates(
+                self.control.status()?.policy.control_seq,
+                DesiredUpdates::Paused,
+            )?;
+            Ok(())
+        })
     }
     fn observation(&self, name: &str, revision: &str) -> SourceObservation {
         SourceObservation {
@@ -1606,10 +1665,77 @@ impl FacadeFixture {
     }
 }
 #[test]
+fn facade_fixture_preparation_keeps_one_end_and_restores_outer_scope() {
+    let f = FacadeFixture::new(SearchProvider::Claude);
+    let outer = deadline();
+    let probe = outer + Duration::from_secs(1);
+    let mut create_calls = 0;
+    f.control
+        .with_runtime_deadline(outer, || {
+            let before = f.control.status()?;
+            let (store, worker) = prepare(&f.control, probe, |end| {
+                assert_eq!(end, outer);
+                create_calls += 1;
+                f.prepare_store_in_scope(end)
+            })?;
+            assert_eq!(worker.boot_id(), &cid("boot"));
+            assert_eq!(store.incarnation(), &cid("incarnation"));
+            assert_preparation_end(outer);
+            assert_eq!(
+                f.control.status()?.policy.control_seq,
+                before.policy.control_seq
+            );
+            f.prepare_pause(probe)?;
+            let after = f.control.status()?;
+            assert_eq!(
+                after.policy.control_seq.get(),
+                before.policy.control_seq.get() + 1
+            );
+            assert_eq!(after.desired_updates, DesiredUpdates::Paused);
+            assert_eq!(after.policy.selections, before.policy.selections);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(create_calls, 1);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+}
+#[test]
+fn facade_fixture_preparation_missing_scope_or_expired_end_has_no_effects() {
+    let f = FacadeFixture::new(SearchProvider::Claude);
+    let end = deadline();
+    let probe = end + Duration::from_secs(1);
+    let before = prepare(&f.control, end, |_| f.control.status()).unwrap();
+    let missing_scope = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = f.prepare_store_in_scope(end);
+    }));
+    assert!(missing_scope.is_err());
+    assert!(!f.catalog.exists());
+    let mut create_calls = 0;
+    let expired = prepare(&f.control, Instant::now(), |end| {
+        create_calls += 1;
+        f.prepare_store_in_scope(end)
+    });
+    assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+    assert_eq!(create_calls, 0);
+    assert!(!f.catalog.exists());
+    let failed: Result<(), PortError> = prepare(&f.control, end, |_| {
+        Err(PortError::InvalidRequest("fixture sentinel".into()))
+    });
+    assert!(matches!(failed, Err(PortError::InvalidRequest(_))));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), PortError> = prepare(&f.control, end, |_| panic!("fixture sentinel"));
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(
+        prepare(&f.control, end, |_| f.control.status()).unwrap(),
+        before
+    );
+}
+#[test]
 fn facade_context_manifest_noop_pause_and_currentness_use_real_control_and_outbox() {
     let f = FacadeFixture::new(SearchProvider::parse("workbuddy").unwrap());
-    let store = ManagedStore::create(&f.catalog, &f.control, cid("incarnation"), 1).unwrap();
-    let worker = f.control.bind_worker(&f.lock, cid("boot")).unwrap();
+    let (store, worker) = f.prepare_store(deadline()).unwrap();
     let mut observation = f.observation("transcript", "facade-first");
     let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
         &observation.binding.source_path,
@@ -1687,12 +1813,7 @@ fn facade_context_manifest_noop_pause_and_currentness_use_real_control_and_outbo
             .unwrap(),
         ctx
     );
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    f.prepare_pause(deadline()).unwrap();
     let hit_count = store
         .with_read(
             &f.control,
@@ -1722,8 +1843,7 @@ fn facade_context_manifest_noop_pause_and_currentness_use_real_control_and_outbo
 #[test]
 fn facade_real_context_apply_failure_leaves_no_partial_source_or_authority() {
     let f = FacadeFixture::new(SearchProvider::parse("workbuddy").unwrap());
-    let store = ManagedStore::create(&f.catalog, &f.control, cid("incarnation"), 1).unwrap();
-    let worker = f.control.bind_worker(&f.lock, cid("boot")).unwrap();
+    let (store, worker) = f.prepare_store(deadline()).unwrap();
     let mut observation = f.observation("transcript", "failure-first");
     let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
         &observation.binding.source_path,
@@ -1811,8 +1931,7 @@ fn scoped_batch(o: &SourceObservation, text: &str, session: &StableId) -> Source
 #[test]
 fn facade_verified_surface_namespace_is_shared_without_rekeying_and_binds_authority() {
     let f = FacadeFixture::new(SearchProvider::parse("antigravity").unwrap());
-    let store = ManagedStore::create(&f.catalog, &f.control, cid("incarnation"), 1).unwrap();
-    let worker = f.control.bind_worker(&f.lock, cid("boot")).unwrap();
+    let (store, worker) = f.prepare_store(deadline()).unwrap();
     let mut old = f.observation("db", "surface-db-first");
     old.binding.source_path = f
         ._temp
@@ -1979,8 +2098,7 @@ fn facade_verified_surface_namespace_is_shared_without_rekeying_and_binds_author
 #[test]
 fn facade_complete_discovery_respects_unresolved_context_and_original_expired_deadline() {
     let f = FacadeFixture::new(SearchProvider::parse("workbuddy").unwrap());
-    let store = ManagedStore::create(&f.catalog, &f.control, cid("incarnation"), 1).unwrap();
-    let worker = f.control.bind_worker(&f.lock, cid("boot")).unwrap();
+    let (store, worker) = f.prepare_store(deadline()).unwrap();
     let selection = SelectionRevision {
         selection_id: f.selection.id.clone(),
         revision: f.selection.revision,
@@ -2069,8 +2187,7 @@ fn facade_complete_discovery_respects_unresolved_context_and_original_expired_de
 #[test]
 fn facade_discovery_sql_contention_does_not_extend_end_and_store_is_reusable() {
     let f = FacadeFixture::new(SearchProvider::Claude);
-    let store = ManagedStore::create(&f.catalog, &f.control, cid("incarnation"), 1).unwrap();
-    let worker = f.control.bind_worker(&f.lock, cid("boot")).unwrap();
+    let (store, worker) = f.prepare_store(deadline()).unwrap();
     let selection = SelectionRevision {
         selection_id: f.selection.id.clone(),
         revision: f.selection.revision,

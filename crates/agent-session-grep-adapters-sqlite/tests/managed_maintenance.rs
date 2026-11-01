@@ -21,8 +21,36 @@ fn id(v: &str) -> ControlId {
 fn end() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
+fn assert_preparation_end(end: Instant) {
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(end + Duration::from_secs(1)),
+        end
+    );
+}
+fn prepare<T>(
+    control: &SqliteControlStore,
+    end: Instant,
+    operation: impl FnOnce(Instant) -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    let probe = end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    let result = control.with_runtime_deadline(end, || {
+        assert_preparation_end(end);
+        let result = operation(end);
+        assert_preparation_end(end);
+        result
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    result
+}
 fn acquire(root: &Path, kind: LockKind) -> ExclusiveGuard {
-    let end = end();
+    acquire_until(root, kind, end())
+}
+fn acquire_until(root: &Path, kind: LockKind, end: Instant) -> ExclusiveGuard {
     loop {
         match ExclusiveGuard::try_acquire(root, kind.clone()) {
             Ok(g) => return g,
@@ -61,26 +89,31 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        let preparation_end = end();
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let root = temp.path().join("data");
         let prefix = temp.path().join("install");
         std::fs::create_dir(&prefix).unwrap();
-        let control =
-            SqliteControlStore::create(&root, &id("installation"), DesiredUpdates::Running)
-                .unwrap();
+        let control = SqliteControlStore::create_with_deadline(
+            &root,
+            &id("installation"),
+            DesiredUpdates::Running,
+            preparation_end,
+        )
+        .unwrap();
         let catalog = root.join("catalog.db");
-        drop(ManagedStore::create(&catalog, &control, id("original_incarnation"), 1).unwrap());
-        let installation_lock = acquire(
+        let installation_lock = acquire_until(
             &prefix,
             LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+            preparation_end,
         );
-        {
-            let guard = acquire(&root, LockKind::PolicyOwner);
-            let bound = control.bind_control_root(&guard).unwrap();
-            control
-                .record_verified_installation_prefix(&prefix, &installation_lock, &bound, end())
-                .unwrap();
-        }
+        let mut preparation_calls = 0;
+        prepare(&control, preparation_end, |end| {
+            preparation_calls += 1;
+            prepare_catalog_and_prefix(&control, &root, &catalog, &prefix, &installation_lock, end)
+        })
+        .unwrap();
+        assert_eq!(preparation_calls, 1);
         Self {
             _tmp: temp,
             root,
@@ -145,6 +178,66 @@ impl Fixture {
         };
         metadata
     }
+}
+fn prepare_catalog_and_prefix(
+    control: &SqliteControlStore,
+    root: &Path,
+    catalog: &Path,
+    prefix: &Path,
+    installation_lock: &ExclusiveGuard,
+    end: Instant,
+) -> Result<(), PortError> {
+    assert_preparation_end(end);
+    drop(ManagedStore::create(
+        catalog,
+        control,
+        id("original_incarnation"),
+        1,
+    )?);
+    let guard = acquire_until(root, LockKind::PolicyOwner, end);
+    let bound = control.bind_control_root(&guard)?;
+    control.record_verified_installation_prefix(prefix, installation_lock, &bound, end)?;
+    assert_preparation_end(end);
+    Ok(())
+}
+#[test]
+fn fixture_catalog_preparation_missing_scope_or_expired_end_has_no_effects() {
+    let f = Fixture::new();
+    let requested_end = end();
+    let probe = requested_end + Duration::from_secs(1);
+    let catalog = f.root.join("uncreated-catalog.db");
+    let before = prepare(&f.control, requested_end, |_| f.control.status()).unwrap();
+    let missing_scope = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = prepare_catalog_and_prefix(
+            &f.control,
+            &f.root,
+            &catalog,
+            &f.prefix,
+            &f.installation_lock,
+            requested_end,
+        );
+    }));
+    assert!(missing_scope.is_err());
+    let mut preparation_calls = 0;
+    let expired = prepare(&f.control, Instant::now(), |end| {
+        preparation_calls += 1;
+        prepare_catalog_and_prefix(
+            &f.control,
+            &f.root,
+            &catalog,
+            &f.prefix,
+            &f.installation_lock,
+            end,
+        )
+    });
+    assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+    assert_eq!(preparation_calls, 0);
+    assert!(!catalog.exists());
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(
+        prepare(&f.control, requested_end, |_| f.control.status()).unwrap(),
+        before
+    );
 }
 #[test]
 fn normal_open_stays_closed_while_authorized_maintenance_works() {
@@ -470,38 +563,52 @@ fn bind_source(f: &Fixture, source: &str, relative: &str) {
     ).unwrap();
 }
 
-fn recovery_discovery(f: &Fixture, as_of: bool) {
+fn recovery_discovery(f: &Fixture, as_of: bool, end: Instant) {
+    prepare(&f.control, end, |end| {
+        recovery_discovery_in_scope(f, as_of, end)
+    })
+    .unwrap();
+}
+fn recovery_discovery_in_scope(f: &Fixture, as_of: bool, end: Instant) -> Result<(), PortError> {
     use agent_session_grep_adapters_sqlite::{PARSER_SEMANTIC_VERSION, SourceBatch};
     use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
     use agent_session_grep_ports::managed::{
         ObservationState, RevisionId, SelectionProof, SourceBinding, SourceId, SourceObservation,
     };
 
-    let selected = select(f, "selected", RootKind::Root);
+    assert_preparation_end(end);
+    let selected = f
+        .control
+        .add_selection(
+            f.control.status()?.policy.control_seq,
+            SelectionRequest {
+                region: ScopeRegion {
+                    provider: SearchProvider::Claude,
+                    locator: source_locator("selected"),
+                    kind: RootKind::Root,
+                },
+                root_identity: Some(id("synthetic_source_root")),
+                now_ms: 3,
+            },
+        )?
+        .value;
     let selection = SelectionRevision {
         selection_id: selected.id.clone(),
         revision: selected.revision,
         root_identity: selected.root_identity.clone().unwrap(),
     };
-    let lock = acquire(&f.root, LockKind::Background);
-    let worker = f.control.bind_worker(&lock, id("recovery_boot")).unwrap();
+    let lock = acquire_until(&f.root, LockKind::Background, end);
+    let worker = f.control.bind_worker(&lock, id("recovery_boot"))?;
     f.control
-        .register_worker(
-            f.control.status().unwrap().policy.control_seq,
-            &worker,
-            1,
-            4,
-        )
-        .unwrap();
-    let store = ManagedStore::open_for_write(&f.catalog, &f.control).unwrap();
-    store.reconcile_progress(&f.control, &worker).unwrap();
+        .register_worker(f.control.status()?.policy.control_seq, &worker, 1, 4)?;
+    let store = ManagedStore::open_for_write(&f.catalog, &f.control)?;
+    store.reconcile_progress(&f.control, &worker)?;
     let CycleAdmission::Queued(queued) = f
         .control
         .queue_cycle(
-            f.control.status().unwrap().policy.control_seq,
+            f.control.status()?.policy.control_seq,
             vec![selection.clone()],
-        )
-        .unwrap()
+        )?
         .value
     else {
         panic!("fixture cycle refused")
@@ -509,12 +616,11 @@ fn recovery_discovery(f: &Fixture, as_of: bool) {
     let cycle = f
         .control
         .start_cycle(
-            f.control.status().unwrap().policy.control_seq,
+            f.control.status()?.policy.control_seq,
             &worker,
             queued.token.cycle_seq,
             5,
-        )
-        .unwrap()
+        )?
         .value;
     let message = StableId::native_checked(IdKind::Message, "recovery_message").unwrap();
     let session = StableId::native_checked(IdKind::Session, "recovery_session").unwrap();
@@ -584,39 +690,37 @@ fn recovery_discovery(f: &Fixture, as_of: bool) {
         provider_id: Some("claude-code".into()),
         resume_claims: vec![],
     };
-    store
-        .begin_discovery(&f.control, &worker, &cycle, &selection, 5)
-        .unwrap();
-    store
-        .commit_source(&f.control, &worker, &batch, &observation)
-        .unwrap();
-    store
-        .commit_discovery(
-            &f.control,
-            &worker,
-            &cycle,
-            &selection,
-            std::slice::from_ref(&observation.binding.source_id),
-            8,
-        )
-        .unwrap();
-    f.control
-        .finish_cycle(
-            f.control.status().unwrap().policy.control_seq,
-            &worker,
-            cycle.token.cycle_seq,
-            CycleFinish::Aborted,
-            9,
-        )
-        .unwrap();
+    store.begin_discovery_with_deadline(&f.control, &worker, &cycle, &selection, end)?;
+    store.commit_source_with_context(
+        &f.control,
+        &worker,
+        &batch,
+        &observation,
+        &Default::default(),
+        end,
+    )?;
+    store.commit_discovery_with_deadline(
+        &f.control,
+        &worker,
+        &cycle,
+        &selection,
+        std::slice::from_ref(&observation.binding.source_id),
+        end,
+    )?;
+    f.control.finish_cycle(
+        f.control.status()?.policy.control_seq,
+        &worker,
+        cycle.token.cycle_seq,
+        CycleFinish::Aborted,
+        9,
+    )?;
     if as_of {
         let CycleAdmission::Queued(queued) = f
             .control
             .queue_cycle(
-                f.control.status().unwrap().policy.control_seq,
+                f.control.status()?.policy.control_seq,
                 vec![selection.clone()],
-            )
-            .unwrap()
+            )?
             .value
         else {
             panic!("fixture epoch refused")
@@ -624,28 +728,23 @@ fn recovery_discovery(f: &Fixture, as_of: bool) {
         let later = f
             .control
             .start_cycle(
-                f.control.status().unwrap().policy.control_seq,
+                f.control.status()?.policy.control_seq,
                 &worker,
                 queued.token.cycle_seq,
                 10,
-            )
-            .unwrap()
+            )?
             .value;
-        store
-            .begin_discovery(&f.control, &worker, &later, &selection, 10)
-            .unwrap();
+        store.begin_discovery_with_deadline(&f.control, &worker, &later, &selection, end)?;
         // The real plain-epoch facade closes the later admitted cycle with the
         // original receipt, re-proving that the earlier cycle owns it.
-        store
-            .commit_discovery_epoch_with_deadline(
-                &f.control,
-                &worker,
-                &later,
-                &selection,
-                std::slice::from_ref(&observation.binding.source_id),
-                Instant::now() + Duration::from_secs(10),
-            )
-            .unwrap();
+        store.commit_discovery_epoch_with_deadline(
+            &f.control,
+            &worker,
+            &later,
+            &selection,
+            std::slice::from_ref(&observation.binding.source_id),
+            end,
+        )?;
         // Both complete fences name the current head receipt, and that receipt
         // still belongs to the earlier cycle: the later fence is as-of.
         let first = rusqlite::types::Value::Integer(cycle.token.cycle_seq.get());
@@ -666,16 +765,99 @@ fn recovery_discovery(f: &Fixture, as_of: bool) {
                 vec![second, yes.clone(), first, yes],
             ]
         );
-        f.control
-            .finish_cycle(
-                f.control.status().unwrap().policy.control_seq,
-                &worker,
-                later.token.cycle_seq,
-                CycleFinish::Aborted,
-                11,
-            )
-            .unwrap();
+        f.control.finish_cycle(
+            f.control.status()?.policy.control_seq,
+            &worker,
+            later.token.cycle_seq,
+            CycleFinish::Aborted,
+            11,
+        )?;
     }
+    assert_preparation_end(end);
+    Ok(())
+}
+
+#[test]
+fn fixture_discovery_preparation_keeps_one_end_and_single_effects() {
+    for as_of in [false, true] {
+        let f = Fixture::new();
+        let outer = end();
+        let probe = outer + Duration::from_secs(1);
+        let mut preparation_calls = 0;
+        f.control
+            .with_runtime_deadline(outer, || {
+                let before = f.control.status()?;
+                prepare(&f.control, probe, |end| {
+                    assert_eq!(end, outer);
+                    preparation_calls += 1;
+                    recovery_discovery_in_scope(&f, as_of, end)
+                })?;
+                assert_preparation_end(outer);
+                let after = f.control.status()?;
+                assert_eq!(
+                    after.policy.selections.len(),
+                    before.policy.selections.len() + 1
+                );
+                assert_eq!(
+                    after.policy.policy_epoch.get(),
+                    before.policy.policy_epoch.get() + 1
+                );
+                assert_eq!(after.desired_updates, before.desired_updates);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(preparation_calls, 1);
+        assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+        let count = if as_of { 2 } else { 1 };
+        assert_eq!(
+            recovery_rows(
+                &SqliteControlStore::path(&f.root),
+                "SELECT count(*),sum(state='aborted') FROM cycles",
+            ),
+            vec![vec![
+                rusqlite::types::Value::Integer(count),
+                rusqlite::types::Value::Integer(count),
+            ]]
+        );
+        assert_eq!(
+            recovery_rows(&f.catalog, "SELECT count(*) FROM source_revision_receipts"),
+            vec![vec![rusqlite::types::Value::Integer(1)]]
+        );
+    }
+}
+#[test]
+fn fixture_discovery_preparation_missing_scope_or_expired_end_has_no_effects() {
+    let f = Fixture::new();
+    let requested_end = end();
+    let probe = requested_end + Duration::from_secs(1);
+    let before = prepare(&f.control, requested_end, |_| f.control.status()).unwrap();
+    let originals = recovery_originals(&f.catalog);
+    let missing_scope = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = recovery_discovery_in_scope(&f, true, requested_end);
+    }));
+    assert!(missing_scope.is_err());
+    let mut preparation_calls = 0;
+    let expired = prepare(&f.control, Instant::now(), |end| {
+        preparation_calls += 1;
+        recovery_discovery_in_scope(&f, true, end)
+    });
+    assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+    assert_eq!(preparation_calls, 0);
+    let failed: Result<(), PortError> = prepare(&f.control, requested_end, |_| {
+        Err(PortError::InvalidRequest("fixture sentinel".into()))
+    });
+    assert!(matches!(failed, Err(PortError::InvalidRequest(_))));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), PortError> =
+            prepare(&f.control, requested_end, |_| panic!("fixture sentinel"));
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(
+        prepare(&f.control, requested_end, |_| f.control.status()).unwrap(),
+        before
+    );
+    assert_eq!(recovery_originals(&f.catalog), originals);
 }
 
 fn recovery_rows(path: &Path, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
@@ -717,7 +899,7 @@ fn recovery_originals(path: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 #[test]
 fn normal_exact_discovery_open_preserves_original_content_and_proof() {
     let f = Fixture::new();
-    recovery_discovery(&f, false);
+    recovery_discovery(&f, false, end());
     let originals = recovery_originals(&f.catalog);
     let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
     let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
@@ -739,7 +921,7 @@ fn normal_exact_discovery_open_preserves_original_content_and_proof() {
 #[test]
 fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_receipts() {
     let f = Fixture::new();
-    recovery_discovery(&f, true);
+    recovery_discovery(&f, true, end());
     let denied = select(&f, "denied", RootKind::Root);
     f.control
         .revoke_selection(
@@ -840,7 +1022,7 @@ fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_re
 #[test]
 fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_effects() {
     let f = Fixture::new();
-    recovery_discovery(&f, true);
+    recovery_discovery(&f, true, end());
     let other = Fixture::new();
     f.fence("owner");
     other.fence("owner");
@@ -933,7 +1115,7 @@ fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_eff
 #[test]
 fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
     let f = Fixture::new();
-    recovery_discovery(&f, true);
+    recovery_discovery(&f, true, end());
     f.fence("owner");
     let installation = f
         .control
