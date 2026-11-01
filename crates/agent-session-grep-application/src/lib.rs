@@ -393,6 +393,63 @@ pub enum AppResponse {
     },
 }
 
+/// One rendered context message inside [`AppResponse::context_data`].
+fn context_message_value(message: &ContextMessage) -> serde_json::Value {
+    serde_json::json!({
+        "id": message.id,
+        "placement_id": message.placement_id,
+        "message_id": message.message_id,
+        "payload": message.payload,
+    })
+}
+
+impl AppResponse {
+    /// The rendered `data` object of a context response, or `None` for any
+    /// other response. Every frontend renders this one shape. Context prefix
+    /// selection never measures it here: only the composition root's final
+    /// serializer measures a frame, and that frame embeds this shape.
+    pub fn context_data(&self) -> Option<serde_json::Value> {
+        let AppResponse::Context {
+            session_id,
+            session,
+            branch_leaf,
+            branch_leaf_placement_id,
+            messages,
+            evidence,
+            tool_activities,
+            requested_level,
+            effective_level,
+            talks,
+            summary,
+            hint,
+            truncation,
+            generation,
+        } = self
+        else {
+            return None;
+        };
+        Some(serde_json::json!({
+            "session_id": session_id,
+            "session": session,
+            "branch_leaf": branch_leaf,
+            "branch_leaf_placement_id": branch_leaf_placement_id,
+            "tool_activities": tool_activities,
+            "messages": messages.iter().map(context_message_value).collect::<Vec<_>>(),
+            "evidence": evidence,
+            "requested_level": requested_level,
+            "effective_level": effective_level,
+            "talks": talks,
+            "summary": summary,
+            "hint": hint,
+            "truncation": {
+                "truncated": truncation.truncated,
+                "reason": truncation.reason,
+            },
+            "generation": generation,
+        }))
+    }
+}
+
 /// 一条经 staging 缓冲、待原子提交的规范化消息（RFC-0002 §5）。
 ///
 /// 承载 parse 产出的语义与 provider-native 身份/threading 元数据，但不含 StableId——

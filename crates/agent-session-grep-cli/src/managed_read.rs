@@ -19,7 +19,7 @@ use agent_session_grep_application::{
     AppError, AppRequest, AppResponse, ContextLevel, ResponseBudget,
     managed::{
         ManagedApp, ManagedCandidateSet, ManagedEvidence, ManagedHandoffRequest, ManagedPartial,
-        ManagedRequestContext,
+        ManagedRequestContext, ManagedResponse, provenance_row,
     },
 };
 use agent_session_grep_domain::{ContextPolicy, IdKind, StableId};
@@ -1379,7 +1379,46 @@ fn prepare(
     let now_ms = request.now_ms;
     let mut budget = request.budget.clone();
     let mut reduced = false;
+    // Machine transports select a context prefix by measuring each candidate
+    // with this very final serializer: MCP counts its JSON-RPC wrapper, both
+    // payload copies (one escaped) and the newline; Robot counts its single
+    // envelope. The last candidate that fit is emitted as measured when
+    // Application returns that same response, so selection and the gate below
+    // see identical bytes and a later `duration_ms` cannot grow the frame.
+    // A reused Robot frame therefore reports `duration_ms` as elapsed when it
+    // was measured; later probes and the gate are not included.
+    // Human output keeps the Application estimate. A render failure keeps its
+    // own error instead of the Application error it must cross as.
+    let measured = matches!(
+        target,
+        RenderTarget::Mcp(_) | RenderTarget::Cli(OutputMode::Json | OutputMode::Jsonl, _)
+    );
+    let frame_error = std::cell::RefCell::new(None);
+    let fitted = std::cell::RefCell::new(None::<(ManagedResponse, PreparedFrame)>);
+    let context_frame_size = |response: &ManagedResponse| -> Result<usize, AppError> {
+        let frame = render_frame(
+            read,
+            FrameData::from_managed(response.clone()),
+            request,
+            target,
+            started,
+            freshness,
+            false,
+        )
+        .map_err(|error| {
+            frame_error.replace(Some(error));
+            AppError::Port(PortError::SchemaIncompatible(
+                "managed context frame is unavailable".into(),
+            ))
+        })?;
+        let size = frame.bytes.len();
+        if size <= request.frame_bytes {
+            fitted.replace(Some((response.clone(), frame)));
+        }
+        Ok(size)
+    };
     for _ in 0..MAX_RENDERS {
+        fitted.take();
         let app = ManagedApp::new(
             read,
             ManagedRequestContext {
@@ -1391,6 +1430,12 @@ fn prepare(
             },
         )
         .map_err(private_app)?;
+        let app = if measured && !reduced {
+            app.with_context_frame_size(&context_frame_size)
+        } else {
+            app
+        };
+        let mut reuse = None;
         let response = if let Operation::Handoff {
             query,
             limit,
@@ -1433,7 +1478,9 @@ fn prepare(
         } else {
             let app_request =
                 bind_request_ids(read, request.app_request(&budget), &request.intersection)?;
-            let response = app.handle(app_request).map_err(private_app)?;
+            let response = app
+                .handle(app_request)
+                .map_err(|error| frame_error.take().unwrap_or_else(|| private_app(error)))?;
             if matches!(
                 &response.response,
                 AppResponse::Get { payload: None } | AppResponse::Show { payload: None }
@@ -1443,20 +1490,16 @@ fn prepare(
                     "entity not found",
                 )));
             }
-            let (outcome, data, _page, warnings) = render(response.response);
-            FrameData {
-                snapshot: response.snapshot,
-                evidence: response.evidence,
-                partial: response.partial,
-                outcome,
-                data,
-                warnings,
-                redacted_count: 0,
-                page: protocol::Page::default(),
-                providers: Vec::new(),
-            }
+            reuse = fitted
+                .take()
+                .filter(|(candidate, _)| *candidate == response)
+                .map(|(_, frame)| frame);
+            FrameData::from_managed(response)
         };
-        let frame = render_frame(read, response, request, target, started, freshness, reduced)?;
+        let frame = match reuse {
+            Some(frame) => frame,
+            None => render_frame(read, response, request, target, started, freshness, reduced)?,
+        };
         if frame.bytes.len() <= request.frame_bytes {
             return Ok(frame);
         }
@@ -1862,6 +1905,23 @@ struct FrameData {
     )>,
 }
 
+impl FrameData {
+    fn from_managed(response: agent_session_grep_application::managed::ManagedResponse) -> Self {
+        let (outcome, data, _page, warnings) = render(response.response);
+        Self {
+            snapshot: response.snapshot,
+            evidence: response.evidence,
+            partial: response.partial,
+            outcome,
+            data,
+            warnings,
+            redacted_count: 0,
+            page: protocol::Page::default(),
+            providers: Vec::new(),
+        }
+    }
+}
+
 fn provenance(
     read: &impl ProjectionRead,
     response: &FrameData,
@@ -1884,24 +1944,9 @@ fn provenance(
                 request.command == "get-session-resume",
             )?
         };
-        let occurrence = e.occurrence.as_ref().map(|o| &o.data.placement);
-        let session = occurrence
-            .map(|p| p.session_id.as_str())
-            .or_else(|| (e.entity_id.kind() == IdKind::Session).then(|| e.entity_id.as_str()));
-        let message = occurrence
-            .map(|p| p.message_id.as_str())
-            .or_else(|| (e.entity_id.kind() == IdKind::Message).then(|| e.entity_id.as_str()));
-        let document = occurrence
-            .map(|p| p.source_document_id.as_str())
-            .or_else(|| (e.entity_id.kind() == IdKind::Document).then(|| e.entity_id.as_str()));
-        // Revision digests are the only projection-private values intentionally
-        // exposed. Related proof identities, native/source locators never escape.
-        let related = e
-            .related
-            .iter()
-            .map(|p| p.revision.digest.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        rows.push(json!({"entity_id":e.entity_id.as_str(),"provider_id":provider.map(SearchProvider::as_str),"session_id":session,"message_id":message,"placement_id":occurrence.map(|p|p.id.as_str()),"document_id":document,"revision_digest":e.proof.revision.digest,"precision":if occurrence.is_some_and(|p|p.span.is_some()){"byte"}else{"unknown"},"related_revision_digests":related}));
+        // One row shape shared with Application; the context frames measured
+        // above embed exactly these rows.
+        rows.push(provenance_row(e, provider));
     }
     Ok(Value::Array(rows))
 }

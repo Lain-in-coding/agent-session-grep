@@ -5619,23 +5619,17 @@ fn render(
             });
             (outcome, data, page, Vec::new())
         }
-        AppResponse::Context {
-            session_id,
-            session,
-            branch_leaf,
-            branch_leaf_placement_id,
-            messages,
-            evidence,
-            tool_activities,
-            requested_level,
-            effective_level,
-            talks,
-            summary,
-            hint,
-            truncation,
-            generation,
-        } => {
-            let outcome = outcome_of(&truncation);
+        response @ AppResponse::Context { .. } => {
+            let data = response.context_data().expect("context response");
+            let AppResponse::Context {
+                evidence,
+                truncation,
+                ..
+            } = &response
+            else {
+                unreachable!()
+            };
+            let outcome = outcome_of(truncation);
             // 降级如实上报：legacy（无 span）行的证据精度是 unknown，调用方应知道
             // 重新 ingest 可恢复字节级定位（design §0.2）。
             let unknown = evidence
@@ -5651,30 +5645,6 @@ fn render(
             } else {
                 Vec::new()
             };
-            let data = serde_json::json!({
-                "session_id": session_id,
-                "session": session,
-                "branch_leaf": branch_leaf,
-                "branch_leaf_placement_id": branch_leaf_placement_id,
-                "tool_activities": tool_activities,
-                "messages": messages
-                    .into_iter()
-                    .map(|message| serde_json::json!({
-                        "id": message.id,
-                        "placement_id": message.placement_id,
-                        "message_id": message.message_id,
-                        "payload": message.payload,
-                    }))
-                    .collect::<Vec<_>>(),
-                "evidence": evidence,
-                "requested_level": requested_level,
-                "effective_level": effective_level,
-                "talks": talks,
-                "summary": summary,
-                "hint": hint,
-                "truncation": truncation_json(&truncation),
-                "generation": generation,
-            });
             (outcome, data, protocol::Page::default(), warnings)
         }
         AppResponse::Message { window } => {

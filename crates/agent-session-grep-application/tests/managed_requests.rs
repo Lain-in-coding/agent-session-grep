@@ -1,7 +1,10 @@
 //! Synthetic typed port tests. No SQLite, source history or host configuration.
 use agent_session_grep_application::{
-    AppRequest, AppResponse, ContextLevel, ResponseBudget,
-    managed::{ManagedApp, ManagedHandoffRequest, ManagedPartial, ManagedRequestContext},
+    AppError, AppRequest, AppResponse, ContextLevel, ResponseBudget,
+    budget::BudgetError,
+    managed::{
+        ManagedApp, ManagedHandoffRequest, ManagedPartial, ManagedRequestContext, ManagedResponse,
+    },
 };
 use agent_session_grep_domain::{
     ContextPolicy, IdKind, Message, MessagePlacement, Role, Session, SourceDocument, StableId,
@@ -1412,4 +1415,185 @@ fn metadata_does_not_inflate_message_groups_or_enter_handoff_evidence() {
             .iter()
             .all(|(name, _)| *name != "metadata")
     );
+}
+
+/// One message of a long synthetic session, ordered by its source ordinal.
+fn long_session_message(n: usize, bytes: usize) -> MessageProjection {
+    let mut message = projection(&format!("long-{n:03}"), &"x".repeat(bytes));
+    let placement = &mut message.occurrence.as_mut().unwrap().data.placement;
+    *placement = MessagePlacement::new(
+        placement.session_id.clone(),
+        placement.source_document_id.clone(),
+        message.message.id.clone(),
+        n as u32,
+        false,
+        None,
+    );
+    message
+}
+
+/// Frame bytes of the synthetic serializer: a fixed overhead plus every kept
+/// message's text and a per-message charge. It grows with each prefix.
+fn synthetic_frame(fixed: usize, texts: impl Iterator<Item = usize>) -> usize {
+    texts.fold(fixed, |size, text| size + text + 100)
+}
+
+#[test]
+fn measured_context_brackets_the_largest_fitting_prefix_without_measuring_the_session() {
+    const MESSAGES: usize = 200;
+    let sizes = (0..MESSAGES)
+        .map(|n| 600 + (n * 397) % 900)
+        .collect::<Vec<_>>();
+    let mut read = Read::new("alpha");
+    read.graph_override = Some(
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(n, bytes)| graph_record(long_session_message(n, *bytes), Vec::new()))
+            .collect(),
+    );
+    let expected_ids = (0..MESSAGES)
+        .map(|n| {
+            id(IdKind::Message, &format!("long-{n:03}"))
+                .as_str()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let expired = || false;
+    let total = synthetic_frame(2000, sizes.iter().copied());
+    // (fixed bytes, max_response_bytes, max_messages)
+    for (fixed, max_bytes, max_messages) in [
+        (2000, 4096, 500),
+        (2000, 8192, 500),
+        (2000, 32 * 1024, 500),
+        (2000, 100 * 1024, 500),
+        (2000, total - 1, 500),
+        (2000, total, 500),
+        (2000, 4 * 1024 * 1024, 500),
+        (2000, 32 * 1024, 50),
+        (2000, 4 * 1024 * 1024, 50),
+        (10_000, 8192, 500),
+    ] {
+        // Every candidate the search renders: (messages, truncation reason, bytes).
+        let calls = RefCell::new(Vec::<(usize, Option<String>, usize)>::new());
+        let measure = |response: &ManagedResponse| -> Result<usize, AppError> {
+            let AppResponse::Context {
+                messages,
+                truncation,
+                ..
+            } = &response.response
+            else {
+                panic!("expected context")
+            };
+            let bytes = synthetic_frame(
+                fixed,
+                messages
+                    .iter()
+                    .map(|m| m.payload["text"].as_str().unwrap().len()),
+            );
+            calls
+                .borrow_mut()
+                .push((messages.len(), truncation.reason.clone(), bytes));
+            Ok(bytes)
+        };
+        let app = ManagedApp::new(&read, context(&expired))
+            .unwrap()
+            .with_context_frame_size(&measure);
+        let result = app.handle(AppRequest::Context {
+            session_id: id(IdKind::Session, "session"),
+            policy: ContextPolicy::Full,
+            level: ContextLevel::Raw,
+            budget: ResponseBudget {
+                max_response_bytes: max_bytes,
+                max_messages,
+                ..ResponseBudget::default()
+            },
+        });
+        let calls = calls.borrow().clone();
+        let case = format!("fixed={fixed} max_bytes={max_bytes} max_messages={max_messages}");
+        let candidates = MESSAGES.min(max_messages);
+        let frame = |k: usize| synthetic_frame(fixed, sizes[..k].iter().copied());
+        // At most 2 * ceil(log2(n + 1)) + 2 measurements.
+        let log2 = (usize::BITS - candidates.leading_zeros()) as usize;
+        assert!(calls.len() <= 2 * log2 + 2, "{case}: {calls:?}");
+        // The complete candidate keeps its own count truncation and is measured
+        // at most once, only after every shorter doubling probe fit.
+        let complete = calls
+            .iter()
+            .filter(|(_, reason, _)| reason.as_deref() != Some("max_response_bytes"))
+            .collect::<Vec<_>>();
+        assert!(complete.len() <= 1, "{case}: {calls:?}");
+        assert!(complete.iter().all(|(len, _, _)| *len == candidates));
+        let doubling_fits = std::iter::successors(Some(1usize), |p| Some(p * 2))
+            .take_while(|p| *p < candidates)
+            .all(|p| frame(p) <= max_bytes);
+        assert_eq!(complete.len() == 1, doubling_fits, "{case}: {calls:?}");
+        let largest = (0..=candidates).rev().find(|k| frame(*k) <= max_bytes);
+        let Some(k) = largest else {
+            assert!(
+                matches!(result, Err(AppError::Budget(BudgetError::TooSmall(_)))),
+                "{case}"
+            );
+            assert!(
+                calls.iter().all(|(len, _, _)| *len <= 2),
+                "{case}: {calls:?}"
+            );
+            continue;
+        };
+        let response = result.unwrap();
+        let AppResponse::Context {
+            messages,
+            truncation,
+            ..
+        } = &response.response
+        else {
+            panic!("expected context")
+        };
+        // Largest fitting prefix, in order, of a measured fit.
+        assert_eq!(messages.len(), k, "{case}: {calls:?}");
+        assert!(
+            messages
+                .iter()
+                .zip(&expected_ids)
+                .all(|(m, id)| m.message_id == *id),
+            "{case}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(len, _, bytes)| *len == k && *bytes <= max_bytes)
+        );
+        // Apart from the complete candidate, no measurement renders more than
+        // 2k + 2 messages, so one render is bounded by the answer.
+        assert!(
+            calls
+                .iter()
+                .filter(|(_, reason, _)| reason.as_deref() == Some("max_response_bytes"))
+                .all(|(len, _, _)| *len <= 2 * k + 2),
+            "{case}: {calls:?}"
+        );
+        if k == candidates {
+            // A complete candidate that fits is returned unchanged.
+            assert_eq!(
+                truncation.reason.as_deref(),
+                (candidates < MESSAGES).then_some("max_messages"),
+                "{case}"
+            );
+            assert_eq!(truncation.truncated, candidates < MESSAGES, "{case}");
+        } else {
+            assert_eq!(
+                truncation.reason.as_deref(),
+                Some("max_response_bytes"),
+                "{case}"
+            );
+            assert!(response.partial.contains(&ManagedPartial::ResponseBudget));
+        }
+        if !doubling_fits {
+            // A budget answered by a short prefix never renders the session.
+            assert!(
+                calls.iter().all(|(len, _, _)| *len < candidates),
+                "{case}: the whole session was measured"
+            );
+        }
+    }
 }

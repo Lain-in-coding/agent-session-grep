@@ -94,6 +94,35 @@ impl ManagedResponse {
     }
 }
 
+/// The public provenance row of one evidence item. Revision digests are the
+/// only projection-private values intentionally exposed; related proof
+/// identities and native/source locators never escape. Frontends render this
+/// exact row. Context prefix selection never measures it here: only the
+/// composition root's final serializer measures a frame, and that frame embeds
+/// this shared shape.
+pub fn provenance_row(
+    evidence: &ManagedEvidence,
+    provider: Option<agent_session_grep_ports::SearchProvider>,
+) -> serde_json::Value {
+    let occurrence = evidence.occurrence.as_ref().map(|o| &o.data.placement);
+    let entity = &evidence.entity_id;
+    let session = occurrence
+        .map(|p| p.session_id.as_str())
+        .or_else(|| (entity.kind() == IdKind::Session).then(|| entity.as_str()));
+    let message = occurrence
+        .map(|p| p.message_id.as_str())
+        .or_else(|| (entity.kind() == IdKind::Message).then(|| entity.as_str()));
+    let document = occurrence
+        .map(|p| p.source_document_id.as_str())
+        .or_else(|| (entity.kind() == IdKind::Document).then(|| entity.as_str()));
+    let related = evidence
+        .related
+        .iter()
+        .map(|p| p.revision.digest.as_str())
+        .collect::<BTreeSet<_>>();
+    serde_json::json!({"entity_id":entity.as_str(),"provider_id":provider.map(agent_session_grep_ports::SearchProvider::as_str),"session_id":session,"message_id":message,"placement_id":occurrence.map(|p|p.id.as_str()),"document_id":document,"revision_digest":evidence.proof.revision.digest,"precision":if occurrence.is_some_and(|p|p.span.is_some()){"byte"}else{"unknown"},"related_revision_digests":related})
+}
+
 /// Exact frozen projection in first-query order. Cache adapters copy these
 /// fields; they never reselect a canonical-ID representative or recompute rank.
 #[derive(Debug, Clone, PartialEq)]
@@ -342,7 +371,15 @@ impl ManagedHandoffInput<'_> {
 pub struct ManagedApp<'a, R: ProjectionRead + ?Sized> {
     read: &'a R,
     context: ManagedRequestContext<'a>,
+    context_frame_size: Option<&'a ContextFrameSize<'a>>,
 }
+
+/// Byte count of the final frame a composition root would emit for one
+/// candidate context response, compared with the request's
+/// `max_response_bytes`. It must be an upper bound of the bytes later written
+/// for the same response: context prefix selection returns only a candidate
+/// this measure accepted.
+pub type ContextFrameSize<'a> = dyn Fn(&ManagedResponse) -> Result<usize, AppError> + 'a;
 
 fn invalid() -> AppError {
     PortError::InvalidRequest("invalid managed request".into()).into()
@@ -407,9 +444,22 @@ impl<'a, R: ProjectionRead + ?Sized> ManagedApp<'a, R> {
         {
             return Err(invalid());
         }
-        let app = Self { read, context };
+        let app = Self {
+            read,
+            context,
+            context_frame_size: None,
+        };
         app.check_deadline()?;
         Ok(app)
+    }
+    /// Supply the final context serializer's byte count, including redaction,
+    /// envelope and every transport copy. Application retains prefix
+    /// selection; the composition root owns the output format. No source is
+    /// reloaded. Without one, context keeps the per-message estimate against
+    /// the fixed identity reserve.
+    pub fn with_context_frame_size(mut self, measure: &'a ContextFrameSize<'a>) -> Self {
+        self.context_frame_size = Some(measure);
+        self
     }
     fn check_deadline(&self) -> Result<(), AppError> {
         if (self.context.deadline_expired)() {
@@ -1993,12 +2043,22 @@ impl<'a, R: ProjectionRead + ?Sized> ManagedApp<'a, R> {
                 .map(|p| vec![loaded.records[p.id.as_str()].message.proof.clone()])
                 .unwrap_or_default(),
         };
-        let fixed = proof_charge(&session_evidence)
-            .saturating_add(crate::json_string_len(session_id.as_str()))
-            .saturating_add(512);
-        let capacity = net_bytes(budget).checked_sub(fixed).ok_or_else(|| {
-            budget::BudgetError::TooSmall("max_response_bytes cannot fit context identity".into())
-        })?;
+        // A composition root that supplies its final serializer selects by
+        // measured whole frames. Without one, the per-item estimates and the
+        // fixed reserve below keep the established selection unchanged.
+        let fit = match self.context_frame_size {
+            Some(measure) => ContextFit::Measured(measure),
+            None => {
+                let fixed = proof_charge(&session_evidence)
+                    .saturating_add(crate::json_string_len(session_id.as_str()))
+                    .saturating_add(512);
+                ContextFit::Estimated(net_bytes(budget).checked_sub(fixed).ok_or_else(|| {
+                    budget::BudgetError::TooSmall(
+                        "max_response_bytes cannot fit context identity".into(),
+                    )
+                })?)
+            }
+        };
         let mut proofs = BTreeMap::new();
         let mut occurrences = Vec::new();
         for placement in selected {
@@ -2015,22 +2075,27 @@ impl<'a, R: ProjectionRead + ?Sized> ManagedApp<'a, R> {
                 &record.document,
                 self.generation(),
             );
-            let tool_bytes = record.tools.iter().try_fold(0usize, |size, tool| {
-                Ok::<_, AppError>(
-                    size.saturating_add(bytes(&tool_value(tool)?)?.len())
-                        .saturating_add(16),
-                )
-            })?;
-            let estimated_bytes = bytes(&message)?
-                .len()
-                .saturating_add(bytes(&evidence)?.len())
-                .saturating_add(proof_charge(&proof))
-                .saturating_add(tool_bytes)
-                .saturating_add(
-                    placement.message_id.as_str().len()
-                        + placement.source_document_id.as_str().len()
-                        + 128,
-                );
+            let estimated_bytes = match fit {
+                ContextFit::Measured(_) => 0,
+                ContextFit::Estimated(_) => {
+                    let tool_bytes = record.tools.iter().try_fold(0usize, |size, tool| {
+                        Ok::<_, AppError>(
+                            size.saturating_add(bytes(&tool_value(tool)?)?.len())
+                                .saturating_add(16),
+                        )
+                    })?;
+                    bytes(&message)?
+                        .len()
+                        .saturating_add(bytes(&evidence)?.len())
+                        .saturating_add(proof_charge(&proof))
+                        .saturating_add(tool_bytes)
+                        .saturating_add(
+                            placement.message_id.as_str().len()
+                                + placement.source_document_id.as_str().len()
+                                + 128,
+                        )
+                }
+            };
             proofs.insert(placement.id.as_str().to_owned(), proof);
             occurrences.push(crate::ContextOccurrence {
                 message,
@@ -2044,65 +2109,138 @@ impl<'a, R: ProjectionRead + ?Sized> ManagedApp<'a, R> {
             .max_messages
             .min(budget.max_items)
             .min(budget.max_evidence_spans);
-        let mut effective = crate::available_level(level, &occurrences);
-        let (mut kept, mut truncation, _) = crate::clamp_context_occurrences(
-            occurrences.clone(),
-            effective,
-            maximum,
-            capacity.saturating_sub(crate::structural_metadata_reserve(&session_id, effective)),
-        );
-        if effective != ContextLevel::Raw
-            && crate::available_level(effective, &kept) == ContextLevel::Raw
-        {
-            effective = ContextLevel::Raw;
-            (kept, truncation, _) =
-                crate::clamp_context_occurrences(occurrences, effective, maximum, capacity);
-        }
-        normalize_context_limit(&mut truncation, budget);
-        let (effective_level, talks, summary) = crate::assemble_level(effective, &kept);
-        let hint = crate::build_hint(&session_id, level, effective_level);
-        let mut evidence_proofs = vec![session_evidence];
-        let mut tools = BTreeMap::new();
-        for occurrence in &kept {
-            self.check_deadline()?;
-            evidence_proofs.push(
-                proofs
-                    .remove(&occurrence.message.placement_id)
-                    .ok_or_else(inconsistent)?,
-            );
-            for tool in &loaded.records[&occurrence.message.placement_id].tools {
-                let value = tool_value(tool)?;
-                tools
-                    .entry(tool.proof.projection_id.as_str().to_owned())
-                    .or_insert(value);
+        let assemble = |assembly_level: ContextLevel,
+                        kept: &[crate::ContextOccurrence],
+                        mut truncation: Truncation|
+         -> Result<ManagedResponse, AppError> {
+            normalize_context_limit(&mut truncation, budget);
+            let (effective_level, talks, summary) = crate::assemble_level(assembly_level, kept);
+            let hint = crate::build_hint(&session_id, level, effective_level);
+            let mut evidence_proofs = vec![session_evidence.clone()];
+            let mut tools = BTreeMap::new();
+            for occurrence in kept {
+                self.check_deadline()?;
+                let placement = occurrence.message.placement_id.as_str();
+                evidence_proofs.push(proofs.get(placement).ok_or_else(inconsistent)?.clone());
+                for tool in &loaded
+                    .records
+                    .get(placement)
+                    .ok_or_else(inconsistent)?
+                    .tools
+                {
+                    let value = tool_value(tool)?;
+                    tools
+                        .entry(tool.proof.projection_id.as_str().to_owned())
+                        .or_insert(value);
+                }
             }
-        }
-        let session = serde_json::json!({"id":session_id.as_str(),"documents":kept.iter().map(|o|o.source_document_id.as_str()).collect::<BTreeSet<_>>(),"messages":kept.iter().map(|o|o.message.message_id.as_str()).collect::<BTreeSet<_>>()});
-        let response = AppResponse::Context {
-            session_id: session_id.as_str().into(),
-            session,
-            branch_leaf,
-            branch_leaf_placement_id,
-            messages: kept.iter().map(|o| o.message.clone()).collect(),
-            evidence: kept.iter().map(|o| o.evidence.clone()).collect(),
-            tool_activities: tools.into_values().collect(),
-            requested_level: level,
-            effective_level,
-            talks,
-            summary,
-            hint,
-            truncation: truncation.clone(),
-            generation: self.generation(),
-        };
-        self.finish(
-            response,
-            evidence_proofs,
-            if truncation.truncated {
+            let session = serde_json::json!({"id":session_id.as_str(),"documents":kept.iter().map(|o|o.source_document_id.as_str()).collect::<BTreeSet<_>>(),"messages":kept.iter().map(|o|o.message.message_id.as_str()).collect::<BTreeSet<_>>()});
+            let partial = if truncation.truncated {
                 vec![ManagedPartial::ResponseBudget]
             } else {
                 Vec::new()
-            },
-        )
+            };
+            self.finish(
+                AppResponse::Context {
+                    session_id: session_id.as_str().into(),
+                    session,
+                    branch_leaf: branch_leaf.clone(),
+                    branch_leaf_placement_id: branch_leaf_placement_id.clone(),
+                    messages: kept.iter().map(|o| o.message.clone()).collect(),
+                    evidence: kept.iter().map(|o| o.evidence.clone()).collect(),
+                    tool_activities: tools.into_values().collect(),
+                    requested_level: level,
+                    effective_level,
+                    talks,
+                    summary,
+                    hint,
+                    truncation,
+                    generation: self.generation(),
+                },
+                evidence_proofs,
+                partial,
+            )
+        };
+        let measure = match fit {
+            ContextFit::Measured(measure) => measure,
+            ContextFit::Estimated(capacity) => {
+                let mut effective = crate::available_level(level, &occurrences);
+                let (mut kept, mut truncation, _) = crate::clamp_context_occurrences(
+                    occurrences.clone(),
+                    effective,
+                    maximum,
+                    capacity
+                        .saturating_sub(crate::structural_metadata_reserve(&session_id, effective)),
+                );
+                if effective != ContextLevel::Raw
+                    && crate::available_level(effective, &kept) == ContextLevel::Raw
+                {
+                    effective = ContextLevel::Raw;
+                    (kept, truncation, _) =
+                        crate::clamp_context_occurrences(occurrences, effective, maximum, capacity);
+                }
+                return assemble(effective, &kept, truncation);
+            }
+        };
+        // Item limits keep the shared count clamp. Budget bytes are the measured
+        // bytes of whole candidates, each prefix in its real truncated shape
+        // (truncation reason, partial outcome and warning included). Doubling
+        // probes of 1, 2, 4, ... messages stop at the first prefix that does not
+        // fit, so no measured prefix exceeds 2k + 2 messages for a final k and
+        // the work of one render stays bounded by the budget's own answer, never
+        // by the session. The complete candidate, with its own count
+        // truncation, is measured only once every shorter probe fits; when it
+        // fits it is returned unchanged. A binary search inside the last
+        // bracket then finds the longest fitting prefix. At most
+        // 2 * ceil(log2(len + 1)) + 2 measurements run, each after a deadline
+        // check, and only a measured fit is ever returned. Raw byte lower
+        // bounds are not used to prune: redaction can shorten text.
+        let (candidates, count_truncation, _) =
+            budget::clamp_items(occurrences, maximum, usize::MAX, |_| 0);
+        let truncated = Truncation {
+            truncated: true,
+            reason: Some(budget::TRUNCATION_MAX_RESPONSE_BYTES.into()),
+        };
+        let fits = |candidate: &ManagedResponse| -> Result<bool, AppError> {
+            self.check_deadline()?;
+            Ok(measure(candidate)? <= budget.max_response_bytes)
+        };
+        // `best` is the longest prefix measured to fit, `low - 1` messages
+        // long; `high` is the shortest length known not to fit.
+        let mut best = None;
+        let (mut low, mut high) = (0, candidates.len());
+        let mut probe = 1;
+        loop {
+            if probe >= candidates.len() {
+                let complete = assemble(level, &candidates, count_truncation)?;
+                if fits(&complete)? {
+                    return Ok(complete);
+                }
+                break;
+            }
+            let candidate = assemble(level, &candidates[..probe], truncated.clone())?;
+            if !fits(&candidate)? {
+                high = probe;
+                break;
+            }
+            best = Some(candidate);
+            low = probe + 1;
+            probe *= 2;
+        }
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let candidate = assemble(level, &candidates[..mid], truncated.clone())?;
+            if fits(&candidate)? {
+                best = Some(candidate);
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        best.ok_or_else(|| {
+            budget::BudgetError::TooSmall("max_response_bytes cannot fit context identity".into())
+                .into()
+        })
     }
 
     fn message_window(
@@ -2470,6 +2608,15 @@ struct LoadedGraph {
     graph: SessionContextGraph,
     session_proof: EvidenceProof,
     records: BTreeMap<String, ContextProjection>,
+}
+
+/// How one context response chooses its prefix: the established per-item
+/// estimate against a fixed capacity, or whole candidates measured by the
+/// composition root's final serializer.
+#[derive(Clone, Copy)]
+enum ContextFit<'m> {
+    Estimated(usize),
+    Measured(&'m ContextFrameSize<'m>),
 }
 fn context_not_found() -> AppError {
     PortError::NotFound("managed context or message not found".into()).into()

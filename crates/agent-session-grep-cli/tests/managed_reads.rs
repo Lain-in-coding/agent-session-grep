@@ -1,6 +1,6 @@
 //! Actual CLI reads over synthetic managed catalogs; no real assistant history.
 use agent_session_grep_adapters_sqlite::{
-    PARSER_SEMANTIC_VERSION, SourceBatch, SqliteControlStore,
+    PARSER_SEMANTIC_VERSION, SourceActivity, SourceBatch, SqliteControlStore,
     control::BackupPurpose,
     managed_locks::{ExclusiveGuard, JobLockKey, LockKind},
     managed_maintenance::{
@@ -10,7 +10,8 @@ use agent_session_grep_adapters_sqlite::{
     managed_store::ManagedStore,
 };
 use agent_session_grep_domain::{
-    EvidenceSpan, IdKind, MessageEdge, MessagePlacement, MessageRelation, StableId,
+    EvidenceSpan, IdKind, MessageEdge, MessagePlacement, MessageRelation, StableId, ToolActivity,
+    ToolActivityActor, ToolActivityKind, ToolActivityStatus,
 };
 use agent_session_grep_ports::{
     PortError, SearchProvider, SourceResumeClaim,
@@ -2189,4 +2190,447 @@ fn f2_human_and_json_direct_evidence_hide_noncontributing_selected_source_failur
                 .contains("extra-source")
         );
     }
+}
+
+/// Synthetic shape of a long assistant session: (role, text bytes, quotes,
+/// backslashes, tool activity). Tool-result turns carry the large, quote-heavy
+/// text whose escaping dominates a rendered context frame. All text is
+/// generated; no assistant history is used.
+const REPLAY_SHAPE: [(&str, usize, usize, usize, bool); 12] = [
+    ("user", 370, 0, 0, false),
+    ("assistant", 131, 0, 0, false),
+    ("assistant", 39, 0, 0, false),
+    ("user", 2767, 384, 0, true),
+    ("assistant", 81, 0, 0, false),
+    ("user", 906, 34, 0, false),
+    ("assistant", 45, 0, 0, false),
+    ("assistant", 86, 0, 0, false),
+    ("user", 5439, 388, 37, true),
+    ("assistant", 679, 2, 0, false),
+    ("assistant", 36, 0, 0, false),
+    ("user", 1716, 170, 0, true),
+];
+
+/// Exactly `bytes` ASCII bytes of plain words with `quotes` double quotes and
+/// `backslashes` backslashes spread through them. No redaction rule matches.
+fn synthetic_text(seed: usize, bytes: usize, quotes: usize, backslashes: usize) -> String {
+    const WORDS: [&str; 8] = [
+        "alpha ", "bravo ", "carrot ", "delta ", "ember ", "fable ", "garden ", "harbor ",
+    ];
+    let mut text = WORDS
+        .iter()
+        .cycle()
+        .skip(seed)
+        .flat_map(|word| word.bytes())
+        .take(bytes)
+        .collect::<Vec<_>>();
+    let specials = quotes + backslashes;
+    for n in 0..specials {
+        text[n * bytes / specials] = if n < quotes { b'"' } else { b'\\' };
+    }
+    String::from_utf8(text).unwrap()
+}
+
+struct Replay {
+    session: StableId,
+    document: StableId,
+    messages: Vec<StableId>,
+    placements: Vec<String>,
+}
+
+impl Fixture {
+    /// Replace the seed source with the synthetic 12-message session: byte
+    /// spans, one reply chain and three tool activities. Identifier lengths
+    /// match the provider-native shape (36-character native suffixes).
+    fn commit_replay(&self) -> Replay {
+        let guard = lock(&self.root, LockKind::Background);
+        let worker = self
+            .control
+            .bind_worker(&guard, id("private-boot"))
+            .unwrap();
+        let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
+        let session = entity(IdKind::Session, "00000000-0000-4000-8000-00000000c0de");
+        let document = entity(IdKind::Document, "00000000-0000-4000-8000-00000000d0c5");
+        let mut observation = self.observation.clone();
+        observation.revision_id = RevisionId::parse("replay-receipt").unwrap();
+        observation.repositories = vec![RepositoryClaim {
+            session_id: session.clone(),
+            slug: "example.test/team/project".into(),
+        }];
+        let mut batch = self.batch.clone();
+        batch.entries = vec![
+            (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()],"title":"Synthetic replay session"})).unwrap(), String::new()),
+            (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":observation.revision_digest,"len":1000000})).unwrap(), String::new()),
+        ];
+        batch.placements.clear();
+        batch.edges.clear();
+        batch.activities.clear();
+        batch.resume_claims[0].session_id = session.as_str().into();
+        let (mut messages, mut placements) = (Vec::new(), Vec::new());
+        let mut offset = 0u64;
+        for (n, (role, bytes, quotes, backslashes, tool)) in REPLAY_SHAPE.into_iter().enumerate() {
+            let message = entity(
+                IdKind::Message,
+                &format!("00000000-0000-4000-8000-0000000000{n:02}"),
+            );
+            let text = synthetic_text(n, bytes, quotes, backslashes);
+            let timestamp = format!("2026-10-17T12:{n:02}:00.000Z");
+            batch.entries.push((
+                message.clone(),
+                serde_json::to_vec(&json!({"role":role,"text":text,"timestamp":timestamp}))
+                    .unwrap(),
+                text.clone(),
+            ));
+            let placement = MessagePlacement::new(
+                session.clone(),
+                document.clone(),
+                message.clone(),
+                n as u32,
+                false,
+                Some(EvidenceSpan {
+                    start: offset,
+                    end: offset + bytes as u64,
+                }),
+            );
+            offset += bytes as u64 + 1;
+            if let Some(parent) = messages.last() {
+                batch.edges.push(MessageEdge {
+                    child_placement_id: placement.id.clone(),
+                    parent_message_id: StableId::clone(parent),
+                    parent_native_id: None,
+                    relation: MessageRelation::Reply,
+                });
+            }
+            if tool {
+                batch.activities.push(SourceActivity {
+                    message_id: message.clone(),
+                    activity: ToolActivity {
+                        kind: ToolActivityKind::Command,
+                        actor: ToolActivityActor::Main,
+                        name: "SyntheticTool".into(),
+                        target: Some(format!("synthetic-target-{n}")),
+                        status: ToolActivityStatus::Success,
+                    },
+                });
+            }
+            placements.push(placement.id.as_str().to_owned());
+            batch.placements.push(placement);
+            messages.push(message);
+        }
+        store
+            .commit_source(&self.control, &worker, &batch, &observation)
+            .unwrap();
+        Replay {
+            session,
+            document,
+            messages,
+            placements,
+        }
+    }
+}
+
+/// A Robot frame with a fixed request id, so its bytes vary only with the
+/// evidence and the elapsed-duration digits.
+fn replay_frame(f: &Fixture, args: &[&str]) -> (Value, String) {
+    let output = Command::new(BIN)
+        .args(["--robot", "--request-id", "replay-request", "--db"])
+        .arg(&f.db)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 10)),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wire = String::from_utf8(output.stdout).unwrap();
+    for private in [
+        "PRIVATE_SOURCE_SENTINEL",
+        "PRIVATE_REVISION_ID",
+        "private-incarnation",
+        "NATIVE_RESUME_SENTINEL",
+        "source_path",
+        "projection_id",
+    ] {
+        assert!(!wire.contains(private), "private field escaped: {private}");
+    }
+    (serde_json::from_str(&wire).unwrap(), wire)
+}
+
+#[test]
+fn context_returns_complete_31k_replay_session_within_32k_robot_frame() {
+    let f = Fixture::new(1, "seed");
+    let replay = f.commit_replay();
+    let context = |max_bytes: usize| {
+        let max_bytes = max_bytes.to_string();
+        replay_frame(
+            &f,
+            &[
+                "context",
+                replay.session.as_str(),
+                "--max-bytes",
+                &max_bytes,
+                "--max-items",
+                "64",
+                "--max-messages",
+                "64",
+            ],
+        )
+    };
+    let assert_complete = |(frame, wire): &(Value, String), limit: usize| {
+        assert!(wire.len() <= limit, "{} > {limit}", wire.len());
+        assert_eq!(frame["outcome"], "success", "{frame}");
+        assert_eq!(frame["warnings"], json!([]), "{frame}");
+        assert_eq!(
+            frame["data"]["truncation"],
+            json!({"truncated":false,"reason":null})
+        );
+        let ids = frame["data"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["message_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let expected = replay
+            .messages
+            .iter()
+            .map(|m| m.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected);
+    };
+    let complete = context(32 * 1024);
+    assert_complete(&complete, 32 * 1024);
+    let frame_bytes = complete.1.len();
+    // The synthetic session is the 31.8 KB shape that previously kept 6 of 12.
+    assert!(
+        (30 * 1024..32 * 1024).contains(&frame_bytes),
+        "fixture drifted from its 31.8 KB shape: {frame_bytes}"
+    );
+    let data_bytes = serde_json::to_vec(&complete.0["data"]).unwrap().len();
+    eprintln!("replay context: robot frame {frame_bytes} B, data {data_bytes} B");
+    // A Robot frame is the measured frame itself, so the selection margin is
+    // zero; across processes only the digit count of `duration_ms` varies.
+    // `base` is the complete frame without those digits. Each attempt targets
+    // the digits last seen and checks the outcome whichever way they moved: no
+    // frame exceeds its limit, a successful frame is whole, and a partial one
+    // is the Application's prefix with one `response_budget` warning (a halved
+    // retry by the final-frame safety net would add a second).
+    let digits = |frame: &Value| frame["meta"]["duration_ms"].to_string().len();
+    let base = frame_bytes - digits(&complete.0);
+    let attempt = |limit: usize| {
+        let (frame, wire) = context(limit);
+        assert!(wire.len() <= limit, "{} > {limit}", wire.len());
+        if frame["outcome"] == "success" {
+            assert_complete(&(frame.clone(), wire.clone()), limit);
+        } else {
+            assert_eq!(frame["warnings"], json!(["response_budget"]), "{frame}");
+            assert_eq!(
+                frame["data"]["truncation"],
+                json!({"truncated":true,"reason":"max_response_bytes"})
+            );
+            assert_eq!(frame["data"]["messages"].as_array().unwrap().len(), 11);
+        }
+        (frame, wire.len())
+    };
+    // A complete frame exactly at its limit is kept whole.
+    let mut previous = digits(&complete.0);
+    let mut exact = false;
+    for _ in 0..5 {
+        let limit = base + previous;
+        let (frame, bytes) = attempt(limit);
+        previous = digits(&frame);
+        if frame["outcome"] == "success" && bytes == limit {
+            exact = true;
+            break;
+        }
+    }
+    assert!(exact, "no call reproduced a frame exactly at its limit");
+    // One byte short of the frame keeps the largest fitting prefix. Durations
+    // only grow within a call, so a partial frame whose own digits equal the
+    // target proves its complete candidate was exactly one byte over.
+    let mut short = false;
+    for _ in 0..5 {
+        let limit = base + previous - 1;
+        let (frame, _) = attempt(limit);
+        let seen = digits(&frame);
+        if frame["outcome"] == "partial" && seen == previous {
+            short = true;
+            break;
+        }
+        previous = seen;
+    }
+    assert!(short, "no call reproduced a frame one byte over its limit");
+}
+
+/// Context calls over one MCP session. Call ids are single digits, so the
+/// frame lengths of different calls are directly comparable.
+fn replay_mcp(f: &Fixture, session: &StableId, calls: &[(usize, usize)]) -> Vec<String> {
+    let mut child = Command::new(BIN)
+        .arg("--db")
+        .arg(&f.db)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}}})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    for (n, (max_bytes, max_messages)) in calls.iter().enumerate() {
+        writeln!(input, "{}", json!({"jsonrpc":"2.0","id":n + 2,"method":"tools/call","params":{"name":"get_session_context","arguments":{"session_id":session.as_str(),"max_bytes":max_bytes,"max_messages":max_messages}}})).unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wire = String::from_utf8(output.stdout).unwrap();
+    assert!(!wire.contains("PRIVATE_SOURCE_SENTINEL"));
+    let lines = wire
+        .split_inclusive('\n')
+        .skip(1)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), calls.len(), "{wire}");
+    lines
+}
+
+fn mcp_payload(line: &str) -> Value {
+    let frame: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(frame["result"]["isError"], false, "{frame}");
+    frame["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn mcp_context_frame_at_limit_is_complete_and_one_byte_less_keeps_largest_prefix() {
+    let f = Fixture::new(1, "seed");
+    let replay = f.commit_replay();
+    let full = replay_mcp(&f, &replay.session, &[(256 * 1024, 64)]);
+    // MCP frame bytes are deterministic: the measurement is the final frame.
+    let limit = full[0].len();
+    let complete = mcp_payload(&full[0]);
+    assert_eq!(complete["data"]["messages"].as_array().unwrap().len(), 12);
+    assert_eq!(complete["data"]["truncation"]["truncated"], false);
+    let lines = replay_mcp(&f, &replay.session, &[(limit, 64), (limit - 1, 64)]);
+    assert_eq!(lines[0].len(), limit, "a frame exactly at its limit fits");
+    assert_eq!(mcp_payload(&lines[0]), complete);
+    assert!(lines[1].len() < limit);
+    let short = mcp_payload(&lines[1]);
+    assert_eq!(short["outcome"], "partial");
+    // A single warning: the Application measurement is exact, so the
+    // final-frame safety net never halves the budget.
+    assert_eq!(short["warnings"], json!(["response_budget"]), "{short}");
+    assert_eq!(
+        short["data"]["truncation"],
+        json!({"truncated":true,"reason":"max_response_bytes"})
+    );
+    let kept = short["data"]["messages"].as_array().unwrap();
+    let k = kept.len();
+    assert!((1..12).contains(&k), "{k}");
+    eprintln!(
+        "replay mcp context: complete frame {limit} B; limit {} B keeps {k} of 12 in {} B",
+        limit - 1,
+        lines[1].len()
+    );
+    for (message, placement) in kept.iter().zip(&replay.placements) {
+        assert_eq!(message["placement_id"], placement.as_str());
+    }
+    // Largest prefix: the k+1 prefix truncated by count renders 12 bytes
+    // shorter than its byte-truncated form (`max_messages` is 6 bytes shorter
+    // than `max_response_bytes`, once per payload copy), and still exceeds
+    // the limit. The k prefix at exactly its own frame size is kept whole.
+    let probe = replay_mcp(
+        &f,
+        &replay.session,
+        &[(256 * 1024, k + 1), (lines[1].len(), 64)],
+    );
+    let next = mcp_payload(&probe[0]);
+    assert_eq!(next["data"]["messages"].as_array().unwrap().len(), k + 1);
+    if k + 1 < 12 {
+        assert_eq!(next["data"]["truncation"]["reason"], "max_messages");
+        assert!(probe[0].len() + 12 > limit - 1);
+    }
+    assert_eq!(probe[1].len(), lines[1].len());
+    assert_eq!(mcp_payload(&probe[1]), short);
+}
+
+#[test]
+fn mcp_context_at_32k_keeps_the_largest_prefix_of_the_whole_frame_in_one_render() {
+    let f = Fixture::new(1, "seed");
+    let replay = f.commit_replay();
+    // `max_bytes` budgets the whole JSON-RPC frame, which carries the payload
+    // twice (once escaped). The session whose single Robot envelope fits in
+    // 32 KiB therefore cannot fit whole here.
+    let limit = 32 * 1024;
+    let lines = replay_mcp(&f, &replay.session, &[(limit, 64)]);
+    assert!(lines[0].len() <= limit, "{} > {limit}", lines[0].len());
+    let payload = mcp_payload(&lines[0]);
+    assert_eq!(payload["outcome"], "partial");
+    // One render passes the final-frame gate: a halved retry would add a
+    // second `response_budget` warning.
+    assert_eq!(payload["warnings"], json!(["response_budget"]), "{payload}");
+    assert_eq!(
+        payload["data"]["truncation"],
+        json!({"truncated":true,"reason":"max_response_bytes"})
+    );
+    let kept = payload["data"]["messages"].as_array().unwrap();
+    let k = kept.len();
+    eprintln!(
+        "replay mcp context at {limit} B: keeps {k} of 12 in {} B",
+        lines[0].len()
+    );
+    assert_eq!(k, 6, "{payload}");
+    for (message, placement) in kept.iter().zip(&replay.placements) {
+        assert_eq!(message["placement_id"], placement.as_str());
+    }
+    // Largest prefix: the k+1 prefix truncated by count is 12 bytes shorter
+    // than its byte-truncated form (one 6-byte reason difference per payload
+    // copy) and still exceeds the limit.
+    let probe = replay_mcp(&f, &replay.session, &[(256 * 1024, k + 1)]);
+    let next = mcp_payload(&probe[0]);
+    assert_eq!(next["data"]["messages"].as_array().unwrap().len(), k + 1);
+    assert_eq!(next["data"]["truncation"]["reason"], "max_messages");
+    assert!(probe[0].len() + 12 > limit, "{}", probe[0].len());
+}
+
+#[test]
+fn context_provenance_rows_are_the_shared_byte_identical_shape() {
+    let f = Fixture::new(1, "seed");
+    let replay = f.commit_replay();
+    let (frame, wire) = replay_frame(
+        &f,
+        &[
+            "context",
+            replay.session.as_str(),
+            "--max-bytes",
+            "65536",
+            "--max-items",
+            "64",
+            "--max-messages",
+            "64",
+        ],
+    );
+    let digest = f.observation.revision_digest.as_str();
+    let mut expected = vec![
+        json!({"entity_id":replay.session.as_str(),"provider_id":"claude-code","session_id":replay.session.as_str(),"message_id":null,"placement_id":null,"document_id":null,"revision_digest":digest,"precision":"unknown","related_revision_digests":[digest]}),
+    ];
+    for (message, placement) in replay.messages.iter().zip(&replay.placements) {
+        expected.push(json!({"entity_id":message.as_str(),"provider_id":"claude-code","session_id":replay.session.as_str(),"message_id":message.as_str(),"placement_id":placement,"document_id":replay.document.as_str(),"revision_digest":digest,"precision":"byte","related_revision_digests":[digest]}));
+    }
+    let expected = Value::Array(expected);
+    assert_eq!(frame["data"]["provenance"], expected);
+    // Field order and bytes too: the budget measures this exact row shape.
+    assert!(
+        wire.contains(&format!("\"provenance\":{expected}")),
+        "{wire}"
+    );
 }
