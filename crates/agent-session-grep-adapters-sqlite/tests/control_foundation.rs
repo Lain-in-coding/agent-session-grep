@@ -1506,6 +1506,281 @@ fn pause_abort_and_resume_never_relabels_previous_observation() {
     );
 }
 
+const EVERY_WORKER_ERROR: [Option<BackgroundFailure>; 16] = [
+    None,
+    Some(BackgroundFailure::Paused),
+    Some(BackgroundFailure::Stopped),
+    Some(BackgroundFailure::Offline),
+    Some(BackgroundFailure::Busy),
+    Some(BackgroundFailure::Failed),
+    Some(BackgroundFailure::Deferred),
+    Some(BackgroundFailure::Upgrading),
+    Some(BackgroundFailure::PolicyChanged),
+    Some(BackgroundFailure::Timeout),
+    Some(BackgroundFailure::ScopeUnverified),
+    Some(BackgroundFailure::SourceChanged),
+    Some(BackgroundFailure::WorkerRestarted),
+    Some(BackgroundFailure::CatalogChanged),
+    Some(BackgroundFailure::RewritePending),
+    Some(BackgroundFailure::DeletionPending),
+];
+
+/// One latest admission against the store's current status. A refusal must
+/// leave every control row unchanged; an admission must store exactly one
+/// Pending barrier with no error, whatever live advisory `barrier()` overlays.
+fn admit_once(
+    root: &Path,
+    store: &SqliteControlStore,
+    selected: &SelectionRevision,
+    now_ms: i64,
+    case: &str,
+) -> LatestAdmission {
+    let before = control_rows(root);
+    let expected = current(store);
+    let admission = retry_expected_success(|| {
+        store.admit_latest(
+            expected,
+            LatestRequest {
+                selections: vec![selected.clone()],
+                max_wait_ms: 1000,
+                now_ms,
+            },
+        )
+    })
+    .unwrap();
+    match &admission.value {
+        LatestAdmission::Queued(barrier) => {
+            assert!(admission.changed, "{case}");
+            assert!(admission.control_seq > expected, "{case}");
+            assert_eq!(barrier.state, BarrierState::Pending, "{case}");
+            assert_eq!(barrier.error, None, "{case}");
+            let stored = store.persisted_barrier(&barrier.id).unwrap();
+            assert_eq!(&stored, barrier, "{case}");
+        }
+        LatestAdmission::Blocked(_) => {
+            assert!(!admission.changed, "{case}");
+            assert_eq!(admission.control_seq, expected, "{case}");
+            assert!(control_rows(root) == before, "{case}: refusal wrote rows");
+        }
+    }
+    admission.value
+}
+
+#[test]
+fn latest_admission_queues_live_busy_deferred_advisories_and_refuses_hard_states() {
+    // Each case rewrites the whole heartbeat before admitting once, and
+    // admission reads only intent, heartbeat and selection, so the cases share
+    // one registered live worker.
+    let (_temp, root, store, worker, s) = worker_setup();
+    let report = |state: UpdateState, error: Option<BackgroundFailure>| {
+        retry_expected_success(|| {
+            store.heartbeat_worker(current(&store), &worker, state, error, 140)
+        })
+        .unwrap();
+    };
+    // Busy/Deferred from a live worker retry within the original wait; their
+    // reported error decides whether that heartbeat is advisory at all.
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let advisory = if state == UpdateState::Busy {
+            BackgroundFailure::Busy
+        } else {
+            BackgroundFailure::Deferred
+        };
+        for error in EVERY_WORKER_ERROR {
+            let case = format!("{state:?} heartbeat with {error:?}");
+            report(state, error);
+            let admitted = admit_once(&root, &store, &s, 141, &case);
+            let advisory_error = matches!(
+                error,
+                None | Some(BackgroundFailure::Busy | BackgroundFailure::Deferred)
+            );
+            if advisory_error {
+                let barrier = match admitted {
+                    LatestAdmission::Queued(barrier) => barrier,
+                    blocked => panic!("{case}: a live advisory must queue, got {blocked:?}"),
+                };
+                // The live overlay still discloses the advisory while the
+                // stored row stays Pending for the same request to wait on.
+                let overlay = store.barrier(&barrier.id).unwrap();
+                assert_eq!(overlay.state, BarrierState::Blocked, "{case}");
+                assert_eq!(overlay.error, Some(advisory), "{case}");
+                assert_eq!(overlay.id, barrier.id, "{case}");
+                assert_eq!(
+                    overlay.required_cycle_seq, barrier.required_cycle_seq,
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    admitted,
+                    LatestAdmission::Blocked(advisory),
+                    "{case}: a hard worker error stays terminal"
+                );
+            }
+        }
+    }
+    // Terminal heartbeats refuse even when they report an advisory error.
+    for (state, reason) in [
+        (UpdateState::Paused, BackgroundFailure::Paused),
+        (UpdateState::Stopped, BackgroundFailure::Stopped),
+        (UpdateState::Failed, BackgroundFailure::Failed),
+        (UpdateState::Upgrading, BackgroundFailure::Upgrading),
+    ] {
+        for error in [
+            None,
+            Some(BackgroundFailure::Busy),
+            Some(BackgroundFailure::Deferred),
+            Some(reason),
+        ] {
+            let case = format!("{state:?} heartbeat with {error:?}");
+            report(state, error);
+            assert_eq!(
+                admit_once(&root, &store, &s, 141, &case),
+                LatestAdmission::Blocked(reason),
+                "{case}"
+            );
+        }
+    }
+    for state in [UpdateState::Running, UpdateState::Idle] {
+        let case = format!("{state:?} heartbeat");
+        report(state, None);
+        let barrier = match admit_once(&root, &store, &s, 141, &case) {
+            LatestAdmission::Queued(barrier) => barrier,
+            blocked => panic!("{case}: an active worker must queue, got {blocked:?}"),
+        };
+        assert_eq!(store.barrier(&barrier.id).unwrap(), barrier, "{case}");
+    }
+}
+
+/// Report the matching Busy/Deferred advisory from the registered live worker.
+fn advise(store: &SqliteControlStore, worker: &TestWorker, state: UpdateState, now_ms: i64) {
+    let error = match state {
+        UpdateState::Busy => BackgroundFailure::Busy,
+        UpdateState::Deferred => BackgroundFailure::Deferred,
+        other => panic!("{other:?} is not a transient advisory"),
+    };
+    retry_expected_success(|| {
+        store.heartbeat_worker(current(store), worker, state, Some(error), now_ms)
+    })
+    .unwrap();
+}
+
+#[test]
+fn latest_admission_terminal_status_wins_over_a_live_advisory_heartbeat() {
+    let (_temp, root, store) = setup();
+    let selected = retry_expected_success(|| {
+        store.add_selection(zero(), request(SearchProvider::Claude, "R", RootKind::Root))
+    })
+    .unwrap();
+    let s = revision(&selected.value);
+    assert_eq!(
+        admit_once(&root, &store, &s, 150, "no worker boot"),
+        LatestAdmission::Blocked(BackgroundFailure::Offline)
+    );
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let (_temp, root, store, worker, s) = worker_setup();
+        advise(&store, &worker, state, 151);
+        retry_expected_success(|| store.stop_worker(current(&store), &worker, 152)).unwrap();
+        assert_eq!(
+            admit_once(&root, &store, &s, 153, "stopped worker"),
+            LatestAdmission::Blocked(BackgroundFailure::Offline)
+        );
+        for (desired, reason) in [
+            (DesiredUpdates::Paused, BackgroundFailure::Paused),
+            (DesiredUpdates::Stopped, BackgroundFailure::Stopped),
+        ] {
+            let (_temp, root, store, worker, s) = worker_setup();
+            advise(&store, &worker, state, 151);
+            retry_expected_success(|| store.set_desired_updates(current(&store), desired)).unwrap();
+            assert_eq!(
+                store.background_status().unwrap().worker.state,
+                state,
+                "the advisory heartbeat survives {desired:?}"
+            );
+            assert_eq!(
+                admit_once(&root, &store, &s, 153, &format!("{desired:?} intent")),
+                LatestAdmission::Blocked(reason)
+            );
+        }
+        let (_temp, root, store, worker, s) = worker_setup();
+        advise(&store, &worker, state, 151);
+        let owner = id("recovery_owner");
+        retry_expected_success(|| {
+            store.set_maintenance(
+                current(&store),
+                &owner,
+                MaintenanceFence {
+                    state: MaintenanceState::Recovering,
+                    owner: Some(owner.clone()),
+                    phase: Some(MaintenancePhase::Reconciling),
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(store.background_status().unwrap().worker.state, state);
+        assert_eq!(
+            admit_once(&root, &store, &s, 153, "maintenance fence"),
+            LatestAdmission::Blocked(BackgroundFailure::Upgrading)
+        );
+    }
+}
+
+#[test]
+fn barrier_admitted_during_live_advisory_is_served_by_the_next_owned_cycle() {
+    for state in [UpdateState::Busy, UpdateState::Deferred] {
+        let (_temp, _root, store, worker, s) = worker_setup();
+        advise(&store, &worker, state, 160);
+        let barrier = latest(&store, &s, 161);
+        // The advisory blocks the worker's own cycle start until it reports
+        // activity again; it never strands or reopens the admitted barrier.
+        assert!(
+            store
+                .start_cycle(current(&store), &worker, barrier.required_cycle_seq, 162)
+                .is_err()
+        );
+        retry_expected_success(|| {
+            store.heartbeat_worker(current(&store), &worker, UpdateState::Running, None, 163)
+        })
+        .unwrap();
+        assert_eq!(store.barrier(&barrier.id).unwrap(), barrier);
+        let cycle = retry_expected_success(|| {
+            store.start_cycle(current(&store), &worker, barrier.required_cycle_seq, 164)
+        })
+        .unwrap()
+        .value;
+        assert!(cycle.started_control_seq.unwrap() > barrier.admission_control_seq);
+        retry_expected_success(|| {
+            store.acknowledge_discovery(
+                current(&store),
+                &worker,
+                DiscoveryAcknowledgement {
+                    token: cycle.token.clone(),
+                    selection: s.clone(),
+                    complete: true,
+                    discovered_count: 0,
+                    observed_count: 0,
+                    committed_count: 0,
+                    error: None,
+                },
+            )
+        })
+        .unwrap();
+        retry_expected_success(|| {
+            store.finish_cycle(
+                current(&store),
+                &worker,
+                cycle.token.cycle_seq,
+                CycleFinish::Committed,
+                165,
+            )
+        })
+        .unwrap();
+        let served = store.persisted_barrier(&barrier.id).unwrap();
+        assert_eq!(served.state, BarrierState::AwaitingCatalog);
+        assert_eq!(served.completed_cycle_seq, Some(cycle.token.cycle_seq));
+        assert_eq!(served.error, None);
+    }
+}
+
 #[test]
 fn latest_demand_inventory_retains_awaiting_work_beyond_the_history_tail() {
     use std::time::{Duration, Instant};

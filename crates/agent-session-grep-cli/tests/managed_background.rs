@@ -1499,49 +1499,12 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
 
 #[test]
 fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
-    use agent_session_grep_ports::control::{LatestAdmission, LatestRequest, SelectionRevision};
     let mut f = Fixture::new("claude");
     let path = f.history.join("latest.jsonl");
     fs::write(&path, claude("latest-source", "latestproofneedle")).unwrap();
     f.spawn();
     f.wait(|f| f.sees_text("latestproofneedle"));
-    let control = SqliteControlStore::open_current_writable(f.db.parent().unwrap()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let barrier = loop {
-        let status = control.bounded(|c| c.status());
-        let selections = status
-            .policy
-            .selections
-            .iter()
-            .filter(|s| s.enabled)
-            .map(|s| SelectionRevision {
-                selection_id: s.id.clone(),
-                revision: s.revision,
-                root_identity: s.root_identity.clone().unwrap(),
-            })
-            .collect();
-        let result = control.admit_latest(
-            status.policy.control_seq,
-            LatestRequest {
-                selections,
-                max_wait_ms: 5000,
-                now_ms: 1,
-            },
-        );
-        match result {
-            Ok(change) => match change.value {
-                LatestAdmission::Queued(barrier) => break barrier,
-                LatestAdmission::Blocked(_) => (),
-            },
-            Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)) => (),
-            Err(_) => panic!("latest admission failed"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "latest admission did not become available"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let barrier = admit_latest_barrier(&f, 1);
     f.wait(|f| latest_satisfied(f, &barrier));
     let c = f.control();
     let source = m2_sources(&f);
@@ -1552,28 +1515,8 @@ fn latest_barrier_requires_post_admission_discovery_and_source_receipts() {
     drop(c);
     fs::remove_file(&path).unwrap();
     f.wait(|f| f.lacks_text("latestproofneedle"));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let after_delete = loop {
-        let status = control.bounded(|c| c.status());
-        let result = control.admit_latest(
-            status.policy.control_seq,
-            LatestRequest {
-                selections: barrier.selections.clone(),
-                max_wait_ms: 5000,
-                now_ms: 2,
-            },
-        );
-        if let Ok(change) = result
-            && let LatestAdmission::Queued(barrier) = change.value
-        {
-            break barrier;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "post-deletion latest admission unavailable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let after_delete = admit_latest_barrier(&f, 2);
+    assert_eq!(after_delete.selections, barrier.selections);
     f.wait(|f| latest_satisfied(f, &after_delete));
     let c = f.control();
     let sources = m2_sources(&f);
@@ -1615,12 +1558,19 @@ fn admit_latest_barrier(f: &Fixture, now_ms: i64) -> LatestBarrier {
     admit_latest_barrier_for(f, now_ms, None)
 }
 
+/// Admit one synthetic latest request at the exact control sequence at which
+/// the intent and worker heartbeat were read. A live Busy/Deferred advisory
+/// must queue a barrier for the request to wait on; only a hard refusal (an
+/// unfinished resume or a cycle aborted by a policy or source change) waits
+/// for the worker's next cadence and is admitted again.
 fn admit_latest_barrier_for(
     f: &Fixture,
     now_ms: i64,
     locator: Option<&CanonicalLocator>,
 ) -> LatestBarrier {
-    use agent_session_grep_ports::control::{LatestAdmission, LatestRequest, SelectionRevision};
+    use agent_session_grep_ports::control::{
+        BackgroundFailure, LatestAdmission, LatestRequest, SelectionRevision,
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     let root = f.db.parent().unwrap();
     let physical = RootIdentity::read(root).unwrap();
@@ -1646,38 +1596,62 @@ fn admit_latest_barrier_for(
         }
     };
     loop {
-        let status = match control.with_runtime_deadline(deadline, || control.status()) {
-            Ok(status) => status,
+        let observed = control.with_runtime_deadline(deadline, || {
+            Ok((control.status()?, control.background_status()?))
+        });
+        let (status, runtime) = match observed {
+            Ok(observed) => observed,
             Err(PortError::WriterBusy(_)) if Instant::now() < deadline => continue,
             Err(error) => panic!("synthetic latest status failed: {error:?}"),
         };
-        let selections = status
-            .policy
-            .selections
-            .iter()
-            .filter(|s| s.enabled && locator.is_none_or(|locator| &s.region.locator == locator))
-            .map(|s| SelectionRevision {
-                selection_id: s.id.clone(),
-                revision: s.revision,
-                root_identity: s.root_identity.clone().unwrap(),
-            })
-            .collect();
-        match control.with_runtime_deadline(deadline, || {
-            control.admit_latest(
-                status.policy.control_seq,
-                LatestRequest {
-                    selections,
-                    max_wait_ms: 5000,
-                    now_ms,
+        // Admission is a CAS on this sequence, so it decides over exactly the
+        // heartbeat read here. Unequal sequences mean a change landed between.
+        if runtime.control_seq == status.policy.control_seq {
+            let selections = status
+                .policy
+                .selections
+                .iter()
+                .filter(|s| s.enabled && locator.is_none_or(|locator| &s.region.locator == locator))
+                .map(|s| SelectionRevision {
+                    selection_id: s.id.clone(),
+                    revision: s.revision,
+                    root_identity: s.root_identity.clone().unwrap(),
+                })
+                .collect();
+            match control.with_runtime_deadline(deadline, || {
+                control.admit_latest(
+                    status.policy.control_seq,
+                    LatestRequest {
+                        selections,
+                        max_wait_ms: 5000,
+                        now_ms,
+                    },
+                )
+            }) {
+                Ok(change) => match change.value {
+                    LatestAdmission::Queued(barrier) => return barrier,
+                    LatestAdmission::Blocked(reason) => {
+                        let worker = &runtime.worker;
+                        let live_advisory = status.desired_updates == DesiredUpdates::Running
+                            && status.policy.maintenance.state == MaintenanceState::Idle
+                            && worker.boot_id.is_some()
+                            && matches!(worker.state, UpdateState::Busy | UpdateState::Deferred)
+                            && worker.error.is_none_or(|error| {
+                                matches!(
+                                    error,
+                                    BackgroundFailure::Busy | BackgroundFailure::Deferred
+                                )
+                            });
+                        assert!(
+                            !live_advisory,
+                            "latest admission refused a live {:?}/{:?} advisory as {reason:?}",
+                            worker.state, worker.error,
+                        );
+                    }
                 },
-            )
-        }) {
-            Ok(change) => match change.value {
-                LatestAdmission::Queued(barrier) => return barrier,
-                LatestAdmission::Blocked(_) => (),
-            },
-            Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)) => (),
-            Err(_) => panic!("latest admission failed"),
+                Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_)) => (),
+                Err(error) => panic!("latest admission failed: {error:?}"),
+            }
         }
         assert!(
             Instant::now() < deadline,

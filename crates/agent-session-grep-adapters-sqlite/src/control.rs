@@ -4441,6 +4441,17 @@ fn blocked_reason(status: &ControlStatus, worker: &WorkerStatus) -> Option<Backg
         _ => None,
     }
 }
+/// A live worker's Busy/Deferred heartbeat is advisory: a latest request may
+/// retry it within its original wait. A hard error reported with that
+/// heartbeat stays terminal, so admission must not queue an abandoned barrier.
+fn transient_advisory(reason: BackgroundFailure, worker: &WorkerStatus) -> bool {
+    matches!(
+        reason,
+        BackgroundFailure::Busy | BackgroundFailure::Deferred
+    ) && worker
+        .error
+        .is_none_or(|error| matches!(error, BackgroundFailure::Busy | BackgroundFailure::Deferred))
+}
 fn validate_selection_set(
     status: &ControlStatus,
     selections: &mut [SelectionRevision],
@@ -5708,7 +5719,9 @@ impl BackgroundControl for SqliteControlStore {
         self.mutate(expected,|conn,status| {
             validate_selection_set(status,&mut request.selections)?;
             let runtime=load_runtime(conn,status)?;
-            if let Some(reason)=blocked_reason(status,&runtime.worker) { return Ok((false,false,LatestAdmission::Blocked(reason))); }
+            // A live Busy/Deferred advisory queues as usual; the read retries it
+            // within its original wait. Every other reason ends admission here.
+            if let Some(reason)=blocked_reason(status,&runtime.worker).filter(|r|!transient_advisory(*r,&runtime.worker)) { return Ok((false,false,LatestAdmission::Blocked(reason))); }
             if runtime.barriers.len() >= MAX_RUNTIME_REFERENCES { return Err(runtime_capacity()); }
             let cycle=allocate_cycle(conn,status,&runtime,&request.selections)?;
             let barrier=LatestBarrier {id:fresh_id(conn,"barrier")?,policy_epoch:status.policy.policy_epoch,admission_control_seq:seq(increment(expected.get())?)?,required_cycle_seq:cycle.token.cycle_seq,state:BarrierState::Pending,requested_wait_ms:request.max_wait_ms,admitted_at_ms:request.now_ms,completed_cycle_seq:None,error:None,selections:request.selections.clone()};
