@@ -8181,8 +8181,21 @@ mod control_deadline_tests {
         ) -> (PortResult<CycleOutcome>, ObservationCycle) {
             let worker = self.worker();
             let mut pending = None;
+            let classify = |error: &PortError| match error {
+                PortError::WriterBusy(_) => "writer_busy",
+                PortError::DeadlineExceeded(_) => "deadline_exceeded",
+                PortError::InvalidRequest(_) => "invalid_request",
+                PortError::GenerationMismatch(_) => "generation_mismatch",
+                PortError::Backend(_) => "backend",
+                PortError::SourceIo(_) => "source_io",
+                PortError::SchemaIncompatible(_) => "schema_incompatible",
+                PortError::NotFound(_) => "not_found",
+                PortError::SnapshotChanged(_) => "snapshot_changed",
+            };
+            let mut run_state = "not_returned";
+            let mut accept_state = "not_called";
             let result = self.control.with_runtime_deadline(self.scope_end, || {
-                run_cycle(
+                let run = run_cycle(
                     &self.db,
                     &self.control,
                     &worker,
@@ -8191,12 +8204,33 @@ mod control_deadline_tests {
                     self.scope_end,
                     &mut pending,
                     schedule,
-                )
-                .and_then(|result| self.accept_cycle(result, &mut pending, schedule))
+                );
+                run_state = match &run {
+                    Ok(CycleResult::Idle(_)) => "idle",
+                    Ok(CycleResult::Work(_)) => "work",
+                    Err(error) => classify(error),
+                };
+                run.and_then(|result| {
+                    let accepted = self.accept_cycle(result, &mut pending, schedule);
+                    accept_state = match &accepted {
+                        Ok(_) => "ok",
+                        Err(error) => classify(error),
+                    };
+                    accepted
+                })
             });
             assert!(
                 pending.is_none(),
-                "production completion must acknowledge its cycle"
+                "production completion must acknowledge its cycle: run={run_state} \
+                 accept={accept_state} outer={:?} pending={:?} remaining={:?}",
+                result.as_ref().err().map(classify),
+                pending.as_ref().map(|intent| (
+                    intent.token.cycle_seq,
+                    intent.finish,
+                    intent.observed.is_some(),
+                    intent.completion_confirmed
+                )),
+                self.scope_end.saturating_duration_since(Instant::now())
             );
             let next = self
                 .read_control(|control| control.background_status())
@@ -12047,6 +12081,15 @@ mod control_deadline_tests {
 
     #[test]
     fn pending_idle_outer_cas_conflict_revalidates_new_latest() {
+        outer_cas_conflict_revalidates_new_latest(false);
+    }
+
+    #[test]
+    fn expired_outer_cas_preserves_pending_before_one_new_boundary() {
+        outer_cas_conflict_revalidates_new_latest(true);
+    }
+
+    fn outer_cas_conflict_revalidates_new_latest(expire_after_admission: bool) {
         let fixture = CycleFixture::new();
         fixture.write_source("source.jsonl", SearchProvider::Claude, "outer cas original");
         let boot = ObservationClock::new(Instant::now());
@@ -12085,6 +12128,7 @@ mod control_deadline_tests {
         };
         let attempted = Rc::new(Cell::new(false));
         let admission_calls = Rc::new(Cell::new(0));
+        let admission_seq = Rc::new(Cell::new(None));
         let admitted = Rc::new(RefCell::new(None));
         let calls = Rc::new(Cell::new(0));
         let timing = Rc::new(Cell::new(None::<(Instant, Instant)>));
@@ -12093,6 +12137,7 @@ mod control_deadline_tests {
         schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
             let attempted = attempted.clone();
             let admission_calls = admission_calls.clone();
+            let admission_seq = admission_seq.clone();
             let admitted = admitted.clone();
             let calls = calls.clone();
             let timing = timing.clone();
@@ -12126,21 +12171,47 @@ mod control_deadline_tests {
                                 Err(error) => Some(failure(error)),
                             },
                         );
-                        let LatestAdmission::Queued(barrier) = admission?.value else {
+                        let admission = admission?;
+                        admission_seq.set(Some(admission.control_seq));
+                        let LatestAdmission::Queued(barrier) = admission.value else {
                             panic!("competing latest must queue: {:?}", diagnostics.borrow());
                         };
                         *admitted.borrow_mut() = Some(barrier);
+                        if expire_after_admission {
+                            // Exhaust this real acceptance window after the
+                            // actual competing write, never renew its end.
+                            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                        }
                     }
                 }
                 Ok(())
             }
         });
         let before = publication_counts(&fixture);
+        let saved_pending = pending.clone();
+        let token = pending.as_ref().unwrap().token.clone();
+        let terminal = fixture.read_control(|control| control.cycle(token.cycle_seq));
+        let sources = || {
+            fixture
+                .sources()
+                .into_iter()
+                .map(|source| {
+                    (
+                        source.binding,
+                        source.latest_receipt,
+                        source.indexed_len,
+                        source.superseded,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let saved_sources = sources();
+        let saved_progress = fixture.read_control(|control| control.source_progress_inventory());
         let worker = fixture.worker();
         let started = Instant::now();
         let end = started + CONTROL_BUDGET;
         timing.set(Some((started, end)));
-        let result = accept_idle_boundary(
+        let mut result = accept_idle_boundary(
             &fixture.db,
             &fixture.control,
             &worker,
@@ -12149,11 +12220,79 @@ mod control_deadline_tests {
             &mut schedule,
             end,
         );
+        let returned_at = Instant::now();
         diagnostics.borrow_mut()[3] = Some((
-            started.elapsed(),
-            end.saturating_duration_since(Instant::now()),
+            returned_at.duration_since(started),
+            end.saturating_duration_since(returned_at),
             result.as_ref().err().map(failure),
         ));
+        if expire_after_admission {
+            assert!(matches!(&result, Err(PortError::WriterBusy(_))));
+        }
+        if matches!(&result, Err(PortError::WriterBusy(_))) && returned_at >= end {
+            assert_eq!(pending, saved_pending);
+            assert!(pending.as_ref().unwrap().completion_confirmed);
+            assert_eq!(admission_calls.get(), 1);
+            assert!(admitted.borrow().is_some());
+            assert!(schedule.closed_idle_at.is_none());
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.status())
+                    .policy
+                    .control_seq,
+                admission_seq.get().unwrap()
+            );
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(token.cycle_seq)),
+                terminal
+            );
+            assert_eq!(sources(), saved_sources);
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress_inventory()),
+                saved_progress
+            );
+            assert_eq!(publication_counts(&fixture), before);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous_end
+            );
+            let service_ends = schedule
+                .demands
+                .iter()
+                .map(|(id, demand)| (id.clone(), demand.service_end))
+                .collect::<BTreeMap<_, _>>();
+            // One independent invocation of the shared acceptance boundary.
+            // It does not replay a cadence, finish or source observation.
+            let second_end = Instant::now() + CONTROL_BUDGET;
+            result = accept_idle_boundary(
+                &fixture.db,
+                &fixture.control,
+                &worker,
+                &ready,
+                &mut pending,
+                &mut schedule,
+                second_end,
+            );
+            for (id, end) in service_ends {
+                assert_eq!(schedule.demands[&id].service_end, end);
+            }
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.status())
+                    .policy
+                    .control_seq,
+                admission_seq.get().unwrap()
+            );
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(token.cycle_seq)),
+                terminal
+            );
+            assert_eq!(sources(), saved_sources);
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress_inventory()),
+                saved_progress
+            );
+        }
         assert!(
             result.as_ref().is_ok_and(Option::is_none),
             "outer={result:?} hook_calls={} admission_calls={} queued={} \
