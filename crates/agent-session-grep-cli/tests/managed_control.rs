@@ -497,6 +497,11 @@ fn settlement_contention(release_early: bool) {
     setup_paused(&db);
     let selected = add(&db, &history);
     let root = db.parent().unwrap();
+    let control = SqliteControlStore::open_current_read_only_with_deadline(
+        root,
+        Instant::now() + Duration::from_secs(8),
+    )
+    .unwrap();
     let emission = acquire(root, LockKind::PolicyEmission);
     let started = Instant::now();
     let child = Command::new(BIN)
@@ -507,18 +512,37 @@ fn settlement_contention(release_early: bool) {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let control = SqliteControlStore::open_current_read_only(root).unwrap();
-    wait_until(|| {
-        control
-            .status()
-            .unwrap()
-            .policy
-            .revocations
-            .iter()
-            .any(|r| r.state == RevocationState::AwaitingDrain)
-    });
+    let end = SqliteControlStore::effective_runtime_deadline(
+        (Instant::now() + Duration::from_secs(8)).min(started + Duration::from_secs(5)),
+    );
+    wait_for_drain_before(
+        end,
+        |received| {
+            assert_eq!(received, end);
+            control.with_runtime_deadline(received, || {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(end + Duration::from_secs(1)),
+                    end
+                );
+                control.status().map(|status| {
+                    status
+                        .policy
+                        .revocations
+                        .iter()
+                        .any(|revocation| revocation.state == RevocationState::AwaitingDrain)
+                })
+            })
+        },
+        Instant::now,
+        std::thread::sleep,
+    )
+    .unwrap();
     let writer = rusqlite::Connection::open(SqliteControlStore::path(root)).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        Instant::now() < end,
+        "writer contention must begin before the setup end"
+    );
     drop(emission);
     if release_early {
         // Deliberately exceed the adapter's single 250ms busy timeout.
@@ -555,6 +579,78 @@ fn settlement_contention(release_early: bool) {
             0,
         );
     }
+}
+
+fn wait_for_drain_before(
+    end: Instant,
+    mut read: impl FnMut(Instant) -> Result<bool, PortError>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), PortError> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    loop {
+        if now() >= end {
+            return Err(PortError::WriterBusy(
+                "synthetic drain observation expired".into(),
+            ));
+        }
+        match read(end) {
+            Ok(true) if now() < end => return Ok(()),
+            Ok(_) | Err(PortError::WriterBusy(_)) => {}
+            Err(error) => return Err(error),
+        }
+        sleep(Duration::from_millis(20).min(end.saturating_duration_since(now())));
+    }
+}
+
+#[test]
+fn drain_observation_keeps_busy_unknown_and_never_accepts_after_expiry() {
+    use std::cell::Cell;
+    let started = Instant::now();
+    let end = started + Duration::from_secs(1);
+    let clock = Cell::new(started);
+    let calls = Cell::new(0);
+    wait_for_drain_before(
+        end,
+        |received| {
+            assert_eq!(received, end);
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(PortError::WriterBusy("synthetic read refusal".into()))
+            } else {
+                Ok(true)
+            }
+        },
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 2);
+    clock.set(started);
+    let late = wait_for_drain_before(
+        end,
+        |_| {
+            clock.set(end);
+            Ok(true)
+        },
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    );
+    assert!(matches!(late, Err(PortError::WriterBusy(_))));
+    let expired = wait_for_drain_before(
+        end,
+        |_| panic!("expired observation cannot read"),
+        || end,
+        |_| panic!("expired observation cannot wait"),
+    );
+    assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+    let failed = wait_for_drain_before(
+        end,
+        |_| Err(PortError::SourceIo("synthetic hard error".into())),
+        || started,
+        |_| panic!("a hard error cannot retry"),
+    );
+    assert!(matches!(failed, Err(PortError::SourceIo(_))));
 }
 
 #[test]
