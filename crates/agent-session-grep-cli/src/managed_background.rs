@@ -2018,6 +2018,10 @@ fn run_cycle(
             pending.as_ref().ok_or_else(invalid)?.token.clone(),
         )));
     }
+    // A fixture resuming one saved result must stop before ordinary new work.
+    // Production and all other tests leave this guard disabled.
+    #[cfg(test)]
+    control_deadline_tests::refuse_new_cycle_during_resume()?;
     let current = control.with_runtime_deadline(end, || control.status())?;
     if current.desired_updates != DesiredUpdates::Running || current.policy.emission_blocked() {
         invalidate_pending_idle(pending, schedule);
@@ -6220,6 +6224,39 @@ mod wal_worker_tests {
         static HOOKS: RefCell<Option<Hooks>> = const { RefCell::new(None) };
     }
 
+    // Reuse the actual finish-attempt observer for a direct fixture, without
+    // spawning a worker or enabling the channel-driven boundary pauses.
+    pub(super) fn count_direct_finishes<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset(Option<Hooks>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HOOKS.with(|hooks| *hooks.borrow_mut() = self.0.take());
+            }
+        }
+        let (events, _) = mpsc::channel();
+        let (_, advance) = mpsc::channel();
+        let reset = Reset(HOOKS.with(|hooks| {
+            hooks.replace(Some(Hooks {
+                events,
+                advance,
+                emitted: 0,
+                expire_completion_once: false,
+                completion: None,
+                checkpoints: 0,
+                finish_attempts: Vec::new(),
+                observe_idle_handoff: false,
+                before_heartbeat_once: false,
+                committed_once: false,
+                stage: IdleStage::Activity,
+                observe_after_checkpoint: false,
+            }))
+        }));
+        let result = operation();
+        let count = HOOKS.with(|hooks| hooks.borrow().as_ref().unwrap().finish_attempts.len());
+        drop(reset);
+        (result, count)
+    }
+
     pub(super) fn event(event: Event) {
         HOOKS.with(|hooks| {
             if let Some(hooks) = hooks.borrow_mut().as_mut() {
@@ -8099,6 +8136,55 @@ mod control_deadline_tests {
     use agent_session_grep_ports::managed::{ProjectionQuery, ProjectionRead};
     use std::{cell::Cell, io::Write, rc::Rc};
 
+    thread_local! {
+        static RESUMING_SAVED_IDLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct SavedIdleResume(bool);
+
+    impl SavedIdleResume {
+        fn enter() -> Self {
+            Self(RESUMING_SAVED_IDLE.with(|active| active.replace(true)))
+        }
+    }
+
+    impl Drop for SavedIdleResume {
+        fn drop(&mut self) {
+            RESUMING_SAVED_IDLE.with(|active| active.set(self.0));
+        }
+    }
+
+    pub(super) fn refuse_new_cycle_during_resume() -> PortResult<()> {
+        if RESUMING_SAVED_IDLE.with(Cell::get) {
+            Err(changed())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CycleDriveTrace {
+        ticks: [Option<Instant>; 32],
+        tick_count: usize,
+        waits: [Option<Instant>; 32],
+        wait_count: usize,
+        runs: usize,
+        acceptances: usize,
+        phase: &'static str,
+        error: Option<&'static str>,
+        first_accept_end: Option<Instant>,
+        last_accept_end: Option<Instant>,
+        first_ready: Option<PendingCycle>,
+        first_busy: Option<PendingCycle>,
+    }
+
+    fn wait_cycle_cadence(wake: Instant, trace: &mut CycleDriveTrace) {
+        assert!(trace.wait_count < trace.waits.len());
+        trace.waits[trace.wait_count] = Some(wake);
+        trace.wait_count += 1;
+        std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+    }
+
     struct CycleFixture {
         control: SqliteControlStore,
         worker_lock: ExclusiveGuard,
@@ -8408,51 +8494,23 @@ mod control_deadline_tests {
             schedule: &mut SourceScheduleState,
             boot: &ObservationClock,
         ) -> (PortResult<CycleOutcome>, ObservationCycle) {
-            let worker = self.worker();
             let mut pending = None;
-            let classify = |error: &PortError| match error {
-                PortError::WriterBusy(_) => "writer_busy",
-                PortError::DeadlineExceeded(_) => "deadline_exceeded",
-                PortError::InvalidRequest(_) => "invalid_request",
-                PortError::GenerationMismatch(_) => "generation_mismatch",
-                PortError::Backend(_) => "backend",
-                PortError::SourceIo(_) => "source_io",
-                PortError::SchemaIncompatible(_) => "schema_incompatible",
-                PortError::NotFound(_) => "not_found",
-                PortError::SnapshotChanged(_) => "snapshot_changed",
-            };
-            let mut run_state = "not_returned";
-            let mut accept_state = "not_called";
-            let result = self.control.with_runtime_deadline(self.scope_end, || {
-                let run = run_cycle(
-                    &self.db,
-                    &self.control,
-                    &worker,
-                    boot,
-                    0,
-                    self.scope_end,
-                    &mut pending,
-                    schedule,
-                );
-                run_state = match &run {
-                    Ok(CycleResult::Idle(_)) => "idle",
-                    Ok(CycleResult::Work(_)) => "work",
-                    Err(error) => classify(error),
-                };
-                run.and_then(|result| {
-                    let accepted = self.accept_cycle(result, &mut pending, schedule);
-                    accept_state = match &accepted {
-                        Ok(_) => "ok",
-                        Err(error) => classify(error),
-                    };
-                    accepted
-                })
-            });
+            let mut trace = CycleDriveTrace::default();
+            let result = self.drive_production_cycle(
+                schedule,
+                boot,
+                &mut pending,
+                &mut trace,
+                |_, _| Ok(()),
+            );
             assert!(
                 pending.is_none(),
-                "production completion must acknowledge its cycle: run={run_state} \
-                 accept={accept_state} outer={:?} pending={:?} remaining={:?}",
-                result.as_ref().err().map(classify),
+                "production completion must acknowledge its cycle: phase={} \
+                 runs={} accepts={} error={:?} pending={:?} remaining={:?}",
+                trace.phase,
+                trace.runs,
+                trace.acceptances,
+                trace.error,
                 pending.as_ref().map(|intent| (
                     intent.token.cycle_seq,
                     intent.finish,
@@ -8467,6 +8525,200 @@ mod control_deadline_tests {
             let cycle =
                 self.read_control(|control| control.cycle(CycleSeq::new(next.get() - 1).unwrap()));
             (result, cycle)
+        }
+
+        fn drive_production_cycle(
+            &self,
+            schedule: &mut SourceScheduleState,
+            boot: &ObservationClock,
+            pending: &mut Option<PendingCycle>,
+            trace: &mut CycleDriveTrace,
+            on_first_busy: impl FnOnce(
+                &mut Option<PendingCycle>,
+                &mut SourceScheduleState,
+            ) -> PortResult<()>,
+        ) -> PortResult<CycleOutcome> {
+            // A seeded entry must carry a real acceptance refusal recorded by
+            // accept_driver_idle, never an invented ready token or completion.
+            let mut saved = if pending.is_some() {
+                if trace.first_busy.is_none()
+                    || pending.as_ref() != trace.first_busy.as_ref()
+                    || trace.first_ready != trace.first_busy
+                    || trace.error != Some("writer_busy")
+                    || trace.tick_count == 0
+                {
+                    return Err(changed());
+                }
+                trace.first_busy.clone()
+            } else {
+                assert_eq!(
+                    trace.tick_count, 0,
+                    "the initial observation runs exactly once"
+                );
+                None
+            };
+            let end = SqliteControlStore::effective_runtime_deadline(self.scope_end);
+            let probe = self.scope_end + CADENCE;
+            let inherited = SqliteControlStore::effective_runtime_deadline(probe);
+            observation_deadline(end)?;
+            let worker = self.worker();
+            let mut on_first_busy = Some(on_first_busy);
+            let result = self.control.with_runtime_deadline(end, || {
+                if saved.is_some() {
+                    on_first_busy.take().unwrap()(pending, schedule)?;
+                    if pending.as_ref() != saved.as_ref() {
+                        return Err(changed());
+                    }
+                    let tick = trace.ticks[trace.tick_count - 1].unwrap();
+                    wait_cycle_cadence((tick + CADENCE).min(end), trace);
+                }
+                loop {
+                    observation_deadline(end)?;
+                    let tick = Instant::now();
+                    assert!(trace.tick_count < trace.ticks.len());
+                    trace.ticks[trace.tick_count] = Some(tick);
+                    trace.tick_count += 1;
+                    let resuming = saved.is_some();
+                    let attempt = (|| {
+                        let _resume = resuming.then(SavedIdleResume::enter);
+                        if resuming {
+                            if pending.as_ref() != saved.as_ref() {
+                                return Err(changed());
+                            }
+                            trace.phase = "quiesce";
+                            if quiesce_before(
+                                &self.control,
+                                end.min(Instant::now() + CONTROL_BUDGET),
+                            )?
+                            .is_some()
+                            {
+                                invalidate_pending_idle(pending, schedule);
+                                return Err(changed());
+                            }
+                            trace.phase = "current";
+                            let current = self
+                                .control
+                                .with_runtime_deadline(end.min(tick + CONTROL_BUDGET), || {
+                                    self.control.status()
+                                })?;
+                            if current.desired_updates == DesiredUpdates::Paused {
+                                invalidate_pending_idle(pending, schedule);
+                                return Err(changed());
+                            }
+                        }
+                        trace.phase = "run";
+                        trace.runs += 1;
+                        // A refused outer boundary does not advance run_child's round.
+                        let run = run_cycle(
+                            &self.db,
+                            &self.control,
+                            &worker,
+                            boot,
+                            0,
+                            if resuming {
+                                end.min(tick + CADENCE)
+                            } else {
+                                end
+                            },
+                            pending,
+                            schedule,
+                        )?;
+                        let ready = match run {
+                            CycleResult::Work(outcome) if !resuming => return Ok(outcome),
+                            CycleResult::Work(_) => return Err(changed()),
+                            CycleResult::Idle(ready) => ready,
+                        };
+                        if let IdleReady::Observed(token) = &ready {
+                            let intent = pending.as_ref().ok_or_else(changed)?;
+                            if &intent.token != token
+                                || !intent.completion_confirmed
+                                || intent
+                                    .observed
+                                    .as_ref()
+                                    .is_none_or(|seen| !seen.outcome.idle())
+                            {
+                                return Err(changed());
+                            }
+                            if let Some(original) = &saved {
+                                if intent != original {
+                                    return Err(changed());
+                                }
+                            } else {
+                                trace.first_ready = Some(intent.clone());
+                                saved = Some(intent.clone());
+                            }
+                        } else if resuming {
+                            return Err(changed());
+                        }
+                        self.accept_driver_idle(&worker, &ready, pending, schedule, end, trace)
+                    })();
+                    trace.error = attempt.as_ref().err().map(ScheduleTestHooks::error_label);
+                    match attempt {
+                        Err(error @ PortError::WriterBusy(_))
+                            if saved.is_some()
+                                && trace.first_busy.as_ref() == saved.as_ref()
+                                && pending.as_ref() == saved.as_ref()
+                                && schedule.closed_idle_at.is_none() =>
+                        {
+                            if Instant::now() >= end {
+                                return Err(error);
+                            }
+                            if let Some(observe) = on_first_busy.take() {
+                                observe(pending, schedule)?;
+                                if pending.as_ref() != saved.as_ref() {
+                                    return Err(changed());
+                                }
+                            }
+                            // The first observation may already have spent its cadence.
+                            // Never add another fixed second or renew the fixture end.
+                            wait_cycle_cadence((tick + CADENCE).min(end), trace);
+                            if Instant::now() >= end {
+                                return Err(error);
+                            }
+                        }
+                        other => return other,
+                    }
+                }
+            });
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                inherited
+            );
+            trace.error = result.as_ref().err().map(ScheduleTestHooks::error_label);
+            result
+        }
+
+        fn accept_driver_idle(
+            &self,
+            worker: &LockedWorkerAuthority<'_>,
+            ready: &IdleReady,
+            pending: &mut Option<PendingCycle>,
+            schedule: &mut SourceScheduleState,
+            end: Instant,
+            trace: &mut CycleDriveTrace,
+        ) -> PortResult<CycleOutcome> {
+            trace.phase = "accept";
+            observation_deadline(end)?;
+            let accept_end = end.min(Instant::now() + CONTROL_BUDGET);
+            trace.first_accept_end.get_or_insert(accept_end);
+            trace.last_accept_end = Some(accept_end);
+            trace.acceptances += 1;
+            let accepted = accept_idle_boundary(
+                &self.db,
+                &self.control,
+                worker,
+                ready,
+                pending,
+                schedule,
+                accept_end,
+            );
+            trace.error = accepted.as_ref().err().map(ScheduleTestHooks::error_label);
+            if matches!(&accepted, Err(PortError::WriterBusy(_))) && trace.first_busy.is_none() {
+                trace.first_busy = pending.clone();
+            }
+            accepted?
+                .map(|accepted| accepted.outcome)
+                .ok_or_else(changed)
         }
 
         fn accept_cycle(
@@ -8553,6 +8805,530 @@ mod control_deadline_tests {
             completion_end: Cell::new(None),
             observation_result: Cell::new(None),
             completion_case: Cell::new(None),
+        }
+    }
+
+    #[derive(Default)]
+    struct IdleExpiryProbe {
+        plans: usize,
+        attempts: usize,
+        publications: usize,
+        observations: usize,
+        validations: usize,
+        heartbeats: usize,
+        accepted: usize,
+        ends: [Option<Instant>; 32],
+    }
+
+    fn expire_real_idle_heartbeat(
+        probe: &Rc<RefCell<IdleExpiryProbe>>,
+        fixture_end: Instant,
+        every_attempt: bool,
+    ) -> ScheduleTestHooks {
+        let probe = probe.clone();
+        ScheduleTestHooks {
+            on_event: Some(RefCell::new(Box::new(move |event| {
+                let mut proof = probe.borrow_mut();
+                match event {
+                    ScheduleTestEvent::Planned => proof.plans += 1,
+                    ScheduleTestEvent::BeforeAttempt(..) => proof.attempts += 1,
+                    ScheduleTestEvent::Published(..) => proof.publications += 1,
+                    ScheduleTestEvent::BeforeCompletion => proof.observations += 1,
+                    ScheduleTestEvent::BeforeIdleValidation => proof.validations += 1,
+                    ScheduleTestEvent::BeforeIdleHeartbeat(_) => {
+                        let end =
+                            SqliteControlStore::effective_runtime_deadline(fixture_end + CADENCE);
+                        assert!(end <= fixture_end);
+                        assert!(end <= Instant::now() + CONTROL_BUDGET);
+                        let index = proof.heartbeats;
+                        assert!(index < proof.ends.len());
+                        proof.ends[index] = Some(end);
+                        proof.heartbeats += 1;
+                        if index == 0 || every_attempt {
+                            drop(proof);
+                            // Refuse the real heartbeat at its already fixed end;
+                            // do not inject an error or alter the product clock.
+                            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                            assert!(Instant::now() >= end);
+                        }
+                    }
+                    ScheduleTestEvent::AfterIdleHeartbeat(end) => {
+                        assert!(end <= fixture_end);
+                        proof.accepted += 1;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }))),
+            ..Default::default()
+        }
+    }
+
+    fn assert_drive_cadence(trace: &CycleDriveTrace, end: Instant) {
+        assert!(trace.wait_count >= trace.tick_count.saturating_sub(1));
+        assert!(trace.wait_count <= trace.tick_count);
+        for index in 0..trace.wait_count {
+            assert_eq!(
+                trace.waits[index],
+                Some((trace.ticks[index].unwrap() + CADENCE).min(end))
+            );
+        }
+        for ticks in trace.ticks[..trace.tick_count].windows(2) {
+            assert!(ticks[1].unwrap().duration_since(ticks[0].unwrap()) >= CADENCE);
+        }
+    }
+
+    #[test]
+    fn production_driver_wait_receives_original_wake_and_waits_until_it() {
+        let mut trace = CycleDriveTrace::default();
+        let tick = Instant::now();
+        let wake = tick + CADENCE;
+        assert!(
+            Instant::now() < wake,
+            "the positive wait must still be owed"
+        );
+        wait_cycle_cadence(wake, &mut trace);
+        assert_eq!(trace.wait_count, 1);
+        assert_eq!(trace.waits[0], Some(wake));
+        assert!(Instant::now() >= wake);
+    }
+
+    #[test]
+    fn production_driver_resumes_expired_idle_without_republication() {
+        for baseline in [false, true] {
+            let fixture = CycleFixture::new();
+            let path =
+                fixture.write_source("driver.jsonl", SearchProvider::Claude, "driver source");
+            let original = std::fs::read(&path).unwrap();
+            let boot = if baseline {
+                ObservationClock::new(Instant::now())
+            } else {
+                ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified)
+            };
+            let mut schedule = SourceScheduleState::default();
+            if baseline {
+                assert!(
+                    fixture
+                        .production_cycle(&mut schedule, &boot)
+                        .0
+                        .unwrap()
+                        .idle()
+                );
+            }
+            let proof = Rc::new(RefCell::new(IdleExpiryProbe::default()));
+            schedule.hooks = expire_real_idle_heartbeat(&proof, fixture.scope_end, false);
+            let outer = fixture
+                .scope_end
+                .min(Instant::now() + Duration::from_secs(10));
+            let probe_end = fixture.scope_end + CADENCE;
+            let inherited = SqliteControlStore::effective_runtime_deadline(probe_end);
+            let mut pending = None;
+            let mut trace = CycleDriveTrace::default();
+            let mut before_acceptance = None;
+            let mut busy_calls = 0;
+            let (result, finishes) = wal_worker_tests::count_direct_finishes(|| {
+                fixture.control.with_runtime_deadline(outer, || {
+                    let outcome = fixture.drive_production_cycle(
+                        &mut schedule,
+                        &boot,
+                        &mut pending,
+                        &mut trace,
+                        |pending, schedule| {
+                            busy_calls += 1;
+                            let saved = pending.as_ref().unwrap();
+                            assert!(saved.completion_confirmed);
+                            assert!(saved.observed.as_ref().unwrap().outcome.idle());
+                            assert!(schedule.closed_idle_at.is_none());
+                            assert_eq!(proof.borrow().accepted, 0);
+                            before_acceptance = Some((
+                                fixture.read_control(|control| control.background_status()),
+                                fixture
+                                    .read_control(|control| control.cycle(saved.token.cycle_seq)),
+                                publication_counts(&fixture),
+                                fixture.read_control(|control| control.source_progress_inventory()),
+                                fixture.sources()[0].latest_receipt.clone(),
+                                fixture
+                                    .read_control(|control| control.status())
+                                    .policy
+                                    .control_seq,
+                            ));
+                            Ok(())
+                        },
+                    )?;
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe_end),
+                        outer
+                    );
+                    Ok(outcome)
+                })
+            });
+            let outcome = result.unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                inherited
+            );
+            assert!(!RESUMING_SAVED_IDLE.with(Cell::get));
+            assert!(pending.is_none());
+            assert!(outcome.idle());
+            assert_eq!(
+                outcome.finish(),
+                if baseline {
+                    CycleFinish::Partial
+                } else {
+                    CycleFinish::Committed
+                }
+            );
+            assert_eq!(busy_calls, 1);
+            assert_eq!(trace.runs, 2);
+            assert_eq!(trace.acceptances, 2);
+            assert_eq!(trace.first_ready, trace.first_busy);
+            assert_eq!(
+                trace
+                    .first_busy
+                    .as_ref()
+                    .unwrap()
+                    .observed
+                    .as_ref()
+                    .unwrap()
+                    .outcome,
+                outcome
+            );
+            assert_eq!(finishes, 1);
+            assert_eq!(
+                trace.wait_count, 1,
+                "even a spent tick calls the wait boundary"
+            );
+            assert_drive_cadence(&trace, outer);
+            let proof = proof.borrow();
+            assert_eq!((proof.plans, proof.observations, proof.accepted), (1, 1, 1));
+            assert_eq!(proof.heartbeats, 2);
+            assert_eq!(proof.attempts, usize::from(!baseline));
+            assert_eq!(proof.publications, usize::from(!baseline));
+            assert!(proof.validations >= 4);
+            assert_eq!(proof.ends[0], trace.first_accept_end);
+            assert_eq!(proof.ends[1], trace.last_accept_end);
+            assert!(trace.last_accept_end.unwrap() <= outer);
+            let (before, terminal, counts, progress, receipt, seq) = before_acceptance.unwrap();
+            let after = fixture.read_control(|control| control.background_status());
+            assert_eq!(after.next_cycle_seq, before.next_cycle_seq);
+            assert_eq!(after.worker.state, UpdateState::Idle);
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(terminal.token.cycle_seq)),
+                terminal
+            );
+            assert_eq!(publication_counts(&fixture), counts);
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress_inventory()),
+                progress
+            );
+            assert_eq!(fixture.sources()[0].latest_receipt, receipt);
+            // One Running heartbeat on resume and one acknowledged Idle.
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.status())
+                    .policy
+                    .control_seq
+                    .get(),
+                seq.get() + 2
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn production_driver_persistent_busy_keeps_pending_until_original_outer_end() {
+        let fixture = CycleFixture::new();
+        fixture.write_source("busy.jsonl", SearchProvider::Claude, "driver busy");
+        let boot = ObservationClock::new(Instant::now());
+        let proof = Rc::new(RefCell::new(IdleExpiryProbe::default()));
+        let mut schedule = SourceScheduleState {
+            hooks: expire_real_idle_heartbeat(&proof, fixture.scope_end, true),
+            ..Default::default()
+        };
+        let mut trace = CycleDriveTrace::default();
+        let mut pending = None;
+        let mut busy_calls = 0;
+        let mut recovery_end = None;
+        let (result, finishes) = wal_worker_tests::count_direct_finishes(|| {
+            // Seed the real completed observation and its first refused
+            // acceptance before starting the shorter recovery-only scope.
+            fixture
+                .control
+                .with_runtime_deadline(fixture.scope_end, || {
+                    let worker = fixture.worker();
+                    trace.ticks[0] = Some(Instant::now());
+                    trace.tick_count = 1;
+                    trace.runs = 1;
+                    let CycleResult::Idle(ready @ IdleReady::Observed(_)) = run_cycle(
+                        &fixture.db,
+                        &fixture.control,
+                        &worker,
+                        &boot,
+                        0,
+                        fixture.scope_end,
+                        &mut pending,
+                        &mut schedule,
+                    )?
+                    else {
+                        panic!("persistent refusal needs a real observed idle candidate");
+                    };
+                    trace.first_ready = pending.clone();
+                    let refused = fixture.accept_driver_idle(
+                        &worker,
+                        &ready,
+                        &mut pending,
+                        &mut schedule,
+                        fixture.scope_end,
+                        &mut trace,
+                    );
+                    assert!(
+                        matches!(refused, Err(PortError::WriterBusy(_))),
+                        "{refused:?}"
+                    );
+                    assert_eq!(
+                        proof.borrow().heartbeats,
+                        1,
+                        "the real first heartbeat expired"
+                    );
+                    assert_eq!(pending, trace.first_busy);
+                    assert_eq!(trace.first_ready, trace.first_busy);
+                    assert!(pending.as_ref().unwrap().completion_confirmed);
+                    let outer = fixture.scope_end.min(Instant::now() + 3 * CADENCE);
+                    recovery_end = Some(outer);
+                    fixture.control.with_runtime_deadline(outer, || {
+                        fixture.drive_production_cycle(
+                            &mut schedule,
+                            &boot,
+                            &mut pending,
+                            &mut trace,
+                            |_, _| {
+                                busy_calls += 1;
+                                Ok(())
+                            },
+                        )
+                    })
+                })
+        });
+        let outer = recovery_end.expect("the first real acceptance refused before recovery");
+        assert!(
+            matches!(result, Err(PortError::WriterBusy(_))),
+            "{result:?}"
+        );
+        assert!(Instant::now() >= outer);
+        assert_eq!(pending, trace.first_busy);
+        assert_eq!(trace.first_ready, trace.first_busy);
+        assert!(pending.as_ref().unwrap().completion_confirmed);
+        assert!(schedule.closed_idle_at.is_none());
+        assert_eq!(busy_calls, 1);
+        assert!(trace.acceptances >= 2);
+        assert!(
+            trace.ticks[..trace.tick_count]
+                .iter()
+                .all(|tick| tick.unwrap() < outer)
+        );
+        assert!(trace.last_accept_end.unwrap() <= outer);
+        assert_drive_cadence(&trace, outer);
+        assert_eq!(finishes, 1);
+        let proof = proof.borrow();
+        assert_eq!(
+            (proof.plans, proof.observations, proof.publications),
+            (1, 1, 1)
+        );
+        assert_eq!(proof.accepted, 0);
+        assert!(!RESUMING_SAVED_IDLE.with(Cell::get));
+        let probe = fixture.scope_end + CADENCE;
+        assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    }
+
+    #[test]
+    fn production_driver_expired_end_has_no_worker_or_cycle_effect() {
+        let mut fixture = CycleFixture::new();
+        let verification_end = fixture.scope_end;
+        let before = fixture.read_control(|control| control.background_status());
+        let counts = publication_counts(&fixture);
+        fixture.scope_end = Instant::now();
+        let mut pending = None;
+        let mut trace = CycleDriveTrace::default();
+        let mut schedule = SourceScheduleState::default();
+        let result = fixture.drive_production_cycle(
+            &mut schedule,
+            &ObservationClock::new(Instant::now()),
+            &mut pending,
+            &mut trace,
+            |_, _| panic!("an expired driver must not reach a Busy continuation"),
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert_eq!((trace.tick_count, trace.runs, trace.acceptances), (0, 0, 0));
+        assert!(pending.is_none());
+        assert!(schedule.closed_idle_at.is_none());
+        assert_eq!(
+            fixture
+                .control
+                .with_runtime_deadline(verification_end, || fixture.control.background_status())
+                .unwrap(),
+            before
+        );
+        assert_eq!(publication_counts(&fixture), counts);
+    }
+
+    #[test]
+    fn production_driver_busy_drift_never_observes_or_accepts_a_replacement() {
+        for change in [
+            "pause",
+            "pause-resume",
+            "identity",
+            "due",
+            "latest",
+            "schema",
+            "pending",
+        ] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("drift.jsonl", SearchProvider::Claude, "driver drift");
+            let boot = ObservationClock::new(Instant::now());
+            let proof = Rc::new(RefCell::new(IdleExpiryProbe::default()));
+            let mut schedule = SourceScheduleState {
+                hooks: expire_real_idle_heartbeat(&proof, fixture.scope_end, false),
+                ..Default::default()
+            };
+            let mut pending = None;
+            let mut trace = CycleDriveTrace::default();
+            let mut expected = None;
+            let mut busy_calls = 0;
+            let (result, finishes) = wal_worker_tests::count_direct_finishes(|| {
+                fixture.drive_production_cycle(
+                    &mut schedule,
+                    &boot,
+                    &mut pending,
+                    &mut trace,
+                    |pending, schedule| {
+                        busy_calls += 1;
+                        let original = pending.as_ref().unwrap().clone();
+                        match change {
+                            "pause" | "pause-resume" => {
+                                control_change_before(
+                                    &fixture.control,
+                                    fixture.scope_end,
+                                    |seq| {
+                                        fixture
+                                            .control
+                                            .set_desired_updates(seq, DesiredUpdates::Paused)
+                                    },
+                                )?;
+                                if change == "pause-resume" {
+                                    control_change_before(
+                                        &fixture.control,
+                                        fixture.scope_end,
+                                        |seq| {
+                                            fixture
+                                                .control
+                                                .set_desired_updates(seq, DesiredUpdates::Running)
+                                        },
+                                    )?;
+                                }
+                            }
+                            "identity" | "schema" => {
+                                rusqlite::Connection::open(&fixture.db)
+                                    .unwrap()
+                                    .execute(
+                                        "UPDATE catalog_meta SET catalog_incarnation=?1",
+                                        [if change == "schema" {
+                                            ""
+                                        } else {
+                                            "driver-changed-catalog"
+                                        }],
+                                    )
+                                    .unwrap();
+                            }
+                            "due" => {
+                                let id = original
+                                    .observed
+                                    .as_ref()
+                                    .unwrap()
+                                    .outcome
+                                    .due_candidates
+                                    .first()
+                                    .unwrap();
+                                schedule.sources.get_mut(id).unwrap().owed = true;
+                                assert!(schedule.full_due(id, schedule.now()));
+                            }
+                            "latest" => {
+                                let request = LatestRequest {
+                                    selections: vec![selection_revision(&fixture.selection)?],
+                                    max_wait_ms: MAX_LATEST_WAIT_MS,
+                                    now_ms: app_clock_ms(),
+                                };
+                                let admission = control_change_before(
+                                    &fixture.control,
+                                    fixture.scope_end,
+                                    |seq| fixture.control.admit_latest(seq, request.clone()),
+                                )?;
+                                assert!(matches!(admission.value, LatestAdmission::Queued(_)));
+                            }
+                            "pending" => {
+                                pending.as_mut().unwrap().token.worker_boot_id =
+                                    ControlId::parse("driver-foreign-boot")?;
+                            }
+                            _ => unreachable!(),
+                        }
+                        expected = Some((
+                            fixture
+                                .read_control(|control| control.background_status())
+                                .next_cycle_seq,
+                            fixture.read_control(|control| control.cycle(original.token.cycle_seq)),
+                            publication_counts(&fixture),
+                            fixture.read_control(|control| control.source_progress_inventory()),
+                        ));
+                        Ok(())
+                    },
+                )
+            });
+            if change == "schema" {
+                assert!(
+                    matches!(result, Err(PortError::SchemaIncompatible(_))),
+                    "{change}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(PortError::SnapshotChanged(_))),
+                    "{change}: {result:?}"
+                );
+            }
+            assert_eq!(busy_calls, 1);
+            assert_eq!(trace.acceptances, 1, "{change}");
+            assert_eq!(trace.first_ready, trace.first_busy);
+            assert!(schedule.closed_idle_at.is_none());
+            assert!(!RESUMING_SAVED_IDLE.with(Cell::get));
+            assert_eq!(finishes, 1);
+            let proof = proof.borrow();
+            assert_eq!(
+                (
+                    proof.plans,
+                    proof.observations,
+                    proof.publications,
+                    proof.accepted
+                ),
+                (1, 1, 1, 0),
+                "{change}"
+            );
+            let (next, terminal, counts, progress) = expected.unwrap();
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.background_status())
+                    .next_cycle_seq,
+                next,
+                "{change}"
+            );
+            assert_eq!(
+                fixture.read_control(|control| control.cycle(terminal.token.cycle_seq)),
+                terminal,
+                "{change}"
+            );
+            assert_eq!(publication_counts(&fixture), counts, "{change}");
+            assert_eq!(
+                fixture.read_control(|control| control.source_progress_inventory()),
+                progress,
+                "{change}"
+            );
         }
     }
 
