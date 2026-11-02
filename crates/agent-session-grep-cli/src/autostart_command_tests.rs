@@ -418,7 +418,60 @@ fn missing_managed_state_or_supervisor_is_rejected_before_native_or_binding() {
 fn paused_and_stopped_enable_registers_without_running_and_disable_preserves_intent() {
     for desired in [DesiredUpdates::Paused, DesiredUpdates::Stopped] {
         let f = Fixture::new(desired);
-        let enabled = f.execute(Action::Enable);
+        let prepared_action = |action| {
+            let mut installation = Some(f.installation(true));
+            let supervisor = installation
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .0
+                .clone();
+            let end = Instant::now() + BUDGET;
+            let calls = Cell::new(0);
+            let last = Cell::new("none");
+            let result = execute(
+                f.catalog.to_str().unwrap(),
+                Options {
+                    action,
+                    prefix: None,
+                },
+                end,
+                &mut |_| Ok(installation.take().unwrap()),
+                &mut || Ok(f.location.clone()),
+                &mut |_, args, received| {
+                    assert_eq!(received, end);
+                    calls.set(calls.get() + 1);
+                    last.set(
+                        [
+                            "LoadUnit",
+                            "ExecStart",
+                            "NeedDaemonReload",
+                            "stop",
+                            "disable",
+                            "enable",
+                            "daemon-reload",
+                        ]
+                        .into_iter()
+                        .find(|name| args.iter().any(|arg| arg == *name))
+                        .unwrap_or("other"),
+                    );
+                    Ok(f.response_with_supervisor(args, &supervisor))
+                },
+            );
+            if result.status != "complete" {
+                eprintln!(
+                    "prepared autostart desired={desired:?} calls={} last={} remaining={:?} summary={}",
+                    calls.get(),
+                    last.get(),
+                    end.saturating_duration_since(Instant::now()),
+                    serde_json::to_string(&result).unwrap()
+                );
+            }
+            result
+        };
+        let enabled = prepared_action(Action::Enable);
         assert_eq!(enabled.status, "complete", "reason={:?}", enabled.reason);
         assert!(
             enabled.intent_recorded
@@ -438,7 +491,7 @@ fn paused_and_stopped_enable_registers_without_running_and_disable_preserves_int
         assert!(control_status(&f.control()).autostart_enabled);
         assert_eq!(control_status(&f.control()).desired_updates, desired);
         f.calls.borrow_mut().clear();
-        let disabled = f.execute(Action::Disable);
+        let disabled = prepared_action(Action::Disable);
         assert_eq!(disabled.status, "complete", "reason={:?}", disabled.reason);
         assert!(disabled.intent_recorded && disabled.private_receipt_recorded);
         assert_eq!(disabled.autostart_enabled, Some(false));
@@ -446,7 +499,7 @@ fn paused_and_stopped_enable_registers_without_running_and_disable_preserves_int
         assert!(!f.target().exists());
         assert!(!control_status(&f.control()).autostart_enabled);
         assert_eq!(control_status(&f.control()).desired_updates, desired);
-        let repeated = f.execute(Action::Disable);
+        let repeated = prepared_action(Action::Disable);
         assert_eq!(repeated.status, "complete");
         f.assert_unrelated();
     }
