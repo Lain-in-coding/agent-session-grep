@@ -323,7 +323,7 @@ struct Harness<'a> {
 impl Harness<'_> {
     fn until(
         &mut self,
-        mut predicate: impl FnMut(&Supervisor, SupervisorState) -> bool,
+        mut predicate: impl FnMut(&Supervisor, SupervisorState, Instant) -> bool,
     ) -> SupervisorState {
         let deadline = Instant::now() + seconds(15);
         loop {
@@ -333,19 +333,27 @@ impl Harness<'_> {
                     self.supervisor.policy().unexpected_exits()
                 );
             });
-            if predicate(&self.supervisor, state) {
-                return state;
-            }
+            let ready = predicate(&self.supervisor, state, deadline);
             assert!(
                 Instant::now() < deadline,
                 "supervisor condition timed out: {state:?}"
             );
+            if ready {
+                return state;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     fn ready(&mut self) -> u32 {
-        self.until(|supervisor, _| {
-            let worker = self.fixture.control().background_status().unwrap().worker;
+        self.until(|supervisor, _, end| {
+            let control = SqliteControlStore::open_current_read_only_with_deadline(
+                self.fixture.catalog.parent().unwrap(),
+                end,
+            )
+            .unwrap();
+            let worker = pause_scope(&control, end, || control.background_status())
+                .unwrap()
+                .worker;
             supervisor.child_id().is_some()
                 && worker.pid_hint == supervisor.child_id()
                 && matches!(worker.state, UpdateState::Idle | UpdateState::Paused)
@@ -927,7 +935,7 @@ fn actual_image_startup_admission_is_separate_from_live_control_polls() {
     assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Running);
     assert_eq!(harness.supervisor.child_id(), Some(worker));
     fixture.desired(DesiredUpdates::Stopped);
-    harness.until(|_, state| state == SupervisorState::Finished);
+    harness.until(|_, state, _| state == SupervisorState::Finished);
     assert_eq!(harness.supervisor.policy().unexpected_exits(), 0);
     fs::write(&pointer, original).unwrap();
     fixture.desired(DesiredUpdates::Running);
@@ -959,7 +967,7 @@ fn real_worker_pause_retains_process_and_stop_releases_both_locks() {
     );
     drop(control);
     fixture.desired(DesiredUpdates::Stopped);
-    harness.until(|_, state| state == SupervisorState::Finished);
+    harness.until(|_, state, _| state == SupervisorState::Finished);
     assert_eq!(harness.supervisor.child_id(), None);
     assert_eq!(harness.supervisor.policy().unexpected_exits(), 0);
     drop(harness);
@@ -980,7 +988,7 @@ fn real_unexpected_exit_recovers_and_exhaustion_waits_for_explicit_start() {
     for n in 1..=MAX_UNEXPECTED_EXITS {
         harness.ready();
         crash_owned(&harness.supervisor);
-        harness.until(|s, _| s.child_id().is_none());
+        harness.until(|s, _, _| s.child_id().is_none());
         assert_eq!(harness.supervisor.policy().unexpected_exits(), n);
         if n < MAX_UNEXPECTED_EXITS {
             assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Backoff);
@@ -1068,7 +1076,7 @@ fn real_maintenance_drains_worker_without_counting_a_crash() {
             )
             .map(|_| ())
     });
-    harness.until(|_, state| state == SupervisorState::Finished);
+    harness.until(|_, state, _| state == SupervisorState::Finished);
     assert_eq!(harness.supervisor.policy().unexpected_exits(), 0);
     assert_eq!(
         control.status().unwrap().desired_updates,
