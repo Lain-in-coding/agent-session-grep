@@ -25,20 +25,41 @@ const SQLITE_256_MIB: u64 = 256 * 1024 * 1024;
 const SQLITE_STEP_BYTES: i64 = 1024 * 1024;
 const MAX_BUSY_RETRIES: usize = 256;
 
-fn backend<E: std::fmt::Display>(_: E) -> PortError {
-    PortError::SourceIo("source snapshot I/O is unavailable".into())
+fn io_error(site: &'static str, error: io::Error) -> PortError {
+    PortError::SourceIo(format!(
+        "source snapshot unavailable: site={site} kind={:?} os={:?}",
+        error.kind(),
+        error.raw_os_error()
+    ))
+}
+fn invalid_snapshot(reason: &'static str) -> PortError {
+    PortError::SourceIo(format!("source snapshot unavailable: reason={reason}"))
+}
+fn phase<T>(result: PortResult<T>, name: &'static str) -> PortResult<T> {
+    result.map_err(|error| match error {
+        PortError::SourceIo(detail) => PortError::SourceIo(format!("phase={name} {detail}")),
+        other => other,
+    })
 }
 fn timeout() -> PortError {
     PortError::WriterBusy("source snapshot is busy or deadline exceeded".into())
 }
-fn sql(error: rusqlite::Error) -> PortError {
+fn sql(site: &'static str, error: rusqlite::Error) -> PortError {
     match error.sqlite_error_code() {
         Some(
             rusqlite::ErrorCode::DatabaseBusy
             | rusqlite::ErrorCode::DatabaseLocked
             | rusqlite::ErrorCode::OperationInterrupted,
         ) => timeout(),
-        _ => backend(error),
+        code => {
+            let extended = match &error {
+                rusqlite::Error::SqliteFailure(code, _) => Some(code.extended_code),
+                _ => None,
+            };
+            PortError::SourceIo(format!(
+                "source snapshot unavailable: site={site} sqlite={code:?} extended={extended:?}"
+            ))
+        }
     }
 }
 fn too_large() -> PortError {
@@ -97,14 +118,16 @@ impl SnapshotBudget {
 }
 
 fn mtime_ms(meta: &std::fs::Metadata) -> PortResult<i64> {
-    let modified = meta.modified().map_err(backend)?;
+    let modified = meta
+        .modified()
+        .map_err(|error| io_error("metadata_modified", error))?;
     i64::try_from(
         modified
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
     )
-    .map_err(backend)
+    .map_err(|_| invalid_snapshot("mtime_range"))
 }
 
 fn fingerprint_reader(reader: &mut dyn Read, budget: SnapshotBudget) -> PortResult<(u64, String)> {
@@ -113,7 +136,9 @@ fn fingerprint_reader(reader: &mut dyn Read, budget: SnapshotBudget) -> PortResu
     let mut chunk = [0_u8; SOURCE_IO_BUFFER_BYTES];
     loop {
         budget.check()?;
-        let read = reader.read(&mut chunk).map_err(backend)?;
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| io_error("fingerprint_read", error))?;
         budget.check()?;
         if read == 0 {
             break;
@@ -121,7 +146,7 @@ fn fingerprint_reader(reader: &mut dyn Read, budget: SnapshotBudget) -> PortResu
         hasher.update(&chunk[..read]);
         total = total
             .checked_add(read as u64)
-            .ok_or_else(|| backend("byte count overflow"))?;
+            .ok_or_else(|| invalid_snapshot("byte_count_overflow"))?;
     }
     budget.check()?;
     Ok((total, hasher.finalize().to_hex().to_string()))
@@ -147,7 +172,10 @@ fn verify_metadata(meta: &std::fs::Metadata, snap: &SourceSnapshot) -> PortResul
 
 /// Compatibility capture: streaming files and SQLite logical images <=128 MiB.
 pub fn capture(path: &Path) -> PortResult<SourceSnapshot> {
-    capture_budget(path, SnapshotBudget::compatibility())
+    phase(
+        capture_budget(path, SnapshotBudget::compatibility()),
+        "capture",
+    )
 }
 /// One original deadline for source read admission, pinned logical backup,
 /// and fixed-buffer hashing. Only 128 MiB and 256 MiB SQLite limits are supported.
@@ -156,21 +184,30 @@ pub fn capture_with_deadline(
     sqlite_byte_limit: u64,
     deadline: Instant,
 ) -> PortResult<SourceSnapshot> {
-    capture_budget(path, SnapshotBudget::bounded(sqlite_byte_limit, deadline)?)
+    phase(
+        capture_budget(path, SnapshotBudget::bounded(sqlite_byte_limit, deadline)?),
+        "capture",
+    )
 }
 fn capture_budget(path: &Path, budget: SnapshotBudget) -> PortResult<SourceSnapshot> {
     budget.check()?;
-    let mut file = File::open(path).map_err(backend)?;
+    let mut file = File::open(path).map_err(|error| io_error("source_open", error))?;
     budget.check()?;
     let mut header = [0; 16];
-    let read = file.read(&mut header).map_err(backend)?;
+    let read = file
+        .read(&mut header)
+        .map_err(|error| io_error("source_header", error))?;
     budget.check()?;
     if read == header.len() && &header == b"SQLite format 3\0" {
         let copy = sqlite_snapshot(path, budget)?;
         let mut snapshot = capture_file(&copy, budget)?;
         budget.check_len(snapshot.len)?;
         snapshot.path = path.to_string_lossy().into_owned();
-        snapshot.mtime_ms = mtime_ms(&file.metadata().map_err(backend)?)?;
+        snapshot.mtime_ms = mtime_ms(
+            &file
+                .metadata()
+                .map_err(|error| io_error("source_metadata", error))?,
+        )?;
         snapshot.fingerprint.insert_str(0, "sqlite:");
         budget.check()?;
         return Ok(snapshot);
@@ -179,6 +216,7 @@ fn capture_budget(path: &Path, budget: SnapshotBudget) -> PortResult<SourceSnaps
 }
 fn sqlite_retry<T>(
     budget: SnapshotBudget,
+    site: &'static str,
     mut operation: impl FnMut() -> rusqlite::Result<T>,
 ) -> PortResult<T> {
     for _ in 0..MAX_BUSY_RETRIES {
@@ -196,7 +234,7 @@ fn sqlite_retry<T>(
                 budget.pause()?
             }
             value => {
-                let value = value.map_err(sql)?;
+                let value = value.map_err(|error| sql(site, error))?;
                 budget.check()?;
                 return Ok(value);
             }
@@ -208,35 +246,37 @@ fn sqlite_retry<T>(
 /// The destination is disposable owned state. No SQL writes target the source.
 fn sqlite_snapshot(path: &Path, budget: SnapshotBudget) -> PortResult<tempfile::TempPath> {
     budget.check()?;
-    let source =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql)?;
+    let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| sql("sqlite_source_open", error))?;
     source
         .busy_timeout(if budget.deadline.is_some() {
             Duration::ZERO
         } else {
             Duration::from_secs(1)
         })
-        .map_err(sql)?;
+        .map_err(|error| sql("sqlite_source_busy_handler", error))?;
     if let Some(end) = budget.deadline {
         source
             .progress_handler(1000, Some(move || Instant::now() >= end))
-            .map_err(sql)?;
+            .map_err(|error| sql("sqlite_source_progress", error))?;
     }
     source
         .pragma_update(None, "cache_size", -2048)
-        .map_err(sql)?;
-    source.execute_batch("BEGIN;").map_err(sql)?;
-    sqlite_retry(budget, || {
+        .map_err(|error| sql("sqlite_source_cache", error))?;
+    source
+        .execute_batch("BEGIN;")
+        .map_err(|error| sql("sqlite_source_begin", error))?;
+    sqlite_retry(budget, "sqlite_source_pin", || {
         source.execute_batch("SELECT rootpage FROM sqlite_schema LIMIT 1;")
     })?;
-    let pages: i64 = sqlite_retry(budget, || {
+    let pages: i64 = sqlite_retry(budget, "sqlite_source_page_count", || {
         source.query_row("PRAGMA page_count", [], |row| row.get(0))
     })?;
-    let page_size: i64 = sqlite_retry(budget, || {
+    let page_size: i64 = sqlite_retry(budget, "sqlite_source_page_size", || {
         source.query_row("PRAGMA page_size", [], |row| row.get(0))
     })?;
     if pages < 1 || !(512..=65_536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
-        return Err(backend("invalid SQLite snapshot geometry"));
+        return Err(invalid_snapshot("sqlite_geometry"));
     }
     let expected_len = pages
         .checked_mul(page_size)
@@ -245,38 +285,43 @@ fn sqlite_snapshot(path: &Path, budget: SnapshotBudget) -> PortResult<tempfile::
     budget.check_len(expected_len)?;
     budget.check()?;
     let destination = tempfile::NamedTempFile::new()
-        .map_err(backend)?
+        .map_err(|error| io_error("sqlite_target_create", error))?
         .into_temp_path();
     let mut target = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(sql)?;
-    target.busy_timeout(Duration::ZERO).map_err(sql)?;
+        .map_err(|error| sql("sqlite_target_open", error))?;
+    target
+        .busy_timeout(Duration::ZERO)
+        .map_err(|error| sql("sqlite_target_busy_handler", error))?;
     target
         .pragma_update(None, "page_size", page_size)
-        .map_err(sql)?;
+        .map_err(|error| sql("sqlite_target_page_size", error))?;
     target
         .pragma_update(None, "cache_size", -2048)
-        .map_err(sql)?;
+        .map_err(|error| sql("sqlite_target_cache", error))?;
     let max_pages =
         i64::try_from(budget.sqlite_byte_limit / page_size as u64).map_err(|_| too_large())?;
     target
         .pragma_update(None, "max_page_count", max_pages)
-        .map_err(sql)?;
+        .map_err(|error| sql("sqlite_target_max_pages", error))?;
     target
         .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
-        .map_err(sql)?;
+        .map_err(|error| sql("sqlite_target_journal", error))?;
     if let Some(end) = budget.deadline {
         target
             .progress_handler(1000, Some(move || Instant::now() >= end))
-            .map_err(sql)?;
+            .map_err(|error| sql("sqlite_target_progress", error))?;
     }
     {
-        let backup = Backup::new(&source, &mut target).map_err(sql)?;
+        let backup =
+            Backup::new(&source, &mut target).map_err(|error| sql("sqlite_backup_open", error))?;
         // At most 1 MiB of pages per step, independent of SQLite's page size.
         let pages_per_step = (SQLITE_STEP_BYTES / page_size).max(1) as i32;
         let mut busy_attempts = 0;
         loop {
             budget.check()?;
-            let step = backup.step(pages_per_step).map_err(sql)?;
+            let step = backup
+                .step(pages_per_step)
+                .map_err(|error| sql("sqlite_backup_step", error))?;
             budget.check()?;
             match step {
                 StepResult::Done | StepResult::More => {
@@ -302,13 +347,17 @@ fn sqlite_snapshot(path: &Path, budget: SnapshotBudget) -> PortResult<tempfile::
                     }
                     budget.pause()?;
                 }
-                _ => return Err(backend("unsupported SQLite backup result")),
+                _ => return Err(invalid_snapshot("sqlite_backup_result")),
             }
         }
     }
-    target.close().map_err(|(_, error)| sql(error))?;
+    target
+        .close()
+        .map_err(|(_, error)| sql("sqlite_target_close", error))?;
     budget.check()?;
-    let len = std::fs::metadata(&destination).map_err(backend)?.len();
+    let len = std::fs::metadata(&destination)
+        .map_err(|error| io_error("sqlite_target_metadata", error))?
+        .len();
     if len != expected_len {
         return Err(PortError::SnapshotChanged(
             "SQLite logical snapshot length changed".into(),
@@ -321,8 +370,10 @@ fn sqlite_snapshot(path: &Path, budget: SnapshotBudget) -> PortResult<tempfile::
 
 fn capture_file(path: &Path, budget: SnapshotBudget) -> PortResult<SourceSnapshot> {
     budget.check()?;
-    let file = File::open(path).map_err(backend)?;
-    let meta = file.metadata().map_err(backend)?;
+    let file = File::open(path).map_err(|error| io_error("fingerprint_open", error))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io_error("fingerprint_metadata", error))?;
     budget.check()?;
     let len = meta.len();
     let mtime = mtime_ms(&meta)?;
@@ -395,8 +446,16 @@ impl ReadOnlySource for FileSource {
         if self._temporary.is_some() {
             self.budget.check_len(self.snapshot.len)?;
         }
-        let file = File::open(&self.path).map_err(backend)?;
-        verify_metadata(&file.metadata().map_err(backend)?, &self.snapshot)?;
+        let file = phase(
+            File::open(&self.path).map_err(|error| io_error("reader_open", error)),
+            "reader",
+        )?;
+        let metadata = phase(
+            file.metadata()
+                .map_err(|error| io_error("reader_metadata", error)),
+            "reader",
+        )?;
+        verify_metadata(&metadata, &self.snapshot)?;
         self.budget.check()?;
         Ok(Box::new(DeadlineReader {
             inner: BufReader::with_capacity(SOURCE_IO_BUFFER_BYTES, file.take(self.snapshot.len)),
@@ -407,7 +466,10 @@ impl ReadOnlySource for FileSource {
 
 /// Compatibility reopening: <=128 MiB logical SQLite snapshots.
 pub fn open_snapshot_source(path: &Path, snapshot: &SourceSnapshot) -> PortResult<FileSource> {
-    open_snapshot_source_budget(path, snapshot, SnapshotBudget::compatibility())
+    phase(
+        open_snapshot_source_budget(path, snapshot, SnapshotBudget::compatibility()),
+        "open_snapshot",
+    )
 }
 pub fn open_snapshot_source_with_deadline(
     path: &Path,
@@ -415,10 +477,13 @@ pub fn open_snapshot_source_with_deadline(
     sqlite_byte_limit: u64,
     deadline: Instant,
 ) -> PortResult<FileSource> {
-    open_snapshot_source_budget(
-        path,
-        snapshot,
-        SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+    phase(
+        open_snapshot_source_budget(
+            path,
+            snapshot,
+            SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+        ),
+        "open_snapshot",
     )
 }
 fn open_snapshot_source_budget(
@@ -440,7 +505,7 @@ fn open_snapshot_source_budget(
             budget,
         });
     }
-    let meta = std::fs::metadata(path).map_err(backend)?;
+    let meta = std::fs::metadata(path).map_err(|error| io_error("source_metadata", error))?;
     verify_metadata(&meta, snapshot)?;
     budget.check()?;
     Ok(FileSource {
@@ -453,7 +518,10 @@ fn open_snapshot_source_budget(
 
 /// Final compatibility verification: metadata + full captured-range fingerprint.
 pub fn verify_snapshot(path: &Path, snapshot: &SourceSnapshot) -> PortResult<()> {
-    verify_snapshot_budget(path, snapshot, SnapshotBudget::compatibility())
+    phase(
+        verify_snapshot_budget(path, snapshot, SnapshotBudget::compatibility()),
+        "verify",
+    )
 }
 pub fn verify_snapshot_with_deadline(
     path: &Path,
@@ -461,10 +529,13 @@ pub fn verify_snapshot_with_deadline(
     sqlite_byte_limit: u64,
     deadline: Instant,
 ) -> PortResult<()> {
-    verify_snapshot_budget(
-        path,
-        snapshot,
-        SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+    phase(
+        verify_snapshot_budget(
+            path,
+            snapshot,
+            SnapshotBudget::bounded(sqlite_byte_limit, deadline)?,
+        ),
+        "verify",
     )
 }
 fn verify_snapshot_budget(
@@ -480,8 +551,13 @@ fn verify_snapshot_budget(
         verify_sqlite_snapshot(snapshot, &current)?;
         return budget.check();
     }
-    let file = File::open(path).map_err(backend)?;
-    verify_metadata(&file.metadata().map_err(backend)?, snapshot)?;
+    let file = File::open(path).map_err(|error| io_error("source_open", error))?;
+    verify_metadata(
+        &file
+            .metadata()
+            .map_err(|error| io_error("source_metadata", error))?,
+        snapshot,
+    )?;
     let mut captured = file.take(snapshot.len);
     let (len, fingerprint) = fingerprint_reader(&mut captured, budget)?;
     if len != snapshot.len {
@@ -510,7 +586,8 @@ fn verify_sqlite_snapshot(expected: &SourceSnapshot, current: &SourceSnapshot) -
     }
 }
 fn post_read_verify(path: &Path, snap: &SourceSnapshot) -> PortResult<()> {
-    let meta_after = std::fs::metadata(path).map_err(backend)?;
+    let meta_after =
+        std::fs::metadata(path).map_err(|error| io_error("post_read_metadata", error))?;
     verify_metadata(&meta_after, snap).map_err(|error| match error {
         PortError::SnapshotChanged(detail) => {
             PortError::SnapshotChanged(format!("source changed during verification: {detail}"))
@@ -563,7 +640,9 @@ impl agent_session_grep_ports::SourceDiscovery for SnapshotFs {
             .map_err(|_| PortError::SourceIo("bounded source allocation failed".into()))?;
         let mut chunk = [0_u8; SOURCE_IO_BUFFER_BYTES];
         loop {
-            let read = reader.read(&mut chunk).map_err(backend)?;
+            let read = reader
+                .read(&mut chunk)
+                .map_err(|error| io_error("verified_read", error))?;
             if read == 0 {
                 break;
             }
@@ -578,6 +657,86 @@ impl agent_session_grep_ports::SourceDiscovery for SnapshotFs {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn snapshot_errors_keep_phase_and_codes_without_raw_payloads() {
+        let marker = "private diagnostic source marker";
+        let failure = io_error(
+            "source_open",
+            io::Error::new(io::ErrorKind::PermissionDenied, marker),
+        );
+        let failure = phase::<()>(Err(failure), "capture").unwrap_err();
+        let PortError::SourceIo(message) = failure else {
+            panic!("wrong I/O classification");
+        };
+        assert!(message.contains("phase=capture"));
+        assert!(message.contains("site=source_open kind=PermissionDenied os=None"));
+        assert!(!message.contains(marker));
+        assert!(message.len() < 256);
+        for (code, busy) in [
+            (rusqlite::ffi::SQLITE_BUSY, true),
+            (rusqlite::ffi::SQLITE_LOCKED, true),
+            (rusqlite::ffi::SQLITE_INTERRUPT, true),
+            (rusqlite::ffi::SQLITE_IOERR_READ, false),
+            (rusqlite::ffi::SQLITE_CORRUPT, false),
+        ] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some(marker.into()),
+            );
+            let failure = sql("sqlite_source_open", error);
+            if busy {
+                assert!(matches!(failure, PortError::WriterBusy(_)));
+            } else {
+                let PortError::SourceIo(message) = failure else {
+                    panic!("wrong SQL classification");
+                };
+                assert!(message.contains(&format!("extended=Some({code})")));
+                assert!(message.contains("site=sqlite_source_open sqlite=Some("));
+                assert!(!message.contains(marker));
+                assert!(message.len() < 256);
+            }
+        }
+        assert!(matches!(
+            phase::<()>(Err(timeout()), "verify"),
+            Err(PortError::WriterBusy(_))
+        ));
+    }
+
+    #[test]
+    fn missing_source_and_invalid_sqlite_preserve_actual_failure_sites() {
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
+        let path = dir.path().join("unreported-private-file");
+        let PortError::SourceIo(message) = capture(&path).unwrap_err() else {
+            panic!("missing source was not an I/O error");
+        };
+        assert!(message.contains("phase=capture"));
+        assert!(message.contains("site=source_open kind=NotFound"));
+        assert!(!message.contains("unreported-private-file"));
+        let valid = write_file(dir.path(), "source.txt", b"healthy source");
+        let snapshot = capture(&valid).unwrap();
+        let PortError::SourceIo(message) = open_snapshot_source(&path, &snapshot).err().unwrap()
+        else {
+            panic!("missing reopen was not an I/O error");
+        };
+        assert!(message.contains("phase=open_snapshot"));
+        assert!(message.contains("site=source_metadata kind=NotFound"));
+        let PortError::SourceIo(message) = verify_snapshot(&path, &snapshot).unwrap_err() else {
+            panic!("missing verification was not an I/O error");
+        };
+        assert!(message.contains("phase=verify"));
+        assert!(message.contains("site=source_open kind=NotFound"));
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend_from_slice(&[0x5a; 112]);
+        std::fs::write(&path, &bytes).unwrap();
+        let PortError::SourceIo(message) = capture(&path).unwrap_err() else {
+            panic!("invalid SQLite was not an I/O error");
+        };
+        assert!(message.contains("phase=capture") && message.contains("site=sqlite_source_"));
+        assert!(message.contains("sqlite=Some("));
+        assert!(!message.contains("unreported-private-file"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 
     #[test]
     fn sqlite_capture_reads_wal_and_detects_wal_only_changes_without_writing_source() {

@@ -7593,11 +7593,17 @@ fn capability_search_claim_matches_real_retrieval_for_every_provider() {
         let source = materialize_golden_source(provider_id, relative, dir.path());
         let path = source.to_string_lossy().into_owned();
 
-        let out = run(&db, &["sync", &path]);
+        let out = Command::new(BIN)
+            .args(["--db", &db, "--robot", "sync", &path])
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("ASG_DEBUG_ERRORS", "1")
+            .output()
+            .expect("spawn capability source sync");
         assert!(
             out.status.success(),
-            "{provider_id}: sync 必须成功: {}",
-            stdout(&out)
+            "{provider_id}: sync must succeed: {}; stderr={}",
+            stdout(&out),
+            String::from_utf8_lossy(&out.stderr)
         );
         let synced = parse_first_line(&out);
         let committed = synced["data"]["committed"]
@@ -7664,6 +7670,71 @@ fn capability_search_claim_matches_real_retrieval_for_every_provider() {
             }
         }
     }
+}
+
+#[test]
+fn source_snapshot_failure_diagnostics_distinguish_source_and_temporary_storage() {
+    let (dir, db) = temp_db("source-diagnostic");
+    let missing = dir.path().join("missing-private-source.db");
+    let source = materialize_golden_source(
+        "cursor",
+        "../agent-session-grep-provider-cursor/tests/golden/basic.db",
+        dir.path(),
+    );
+    let blocked_temp = dir.path().join("blocked-private-temp");
+    std::fs::write(&blocked_temp, b"synthetic ordinary file").unwrap();
+    for (path, bad_temp, site) in [
+        (&missing, false, "site=source_open"),
+        (&source, true, "site=sqlite_target_create"),
+    ] {
+        let mut command = Command::new(BIN);
+        command
+            .arg("--db")
+            .arg(&db)
+            .args(["--robot", "sync"])
+            .arg(path)
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("ASG_DEBUG_ERRORS", "1");
+        if bad_temp {
+            for name in ["TMP", "TEMP", "TMPDIR"] {
+                command.env(name, &blocked_temp);
+            }
+        }
+        let out = command.output().unwrap();
+        assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+        let frame = parse_first_line(&out);
+        assert_eq!(frame["error"]["code"], "source_io");
+        assert_eq!(frame["error"]["message"], "源文件无法读取");
+        let diagnostic = String::from_utf8_lossy(&out.stderr);
+        assert!(diagnostic.contains("phase=capture"), "{diagnostic}");
+        assert!(diagnostic.contains(site), "{diagnostic}");
+        assert!(diagnostic.contains("kind=") && diagnostic.contains("os="));
+        for private_name in ["missing-private-source", "blocked-private-temp", "basic.db"] {
+            assert!(!diagnostic.contains(private_name), "{diagnostic}");
+        }
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT active_generation FROM store_metadata", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM source_scans", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    let out = run(&db, &["sync", source.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(
+        parse_first_line(&out)["data"]["committed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 // ---- usage 维度端到端：ingest → status（schema v15 投影）----
