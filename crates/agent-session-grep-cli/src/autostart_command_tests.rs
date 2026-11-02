@@ -125,6 +125,7 @@ struct Fixture {
     catalog: PathBuf,
     location: NativeLocation,
     enabled: Cell<bool>,
+    installations: Cell<usize>,
     calls: RefCell<Vec<Vec<OsString>>>,
 }
 impl Fixture {
@@ -163,6 +164,7 @@ impl Fixture {
             catalog,
             location: NativeLocation::SystemdUser { directory },
             enabled: Cell::new(false),
+            installations: Cell::new(0),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -181,6 +183,7 @@ impl Fixture {
         directory.join(self.store().entry_name())
     }
     fn installation(&self, supervisor: bool) -> Installation {
+        self.installations.set(self.installations.get() + 1);
         install(&self.prefix, supervisor)
     }
     fn control(&self) -> SqliteControlStore {
@@ -194,11 +197,6 @@ impl Fixture {
                 Err(error) => panic!("synthetic control open failed: {error:?}"),
             }
         }
-    }
-    fn response(&self, args: &[OsString]) -> LocalCapture {
-        let registration = self.installation(true);
-        let (supervisor, _) = registration.supervisor.as_ref().unwrap();
-        self.response_with_supervisor(args, supervisor)
     }
     fn response_with_supervisor(&self, args: &[OsString], supervisor: &Path) -> LocalCapture {
         let store = self.store();
@@ -240,17 +238,45 @@ impl Fixture {
         }
     }
     fn execute(&self, action: Action) -> Summary {
-        execute(
+        // Construct the synthetic installation before the real command end.
+        // Native replies only read that prepared supervisor, never reinstall it.
+        let before = self.installations.get();
+        let mut installation = Some(self.installation(true));
+        let supervisor = installation
+            .as_ref()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        let end = Instant::now() + BUDGET;
+        let observation = ObserveDeadline::start(end);
+        let result = execute(
             self.catalog.to_str().unwrap(),
             Options {
                 action,
                 prefix: None,
             },
-            Instant::now() + BUDGET,
-            &mut |_| Ok(self.installation(true)),
+            end,
+            &mut |_| Ok(installation.take().unwrap()),
             &mut || Ok(self.location.clone()),
-            &mut |_, args, _| Ok(self.response(args)),
-        )
+            &mut |_, args, received| {
+                assert_eq!(received, end);
+                Ok(self.response_with_supervisor(args, &supervisor))
+            },
+        );
+        let observed = observation.finish();
+        assert_eq!(self.installations.get(), before + 1);
+        if result.status != "complete" {
+            eprintln!(
+                "fixture action={action:?} calls={} remaining={:?} deadline={observed:?} summary={}",
+                self.calls.borrow().len(),
+                end.saturating_duration_since(Instant::now()),
+                serde_json::to_string(&result).unwrap()
+            );
+        }
+        result
     }
     fn assert_unrelated(&self) {
         let NativeLocation::SystemdUser { directory } = &self.location else {
@@ -740,7 +766,9 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
             .unwrap()
             .0
             .clone();
+        let control = SqliteControlStore::open_current_writable(&f.root).unwrap();
         let end = Instant::now() + BUDGET;
+        let observation = ObserveDeadline::start(end);
         let mut rechecked = false;
         let result = execute(
             f.catalog.to_str().unwrap(),
@@ -751,14 +779,17 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
             end,
             &mut |_| Ok(installation.take().unwrap()),
             &mut || Ok(f.location.clone()),
-            &mut |_, args, _| {
+            &mut |_, args, received| {
+                assert_eq!(received, end);
                 let response = f.response_with_supervisor(args, &supervisor);
                 if !rechecked && args.iter().any(|arg| arg == "ExecStart") {
                     rechecked = true;
-                    let control = SqliteControlStore::open_current_writable(&f.root).unwrap();
-                    let seq = control_status(&control).policy.control_seq;
+                    let probe = end + Duration::from_secs(1);
+                    let previous = SqliteControlStore::effective_runtime_deadline(probe);
                     control
-                        .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                        .with_runtime_deadline(received, || {
+                            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                            let seq = control.status()?.policy.control_seq;
                             if paused {
                                 control.set_desired_updates(seq, DesiredUpdates::Paused)
                             } else {
@@ -773,11 +804,17 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
                             }
                         })
                         .unwrap();
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                        previous
+                    );
                 }
                 Ok(response)
             },
         );
+        let observed = observation.finish();
         assert!(rechecked);
+        assert_eq!(f.installations.get(), 1);
         assert!(
             f.calls
                 .borrow()
@@ -788,7 +825,7 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
             assert_eq!(
                 result.status,
                 "complete",
-                "phase=late_intent rechecked={rechecked} native_calls={} summary={}",
+                "phase=late_intent rechecked={rechecked} native_calls={} deadline={observed:?} summary={}",
                 f.calls.borrow().len(),
                 serde_json::to_string(&result).unwrap()
             );
@@ -1172,6 +1209,14 @@ fn native_launch_observes_the_original_autostart_deadline() {
 fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
     let f = Fixture::new(DesiredUpdates::Running);
     let mut installation = Some(f.installation(true));
+    let supervisor = installation
+        .as_ref()
+        .unwrap()
+        .supervisor
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     let (locked, acquired) = std::sync::mpsc::channel();
     let root = f.root.clone();
     let holder = std::thread::spawn(move || {
@@ -1186,6 +1231,7 @@ fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
     });
     acquired.recv_timeout(Duration::from_secs(2)).unwrap();
     let end = Instant::now() + BUDGET;
+    let observation = ObserveDeadline::start(end);
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -1197,14 +1243,16 @@ fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
         &mut || Ok(f.location.clone()),
         &mut |_, args, deadline| {
             assert_eq!(deadline, end);
-            Ok(f.response(args))
+            Ok(f.response_with_supervisor(args, &supervisor))
         },
     );
     holder.join().unwrap();
+    let observed = observation.finish();
+    assert_eq!(f.installations.get(), 1);
     assert_eq!(
         result.status,
         "complete",
-        "phase=control_contention native_calls={} summary={}",
+        "phase=control_contention native_calls={} deadline={observed:?} summary={}",
         f.calls.borrow().len(),
         serde_json::to_string(&result).unwrap()
     );
