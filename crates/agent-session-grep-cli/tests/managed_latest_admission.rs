@@ -11,7 +11,7 @@ use agent_session_grep_domain::{
     EvidenceSpan, IdKind, MessageEdge, MessagePlacement, MessageRelation, StableId,
 };
 use agent_session_grep_ports::{
-    PortError, SearchProvider, SourceResumeClaim,
+    PortError, PortResult, SearchProvider, SourceResumeClaim,
     control::*,
     managed::{
         ObservationState, RepositoryClaim, RevisionId, SelectionProof, SourceBinding, SourceId,
@@ -36,8 +36,12 @@ fn entity(kind: IdKind, name: &str) -> StableId {
     StableId::native_checked(kind, name).unwrap()
 }
 fn lock(root: &Path, kind: LockKind) -> ExclusiveGuard {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    lock_before(root, kind, Instant::now() + Duration::from_secs(2))
+}
+fn lock_before(root: &Path, kind: LockKind, end: Instant) -> ExclusiveGuard {
+    let deadline = end.min(Instant::now() + Duration::from_secs(2));
     loop {
+        assert!(Instant::now() < deadline, "fixture lock deadline expired");
         match ExclusiveGuard::try_acquire(root, kind.clone()) {
             Ok(guard) => return guard,
             Err(PortError::WriterBusy(_)) if Instant::now() < deadline => std::thread::yield_now(),
@@ -49,6 +53,45 @@ fn current(control: &SqliteControlStore) -> ControlSeq {
     control.status().unwrap().policy.control_seq
 }
 
+fn prepare_before<T>(
+    control: &SqliteControlStore,
+    requested: Instant,
+    prepare: impl FnOnce(Instant) -> PortResult<T>,
+) -> PortResult<T> {
+    let end = SqliteControlStore::effective_runtime_deadline(requested);
+    let probe = requested + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = control.with_runtime_deadline(end, || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            end,
+            "fixture preparation must receive its original scope"
+        );
+        prepare(end)
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous,
+        "fixture preparation must restore the caller scope"
+    );
+    result
+}
+
+fn bind_before<'a>(
+    control: &'a SqliteControlStore,
+    guard: &'a ExclusiveGuard,
+    end: Instant,
+) -> PortResult<LockedWorkerAuthority<'a>> {
+    prepare_before(control, end, |end| {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(end + Duration::from_secs(1)),
+            end,
+            "worker binding must receive the original fixture end"
+        );
+        control.bind_worker(guard, id(BOOT))
+    })
+}
+
 /// One committed synthetic source under a registered worker boot whose OS
 /// lock is released; each test binds the same boot to act as the live owner.
 struct Fixture {
@@ -57,6 +100,7 @@ struct Fixture {
     control: SqliteControlStore,
     batch: SourceBatch,
     observation: SourceObservation,
+    publication_end: Instant,
     // Connections and OS guards must close before Windows temp cleanup.
     _temp: tempfile::TempDir,
 }
@@ -71,84 +115,95 @@ impl Fixture {
             DesiredUpdates::Running,
         )
         .unwrap();
-        let selection = control
-            .add_selection(
-                current(&control),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: CanonicalLocator::from_path(&temp.path().canonicalize().unwrap())
-                            .unwrap(),
-                        kind: RootKind::Root,
-                    },
-                    root_identity: Some(id("source-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap()
-            .value;
-        let guard = lock(&root, LockKind::Background);
-        let worker = control.bind_worker(&guard, id(BOOT)).unwrap();
-        control
-            .register_worker(current(&control), &worker, 1, 1)
-            .unwrap();
-        let cycle = match control
-            .queue_cycle(
-                current(&control),
-                vec![SelectionRevision {
-                    selection_id: selection.id.clone(),
-                    revision: selection.revision,
-                    root_identity: id("source-root"),
-                }],
-            )
-            .unwrap()
-            .value
-        {
-            CycleAdmission::Queued(cycle) => cycle,
-            blocked => panic!("fixture cycle: {blocked:?}"),
-        };
-        let cycle = control
-            .start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)
-            .unwrap()
-            .value;
-        let session = entity(IdKind::Session, "session");
-        let document = entity(IdKind::Document, "document");
-        let message = entity(IdKind::Message, "message-0");
-        let system = entity(IdKind::Message, "system");
-        let observation = SourceObservation {
-            binding: SourceBinding {
-                source_id: SourceId::parse("synthetic-source").unwrap(),
-                source_path: CanonicalLocator::from_path(&temp.path().join("synthetic.jsonl"))
+        // This is a new fixture preparation allowance after control creation,
+        // not the test operation's separately started end or a create budget.
+        let setup_end = SqliteControlStore::effective_runtime_deadline(
+            Instant::now() + Duration::from_secs(20),
+        );
+        let (batch, observation, publication_end) =
+            prepare_before(&control, setup_end, |setup_end| {
+                let selection = control
+                    .add_selection(
+                        current(&control),
+                        SelectionRequest {
+                            region: ScopeRegion {
+                                provider: SearchProvider::Claude,
+                                locator: CanonicalLocator::from_path(
+                                    &temp.path().canonicalize().unwrap(),
+                                )
+                                .unwrap(),
+                                kind: RootKind::Root,
+                            },
+                            root_identity: Some(id("source-root")),
+                            now_ms: 1,
+                        },
+                    )
                     .unwrap()
-                    .as_str()
-                    .into(),
-                provider: SearchProvider::Claude,
-                namespace_id: None,
-                root_identity: "source-root".into(),
-            },
-            revision_id: RevisionId::parse("synthetic-revision").unwrap(),
-            revision_digest: "0123456789abcdef".repeat(4),
-            parser_version: PARSER_SEMANTIC_VERSION,
-            state: ObservationState::Complete,
-            cycle_seq: cycle.token.cycle_seq.get(),
-            worker_boot_id: BOOT.into(),
-            catalog_incarnation: "synthetic-incarnation".into(),
-            policy_epoch: cycle.policy_epoch.get(),
-            started_control_seq: cycle.started_control_seq.unwrap().get(),
-            observed_at_ms: 3,
-            committed_at_ms: 4,
-            selections: vec![SelectionProof {
-                selection_id: selection.id.as_str().into(),
-                selection_revision: selection.revision.get(),
-                root_identity: "source-root".into(),
-            }],
-            repositories: vec![RepositoryClaim {
-                session_id: session.clone(),
-                slug: "example.test/team/project".into(),
-            }],
-        };
-        let timestamp = "2026-10-17T12:00:00Z";
-        let entries = vec![
+                    .value;
+                let guard = lock_before(&root, LockKind::Background, setup_end);
+                let worker = bind_before(&control, &guard, setup_end)?;
+                control
+                    .register_worker(current(&control), &worker, 1, 1)
+                    .unwrap();
+                let cycle = match control
+                    .queue_cycle(
+                        current(&control),
+                        vec![SelectionRevision {
+                            selection_id: selection.id.clone(),
+                            revision: selection.revision,
+                            root_identity: id("source-root"),
+                        }],
+                    )
+                    .unwrap()
+                    .value
+                {
+                    CycleAdmission::Queued(cycle) => cycle,
+                    blocked => panic!("fixture cycle: {blocked:?}"),
+                };
+                let cycle = control
+                    .start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)
+                    .unwrap()
+                    .value;
+                let session = entity(IdKind::Session, "session");
+                let document = entity(IdKind::Document, "document");
+                let message = entity(IdKind::Message, "message-0");
+                let system = entity(IdKind::Message, "system");
+                let observation = SourceObservation {
+                    binding: SourceBinding {
+                        source_id: SourceId::parse("synthetic-source").unwrap(),
+                        source_path: CanonicalLocator::from_path(
+                            &temp.path().join("synthetic.jsonl"),
+                        )
+                        .unwrap()
+                        .as_str()
+                        .into(),
+                        provider: SearchProvider::Claude,
+                        namespace_id: None,
+                        root_identity: "source-root".into(),
+                    },
+                    revision_id: RevisionId::parse("synthetic-revision").unwrap(),
+                    revision_digest: "0123456789abcdef".repeat(4),
+                    parser_version: PARSER_SEMANTIC_VERSION,
+                    state: ObservationState::Complete,
+                    cycle_seq: cycle.token.cycle_seq.get(),
+                    worker_boot_id: BOOT.into(),
+                    catalog_incarnation: "synthetic-incarnation".into(),
+                    policy_epoch: cycle.policy_epoch.get(),
+                    started_control_seq: cycle.started_control_seq.unwrap().get(),
+                    observed_at_ms: 3,
+                    committed_at_ms: 4,
+                    selections: vec![SelectionProof {
+                        selection_id: selection.id.as_str().into(),
+                        selection_revision: selection.revision.get(),
+                        root_identity: "source-root".into(),
+                    }],
+                    repositories: vec![RepositoryClaim {
+                        session_id: session.clone(),
+                        slug: "example.test/team/project".into(),
+                    }],
+                };
+                let timestamp = "2026-10-17T12:00:00Z";
+                let entries = vec![
             (
                 session.clone(),
                 serde_json::to_vec(
@@ -179,50 +234,69 @@ impl Fixture {
                 "synthetic system text".into(),
             ),
         ];
-        let placement = MessagePlacement::new(
-            session.clone(),
-            document.clone(),
-            message.clone(),
-            0,
-            false,
-            Some(EvidenceSpan { start: 0, end: 90 }),
-        );
-        let system_placement =
-            MessagePlacement::new(session.clone(), document, system, 1, false, None);
-        let edges = vec![MessageEdge {
-            child_placement_id: system_placement.id.clone(),
-            parent_message_id: message,
-            parent_native_id: None,
-            relation: MessageRelation::Reply,
-        }];
-        let batch = SourceBatch {
-            source_path: observation.binding.source_path.clone(),
-            entries,
-            placements: vec![placement, system_placement],
-            edges,
-            activities: vec![],
-            usage_events: vec![],
-            relation_complete: true,
-            len_bytes: Some(1000000),
-            fingerprint: Some(observation.revision_digest.clone()),
-            provider_id: Some("claude-code".into()),
-            resume_claims: vec![SourceResumeClaim {
-                session_id: session.as_str().into(),
-                provider_id: "claude-code".into(),
-                provider_session_id: Some("synthetic-native-session".into()),
-                provider_session_id_state: "resolved".into(),
-                original_working_directory: Some("synthetic-working-directory".into()),
-                original_working_directory_state: "resolved".into(),
-                pair_observed: true,
-            }],
-        };
-        let store = ManagedStore::create(&db, &control, id("synthetic-incarnation"), 1).unwrap();
-        store
-            .commit_source(&control, &worker, &batch, &observation)
+                let placement = MessagePlacement::new(
+                    session.clone(),
+                    document.clone(),
+                    message.clone(),
+                    0,
+                    false,
+                    Some(EvidenceSpan { start: 0, end: 90 }),
+                );
+                let system_placement =
+                    MessagePlacement::new(session.clone(), document, system, 1, false, None);
+                let edges = vec![MessageEdge {
+                    child_placement_id: system_placement.id.clone(),
+                    parent_message_id: message,
+                    parent_native_id: None,
+                    relation: MessageRelation::Reply,
+                }];
+                let batch = SourceBatch {
+                    source_path: observation.binding.source_path.clone(),
+                    entries,
+                    placements: vec![placement, system_placement],
+                    edges,
+                    activities: vec![],
+                    usage_events: vec![],
+                    relation_complete: true,
+                    len_bytes: Some(1000000),
+                    fingerprint: Some(observation.revision_digest.clone()),
+                    provider_id: Some("claude-code".into()),
+                    resume_claims: vec![SourceResumeClaim {
+                        session_id: session.as_str().into(),
+                        provider_id: "claude-code".into(),
+                        provider_session_id: Some("synthetic-native-session".into()),
+                        provider_session_id_state: "resolved".into(),
+                        original_working_directory: Some("synthetic-working-directory".into()),
+                        original_working_directory_state: "resolved".into(),
+                        pair_observed: true,
+                    }],
+                };
+                let store =
+                    ManagedStore::create(&db, &control, id("synthetic-incarnation"), 1).unwrap();
+                let publication_started = Instant::now();
+                let publication_end = setup_end.min(publication_started + Duration::from_secs(10));
+                let publish = |received: Instant| {
+                    assert_eq!(
+                        received, publication_end,
+                        "catalog publication must receive the saved setup-capped end"
+                    );
+                    store.commit_source_with_context(
+                    &control,
+                    &worker,
+                    &batch,
+                    &observation,
+                    &agent_session_grep_ports::source_context::SourcePublicationContext::default(),
+                    received,
+                )?;
+                    Ok::<_, PortError>(received)
+                };
+                let publication_end = publish(publication_end)?;
+                drop(store);
+                drop(worker);
+                drop(guard);
+                Ok((batch, observation, publication_end))
+            })
             .unwrap();
-        drop(store);
-        drop(worker);
-        drop(guard);
         Self {
             _temp: temp,
             root,
@@ -230,6 +304,7 @@ impl Fixture {
             control,
             batch,
             observation,
+            publication_end,
         }
     }
 
@@ -452,13 +527,119 @@ fn response(output: Output) -> Value {
 }
 
 #[test]
+fn preparation_and_real_worker_binding_restore_original_ends() {
+    let fixture = Fixture::new();
+    let control = &fixture.control;
+    for nested in [false, true] {
+        let end = Instant::now() + Duration::from_secs(20);
+        let requested = end
+            + if nested {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            };
+        let calls = std::cell::Cell::new(0);
+        let once = String::from("one preparation");
+        let prepare = || {
+            prepare_before(control, requested, |received| {
+                drop(once);
+                calls.set(calls.get() + 1);
+                assert_eq!(received, end);
+                let guard = lock_before(&fixture.root, LockKind::Background, received);
+                let worker = bind_before(control, &guard, received)?;
+                worker.validate()?;
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(
+                        requested + Duration::from_secs(1)
+                    ),
+                    end
+                );
+                assert_eq!(control.background_status()?.worker.boot_id, Some(id(BOOT)));
+                Ok(())
+            })
+        };
+        if nested {
+            control
+                .with_runtime_deadline(end, || {
+                    prepare()?;
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(requested),
+                        end
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        } else {
+            prepare().unwrap();
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested),
+            requested
+        );
+        // Also exercise the later, otherwise unscoped test-side binding.
+        let guard = lock_before(&fixture.root, LockKind::Background, end);
+        let worker = bind_before(control, &guard, end).unwrap();
+        drop(worker);
+        drop(guard);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested),
+            requested
+        );
+    }
+}
+
+#[test]
+fn publication_receives_the_earlier_setup_end_before_catalog_sql() {
+    let fixture = Fixture::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    let nested = fixture
+        .control
+        .with_runtime_deadline(end, || Ok(Fixture::new()))
+        .unwrap();
+    assert_eq!(nested.publication_end, end);
+    let probe = end + Duration::from_secs(1);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+}
+
+#[test]
+fn expired_preparation_never_starts_selection_or_worker_lock() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().join("private");
+    let control =
+        SqliteControlStore::create(&root, &id("expired-setup"), DesiredUpdates::Paused).unwrap();
+    let probe = Instant::now() + Duration::from_secs(20);
+    let before = control
+        .with_runtime_deadline(probe, || control.status())
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = prepare_before(&control, Instant::now() - Duration::from_millis(1), |end| {
+        calls.set(calls.get() + 1);
+        let guard = lock_before(&root, LockKind::Background, end);
+        let _worker = bind_before(&control, &guard, end)?;
+        Ok(())
+    });
+    assert!(matches!(result, Err(PortError::WriterBusy(_))));
+    assert_eq!(calls.get(), 0);
+    assert!(!root.join("background.lock").exists());
+    assert!(!root.join("catalog.db").exists());
+    assert_eq!(
+        control
+            .with_runtime_deadline(probe, || control.status())
+            .unwrap(),
+        before
+    );
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+}
+
+#[test]
 fn latest_admitted_during_live_advisory_waits_for_same_barrier_publication() {
     for state in [UpdateState::Busy, UpdateState::Deferred] {
         let f = Fixture::new();
         // Preparation gets its own end; the actual CLI keeps its usual budget.
         let end = Instant::now() + Duration::from_secs(20);
         let guard = lock(&f.root, LockKind::Background);
-        let worker = f.control.bind_worker(&guard, id(BOOT)).unwrap();
+        let worker = bind_before(&f.control, &guard, end).unwrap();
         let (store, next) = f.advise_before_admission(&worker, state, end);
         let mut child = f.spawn_latest(10_000);
         let admitted = f.await_admission(&mut child, next, 10_000, state, end);
@@ -547,7 +728,7 @@ fn latest_admitted_during_live_advisory_returns_offline_when_the_owner_is_gone()
             let f = Fixture::new();
             let end = Instant::now() + Duration::from_secs(20);
             let guard = lock(&f.root, LockKind::Background);
-            let worker = f.control.bind_worker(&guard, id(BOOT)).unwrap();
+            let worker = bind_before(&f.control, &guard, end).unwrap();
             let (store, next) = f.advise_before_admission(&worker, state, end);
             drop(store);
             // The heartbeat row stays advisory; only the OS owner disappears,
@@ -595,7 +776,7 @@ fn latest_admitted_during_lasting_advisory_expires_at_its_original_end() {
         let f = Fixture::new();
         let end = Instant::now() + Duration::from_secs(20);
         let guard = lock(&f.root, LockKind::Background);
-        let worker = f.control.bind_worker(&guard, id(BOOT)).unwrap();
+        let worker = bind_before(&f.control, &guard, end).unwrap();
         let (store, next) = f.advise_before_admission(&worker, state, end);
         drop(store);
         let mut child = f.spawn_latest(5000);
