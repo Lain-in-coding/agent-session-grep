@@ -9,6 +9,7 @@ use std::{
     cell::{Cell, RefCell},
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -2770,6 +2771,24 @@ fn fresh_id(conn: &Connection, prefix: &str) -> PortResult<ControlId> {
     id(format!("{prefix}_{random}"))
 }
 
+fn normalized_control_schema(version: i64) -> &'static [String] {
+    static LEGACY: OnceLock<Vec<String>> = OnceLock::new();
+    static CURRENT: OnceLock<Vec<String>> = OnceLock::new();
+    let (stored, indexes) = if version == VERSION {
+        (&CURRENT, RUNTIME_INDEXES)
+    } else {
+        (&LEGACY, "")
+    };
+    stored.get_or_init(|| {
+        SCHEMA
+            .split(';')
+            .chain(indexes.split(';'))
+            .filter(|statement| !statement.trim().is_empty())
+            .map(|statement| statement.split_whitespace().collect())
+            .collect()
+    })
+}
+
 pub(crate) fn validate_schema(conn: &Connection) -> PortResult<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -2788,19 +2807,15 @@ pub(crate) fn validate_schema(conn: &Connection) -> PortResult<()> {
     let entries = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| sql_query_error(conn, e))?;
-    let mut expected: Vec<&str> = SCHEMA.split(';').filter(|s| !s.trim().is_empty()).collect();
-    if version == VERSION {
-        expected.extend(RUNTIME_INDEXES.split(';').filter(|s| !s.trim().is_empty()));
-    }
+    // Only built-in declarations are immutable. Read and validate the actual
+    // schema, reserved contents and version on every call, including warm ones.
+    let expected = normalized_control_schema(version);
     let mut count = 0;
     for entry in entries {
         runtime_tick()?;
         let (name, sql) = entry.map_err(|e| sql_query_error(conn, e))?;
         let normalized = sql.split_whitespace().collect::<String>();
-        if !expected
-            .iter()
-            .any(|e| e.split_whitespace().collect::<String>() == normalized)
-        {
+        if !expected.contains(&normalized) {
             return Err(corrupt());
         }
         if RESERVED_TABLES.contains(&name.as_str()) {
@@ -7036,6 +7051,97 @@ mod windows_private {
                     ),
                     PortError::SchemaIncompatible(_)
                 ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_expectation_tests {
+    use super::*;
+
+    fn schema(version: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        if version == VERSION {
+            conn.execute_batch(RUNTIME_INDEXES).unwrap();
+        }
+        conn.pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn
+    }
+
+    #[test]
+    fn warmed_schema_expectations_still_inspect_actual_schema_and_reserved_rows() {
+        for version in [LEGACY_VERSION, VERSION, LEGACY_VERSION, VERSION] {
+            let conn = schema(version);
+            validate_schema(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER unexpected AFTER INSERT ON worker_state BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+            assert!(matches!(
+                validate_schema(&conn),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            conn.execute_batch("DROP TRIGGER unexpected;").unwrap();
+            validate_schema(&conn).unwrap();
+
+            conn.execute_batch(
+                "INSERT INTO update_receipts(
+                 update_id,phase,from_version,to_version,target,source_commit,
+                 archive_digest,manifest_digest,started_at_ms,updated_at_ms
+                 ) VALUES('synthetic','complete','old','new','target','source',
+                 'archive','manifest',0,0);",
+            )
+            .unwrap();
+            assert!(matches!(
+                validate_schema(&conn),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            conn.execute_batch("DELETE FROM update_receipts;").unwrap();
+            validate_schema(&conn).unwrap();
+
+            conn.pragma_update(None, "user_version", VERSION + 1)
+                .unwrap();
+            assert!(matches!(
+                validate_schema(&conn),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            conn.pragma_update(None, "user_version", version).unwrap();
+            validate_schema(&conn).unwrap();
+
+            conn.execute_batch("DROP TABLE worker_state;").unwrap();
+            let original = SCHEMA
+                .split(';')
+                .find(|statement| {
+                    statement
+                        .trim_start()
+                        .starts_with("CREATE TABLE worker_state")
+                })
+                .unwrap();
+            let changed = original.replace("CHECK(singleton=1)", "CHECK(singleton>=1)");
+            assert_ne!(changed, original);
+            conn.execute_batch(&changed).unwrap();
+            assert!(matches!(
+                validate_schema(&conn),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            conn.execute_batch("DROP TABLE worker_state;").unwrap();
+            conn.execute_batch(original).unwrap();
+            validate_schema(&conn).unwrap();
+
+            if version == VERSION {
+                conn.execute_batch("DROP INDEX cycles_runtime_state;")
+                    .unwrap();
+                assert!(matches!(
+                    validate_schema(&conn),
+                    Err(PortError::SchemaIncompatible(_))
+                ));
+                conn.execute_batch("CREATE INDEX cycles_runtime_state ON cycles(state,cycle_seq);")
+                    .unwrap();
+                validate_schema(&conn).unwrap();
             }
         }
     }
