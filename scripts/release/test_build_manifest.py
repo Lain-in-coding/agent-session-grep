@@ -413,6 +413,11 @@ class BuildManifestTests(unittest.TestCase):
             source.write_text(
                 'using System; using System.IO; using System.Text; class Fixture { static int Main(string[] args) {'
                 'if(args.Length == 1) { '
+                'string trace = Environment.GetEnvironmentVariable("ASG_TEST_PROBE_TRACE"); '
+                'if(trace != null) File.AppendAllText(trace, '
+                'System.Reflection.Assembly.GetExecutingAssembly().Location + "\\n"); '
+                'string change = Environment.GetEnvironmentVariable("ASG_TEST_PROBE_CHANGE"); '
+                'if(change != null) File.WriteAllText(change, "synthetic probe changed document"); '
                 f'if(args[0] == "--version") {{ Console.WriteLine("{product} {reported_version}"); return 0; }}'
                 f'if(args[0] == "--asg-launcher-info") {{ Console.WriteLine({literal}); return 0; }}'
                 'return 24; } '
@@ -868,16 +873,15 @@ foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(unused_prefix.exists())
 
-    def test_powershell_bad_launcher_preserves_staging_without_publishing(self) -> None:
+    def test_powershell_bad_launcher_rejects_before_staging(self) -> None:
         root, manifest, checksums = self.powershell_fixture(broken_launcher=True)
         prefix = self.workspace / "installation"
         result = self.run_ps_install(root, manifest, checksums, prefix)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(prefix.exists())
         staged = list(self.workspace.glob("installation.asg-stage-*"))
-        self.assertEqual(len(staged), 1)
-        self.assertTrue((staged[0] / "current.json").is_file())
-        self.assertIn("staging preserved", result.stderr)
+        self.assertEqual(staged, [])
+        self.assertNotIn("staging preserved", result.stderr)
 
     def test_powershell_rejects_supervisor_version_even_with_matching_package_hash(self) -> None:
         root, manifest, checksums = self.powershell_fixture(broken_supervisor=True)
@@ -887,8 +891,37 @@ foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
         self.assertFalse(prefix.exists())
         self.assertIn("supervisor version", result.stderr)
         staged = list(self.workspace.glob("supervisor-install.asg-stage-*"))
-        self.assertEqual(len(staged), 1)
-        self.assertEqual(len(list(staged[0].glob("versions/*/asg-supervisor.exe"))), 1)
+        self.assertEqual(staged, [])
+
+    def test_powershell_probes_source_and_rejects_changed_source_before_publication(self) -> None:
+        root, manifest, checksums = self.powershell_fixture()
+        source_files = self.file_snapshot(root)
+        for engine in ("pwsh", "powershell"):
+            if not shutil.which(engine):
+                continue
+            with self.subTest(engine=engine):
+                trace = self.workspace / (engine + "-probes.txt")
+                prefix = self.workspace / (engine + "-installed")
+                result = self.run_ps_install(
+                    root, manifest, checksums, prefix, engine=engine,
+                    env={**os.environ, "ASG_TEST_PROBE_TRACE": str(trace)},
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                images = [Path(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(images), 6)
+                self.assertTrue(all(image.is_relative_to(root) for image in images))
+                for name, contents in source_files.items():
+                    self.assertEqual((prefix / name).read_bytes(), contents)
+                self.assertTrue((prefix / "package-install.json").is_file())
+        prefix = self.workspace / "changed-during-probe"
+        result = self.run_ps_install(
+            root, manifest, checksums, prefix,
+            env={**os.environ, "ASG_TEST_PROBE_CHANGE": str(root / "README.md")},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(prefix.exists())
+        self.assertIn("staged digest mismatch", result.stderr)
+        self.assertIn("staging preserved", result.stderr)
 
     def native_posix_shell(self):
         """Return (argv prefix, path mapper) for a real POSIX shell, or skip.

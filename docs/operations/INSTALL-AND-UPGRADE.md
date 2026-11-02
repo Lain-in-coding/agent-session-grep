@@ -102,6 +102,9 @@ exclusive `mkdir`, then publishes the pointer and receipt last by rename.
 Before Windows publishes, each executable probe drains its output and waits
 for the process exit signal within that probe's original 30-second budget.
 An available exit code alone does not establish that the process has finished.
+On first install, these probes run in the verified extracted package before
+staging is created. The installer then copies, hashes and flushes each staged
+member; it never launches a staged executable before the directory rename.
 Failures preserve the exact staging path and any incomplete installation for
 inspection; there is no automatic recursive cleanup or stale-lock stealing.
 An interrupted Unix publication needs manual inspection and a fresh prefix;

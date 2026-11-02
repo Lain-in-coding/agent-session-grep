@@ -460,6 +460,9 @@ try {
         }
         throw 'first install requires an absent dedicated prefix; refusing an existing empty directory'
     }
+    # Probe the verified input before staging: a published directory must not
+    # still be an executable probe's image location while it is being renamed.
+    Verify-Programs $root $pointer $versionInfo
     $stage = "$Prefix.asg-stage-$([Guid]::NewGuid().ToString('N'))"
     if (Test-Path -LiteralPath $stage) { throw 'staging collision' }
     [void][IO.Directory]::CreateDirectory($stage)
@@ -478,7 +481,6 @@ try {
         $stream = [IO.File]::Open($destination, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try { $stream.Flush($true) } finally { $stream.Dispose() }
     }
-    Verify-Programs $stage $pointer $versionInfo
     $receipt = [ordered]@{
         schema = 'asg.package-install/v1'; product = 'agent-session-grep'
         version = $pointer.version; target = $release.target; source_commit = $release.source_commit
