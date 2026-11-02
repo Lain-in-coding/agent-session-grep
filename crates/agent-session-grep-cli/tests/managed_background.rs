@@ -1706,16 +1706,43 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
         let original = m2_sources(&f).pop().unwrap();
         let original_receipt = original.latest_receipt.clone().unwrap();
         let mut quiet_cycle = None;
+        let (mut sample, mut sampled_next) = (0usize, 0i64);
+        let mut sampled_cycles = Vec::new();
         f.wait(|f| {
+            sample += 1;
+            sampled_cycles.clear();
             let control = f.control();
             let number = control
                 .bounded(|control| control.background_status())
                 .next_cycle_seq;
+            sampled_next = number.get();
             let mut found = Vec::new();
             for seq in (1..number.get()).rev().take(8) {
                 let cycle = control.bounded(|control| {
                     control.cycle(agent_session_grep_ports::control::CycleSeq::new(seq).unwrap())
                 });
+                let counts = cycle
+                    .selections
+                    .iter()
+                    .fold((0u64, 0u64, 0u64), |(d, o, c), s| {
+                        (
+                            d.saturating_add(s.discovered_count),
+                            o.saturating_add(s.observed_count),
+                            c.saturating_add(s.committed_count),
+                        )
+                    });
+                sampled_cycles.push((
+                    seq,
+                    cycle.state,
+                    cycle.token.worker_boot_id.as_str() == original_receipt.worker_boot_id,
+                    cycle.policy_epoch.get(),
+                    cycle.started_at_ms,
+                    cycle.completed_at_ms,
+                    cycle.selections.len(),
+                    counts,
+                    cycle.selections.iter().all(|s| s.discovery_complete),
+                    cycle.selections.iter().find_map(|s| s.error),
+                ));
                 if cycle.state == CycleState::Partial
                     && cycle.selections.iter().all(|selection| {
                         selection.discovery_complete
@@ -1738,7 +1765,17 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
         assert!(quiet_cycle.unwrap().get() > original_receipt.cycle_seq);
         assert_eq!(
             m2_sources(&f)[0].latest_receipt.as_ref(),
-            Some(&original_receipt)
+            Some(&original_receipt),
+            "provider={provider}; barrier400_at_admission(required,seq,policy,state,error)={:?}; \
+             sample={sample} next={sampled_next} read_order=newest_first; \
+             cycles(seq,state,same_boot,policy,start_ms,end_ms,selections,(discovered,observed,committed),complete,first_error)={sampled_cycles:?}",
+            (
+                initial.required_cycle_seq.get(),
+                initial.admission_control_seq.get(),
+                initial.policy_epoch.get(),
+                initial.state,
+                initial.error
+            )
         );
         let latest = admit_latest_barrier(&f, 401);
         f.wait(|f| latest_satisfied(f, &latest));
