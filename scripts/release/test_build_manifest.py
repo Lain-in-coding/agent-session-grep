@@ -923,6 +923,109 @@ foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
         self.assertIn("staged digest mismatch", result.stderr)
         self.assertIn("staging preserved", result.stderr)
 
+    def test_powershell_release_metadata_snapshot_is_bounded_and_stable(self) -> None:
+        script = r'''
+$ErrorActionPreference='Stop'
+$tokens=$null; $errors=$null
+$tree=[Management.Automation.Language.Parser]::ParseFile(
+  $env:ASG_TEST_METADATA_SOURCE,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'installer parse failed'}
+foreach($name in @('Assert-PlainPath','Assert-File','Hash','Read-ReleaseMetadata')){
+  $nodes=@($tree.FindAll({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+  },$true))
+  if($nodes.Count -ne 1){throw 'metadata reader function missing'}
+  . ([scriptblock]::Create($nodes[0].Extent.Text))
+}
+$path=$env:ASG_TEST_METADATA_FILE
+foreach($bom in @($false,$true)){
+  $bytes=[Text.Encoding]::UTF8.GetBytes("{`"value`":`"captured`"}`n")
+  if($bom){$bytes=[byte[]](@(239,187,191)+$bytes)}
+  [IO.File]::WriteAllBytes($path,$bytes)
+  $original=Hash $path
+  $snapshot=Read-ReleaseMetadata $path $bytes.Length
+  [IO.File]::WriteAllText($path,'changed')
+  if($snapshot.Sha256 -cne $original -or
+     $snapshot.Text -cne "{`"value`":`"captured`"}`n"){throw 'snapshot is not the captured bytes'}
+  [IO.File]::WriteAllBytes($path,$bytes)
+  $failed=$false
+  try{Read-ReleaseMetadata $path ($bytes.Length-1)|Out-Null}catch{$failed=$true}
+  if(-not $failed){throw 'oversized metadata accepted'}
+}
+[IO.File]::WriteAllBytes($path,[byte[]]@(255))
+$failed=$false
+try{Read-ReleaseMetadata $path 8|Out-Null}catch{$failed=$true}
+if(-not $failed){throw 'invalid UTF-8 accepted'}
+[IO.File]::WriteAllBytes($path,[byte[]]@())
+$empty=Read-ReleaseMetadata $path 8
+if($empty.Text -cne '' -or $empty.Sha256 -cne (Hash $path)){throw 'empty snapshot differs'}
+# Reading an absent input does not create it; every opened handle is released.
+[IO.File]::Delete($path)
+$failed=$false
+try{Read-ReleaseMetadata $path 8|Out-Null}catch{$failed=$true}
+if(-not $failed -or [IO.File]::Exists($path)){throw 'missing metadata created'}
+'''
+        engines = [engine for engine in ("pwsh", "powershell") if shutil.which(engine)]
+        if os.name != "nt" or not engines:
+            self.skipTest("Windows PowerShell required for metadata snapshot regression")
+        path = self.workspace / "metadata-reader-test.ps1"
+        path.write_text(script, encoding="utf-8")
+        for engine in engines:
+            with self.subTest(engine=engine):
+                result = subprocess.run(
+                    [shutil.which(engine), "-NoProfile", "-NonInteractive", "-File", str(path)],
+                    env={**os.environ,
+                         "ASG_TEST_METADATA_SOURCE": str(MODULE_PATH.parents[2] / "scripts/install/package-install.ps1"),
+                         "ASG_TEST_METADATA_FILE": str(self.workspace / "snapshot.json")},
+                    capture_output=True, text=True, errors="backslashreplace", timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_powershell_refuses_release_metadata_changed_by_probes(self) -> None:
+        root, manifest, checksums = self.powershell_fixture()
+        originals = {path: path.read_bytes() for path in (manifest, checksums)}
+        for engine in ("pwsh", "powershell"):
+            if not shutil.which(engine):
+                continue
+            for source in originals:
+                with self.subTest(engine=engine, metadata=source.name):
+                    prefix = self.workspace / (engine + "-" + source.suffix.lstrip(".") + "-metadata")
+                    commands = self.workspace / (prefix.name + "-commands.bin")
+                    try:
+                        result = self.run_ps_install(
+                            root, manifest, checksums, prefix, engine=engine,
+                            env={**os.environ, "ASG_TEST_PROBE_CHANGE": str(source),
+                                 "ASG_TEST_COMMAND_RECEIPT": str(commands)},
+                            extra_args=("-HostChoice", "zcode"),
+                        )
+                        self.assertNotEqual(source.read_bytes(), originals[source])
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertFalse(prefix.exists())
+                        self.assertIn("staged release metadata changed", result.stderr)
+                        stages = list(self.workspace.glob(prefix.name + ".asg-stage-*"))
+                        self.assertEqual(len(stages), 1)
+                        self.assertFalse((stages[0] / "package-install.json").exists())
+                        self.assertEqual(self.command_receipts(commands), [])
+                    finally:
+                        source.write_bytes(originals[source])
+        # Existing installation metadata must also survive executable validation.
+        prefix = self.workspace / "metadata-repeat"
+        result = self.run_ps_install(root, manifest, checksums, prefix)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for source, installed in ((manifest, prefix / "release.manifest.json"),
+                                  (checksums, prefix / "SHA256SUMS")):
+            with self.subTest(installed=installed.name):
+                try:
+                    result = self.run_ps_install(
+                        root, manifest, checksums, prefix,
+                        env={**os.environ, "ASG_TEST_PROBE_CHANGE": str(installed)},
+                    )
+                    self.assertNotEqual(installed.read_bytes(), originals[source])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("installed release metadata changed", result.stderr)
+                finally:
+                    installed.write_bytes(originals[source])
+
     def native_posix_shell(self):
         """Return (argv prefix, path mapper) for a real POSIX shell, or skip.
 
@@ -963,6 +1066,14 @@ foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
             source.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n'
                 'static void u32(FILE*f,unsigned n){for(int i=0;i<4;i++){fputc(n&255,f);n>>=8;}}\n'
                 'int main(int n,char**v){if(n==2){'
+                'const char*change=getenv("ASG_TEST_PROBE_CHANGE");'
+                'if(change){char dest[8192];'
+                'if(change[0]==\'/\'){if(snprintf(dest,sizeof(dest),"%s",change)>=(int)sizeof(dest))return 27;}'
+                'else{const char*slash=strrchr(v[0],\'/\');if(!slash)return 28;'
+                'if(snprintf(dest,sizeof(dest),"%.*s/%s",(int)(slash-v[0]),v[0],change)>=(int)sizeof(dest))return 29;}'
+                'FILE*f=fopen(dest,"rb");if(f){if(fclose(f))return 30;'
+                'f=fopen(dest,"wb");if(!f)return 31;'
+                'fputs("synthetic probe changed metadata",f);if(fclose(f))return 32;}}'
                 f'if(!strcmp(v[1],"--version")){{puts({json.dumps(product + " 0.1.0")});return 0;}}'
                 f'if(!strcmp(v[1],"--asg-launcher-info")){{puts({json.dumps(info)});return 0;}}return 24;}}'
                 'int setup=0,path=0;for(int i=1;i<n;i++){setup|=!strcmp(v[i],"setup");path|=!strcmp(v[i],"path");}'
@@ -1008,6 +1119,62 @@ foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
         result = subprocess.run(command, cwd=self.workspace, capture_output=True, text=True, errors="backslashreplace", timeout=55)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(supervisor.read_text(), "unrelated supervisor")
+
+    def test_shell_refuses_metadata_and_payload_changed_by_probes(self) -> None:
+        root, manifest, checksums, invoke, native_path = self.posix_fixture()
+        original_files = self.file_snapshot(root)
+        sidecars = {path: path.read_bytes() for path in (manifest, checksums)}
+        cases = [("copied-" + name, name) for name in
+                 ("release.manifest.json", "SHA256SUMS", "README.md")]
+        cases += [("source-" + path.name, native_path(path)) for path in sidecars]
+        for ordinal, (label, change) in enumerate(cases):
+            with self.subTest(case=label):
+                prefix = self.workspace / ("changed-posix-" + str(ordinal))
+                commands = self.workspace / ("changed-posix-commands-" + str(ordinal))
+                command = invoke + ["env", "ASG_TEST_PROBE_CHANGE=" + change,
+                    "ASG_TEST_COMMAND_RECEIPT=" + native_path(commands),
+                    "sh", native_path(root / "package-install.sh"), "--manifest", native_path(manifest),
+                    "--checksums", native_path(checksums), "--prefix", native_path(prefix),
+                    "--host", "zcode"]
+                try:
+                    result = subprocess.run(command, cwd=self.workspace, capture_output=True,
+                                            text=True, errors="backslashreplace", timeout=55)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("changed" if "README" not in label else "checksum mismatch", result.stderr)
+                    self.assertFalse(prefix.exists())
+                    self.assertEqual(self.command_receipts(commands), [])
+                    if label.startswith("source-"):
+                        path = next(path for path in sidecars if path.name == label.removeprefix("source-"))
+                        self.assertNotEqual(path.read_bytes(), sidecars[path])
+                    else:
+                        changed = list(self.workspace.glob(".asg-stage.*/payload/" + change))
+                        self.assertTrue(any(path.read_bytes() == b"synthetic probe changed metadata"
+                                            for path in changed))
+                finally:
+                    for path, content in sidecars.items():
+                        path.write_bytes(content)
+        self.assertEqual(self.file_snapshot(root), original_files)
+        # The same post-probe validation applies to an already installed prefix.
+        prefix = self.workspace / "posix-repeat-metadata"
+        command = invoke + ["sh", native_path(root / "package-install.sh"),
+            "--manifest", native_path(manifest), "--checksums", native_path(checksums),
+            "--prefix", native_path(prefix)]
+        result = subprocess.run(command, cwd=self.workspace, capture_output=True,
+                                text=True, errors="backslashreplace", timeout=55)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("release.manifest.json", "SHA256SUMS"):
+            original = (prefix / name).read_bytes()
+            try:
+                result = subprocess.run(
+                    invoke + ["env", "ASG_TEST_PROBE_CHANGE=" + name] + command[len(invoke):],
+                    cwd=self.workspace, capture_output=True, text=True,
+                    errors="backslashreplace", timeout=55,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("changed", result.stderr)
+                self.assertNotEqual((prefix / name).read_bytes(), original)
+            finally:
+                (prefix / name).write_bytes(original)
 
     def test_shell_installer_native_image_gate_accepts_macho_filetype(self) -> None:
         # Byte-level regression for the installer's Mach-O header check:

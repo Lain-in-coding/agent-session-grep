@@ -167,6 +167,7 @@ manifest=$(absolute "$manifest"); checksums=$(absolute "$checksums")
 regular "$manifest"; regular "$checksums"
 [ "$(wc -c < "$manifest" | tr -d ' ')" -le 524288 ] || fail 'manifest exceeds size limit'
 [ "$(wc -c < "$checksums" | tr -d ' ')" -le 262144 ] || fail 'checksums exceed size limit'
+checksums_hash=$(digest "$checksums")
 awk '
     length($1)!=64 || $1 ~ /[^0-9a-f]/ || $0 !~ /^[0-9a-f]+  [A-Za-z0-9][A-Za-z0-9_.+-]*$/ {exit 1}
     seen[tolower($2)]++ || NR>16 {exit 1}
@@ -240,6 +241,11 @@ awk -v version="$version" '
     !($2 in allowed) {exit 1}
 ' "$checksums" || fail 'unexpected release checksum asset'
 
+validate_release_inputs() {
+    [ "$(digest "$manifest")" = "$manifest_hash" ] || fail 'release manifest changed'
+    [ "$(digest "$checksums")" = "$checksums_hash" ] || fail 'release checksums changed'
+}
+validate_release_inputs
 
 validate_tree() {
     tree=$1
@@ -268,7 +274,7 @@ validate_tree() {
     if [ "$tree" != "$root" ]; then
         regular "$tree/release.manifest.json"; regular "$tree/SHA256SUMS"
         [ "$(digest "$tree/release.manifest.json")" = "$manifest_hash" ] || fail 'installed release manifest changed'
-        cmp -s "$checksums" "$tree/SHA256SUMS" || fail 'installed release checksums changed'
+        [ "$(digest "$tree/SHA256SUMS")" = "$checksums_hash" ] || fail 'installed release checksums changed'
     fi
 }
 helper_sh="$dir/helpers/update-check.sh"
@@ -413,6 +419,8 @@ if [ -e "$prefix" ]; then
         cmp -s "$receipt" "$prefix/package-install.json" || fail 'unowned prefix or different package; upgrade is not implemented'
         expected_count=$((record_count + 4)); validate_tree "$prefix"
         verify_programs "$prefix"
+        validate_tree "$prefix"
+        validate_release_inputs
         # Remove only our exact temporary probe files and then the empty stage.
         rm "$receipt" "$stage/probe.out" "$stage/probe.err" "$stage/expected-version" "$stage/actual-info" "$stage/expected-info"
         rmdir "$stage"; stage=
@@ -436,6 +444,8 @@ cp "$checksums" "$payload/SHA256SUMS"
 chmod 644 "$payload/release.manifest.json" "$payload/SHA256SUMS"
 expected_count=$((record_count + 3)); validate_tree "$payload"
 verify_programs "$payload"
+validate_tree "$payload"
+validate_release_inputs
 cp "$receipt" "$payload/package-install.json"
 chmod 600 "$payload/package-install.json"
 sync

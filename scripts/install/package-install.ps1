@@ -177,6 +177,31 @@ function Hash([string]$Path) {
     finally { $stream.Dispose(); $algorithm.Dispose() }
 }
 
+function Read-ReleaseMetadata([string]$Path, [int]$MaxBytes) {
+    Assert-File $Path
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($MaxBytes -lt 1 -or $stream.Length -gt $MaxBytes) { throw 'release metadata exceeds size limit' }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $position = 0
+        while ($position -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $position, $bytes.Length - $position)
+            if ($read -eq 0) { throw 'release metadata changed while reading' }
+            $position += $read
+        }
+        if ($stream.ReadByte() -ne -1) { throw 'release metadata changed while reading' }
+    } finally { $stream.Dispose() }
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+    $offset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) { 3 } else { 0 }
+    $encoding = New-Object Text.UTF8Encoding($false, $true)
+    return [pscustomobject]@{
+        Text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset)
+        Sha256 = $digest
+    }
+}
+
 function Safe-Relative([string]$Path) {
     if ($Path -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_.+-]*(/[A-Za-z0-9][A-Za-z0-9_.+-]*)*$') {
         throw 'unsafe package path'
@@ -327,20 +352,23 @@ try {
     $root = [IO.Path]::GetFullPath($PSScriptRoot)
     $Manifest = [IO.Path]::GetFullPath($Manifest)
     $Checksums = [IO.Path]::GetFullPath($Checksums)
-    Assert-File $Manifest
-    Assert-File $Checksums
-    if ((Get-Item -LiteralPath $Manifest).Length -gt 524288 -or (Get-Item -LiteralPath $Checksums).Length -gt 262144) { throw 'release metadata exceeds size limit' }
+    $manifestInput = Read-ReleaseMetadata $Manifest 524288
+    $checksumsInput = Read-ReleaseMetadata $Checksums 262144
+    $manifestHash = $manifestInput.Sha256
+    $checksumsHash = $checksumsInput.Sha256
     $sums = @{}
-    foreach ($line in [IO.File]::ReadAllLines($Checksums)) {
-        if ($line -cnotmatch '^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9_.+-]*)$') { throw 'invalid SHA256SUMS' }
-        $name = $Matches[2]; $digest = $Matches[1]
-        Safe-Relative $name
-        if ($sums.ContainsKey($name) -or $sums.Count -ge 16) { throw 'duplicate or oversized SHA256SUMS inventory' }
-        $sums[$name] = $digest
-    }
-    $manifestHash = Hash $Manifest
+    $lines = New-Object IO.StringReader($checksumsInput.Text)
+    try {
+        while ($null -ne ($line = $lines.ReadLine())) {
+            if ($line -cnotmatch '^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9_.+-]*)$') { throw 'invalid SHA256SUMS' }
+            $name = $Matches[2]; $digest = $Matches[1]
+            Safe-Relative $name
+            if ($sums.ContainsKey($name) -or $sums.Count -ge 16) { throw 'duplicate or oversized SHA256SUMS inventory' }
+            $sums[$name] = $digest
+        }
+    } finally { $lines.Dispose() }
     if ($sums[[IO.Path]::GetFileName($Manifest)] -cne $manifestHash) { throw 'manifest checksum mismatch' }
-    $metadata = [IO.File]::ReadAllText($Manifest) | ConvertFrom-Json
+    $metadata = $manifestInput.Text | ConvertFrom-Json
     if ($metadata.schema -cne 'agent-session-grep.release-archive-manifest/v1' -or $metadata.layout -cne 'asg.managed-candidate/v1') { throw 'unsupported package manifest' }
     $release = $metadata.release
     if ($release.target -cne 'x86_64-pc-windows-msvc') { throw 'package target mismatch' }
@@ -447,11 +475,12 @@ try {
             $receipt = Read-Metadata $receiptPath @('schema', 'product', 'version', 'target', 'source_commit', 'launcher_protocol', 'manifest_sha256', 'archive_sha256', 'package_files_sha256')
             if ($receipt.schema -cne 'asg.package-install/v1' -or $receipt.product -cne 'agent-session-grep' -or $receipt.version -cne $pointer.version -or $receipt.target -cne $release.target -or $receipt.source_commit -cne $release.source_commit -or $receipt.launcher_protocol -ne 1 -or $receipt.manifest_sha256 -cne $manifestHash -or $receipt.package_files_sha256 -cne $metadata.install_manifest_sha256 -or $receipt.archive_sha256 -cne $metadata.archive.sha256) { throw 'unowned prefix or different package; upgrade is not implemented' }
             if (@(File-Names $Prefix).Count -ne $files.Count + 3) { throw 'installed file set changed' }
-            if ((Hash (Join-Path $Prefix 'release.manifest.json')) -cne $manifestHash -or (Hash (Join-Path $Prefix 'SHA256SUMS')) -cne (Hash $Checksums)) { throw 'installed release metadata changed' }
+            if ((Hash (Join-Path $Prefix 'release.manifest.json')) -cne $manifestHash -or (Hash (Join-Path $Prefix 'SHA256SUMS')) -cne $checksumsHash) { throw 'installed release metadata changed' }
             foreach ($name in $files.Keys) {
                 if ((Hash (Join-Path $Prefix $name)) -cne $files[$name].sha256) { throw 'installed file changed; refusing repair' }
             }
             Verify-Programs $Prefix $pointer $versionInfo
+            if ((Hash (Join-Path $Prefix 'release.manifest.json')) -cne $manifestHash -or (Hash (Join-Path $Prefix 'SHA256SUMS')) -cne $checksumsHash) { throw 'installed release metadata changed' }
             Write-Output "package-install: same verified developer candidate already installed at $Prefix"
             $lock.Dispose()
             $lock = $null
@@ -474,10 +503,10 @@ try {
         $stream = [IO.File]::Open($destination, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try { $stream.Flush($true) } finally { $stream.Dispose() }
     }
-    foreach ($metadataFile in @(@($Manifest, 'release.manifest.json'), @($Checksums, 'SHA256SUMS'))) {
+    foreach ($metadataFile in @(@($Manifest, 'release.manifest.json', $manifestHash), @($Checksums, 'SHA256SUMS', $checksumsHash))) {
         $destination = Join-Path $stage $metadataFile[1]
         [IO.File]::Copy($metadataFile[0], $destination, $false)
-        if ((Hash $destination) -cne (Hash $metadataFile[0])) { throw 'staged release metadata changed' }
+        if ((Hash $destination) -cne $metadataFile[2]) { throw 'staged release metadata changed' }
         $stream = [IO.File]::Open($destination, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try { $stream.Flush($true) } finally { $stream.Dispose() }
     }

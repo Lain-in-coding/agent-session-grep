@@ -105,6 +105,9 @@ An available exit code alone does not establish that the process has finished.
 On first install, these probes run in the verified extracted package before
 staging is created. The installer then copies, hashes and flushes each staged
 member; it never launches a staged executable before the directory rename.
+Release metadata is checked against the bytes admitted before program probes.
+Changes to the manifest, checksums or copied payload are refused before
+publication; verification of an existing prefix also rechecks after probes.
 Failures preserve the exact staging path and any incomplete installation for
 inspection; there is no automatic recursive cleanup or stale-lock stealing.
 An interrupted Unix publication needs manual inspection and a fresh prefix;
