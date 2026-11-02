@@ -632,10 +632,14 @@ fn execute(
                 let mut run = |program: &Path, args: &[OsString], deadline: Instant| {
                     preflight(&live, &install.prefix, prefix_identity, deadline)
                         .map_err(manager_preflight)?;
+                    #[cfg(test)]
+                    tests::observe_manager_preflight(false, deadline).map_err(manager_preflight)?;
                     calls.set(calls.get() + 1);
                     let output = native(program, args, deadline)?;
                     preflight(&live, &install.prefix, prefix_identity, deadline)
                         .map_err(manager_preflight)?;
+                    #[cfg(test)]
+                    tests::observe_manager_preflight(true, deadline).map_err(manager_preflight)?;
                     Ok(output)
                 };
                 let mut should_run = || {
@@ -945,10 +949,10 @@ fn manager_reason(error: ManagerError) -> Reason {
     }
 }
 fn manager_preflight(reason: Reason) -> ManagerError {
-    ManagerError::from(if reason == Reason::Timeout {
-        native_manager::ErrorCode::Timeout
-    } else {
-        native_manager::ErrorCode::Conflict
+    ManagerError::from(match reason {
+        Reason::Timeout => native_manager::ErrorCode::Timeout,
+        Reason::NativeBusy => native_manager::ErrorCode::Busy,
+        _ => native_manager::ErrorCode::Conflict,
     })
 }
 

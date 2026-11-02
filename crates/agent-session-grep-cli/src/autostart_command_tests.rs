@@ -12,6 +12,112 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 
+struct PreflightObservation {
+    end: Instant,
+    refuse_after: bool,
+    injected: bool,
+    calls: [usize; 2],
+}
+thread_local! {
+    static PREFLIGHT_OBSERVATION: RefCell<Option<PreflightObservation>> = const { RefCell::new(None) };
+}
+
+pub(super) fn observe_manager_preflight(after: bool, end: Instant) -> Result<(), Reason> {
+    PREFLIGHT_OBSERVATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(observed) = slot.as_mut() else {
+            return Ok(());
+        };
+        assert_eq!(
+            end, observed.end,
+            "manager preflight must retain command end"
+        );
+        observed.calls[usize::from(after)] += 1;
+        if after == observed.refuse_after && !observed.injected {
+            observed.injected = true;
+            Err(Reason::NativeBusy)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[test]
+fn preflight_busy_preserves_classification_and_native_replay_boundary() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PREFLIGHT_OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    for after in [false, true] {
+        let fixture = Fixture::new(DesiredUpdates::Running);
+        let mut installation = Some(fixture.installation(true));
+        let supervisor = installation
+            .as_ref()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        let end = Instant::now() + BUDGET;
+        PREFLIGHT_OBSERVATION.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(PreflightObservation {
+                end,
+                refuse_after: after,
+                injected: false,
+                calls: [0, 0],
+            });
+        });
+        let reset = Reset;
+        let callbacks = Cell::new(0);
+        let result = execute(
+            fixture.catalog.to_str().unwrap(),
+            Options {
+                action: Action::Enable,
+                prefix: None,
+            },
+            end,
+            &mut |_| Ok(installation.take().unwrap()),
+            &mut || Ok(fixture.location.clone()),
+            &mut |_, args, received| {
+                assert_eq!(received, end);
+                callbacks.set(callbacks.get() + 1);
+                if after {
+                    Ok(fixture.response_with_supervisor(args, &supervisor))
+                } else {
+                    Err(native_manager::ErrorCode::Failed.into())
+                }
+            },
+        );
+        let observed = PREFLIGHT_OBSERVATION.with(|slot| slot.borrow_mut().take().unwrap());
+        drop(reset);
+        let summary = serde_json::to_string(&result).unwrap();
+        assert!(observed.injected, "{summary}");
+        assert_eq!(callbacks.get(), 1, "{summary}");
+        assert_eq!(
+            observed.calls,
+            if after { [1, 1] } else { [2, 0] },
+            "{summary}"
+        );
+        assert_eq!(
+            result.reason,
+            Some(if after {
+                Reason::NativeBusy
+            } else {
+                Reason::NativeFailed
+            }),
+            "{summary}"
+        );
+        assert!(
+            result.intent_recorded && result.private_receipt_recorded,
+            "{summary}"
+        );
+    }
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -375,7 +481,14 @@ fn running_enable_uses_manager_start_after_owned_registration_and_latest_gate() 
 #[test]
 fn independently_edited_native_configuration_retains_durable_disabled_intent() {
     let f = Fixture::new(DesiredUpdates::Running);
-    assert_eq!(f.execute(Action::Enable).status, "complete");
+    let enabled = f.execute(Action::Enable);
+    assert_eq!(
+        enabled.status,
+        "complete",
+        "phase=initial_enable native_calls={} summary={}",
+        f.calls.borrow().len(),
+        serde_json::to_string(&enabled).unwrap()
+    );
     let user = b"independently edited native registration";
     fs::write(f.target(), user).unwrap();
     f.calls.borrow_mut().clear();
@@ -619,7 +732,13 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
                 .all(|args| !args.iter().any(|arg| arg == "start"))
         );
         if paused {
-            assert_eq!(result.status, "complete");
+            assert_eq!(
+                result.status,
+                "complete",
+                "phase=late_intent rechecked={rechecked} native_calls={} summary={}",
+                f.calls.borrow().len(),
+                serde_json::to_string(&result).unwrap()
+            );
             assert_eq!(
                 control_status(&f.control()).desired_updates,
                 DesiredUpdates::Paused
@@ -837,7 +956,13 @@ fn control_contention_longer_than_the_default_budget_uses_the_command_end() {
         },
     );
     holder.join().unwrap();
-    assert_eq!(result.status, "complete", "reason={:?}", result.reason);
+    assert_eq!(
+        result.status,
+        "complete",
+        "phase=control_contention native_calls={} summary={}",
+        f.calls.borrow().len(),
+        serde_json::to_string(&result).unwrap()
+    );
     assert!(result.intent_recorded);
     assert!(control_status(&f.control()).autostart_enabled);
 }
