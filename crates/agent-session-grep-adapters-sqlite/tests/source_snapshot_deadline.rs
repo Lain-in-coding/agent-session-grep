@@ -259,11 +259,13 @@ fn source_write_lock_exhausts_only_original_budget_and_returns_no_snapshot() {
     writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
     let started = Instant::now();
     let deadline = started + Duration::from_millis(50);
-    assert!(matches!(
-        capture_with_deadline(&path, SQLITE_MAX_SOURCE_BYTES, deadline),
-        Err(PortError::WriterBusy(_))
-    ));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let result = capture_with_deadline(&path, SQLITE_MAX_SOURCE_BYTES, deadline);
+    let elapsed = started.elapsed();
+    assert!(matches!(result, Err(PortError::WriterBusy(_))));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "locked snapshot exceeded wall-time bound: elapsed={elapsed:?}, budget=50ms"
+    );
     writer.execute_batch("ROLLBACK;").unwrap();
     assert_eq!(hash_file(&path), before);
     assert!(capture_with_deadline(&path, SQLITE_MAX_SOURCE_BYTES, end()).is_ok());
