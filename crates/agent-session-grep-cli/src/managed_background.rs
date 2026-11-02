@@ -6113,7 +6113,7 @@ mod wal_worker_tests {
         managed_store::{WalCheckpointOutcome, WalCheckpointReport, WalDeferral},
     };
     use rusqlite::{Connection, OpenFlags, types::Value};
-    use std::{io::Write, sync::mpsc, thread::JoinHandle};
+    use std::{cell::Cell, io::Write, sync::mpsc, thread::JoinHandle};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct CompletionSnapshot {
@@ -6164,9 +6164,30 @@ mod wal_worker_tests {
         AfterIdleCheckpoint(Box<CycleSnapshot>),
     }
 
+    impl Event {
+        fn label(&self) -> &'static str {
+            match self {
+                Self::Boundary(WorkerBoundary::Idle, _) => "boundary_idle",
+                Self::Boundary(WorkerBoundary::Paused, _) => "boundary_paused",
+                Self::Boundary(WorkerBoundary::Busy, _) => "boundary_busy",
+                Self::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped), _) => "exit_stopped",
+                Self::Boundary(WorkerBoundary::Exit(WorkerExit::Fenced), _) => "exit_fenced",
+                Self::Checkpoint(Ok(_)) => "checkpoint_ok",
+                Self::Checkpoint(Err(_)) => "checkpoint_error",
+                Self::StopCleanupDeferred => "stop_cleanup_deferred",
+                Self::IdleReady(_) => "idle_ready",
+                Self::BeforeIdleHeartbeat(_, _) => "before_idle_heartbeat",
+                Self::IdleDeferred(_, _) => "idle_deferred",
+                Self::HeartbeatCommitted(_) => "heartbeat_committed",
+                Self::AfterIdleCheckpoint(_) => "after_idle_checkpoint",
+            }
+        }
+    }
+
     struct Hooks {
         events: mpsc::Sender<Event>,
         advance: mpsc::Receiver<bool>,
+        emitted: usize,
         expire_completion_once: bool,
         completion: Option<CompletionSnapshot>,
         checkpoints: usize,
@@ -6188,11 +6209,18 @@ mod wal_worker_tests {
                 if matches!(event, Event::Checkpoint(_)) {
                     hooks.checkpoints += 1;
                 }
-                hooks.events.send(event).expect("test worker observer");
+                hooks.emitted += 1;
+                let emitted = hooks.emitted;
+                let label = event.label();
+                hooks.events.send(event).unwrap_or_else(|error| {
+                    panic!("test worker observer event={label} sequence={emitted}: {error}")
+                });
                 hooks.expire_completion_once |= hooks
                     .advance
                     .recv_timeout(Duration::from_secs(20))
-                    .expect("test boundary release");
+                    .unwrap_or_else(|error| {
+                        panic!("test boundary release event={label} sequence={emitted}: {error}")
+                    });
             }
         });
     }
@@ -6357,6 +6385,10 @@ mod wal_worker_tests {
         events: Option<mpsc::Receiver<Event>>,
         advance: Option<mpsc::Sender<bool>>,
         thread: Option<JoinHandle<PortResult<()>>>,
+        received: Cell<usize>,
+        last_event: Cell<Option<&'static str>>,
+        phase: Cell<&'static str>,
+        stop_case: Option<(bool, &'static str)>,
     }
 
     impl Worker {
@@ -6386,6 +6418,7 @@ mod wal_worker_tests {
                     *hooks.borrow_mut() = Some(Hooks {
                         events: events_tx,
                         advance: advance_rx,
+                        emitted: 0,
                         expire_completion_once,
                         completion: None,
                         checkpoints: 0,
@@ -6403,7 +6436,16 @@ mod wal_worker_tests {
                 events: Some(events_rx),
                 advance: Some(advance_tx),
                 thread: Some(thread),
+                received: Cell::new(0),
+                last_event: Cell::new(None),
+                phase: Cell::new("start"),
+                stop_case: None,
             }
+        }
+
+        fn with_stop_case(mut self, hard_error: bool, next_intent: &'static str) -> Self {
+            self.stop_case = Some((hard_error, next_intent));
+            self
         }
 
         fn next(&self) -> Event {
@@ -6411,18 +6453,105 @@ mod wal_worker_tests {
         }
 
         fn next_before(&self, end: Instant) -> Event {
-            self.events
+            self.phase.set("receive");
+            let event = self
+                .events
                 .as_ref()
                 .unwrap()
                 .recv_timeout(end.saturating_duration_since(Instant::now()))
-                .expect("worker must reach the expected boundary")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "worker must reach the expected boundary case={:?} phase={} \
+                         received={} last_event={:?}: {error}",
+                        self.stop_case,
+                        self.phase.get(),
+                        self.received.get(),
+                        self.last_event.get()
+                    )
+                });
+            self.received.set(self.received.get() + 1);
+            self.last_event.set(Some(event.label()));
+            self.phase.set("received");
+            event
         }
 
         fn advance(&self) {
+            self.phase.set("advance");
             self.advance.as_ref().unwrap().send(false).unwrap();
         }
 
+        fn advance_before(&self, end: Instant) {
+            assert!(Instant::now() < end, "stop handshake deadline expired");
+            self.advance();
+        }
+
+        fn stop_event_before(&self, end: Instant) -> Event {
+            assert!(Instant::now() < end, "stop handshake deadline expired");
+            let event = self.next_before(end);
+            assert!(Instant::now() < end, "stop handshake event arrived late");
+            event
+        }
+
+        fn cleanup_before(
+            &self,
+            fixture: &Fixture,
+            boot: &Option<ControlId>,
+            end: Instant,
+            resume: bool,
+            mut on_deferred: impl FnMut(usize),
+        ) -> usize {
+            let mut deferred = 0;
+            loop {
+                assert!(Instant::now() < end, "stop cleanup deadline expired");
+                self.phase.set("stop_cleanup_receive");
+                let event = self
+                    .events
+                    .as_ref()
+                    .unwrap()
+                    .recv_timeout(end.saturating_duration_since(Instant::now()));
+                assert!(Instant::now() < end, "stop cleanup result arrived late");
+                match event {
+                    Ok(event) => {
+                        self.received.set(self.received.get() + 1);
+                        self.last_event.set(Some(event.label()));
+                        self.phase.set("stop_cleanup_received");
+                        match event {
+                            Event::StopCleanupDeferred => {
+                                deferred += 1;
+                                assert!(deferred <= 8, "too many stop cleanup deferrals");
+                                let state = fixture.status_before(end);
+                                assert_eq!(&state.boot_id, boot);
+                                assert_ne!(state.state, UpdateState::Offline);
+                                on_deferred(deferred);
+                                self.advance_before(end);
+                            }
+                            Event::Boundary(WorkerBoundary::Idle, _) if resume => {
+                                let state = fixture.status_before(end);
+                                assert_eq!(&state.boot_id, boot);
+                                assert_eq!(state.state, UpdateState::Idle);
+                                return deferred;
+                            }
+                            unexpected => panic!(
+                                "unexpected stop cleanup event={} case={:?} deferred={deferred}",
+                                unexpected.label(),
+                                self.stop_case
+                            ),
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) if !resume => return deferred,
+                    Err(error) => panic!(
+                        "stop cleanup receive case={:?} deferred={deferred} \
+                         received={} last_event={:?}: {error}",
+                        self.stop_case,
+                        self.received.get(),
+                        self.last_event.get()
+                    ),
+                }
+            }
+        }
+
         fn advance_expiring_completion(&self) {
+            self.phase.set("advance_expiring_completion");
             self.advance.as_ref().unwrap().send(true).unwrap();
         }
 
@@ -6439,11 +6568,17 @@ mod wal_worker_tests {
         }
 
         fn join(mut self) -> PortResult<()> {
-            self.thread
-                .take()
-                .unwrap()
-                .join()
-                .expect("worker did not panic")
+            self.phase.set("join");
+            self.thread.take().unwrap().join().unwrap_or_else(|error| {
+                panic!(
+                    "worker did not panic case={:?} phase={} received={} last_event={:?}: \
+                         {error:?}",
+                    self.stop_case,
+                    self.phase.get(),
+                    self.received.get(),
+                    self.last_event.get()
+                )
+            })
         }
     }
 
@@ -6712,6 +6847,17 @@ mod wal_worker_tests {
                     Ok(self.control.background_status()?.worker)
                 })
                 .unwrap()
+        }
+
+        fn status_before(&self, end: Instant) -> WorkerStatus {
+            let read_end = end.min(Instant::now() + Duration::from_secs(2));
+            assert!(Instant::now() < read_end, "stop status deadline expired");
+            let state = self
+                .control
+                .with_runtime_deadline(read_end, || Ok(self.control.background_status()?.worker))
+                .unwrap();
+            assert!(Instant::now() < read_end, "stop status arrived late");
+            state
         }
 
         fn publications(&self) -> (i64, i64, i64) {
@@ -7775,7 +7921,7 @@ mod wal_worker_tests {
             for next_intent in ["stop", "running", "fence"] {
                 let fixture = Fixture::new(false);
                 fixture.desired(DesiredUpdates::Stopped);
-                let worker = Worker::start(&fixture.db);
+                let worker = Worker::start(&fixture.db).with_stop_case(hard_error, next_intent);
                 worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
                 if hard_error {
                     Connection::open(&fixture.db)
@@ -7828,38 +7974,100 @@ mod wal_worker_tests {
                     }
                     _ => {}
                 }
-                worker.advance();
+                let cleanup_end = SqliteControlStore::effective_runtime_deadline(
+                    Instant::now() + Duration::from_secs(20),
+                );
+                worker.advance_before(cleanup_end);
                 if next_intent == "running" {
-                    worker.boundary(WorkerBoundary::Idle);
-                    assert_eq!(fixture.status().boot_id, boot);
-                    assert_eq!(fixture.status().state, UpdateState::Idle);
+                    worker.cleanup_before(&fixture, &boot, cleanup_end, true, |_| {});
+                    let resumed = fixture.status_before(cleanup_end);
+                    assert_eq!(resumed.boot_id, boot);
+                    assert_eq!(resumed.state, UpdateState::Idle);
                     // No stop attempt is replayed before current work resumes.
-                    fixture.desired(DesiredUpdates::Stopped);
-                    worker.advance();
-                    let next = worker.next();
+                    let stop_end = SqliteControlStore::effective_runtime_deadline(
+                        Instant::now() + Duration::from_secs(20),
+                    );
+                    control_change_before(
+                        &fixture.control,
+                        stop_end.min(Instant::now() + Duration::from_secs(5)),
+                        |seq| {
+                            fixture
+                                .control
+                                .set_desired_updates(seq, DesiredUpdates::Stopped)
+                        },
+                    )
+                    .unwrap();
+                    worker.advance_before(stop_end);
+                    let next = worker.stop_event_before(stop_end);
                     if matches!(next, Event::Checkpoint(_)) {
-                        worker.advance();
-                        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+                        worker.advance_before(stop_end);
+                        assert!(matches!(
+                            worker.stop_event_before(stop_end),
+                            Event::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped), _)
+                        ));
                     } else {
                         assert!(matches!(
                             next,
                             Event::Boundary(WorkerBoundary::Exit(WorkerExit::Stopped), _)
                         ));
                     }
-                    worker.advance();
+                    worker.advance_before(stop_end);
+                    worker.cleanup_before(&fixture, &boot, stop_end, false, |_| {});
                     worker.join().unwrap();
                 } else {
+                    worker.cleanup_before(&fixture, &boot, cleanup_end, false, |_| {});
                     let result = worker.join();
                     if hard_error {
                         assert!(matches!(result, Err(PortError::SchemaIncompatible(_))));
                     } else {
                         result.unwrap();
                     }
-                    assert_eq!(fixture.status().state, UpdateState::Offline);
-                    assert_eq!(fixture.status().boot_id, boot);
+                    let stopped = fixture.status_before(cleanup_end);
+                    assert_eq!(stopped.state, UpdateState::Offline);
+                    assert_eq!(stopped.boot_id, boot);
                 }
             }
         }
+    }
+
+    #[test]
+    fn wal_worker_second_cleanup_deferral_is_received_before_join() {
+        let fixture = Fixture::new(false);
+        fixture.desired(DesiredUpdates::Stopped);
+        let worker = Worker::start(&fixture.db).with_stop_case(false, "repeated_stop");
+        worker.boundary(WorkerBoundary::Exit(WorkerExit::Stopped));
+        let boot = fixture.status().boot_id;
+        worker.advance();
+        worker.checkpoint(WalCheckpointOutcome::Reset);
+        // Keep a later physical retry observable after the first Reset emptied
+        // the WAL. This synthetic table write does not publish source evidence.
+        fixture.grow("after-stop-checkpoint");
+        let contender =
+            Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap())).unwrap();
+        contender.execute_batch("BEGIN IMMEDIATE").unwrap();
+        worker.advance();
+        assert!(matches!(worker.next(), Event::StopCleanupDeferred));
+        let cleanup_end = SqliteControlStore::effective_runtime_deadline(
+            Instant::now() + Duration::from_secs(20),
+        );
+        let state = fixture.status_before(cleanup_end);
+        assert_eq!(state.boot_id, boot);
+        assert_ne!(state.state, UpdateState::Offline);
+        let mut held = Some(contender);
+        worker.advance_before(cleanup_end);
+        let deferred = worker.cleanup_before(&fixture, &boot, cleanup_end, false, |count| {
+            if count == 1 {
+                // Release only after a second real cleanup refusal is received.
+                // The strict receiver rejects any repeated physical checkpoint.
+                held.take().unwrap().execute_batch("ROLLBACK").unwrap();
+            }
+        });
+        assert!(deferred >= 1, "second cleanup refusal was not observed");
+        assert!(held.is_none());
+        worker.join().unwrap();
+        let stopped = fixture.status_before(cleanup_end);
+        assert_eq!(stopped.state, UpdateState::Offline);
+        assert_eq!(stopped.boot_id, boot);
     }
 }
 
