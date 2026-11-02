@@ -538,6 +538,107 @@ class BuildManifestTests(unittest.TestCase):
             self.fail(f"isolated profile changed: added={sorted(after.keys() - before.keys())} "
                       f"removed={sorted(before.keys() - after.keys())} changed={changed}")
 
+    def test_powershell_probe_requires_signal_with_original_remaining_budget(self) -> None:
+        script = r'''
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$tree = [Management.Automation.Language.Parser]::ParseFile(
+    $env:ASG_TEST_PROBE_SOURCE, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw 'installer parse failed' }
+$functions = @($tree.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Probe'
+}, $true))
+if ($functions.Count -ne 1) { throw 'probe definition is not unique' }
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+public class ProbeReader {
+    readonly string value; bool read;
+    public ProbeReader(string text) { value=text; }
+    public Task<int> ReadAsync(char[] buffer,int offset,int count) {
+        if(read)return Task.FromResult(0);
+        read=true;value.CopyTo(0,buffer,offset,value.Length);
+        return Task.FromResult(value.Length);
+    }
+}
+public class ProbeProcess {
+    public object StartInfo {get;set;}
+    public bool HasExited {get {return true;}}
+    public int ExitCode {get;set;}
+    public ProbeReader StandardOutput {get;set;}
+    public ProbeReader StandardError {get;set;}
+    public bool Signal=true, Waited, Disposed, WaitBeforeDispose;
+    public int Budget=-1; public ProbeTimer Timer; public bool Late;
+    public bool Start(){return true;}
+    public bool WaitForExit(int milliseconds){
+        Waited=true; Budget=milliseconds;
+        if(Late)Timer.ElapsedMilliseconds=30000;
+        return Signal;
+    }
+    public void Kill(){throw new Exception("must not kill an exited-code fixture");}
+    public void Dispose(){Disposed=true;WaitBeforeDispose=Waited;}
+}
+public class ProbeTimer {
+    public long ElapsedMilliseconds {get;set;}
+    public static ProbeTimer Current;
+    public static ProbeTimer StartNew(){return Current;}
+}
+'@
+function Assert-File([string]$Path) {}
+function Start-Sleep { param([int]$Milliseconds) }
+function New-Object {
+    param([string]$TypeName, [Parameter(ValueFromRemainingArguments=$true)][object[]]$Tail)
+    if ($TypeName -ceq 'Diagnostics.Process') { return $script:fake }
+    Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName -ArgumentList $Tail
+}
+# Execute the same parsed function with only its stopwatch type injected.
+# Process construction is intercepted above; no product or installer main runs.
+$text = $functions[0].Extent.Text
+if (@([regex]::Matches($text,'\[Diagnostics\.Stopwatch\]::StartNew\(\)')).Count -ne 1) {
+    throw 'unexpected stopwatch seam'
+}
+$text = $text.Replace('[Diagnostics.Stopwatch]::StartNew()', '[ProbeTimer]::StartNew()')
+. ([scriptblock]::Create($text))
+foreach ($case in @('ready','no_signal','expired','late','stderr','bad_exit')) {
+    $script:fake = [ProbeProcess]::new()
+    $fake.StandardOutput = [ProbeReader]::new("synthetic")
+    $fake.StandardError = [ProbeReader]::new($(if($case -eq 'stderr'){'problem'}else{''}))
+    $clock = [ProbeTimer]::new()
+    $clock.ElapsedMilliseconds = if($case -eq 'expired'){30000}else{12000}
+    [ProbeTimer]::Current = $clock
+    $fake.Timer = $clock
+    $fake.Signal = $case -ne 'no_signal'
+    $fake.Late = $case -eq 'late'
+    $fake.ExitCode = if($case -eq 'bad_exit'){1}else{0}
+    $failed = $false
+    try { $value = Probe 'synthetic.exe' '--version' } catch { $failed = $true }
+    if ($case -eq 'ready') {
+        if ($failed -or $value -cne 'synthetic' -or -not $fake.Waited -or
+            -not $fake.WaitBeforeDispose -or $fake.Budget -ne 18000) { throw 'early exit was accepted without signal' }
+    } elseif (-not $failed) { throw "invalid probe accepted: $case" }
+    if (-not $fake.Disposed) { throw 'process was not disposed' }
+    if ($case -eq 'expired' -and $fake.Waited) { throw 'expired end reached a new wait' }
+    if ($fake.Waited -and $fake.Budget -ne 18000) { throw 'probe end was renewed' }
+}
+'''
+        available = [engine for engine in ("pwsh", "powershell") if shutil.which(engine)]
+        if os.name != "nt" or not available:
+            self.skipTest("Windows PowerShell required for process signal regression")
+        path = self.workspace / "probe-signal-test.ps1"
+        path.write_text(script, encoding="utf-8")
+        source = MODULE_PATH.parents[2] / "scripts/install/package-install.ps1"
+        for engine in available:
+            with self.subTest(engine=engine):
+                result = subprocess.run(
+                    [shutil.which(engine), "-NoProfile", "-NonInteractive", "-File", str(path)],
+                    env={**os.environ, "ASG_TEST_PROBE_SOURCE": str(source)},
+                    capture_output=True, text=True, errors="backslashreplace", timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_powershell_six_host_history_forwarding_records_literal_argv_and_legacy_repeat(self) -> None:
         schemas = BUILD_MANIFEST._source_schemas(MODULE_PATH.parents[2])
         self.assertEqual(schemas, (22, 2))

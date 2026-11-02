@@ -265,6 +265,11 @@ function Probe([string]$Executable, [string]$Argument) {
             }
             Start-Sleep -Milliseconds 10
         }
+        # HasExited can observe an exit code before Windows signals termination.
+        # Keep the process handle until its signal, within this probe's same end.
+        $remaining = 30000 - [int]$timer.ElapsedMilliseconds
+        if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or
+            $timer.ElapsedMilliseconds -ge 30000) { throw 'probe exceeded time limit' }
         if ($process.ExitCode -ne 0 -or $texts[1].Length -ne 0) { throw 'probe failed' }
         return $texts[0].ToString()
     } finally {

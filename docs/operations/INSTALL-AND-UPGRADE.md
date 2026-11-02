@@ -99,6 +99,9 @@ installer is not recovery for a v2 updated installation with a newer pointer.
 Windows holds an OS lock through a persistent sibling lock file and publishes
 the verified staging directory by rename. Unix reserves a new prefix with
 exclusive `mkdir`, then publishes the pointer and receipt last by rename.
+Before Windows publishes, each executable probe drains its output and waits
+for the process exit signal within that probe's original 30-second budget.
+An available exit code alone does not establish that the process has finished.
 Failures preserve the exact staging path and any incomplete installation for
 inspection; there is no automatic recursive cleanup or stale-lock stealing.
 An interrupted Unix publication needs manual inspection and a fresh prefix;
