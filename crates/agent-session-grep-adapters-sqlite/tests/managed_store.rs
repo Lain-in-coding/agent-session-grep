@@ -22,8 +22,12 @@ use std::{
 fn id(s: &str) -> ControlId {
     ControlId::parse(s).unwrap()
 }
+#[track_caller]
 fn current(c: &SqliteControlStore) -> ControlSeq {
-    c.status().unwrap().policy.control_seq
+    prepare(c, Instant::now() + Duration::from_secs(5), || {
+        Ok(c.status()?.policy.control_seq)
+    })
+    .unwrap()
 }
 fn prepare<T>(
     control: &SqliteControlStore,
@@ -163,9 +167,9 @@ impl Fixture {
             .unwrap()
     }
     fn create_with_deadline(&self, end: Instant) -> Result<ManagedStore, PortError> {
-        prepare(&self.control, end, || {
-            ManagedStore::create(&self.catalog, &self.control, id("catalog-one"), 1)
-        })
+        // The end bounds admission; a catalog COMMIT is not a control write
+        // and must not acquire a trailing whole-operation runtime_tick.
+        ManagedStore::create_with_deadline(&self.catalog, &self.control, id("catalog-one"), 1, end)
     }
     fn batch(&self, text: &str) -> SourceBatch {
         SourceBatch {
@@ -255,6 +259,9 @@ fn fixture_preparation_refuses_expiry_and_does_not_retry_or_leak_a_scope() {
     );
     assert_eq!(calls, 1, "a failed preparation must not be retried");
     assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    // The production API acquires CatalogHandles before control admission.
+    // Prepare its inert lock file before comparing the expired call's effects.
+    drop(acquire(&f.root, LockKind::CatalogHandles));
     let files = || {
         let mut names = std::fs::read_dir(&f.root)
             .unwrap()
