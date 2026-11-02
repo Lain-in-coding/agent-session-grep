@@ -1390,7 +1390,10 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::*;
     let f = Fixture::new(DesiredUpdates::Paused);
-    let installation = f.installation(true);
+    let mut enable_installation = Some(f.installation(true));
+    let mut disable_installation = Some(f.installation(true));
+    let preparations = f.installations.get();
+    assert_eq!(preparations, 2);
     struct RegistryFixture {
         subkey: String,
     }
@@ -1452,17 +1455,26 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     let location = NativeLocation::WindowsRun {
         subkey: registry.subkey.clone(),
     };
+    let enable_end = Instant::now() + Duration::from_secs(3);
+    let observation = ObserveDeadline::start(enable_end);
     let enabled = execute(
         f.catalog.to_str().unwrap(),
         Options {
             action: Action::Enable,
             prefix: None,
         },
-        Instant::now() + Duration::from_secs(3),
-        &mut |_| Ok(f.installation(true)),
+        enable_end,
+        &mut |_| Ok(enable_installation.take().unwrap()),
         &mut || Ok(location.clone()),
         &mut |_, _, _| panic!("Run registration needs no native CLI"),
     );
+    let observed = observation.finish();
+    assert!(
+        observed.checks > 0 && observed.rejections == 0,
+        "{observed:?}"
+    );
+    assert!(enable_installation.is_none());
+    assert_eq!(f.installations.get(), preparations);
     assert_eq!(enabled.status, "complete", "reason={:?}", enabled.reason);
     assert!(!enabled.manager.as_ref().unwrap().launch_requested);
     let writable = SqliteControlStore::open_current_writable(&f.root).unwrap();
@@ -1473,17 +1485,26 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
         })
         .unwrap();
     drop(writable);
+    let disable_end = Instant::now() + Duration::from_secs(3);
+    let observation = ObserveDeadline::start(disable_end);
     let disabled = execute(
         f.catalog.to_str().unwrap(),
         Options {
             action: Action::Disable,
             prefix: None,
         },
-        Instant::now() + Duration::from_secs(3),
-        &mut |_| Ok(f.installation(true)),
+        disable_end,
+        &mut |_| Ok(disable_installation.take().unwrap()),
         &mut || panic!("disable must use persisted NativeLocation"),
         &mut |_, _, _| panic!("disable must not kill or spawn manual worker"),
     );
+    let observed = observation.finish();
+    assert!(
+        observed.checks > 0 && observed.rejections == 0,
+        "{observed:?}"
+    );
+    assert!(disable_installation.is_none());
+    assert_eq!(f.installations.get(), preparations);
     assert_eq!(disabled.status, "complete", "reason={:?}", disabled.reason);
     assert_eq!(disabled.autostart_enabled, Some(false));
     assert_eq!(disabled.registration_present, Some(false));
@@ -1511,5 +1532,4 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     assert_eq!(kind, REG_BINARY);
     assert_eq!(&actual[..size as usize], payload);
     assert_eq!(unsafe { RegCloseKey(handle) }, 0);
-    drop(installation);
 }
