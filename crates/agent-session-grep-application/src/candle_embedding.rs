@@ -703,6 +703,210 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_local_forward_preserves_prefix_padding_and_normalized_vectors() {
+        for prefix in ["", "bert."] {
+            let dir = agent_session_grep_testkit::tempdir().unwrap();
+            write_synthetic_forward_bundle(dir.path(), prefix);
+            let model = CandleE5Model::load_from_dir(dir.path()).unwrap();
+            let manifest = read_manifest(dir.path());
+            assert_eq!(model.manifest().model_id, E5_SMALL_MODEL_ID);
+            assert_eq!(model.dimension(), BIGRAM_HASH_DIMENSION);
+            assert_eq!(
+                model.manifest().file_hash,
+                format!("sha256:{}", manifest.files[2].sha256)
+            );
+            let query = model.embed("alpha", true).unwrap();
+            let passage = model.embed("alpha", false).unwrap();
+            assert_synthetic_embedding(&query, &[2, 4]);
+            assert_synthetic_embedding(&passage, &[3, 4]);
+            assert_ne!(query, passage);
+
+            // The pad vector is nonzero and orthogonal to these token vectors.
+            // Including it in pooling cannot pass the scalar reference oracle.
+            let batch = model
+                .embed_batch(&["query: alpha", "passage: alpha beta"])
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_synthetic_embedding(&batch[0], &[2, 4]);
+            assert_synthetic_embedding(&batch[1], &[3, 4, 5]);
+            assert!(model.embed_batch(&[]).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn synthetic_local_forward_retains_the_512_token_limit() {
+        let dir = agent_session_grep_testkit::tempdir().unwrap();
+        write_synthetic_forward_bundle(dir.path(), "");
+        let model = CandleE5Model::load_from_dir(dir.path()).unwrap();
+        // The final beta is token 513 after the production query prefix.
+        let text = format!("{}beta", "alpha ".repeat(511));
+        let result = model.embed(&text, true).unwrap();
+        let mut retained = vec![4; 512];
+        retained[0] = 2;
+        assert_synthetic_embedding(&result, &retained);
+    }
+
+    fn synthetic_token_component(token: usize, dimension: usize) -> f32 {
+        if (dimension >> token) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    fn assert_synthetic_embedding(actual: &[f32], token_ids: &[usize]) {
+        assert_eq!(actual.len(), BIGRAM_HASH_DIMENSION);
+        assert!(actual.iter().all(|value| value.is_finite()));
+        let norm = actual.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.00002, "unit norm: {norm}");
+        // Balanced, equal-norm token vectors survive the fixture's three
+        // identity layer norms. Mean-pool then L2 is their normalized sum.
+        // This reference uses scalar arithmetic, independent of Candle.
+        let expected: Vec<f64> = (0..BIGRAM_HASH_DIMENSION)
+            .map(|dimension| {
+                token_ids
+                    .iter()
+                    .map(|&token| f64::from(synthetic_token_component(token, dimension)))
+                    .sum()
+            })
+            .collect();
+        let scale = expected
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        for (&observed, sum) in actual.iter().zip(expected) {
+            assert!(
+                (f64::from(observed) - sum / scale).abs() < 0.00002,
+                "forward/pooling differs from scalar fixture reference"
+            );
+        }
+    }
+
+    fn write_synthetic_forward_bundle(dir: &Path, prefix: &str) {
+        const VOCAB: [&str; 6] = ["[PAD]", "[UNK]", "query:", "passage:", "alpha", "beta"];
+        let width = BIGRAM_HASH_DIMENSION;
+        let config = serde_json::json!({
+            "vocab_size": VOCAB.len(), "hidden_size": width,
+            "num_hidden_layers": 1, "num_attention_heads": 12,
+            "intermediate_size": 1, "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.0, "max_position_embeddings": 512,
+            "type_vocab_size": 2, "initializer_range": 0.02,
+            "layer_norm_eps": 1e-12, "pad_token_id": 0, "model_type": "bert"
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let words = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                VOCAB
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| (word.to_string(), index as u32))
+                    .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(words);
+        tokenizer.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
+
+        let mut tensors = Vec::new();
+        let mut tensor = |name: &str, shape: &[usize], value: fn(usize) -> f32| {
+            let bytes: Vec<u8> = (0..shape.iter().product())
+                .flat_map(|index| value(index).to_le_bytes())
+                .collect();
+            tensors.push((format!("{prefix}{name}"), shape.to_vec(), bytes));
+        };
+        tensor(
+            "embeddings.word_embeddings.weight",
+            &[VOCAB.len(), width],
+            |index| {
+                synthetic_token_component(
+                    index / BIGRAM_HASH_DIMENSION,
+                    index % BIGRAM_HASH_DIMENSION,
+                )
+            },
+        );
+        tensor(
+            "embeddings.position_embeddings.weight",
+            &[512, width],
+            |_| 0.0,
+        );
+        tensor(
+            "embeddings.token_type_embeddings.weight",
+            &[2, width],
+            |_| 0.0,
+        );
+        for name in [
+            "embeddings.LayerNorm",
+            "encoder.layer.0.attention.output.LayerNorm",
+            "encoder.layer.0.output.LayerNorm",
+        ] {
+            tensor(&format!("{name}.weight"), &[width], |_| 1.0);
+            tensor(&format!("{name}.bias"), &[width], |_| 0.0);
+        }
+        for (name, output, input) in [
+            ("attention.self.query", width, width),
+            ("attention.self.key", width, width),
+            ("attention.self.value", width, width),
+            ("attention.output.dense", width, width),
+            ("intermediate.dense", 1, width),
+            ("output.dense", width, 1),
+        ] {
+            tensor(
+                &format!("encoder.layer.0.{name}.weight"),
+                &[output, input],
+                |_| 0.0,
+            );
+            tensor(&format!("encoder.layer.0.{name}.bias"), &[output], |_| 0.0);
+        }
+        // Write the old public safetensors format and load it via Candle's
+        // current mmap reader. No real E5 weights or network are required.
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name,
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        shape.clone(),
+                        bytes,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        safetensors::tensor::serialize_to_file(views, &None, &dir.join("model.safetensors"))
+            .unwrap();
+        let files = ["config.json", "tokenizer.json", "model.safetensors"]
+            .into_iter()
+            .map(|name| {
+                let bytes = fs::read(dir.join(name)).unwrap();
+                ModelBundleFile {
+                    name: name.into(),
+                    sha256: sha256_hex(&bytes),
+                    size_bytes: bytes.len() as u64,
+                }
+            })
+            .collect();
+        write_manifest(
+            dir,
+            &ModelBundleManifest {
+                model_id: E5_SMALL_MODEL_ID.into(),
+                dimension: width,
+                license: "synthetic regression fixture; not model weights".into(),
+                files,
+            },
+        );
+    }
+
+    #[test]
     fn sanitize_model_id_replaces_unsafe_characters() {
         assert_eq!(sanitize_model_id("a/b\\c d"), "a_b_c_d");
         // The pinned id is already sanitized-safe.

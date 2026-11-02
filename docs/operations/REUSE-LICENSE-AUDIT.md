@@ -346,9 +346,9 @@ approver sign the direct-copy/attribution matrix.
 | ID | Retained NOTICE group | Disposition |
 |---|---|---|
 | M01 | Optional `intfloat/multilingual-e5-small` @ `614241f622f53c4eeff9890bdc4f31cfecc418b3`, declared MIT; model card / technical report | Preserve default-off semantic-candle, local `asg model import --dir <bundle>`, no tool download/default bundled weights; weight redistribution remains separate/deferred; no new model/license evaluation |
-| D01 | candle-core / candle-nn / candle-transformers 0.10.2; MIT OR Apache-2.0 | Preserve declared optional inference group; not default-binary inclusion proof |
-| D02 | tokenizers 0.22.2; Apache-2.0 | Preserve declared optional dependency, not weights |
-| D03 | safetensors 0.4.5 and 0.7.0; Apache-2.0 | Preserve both resolved version instances; do not deduplicate by package name |
+| D01 | candle-core / candle-nn / candle-transformers 0.11.1; MIT OR Apache-2.0 | Core is a narrowly vendored library with its complete Apache-2.0 LICENSE and CPUID compiler-compatibility patch; see NOTICE and vendor/candle-core-0.11.1/UPSTREAM.json. NN/transformers remain registry dependencies. Optional group, not default-binary inclusion proof |
+| D02 | tokenizers 0.22.2 and 0.23.2; Apache-2.0 | Preserve both declared optional dependencies, not weights |
+| D03 | safetensors 0.4.5 and 0.8.0; Apache-2.0 | Preserve both resolved version instances; do not deduplicate by package name |
 | D04 | rusqlite 0.40.2; MIT; bundled SQLite / libsqlite3-sys 0.38.2 | Preserve group; SQLite/FFI are separate identities in resolved reports, not automatically rusqlite's MIT |
 | D05 | blake3 1.8.5; CC0-1.0 OR Apache-2.0 | Preserve declared metadata, not independent license-file verification |
 | D06 | ratatui 0.30.2 / crossterm 0.29.0; MIT | Preserve both packages; not complete TUI transitive inventory |

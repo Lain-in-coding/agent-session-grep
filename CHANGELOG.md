@@ -343,6 +343,12 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Optional semantic dependencies use Candle 0.11.1 and ZIP 9.1.3, removing
+  the transitive ZIP version affected by RUSTSEC-2026-0429. The offline
+  bundle verifier uses the same fixed ZIP version. Semantic inference
+  remains opt-in, with the same model identity and local bundle format.
+  A documented Candle core CPUID compatibility patch retains Rust 1.90
+  support without changing model computation.
 - Managed `get_session_context` over MCP and Robot JSON/JSONL now chooses
   its message prefix using the final serialized response, including redaction,
   provenance and transport framing. Robot JSON no longer spends its budget on

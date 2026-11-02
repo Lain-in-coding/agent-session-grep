@@ -116,9 +116,25 @@ tool itself; operators import a verified local bundle with
 
 The optional-model and runtime rows above preserve declared metadata, not an
 independent license-file audit. Model redistribution remains separate/deferred.
-Resolved reports retain both safetensors 0.4.5 and 0.7.0; rusqlite's MIT label
+Resolved reports retain both safetensors 0.4.5 and 0.8.0; rusqlite's MIT label
 does not replace SQLite/libsqlite3-sys attribution, and ratatui/crossterm are
 separate packages. No name-only deduplication or full SPDX claim is implied.
+
+The optional Candle core 0.11.1 library is included under
+`vendor/candle-core-0.11.1` to retain Rust 1.90 compatibility while using the
+fixed ZIP dependency. Its complete upstream Apache-2.0 LICENSE and exact
+source/patch/file hashes are retained in that directory. The only library
+source change is the CPUID unsafe wrapper from
+https://github.com/huggingface/candle/pull/4076
+(proposal commit `486cd95a1e53f38719e77129444f0da621086966`); it is not
+represented as an upstream release. The normalized manifest omits unused
+example/test/benchmark targets and dev dependencies and disables publishing.
+The official crate archive SHA-256 is
+`d11c8be87cfbaef9ebb62fb3f850d1fc8e00cc1d11d393fdbe55a4d5c2cdb325`.
+Its local dependency-inventory row has no registry checksum; the vendored
+provenance supplies that separate upstream identity. Remove the override
+only when a released replacement passes security, Rust 1.90 and local
+inference checks. No model weights are included.
 
 ## Preserved observed MIT root notices
 

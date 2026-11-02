@@ -19,3 +19,6 @@ scripts/release/public_AGENTS.md text eol=lf
 
 # Immutable import snapshot pins bind raw bytes, independent of core.autocrlf.
 docs/operations/imports/public-tree-*.json -text
+
+# Reviewed third-party source hashes bind exact upstream library bytes.
+vendor/candle-core-0.11.1/** -text
