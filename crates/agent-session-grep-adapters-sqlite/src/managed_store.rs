@@ -297,10 +297,14 @@ fn history_cache_error(error: crate::managed_cache::CacheError) -> PortError {
 }
 
 fn storage(error: rusqlite::Error) -> PortError {
+    #[cfg(test)]
+    baseline_deadline_tests::observe_storage_error(&error);
     match error.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
-            PortError::WriterBusy("managed catalog is busy".into())
-        }
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::OperationInterrupted,
+        ) => PortError::WriterBusy("managed catalog is busy".into()),
         _ => incompatible(),
     }
 }
@@ -2731,6 +2735,9 @@ pub(crate) mod activation_deadline_tests {
 #[cfg(test)]
 mod baseline_deadline_tests {
     use super::*;
+    use agent_session_grep_domain::{IdKind, MessagePlacement, StableId};
+    use rusqlite::functions::FunctionFlags;
+    use std::sync::{Arc, Mutex};
 
     const FINITE_SQL: &str = "WITH RECURSIVE n(x) AS (
         VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
@@ -2756,6 +2763,9 @@ mod baseline_deadline_tests {
         progress_end: Option<Instant>,
         progress_end_changed: bool,
         interrupted: bool,
+        storage_error_calls: u32,
+        storage_code: Option<rusqlite::ErrorCode>,
+        storage_extended: Option<i32>,
     }
 
     thread_local! {
@@ -2778,6 +2788,9 @@ mod baseline_deadline_tests {
                     progress_end: None,
                     progress_end_changed: false,
                     interrupted: false,
+                    storage_error_calls: 0,
+                    storage_code: None,
+                    storage_extended: None,
                 });
             });
             Self
@@ -2839,6 +2852,467 @@ mod baseline_deadline_tests {
                 observed.interrupted |= interrupted;
             }
         });
+    }
+
+    pub(super) fn observe_storage_error(error: &rusqlite::Error) {
+        OBSERVATIONS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                if observed.storage_error_calls == 0 {
+                    observed.storage_code = error.sqlite_error_code();
+                    observed.storage_extended = match error {
+                        rusqlite::Error::SqliteFailure(code, _) => Some(code.extended_code),
+                        _ => None,
+                    };
+                }
+                observed.storage_error_calls += 1;
+            }
+        });
+    }
+
+    fn publication_batch(observation: &SourceObservation, text: &str) -> SourceBatch {
+        let native = |kind, value| StableId::native_checked(kind, value).unwrap();
+        let message = native(IdKind::Message, "deadline-message");
+        let session = native(IdKind::Session, "deadline-session");
+        let document = native(IdKind::Document, "deadline-document");
+        SourceBatch {
+            source_path: observation.binding.source_path.clone(),
+            entries: vec![
+                (
+                    message.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "role": "user", "text": text, "timestamp": null
+                    }))
+                    .unwrap(),
+                    text.into(),
+                ),
+                (
+                    session.clone(),
+                    serde_json::to_vec(&serde_json::json!({"documents": [document.as_str()]}))
+                        .unwrap(),
+                    String::new(),
+                ),
+                (
+                    document.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "provider": "claude-code", "variant": "synthetic",
+                        "fingerprint": observation.revision_digest, "len": 100
+                    }))
+                    .unwrap(),
+                    String::new(),
+                ),
+            ],
+            placements: vec![MessagePlacement::new(
+                session, document, message, 0, false, None,
+            )],
+            edges: Vec::new(),
+            activities: Vec::new(),
+            usage_events: Vec::new(),
+            relation_complete: true,
+            len_bytes: Some(100),
+            fingerprint: Some(observation.revision_digest.clone()),
+            provider_id: Some("claude-code".into()),
+            resume_claims: Vec::new(),
+        }
+    }
+
+    fn prepare_publication(
+        fixture: &wal_tests::Fixture,
+    ) -> (ManagedStore, SourceObservation, SourceBatch) {
+        use agent_session_grep_ports::{
+            control::CycleAdmission, managed::ObservationState,
+            source_context::SourcePublicationContext,
+        };
+        let control = &fixture.control;
+        let end = Instant::now() + Duration::from_secs(10);
+        control
+            .with_runtime_deadline(end, || {
+                let selection = fixture.select();
+                let worker = control.bind_worker(&fixture.worker_lock, wal_tests::id("boot"))?;
+                control.register_worker(control.status()?.policy.control_seq, &worker, 1, 1)?;
+                let admitted = control
+                    .queue_cycle(
+                        control.status()?.policy.control_seq,
+                        vec![SelectionRevision {
+                            selection_id: selection.id.clone(),
+                            revision: selection.revision,
+                            root_identity: selection.root_identity.clone().unwrap(),
+                        }],
+                    )?
+                    .value;
+                let CycleAdmission::Queued(cycle) = admitted else {
+                    panic!("synthetic publication cycle was refused");
+                };
+                let cycle = control
+                    .start_cycle(
+                        control.status()?.policy.control_seq,
+                        &worker,
+                        cycle.token.cycle_seq,
+                        2,
+                    )?
+                    .value;
+                let store = ManagedStore::open_for_write(&fixture.catalog, control)?;
+                let mut observation = SourceObservation {
+                    binding: SourceBinding {
+                        source_id: SourceId::parse("deadline-source")?,
+                        source_path: selection.region.locator.as_str().into(),
+                        provider: SearchProvider::Claude,
+                        namespace_id: None,
+                        root_identity: selection.root_identity.as_ref().unwrap().as_str().into(),
+                    },
+                    revision_id: RevisionId::parse("deadline-first")?,
+                    revision_digest: "synthetic-original-digest".into(),
+                    parser_version: 1,
+                    state: ObservationState::Complete,
+                    cycle_seq: cycle.token.cycle_seq.get(),
+                    worker_boot_id: cycle.token.worker_boot_id.as_str().into(),
+                    catalog_incarnation: "catalog".into(),
+                    policy_epoch: cycle.policy_epoch.get(),
+                    started_control_seq: cycle.started_control_seq.unwrap().get(),
+                    observed_at_ms: 3,
+                    committed_at_ms: 4,
+                    selections: vec![SelectionProof {
+                        selection_id: selection.id.as_str().into(),
+                        selection_revision: selection.revision.get(),
+                        root_identity: selection.root_identity.as_ref().unwrap().as_str().into(),
+                    }],
+                    repositories: Vec::new(),
+                };
+                let legacy =
+                    agent_session_grep_application::relocation::legacy_installation_namespace(
+                        &observation.binding.source_path,
+                        "claude-code",
+                    );
+                let namespace = store.reserve_namespace(control, &observation, &worker, &legacy)?;
+                observation.binding.namespace_id = Some(namespace.namespace_id);
+                let batch = publication_batch(&observation, "original deadline evidence");
+                let published = store.commit_source_with_context(
+                    control,
+                    &worker,
+                    &batch,
+                    &observation,
+                    &SourcePublicationContext::default(),
+                    end,
+                )?;
+                assert!(published.content_changed && published.receipt.published);
+                assert_eq!(published.receipt.committed_generation, Some(1));
+                observation.revision_id = RevisionId::parse("deadline-next")?;
+                observation.revision_digest = "synthetic-next-digest".into();
+                observation.observed_at_ms = 5;
+                observation.committed_at_ms = 6;
+                let next = publication_batch(&observation, "replacement deadline evidence");
+                Ok((store, observation, next))
+            })
+            .unwrap()
+    }
+
+    type EvidenceRows = Vec<(&'static str, Vec<Vec<rusqlite::types::Value>>)>;
+
+    fn publication_evidence(store: &ManagedStore) -> EvidenceRows {
+        let conn = store.inner.conn.borrow();
+        [
+            "store_metadata",
+            "catalog_meta",
+            "source_heads",
+            "source_revision_receipts",
+            "source_projections",
+            "source_scope_claims",
+            "source_occurrences",
+            "source_entity_projections",
+            "source_session_projections",
+            "source_publication_contexts",
+            "source_context_heads",
+            "source_scans",
+            "catalog",
+            "fts",
+            "fts_ids",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (table, rows)
+        })
+        .collect()
+    }
+
+    fn batch_states(store: &ManagedStore) -> Vec<(String, String, String)> {
+        store
+            .inner
+            .conn
+            .borrow()
+            .prepare(
+                "SELECT operation_id,state,durable_point FROM index_batches ORDER BY operation_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[derive(Default)]
+    struct TriggerObservation {
+        end: Option<Instant>,
+        wait: bool,
+        calls: u32,
+        received_end: Option<Instant>,
+        entered_before_end: bool,
+    }
+
+    fn install_publication_trigger(store: &ManagedStore) -> Arc<Mutex<TriggerObservation>> {
+        let observed = Arc::new(Mutex::new(TriggerObservation::default()));
+        let hook = observed.clone();
+        let conn = store.inner.conn.borrow();
+        conn.create_scalar_function(
+            "synthetic_publication_wait",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                let (end, wait) = {
+                    let mut observed = hook.lock().unwrap();
+                    let end = observed.end.expect("original test end");
+                    observed.calls += 1;
+                    observed.received_end = Some(SqliteControlStore::effective_runtime_deadline(
+                        end + Duration::from_secs(10),
+                    ));
+                    observed.entered_before_end = Instant::now() < end;
+                    (end, observed.wait)
+                };
+                if wait {
+                    // The real progress handler, not this callback, interrupts
+                    // the INSERT. Never query or mutate its connection here.
+                    while let Some(remaining) = end.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(remaining);
+                    }
+                }
+                Ok(0_i64)
+            },
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER synthetic_publication_deadline
+             BEFORE INSERT ON source_scans BEGIN
+               SELECT synthetic_publication_wait();
+               SELECT (WITH RECURSIVE n(x) AS
+                 (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+                 SELECT sum(x) FROM n);
+             END;",
+        )
+        .unwrap();
+        observed
+    }
+
+    fn assert_publication_handlers_restored(
+        store: &ManagedStore,
+        recording: &Recording,
+        original_end: Instant,
+    ) {
+        let before = recording.snapshot().progress_calls;
+        let conn = store.inner.conn.borrow();
+        assert!(
+            conn.is_autocommit(),
+            "the failed apply transaction is still active"
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            BUSY_TIMEOUT_MILLIS as i64
+        );
+        assert_eq!(
+            conn.query_row(FINITE_SQL, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            50_005_000
+        );
+        assert_eq!(recording.snapshot().progress_calls, before);
+        let probe = original_end + Duration::from_secs(10);
+        assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    }
+
+    #[test]
+    fn publication_insert_interrupt_is_busy_and_preserves_prior_evidence() {
+        use agent_session_grep_ports::source_context::SourcePublicationContext;
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, batch) = prepare_publication(&fixture);
+        let worker = fixture
+            .control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                fixture
+                    .control
+                    .bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        let prior = publication_evidence(&store);
+        let prior_batches = batch_states(&store);
+        assert_eq!(prior_batches.len(), 1);
+        assert_eq!(prior_batches[0].1, "activated");
+        let trigger = install_publication_trigger(&store);
+        let recording = Recording::start(&store.inner.conn.borrow());
+        let original_end = Instant::now() + Duration::from_secs(10);
+        {
+            let mut observed = trigger.lock().unwrap();
+            observed.end = Some(original_end);
+            observed.wait = true;
+        }
+        let result = store.commit_source_with_context(
+            &fixture.control,
+            &worker,
+            &batch,
+            &observation,
+            &SourcePublicationContext::default(),
+            original_end,
+        );
+        let observed = recording.snapshot();
+        assert_eq!(
+            trigger.lock().unwrap().calls,
+            1,
+            "INSERT trigger was not reached once"
+        );
+        assert!(trigger.lock().unwrap().entered_before_end);
+        assert_eq!(trigger.lock().unwrap().received_end, Some(original_end));
+        assert!(observed.interrupted, "{observed:?}");
+        assert_eq!(observed.progress_end, Some(original_end));
+        assert!(!observed.progress_end_changed);
+        assert_eq!(observed.storage_error_calls, 1, "{observed:?}");
+        assert_eq!(
+            observed.storage_code,
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+        assert_eq!(
+            observed.storage_extended,
+            Some(rusqlite::ffi::SQLITE_INTERRUPT)
+        );
+        assert!(
+            matches!(result, Err(PortError::WriterBusy(_))),
+            "{result:?}"
+        );
+        assert_publication_handlers_restored(&store, &recording, original_end);
+        assert_eq!(publication_evidence(&store), prior);
+        let after_batches = batch_states(&store);
+        assert!(after_batches.contains(&prior_batches[0]));
+        let pending = after_batches
+            .iter()
+            .filter(|row| row.1 == "building")
+            .collect::<Vec<_>>();
+        assert_eq!(after_batches.len(), prior_batches.len() + 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].2, "intent");
+        let operation = pending[0].0.clone();
+        drop(recording);
+        drop(store);
+
+        let recovered = fixture
+            .control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                ManagedStore::open_for_write(&fixture.catalog, &fixture.control)
+            })
+            .unwrap();
+        assert_eq!(publication_evidence(&recovered), prior);
+        let recovered_batches = batch_states(&recovered);
+        assert!(recovered_batches.contains(&prior_batches[0]));
+        assert_eq!(recovered_batches.len(), after_batches.len());
+        assert_eq!(
+            recovered_batches
+                .iter()
+                .find(|row| row.0 == operation)
+                .unwrap()
+                .1,
+            "aborted"
+        );
+        assert!(!recovered_batches.iter().any(|row| row.1 == "building"));
+    }
+
+    #[test]
+    fn publication_insert_without_expiry_commits_and_restores_handlers() {
+        use agent_session_grep_ports::source_context::SourcePublicationContext;
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, batch) = prepare_publication(&fixture);
+        let worker = fixture
+            .control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                fixture
+                    .control
+                    .bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        let trigger = install_publication_trigger(&store);
+        let recording = Recording::start(&store.inner.conn.borrow());
+        let original_end = Instant::now() + Duration::from_secs(10);
+        trigger.lock().unwrap().end = Some(original_end);
+        let publication = store
+            .commit_source_with_context(
+                &fixture.control,
+                &worker,
+                &batch,
+                &observation,
+                &SourcePublicationContext::default(),
+                original_end,
+            )
+            .unwrap();
+        assert_eq!(trigger.lock().unwrap().calls, 1);
+        assert_eq!(trigger.lock().unwrap().received_end, Some(original_end));
+        assert!(publication.content_changed && publication.receipt.published);
+        assert_eq!(publication.receipt.revision_id, observation.revision_id);
+        assert_eq!(publication.receipt.committed_generation, Some(2));
+        assert!(!recording.snapshot().interrupted);
+        assert_eq!(recording.snapshot().storage_error_calls, 0);
+        assert_publication_handlers_restored(&store, &recording, original_end);
+        assert!(batch_states(&store).iter().all(|row| row.1 == "activated"));
+        assert_eq!(batch_states(&store).len(), 2);
+    }
+
+    #[test]
+    fn publication_missing_column_remains_schema_incompatible() {
+        use agent_session_grep_ports::source_context::SourcePublicationContext;
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, batch) = prepare_publication(&fixture);
+        let worker = fixture
+            .control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                fixture
+                    .control
+                    .bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        store
+            .inner
+            .conn
+            .borrow()
+            .execute_batch(
+                "ALTER TABLE source_scans RENAME COLUMN parser_version TO synthetic_missing_column",
+            )
+            .unwrap();
+        let prior = publication_evidence(&store);
+        let recording = Recording::start(&store.inner.conn.borrow());
+        let original_end = Instant::now() + Duration::from_secs(10);
+        let result = store.commit_source_with_context(
+            &fixture.control,
+            &worker,
+            &batch,
+            &observation,
+            &SourcePublicationContext::default(),
+            original_end,
+        );
+        let observed = recording.snapshot();
+        assert!(
+            matches!(result, Err(PortError::SchemaIncompatible(_))),
+            "{result:?}"
+        );
+        assert!(!observed.interrupted);
+        assert_eq!(observed.storage_error_calls, 1);
+        assert_eq!(observed.storage_extended, Some(rusqlite::ffi::SQLITE_ERROR));
+        assert_publication_handlers_restored(&store, &recording, original_end);
+        assert_eq!(publication_evidence(&store), prior);
     }
 
     #[test]
@@ -2991,7 +3465,7 @@ pub(crate) mod wal_tests {
 
     pub(crate) struct Fixture {
         pub(crate) control: SqliteControlStore,
-        worker_lock: ExclusiveGuard,
+        pub(super) worker_lock: ExclusiveGuard,
         pub(crate) catalog: PathBuf,
         pub(crate) root: PathBuf,
         _temp: tempfile::TempDir,
