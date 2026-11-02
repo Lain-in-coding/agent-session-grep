@@ -206,18 +206,14 @@ pub(crate) fn run(
             profiles: None,
             create_missing_parents: true,
         },
-        &mut |_| {
-            identity
-                .validate()
-                .map_err(|_| setup_hosts::SetupHostsErrorCode::IdentityMismatch.into())
-        },
+        &mut |_| validate_setup_identity(&identity, deadline),
     );
-    let mut interrupted = false;
+    let mut interruption = None;
     match report {
         Ok(report) => {
-            interrupted = report.interruption.is_some();
-            let recorded = !interrupted
-                && record_receipts(&catalog, &identity, &report.private_receipts).is_ok();
+            interruption = report.interruption;
+            let recorded = interruption.is_none()
+                && record_receipts(&catalog, &identity, &report.private_receipts, deadline).is_ok();
             data["local_asg"] = json!(report.local_asg);
             data["hosts"] = json!(report.hosts);
             data["private_receipt_count"] = json!(report.private_receipts.len());
@@ -225,8 +221,8 @@ pub(crate) fn run(
             if !recorded {
                 data["recovery"] = json!("host_receipt_inventory_pending");
             }
-            if interrupted {
-                data["recovery"] = json!("setup_identity_changed");
+            if let Some(code) = interruption {
+                data["recovery"] = json!(setup_identity_reason(code));
             }
             data["stages"]["host_registration"] = json!("see_host_stages");
         }
@@ -242,7 +238,7 @@ pub(crate) fn run(
             data["stages"]["host_registration"] = json!("not_attempted");
         }
     }
-    if !interrupted && identity.validate().is_ok() {
+    if interruption.is_none() && validate_setup_identity(&identity, deadline).is_ok() {
         let mut selections = Vec::new();
         for (provider, path) in &options.histories {
             match managed_control::add_selected_history(provider, path, &identity, deadline) {
@@ -259,8 +255,12 @@ pub(crate) fn run(
             data["stages"]["history_selection"] = json!("selected");
         }
     }
-    data["autostart"] = if interrupted || identity.validate().is_err() {
-        json!({"status":"incomplete","reason":"setup_identity_changed"})
+    let autostart_identity = match interruption {
+        Some(code) => Err(code.into()),
+        None => validate_setup_identity(&identity, deadline),
+    };
+    data["autostart"] = if let Err(error) = autostart_identity {
+        json!({"status":"incomplete","reason":setup_identity_reason(error.code)})
     } else if options.no_autostart {
         json!({"status":"unchanged","reason":"explicit_opt_out"})
     } else if install.supervisor.is_none() {
@@ -278,16 +278,42 @@ pub(crate) fn run(
     };
     // The initial managed stage predates native registration. Refresh only from
     // the original identity; never replace A's result with a replacement B.
-    if let Ok(control) = identity.control()
-        && let Ok(status) = control.status()
+    if let Ok(control) = retry_setup_control(deadline, || identity.control_before(deadline))
+        && let Ok(status) = retry_setup_control(deadline, || {
+            control.with_runtime_deadline(deadline, || control.status())
+        })
     {
         data["autostart_enabled"] = json!(status.autostart_enabled);
         data["control_seq"] = json!(status.policy.control_seq.get());
     }
-    if !options.histories.is_empty() && identity.validate().is_ok() {
+    if interruption.is_none()
+        && !options.histories.is_empty()
+        && validate_setup_identity(&identity, deadline).is_ok()
+    {
         data["background_start"] = managed_control::start_if_selected(&catalog, deadline);
     }
     finish_setup(data, started, mode, request_id)
+}
+
+fn validate_setup_identity(
+    identity: &SetupIdentity,
+    deadline: Instant,
+) -> Result<(), setup_hosts::SetupHostsError> {
+    retry_setup_control(deadline, || identity.validate_before(deadline)).map_err(|error| {
+        if matches!(error, PortError::SnapshotChanged(_)) {
+            setup_hosts::SetupHostsErrorCode::IdentityMismatch
+        } else {
+            setup_hosts::SetupHostsErrorCode::Io
+        }
+        .into()
+    })
+}
+
+fn setup_identity_reason(code: setup_hosts::SetupHostsErrorCode) -> &'static str {
+    match code {
+        setup_hosts::SetupHostsErrorCode::IdentityMismatch => "setup_identity_changed",
+        _ => "setup_identity_unavailable",
+    }
 }
 
 fn setup_control_error(error: PortError) -> CliError {
@@ -389,6 +415,7 @@ fn record_receipts(
     catalog: &Path,
     identity: &SetupIdentity,
     receipts: &[setup_hosts::PrivateReceiptLocator],
+    deadline: Instant,
 ) -> Result<(), CliError> {
     if receipts.is_empty() {
         return Ok(());
@@ -408,6 +435,7 @@ fn record_receipts(
         identity,
         "setup-hosts",
         json!({"schema":"asg.setup-host-inventory/v1","receipts":locators}),
+        deadline,
     )
 }
 
@@ -416,6 +444,7 @@ fn record_inventory(
     identity: &SetupIdentity,
     name: &str,
     mut value: Value,
+    deadline: Instant,
 ) -> Result<(), CliError> {
     let root = catalog
         .parent()
@@ -423,9 +452,14 @@ fn record_inventory(
     ordinary(root)?;
     // Existing control API checks private directory ownership/mode/ACL. No new
     // profile directories or user settings are created by this inventory write.
-    identity.validate().map_err(invalid_install)?;
-    let control = identity.control().map_err(invalid_install)?;
-    let status = control.status().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
+    let control = retry_setup_control(deadline, || identity.control_before(deadline))
+        .map_err(setup_control_error)?;
+    let status = retry_setup_control(deadline, || {
+        control.with_runtime_deadline(deadline, || control.status())
+    })
+    .map_err(setup_control_error)?;
     let physical = agent_session_grep_adapters_sqlite::managed_locks::RootIdentity::read(root)
         .map_err(invalid_install)?;
     value["binding"] = json!({"schema":"asg.setup-inventory-binding/v1",
@@ -453,14 +487,17 @@ fn record_inventory(
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(1).custom_flags(0x00200000);
     }
-    identity.validate().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
     let mut file = options.open(&pending).map_err(invalid_install)?;
     file.write_all(&content).map_err(invalid_install)?;
     file.sync_all().map_err(invalid_install)?;
     drop(file);
-    identity.validate().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
     fs::hard_link(&pending, &path).map_err(invalid_install)?;
-    identity.validate().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
     fs::remove_file(&pending).map_err(invalid_install)?;
     #[cfg(unix)]
     fs::File::open(root)
@@ -496,11 +533,16 @@ fn setup_native(
     command_end: Instant,
 ) -> Result<Value, CliError> {
     use agent_session_grep_adapters_sqlite::managed_locks::{ExclusiveGuard, LockKind};
+    let deadline = command_end;
     let root = catalog
         .parent()
         .ok_or_else(|| invalid_install("data root"))?;
-    let control = identity.control().map_err(invalid_install)?;
-    let state = control.status().map_err(invalid_install)?;
+    let control = retry_setup_control(deadline, || identity.control_before(deadline))
+        .map_err(setup_control_error)?;
+    let state = retry_setup_control(deadline, || {
+        control.with_runtime_deadline(deadline, || control.status())
+    })
+    .map_err(setup_control_error)?;
     let installation = state.policy.installation_id;
     let (supervisor, digest) = install
         .supervisor
@@ -515,8 +557,8 @@ fn setup_native(
     };
     let store = NativeAutostartStore::open(location.clone(), &journal, installation.as_str())
         .map_err(invalid_install)?;
-    let deadline = command_end;
-    identity.validate().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
     let recovered = match store.recover_pending(deadline) {
         Ok(value) => value,
         Err(error) => {
@@ -531,7 +573,8 @@ fn setup_native(
             "reason":native_configuration_reason(error.code)}));
         }
     };
-    identity.validate().map_err(invalid_install)?;
+    retry_setup_control(deadline, || identity.validate_before(deadline))
+        .map_err(setup_control_error)?;
     let registration = SupervisorRegistration {
         supervisor: supervisor.clone(),
         supervisor_sha256: digest.clone(),
@@ -558,35 +601,33 @@ fn setup_native(
             "setup-autostart",
             json!({"schema":"asg.setup-autostart-inventory/v1",
         "location":location,"journal_root":journal,"receipt":change.receipt}),
+            deadline,
         )?;
         summary["private_receipt_recorded"] = json!(true);
         drop(control);
-        let control = identity.writable_control().map_err(invalid_install)?;
+        let control = retry_setup_control(deadline, || identity.writable_control_before(deadline))
+            .map_err(setup_control_error)?;
         loop {
-            identity.validate().map_err(invalid_install)?;
-            match control.set_autostart_enabled(
-                control
-                    .status()
-                    .map_err(invalid_install)?
-                    .policy
-                    .control_seq,
-                true,
-            ) {
+            let result = retry_setup_control(deadline, || {
+                control.with_runtime_deadline(deadline, || {
+                    identity.validate_before(deadline)?;
+                    control.set_autostart_enabled(control.status()?.policy.control_seq, true)
+                })
+            });
+            match result {
                 Ok(_) => break,
-                Err(PortError::WriterBusy(_) | PortError::GenerationMismatch(_))
-                    if Instant::now() < deadline =>
-                {
+                Err(PortError::GenerationMismatch(_)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5))
                 }
-                Err(error) => return Err(invalid_install(error)),
+                Err(error) => return Err(setup_control_error(error)),
             }
         }
-        let current = identity
-            .control()
-            .map_err(invalid_install)?
-            .status()
-            .map_err(invalid_install)?;
-        identity.validate().map_err(invalid_install)?;
+        let current = retry_setup_control(deadline, || {
+            control.with_runtime_deadline(deadline, || control.status())
+        })
+        .map_err(setup_control_error)?;
+        retry_setup_control(deadline, || identity.validate_before(deadline))
+            .map_err(setup_control_error)?;
         let manager = match crate::native_manager::apply(
             &store,
             &change,
@@ -613,7 +654,8 @@ fn setup_native(
                 return Ok(());
             }
         };
-        identity.validate().map_err(invalid_install)?;
+        retry_setup_control(deadline, || identity.validate_before(deadline))
+            .map_err(setup_control_error)?;
         record_manager_summary(&mut summary, &manager);
         let mut observed_lock = false;
         let mut started = false;
@@ -624,12 +666,14 @@ fn setup_native(
             && manager.configured_command_verified
             && current.desired_updates != DesiredUpdates::Stopped
         {
-            identity.validate().map_err(invalid_install)?;
+            retry_setup_control(deadline, || identity.validate_before(deadline))
+                .map_err(setup_control_error)?;
             match ExclusiveGuard::try_acquire(root, LockKind::Supervisor) {
                 Err(PortError::WriterBusy(_)) => observed_lock = true,
                 Ok(guard) => {
                     drop(guard);
-                    identity.validate().map_err(invalid_install)?;
+                    retry_setup_control(deadline, || identity.validate_before(deadline))
+                        .map_err(setup_control_error)?;
                     let mut child = agent_session_grep_launcher::spawn_verified_background(
                         supervisor,
                         digest,
@@ -638,7 +682,8 @@ fn setup_native(
                     .map_err(invalid_install)?;
                     started = true;
                     while Instant::now() < deadline {
-                        identity.validate().map_err(invalid_install)?;
+                        retry_setup_control(deadline, || identity.validate_before(deadline))
+                            .map_err(setup_control_error)?;
                         if child.try_wait().map_err(invalid_install)?.is_some() {
                             break;
                         }
@@ -670,13 +715,15 @@ fn setup_native(
         Ok(())
     })();
     if completion.is_err() {
-        summary["reason"] = json!(if identity.validate().is_err() {
-            "setup_identity_changed"
-        } else if summary["private_receipt_recorded"] != true {
-            "native_receipt_inventory_pending"
-        } else {
-            "native_completion_pending"
-        });
+        summary["reason"] = json!(
+            if let Err(error) = validate_setup_identity(identity, deadline) {
+                setup_identity_reason(error.code)
+            } else if summary["private_receipt_recorded"] != true {
+                "native_receipt_inventory_pending"
+            } else {
+                "native_completion_pending"
+            }
+        );
     }
     Ok(summary)
 }
@@ -986,7 +1033,16 @@ mod identity_tests {
         let registry = RegistryFixture::new();
         fs::rename(base.join("data"), base.join("original")).unwrap();
         fs::rename(replacement, base.join("data")).unwrap();
-        assert!(record_inventory(&path, &identity, "setup-hosts", json!({"receipts":[]})).is_err());
+        assert!(
+            record_inventory(
+                &path,
+                &identity,
+                "setup-hosts",
+                json!({"receipts":[]}),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .is_err()
+        );
         assert!(
             setup_native(
                 &install,
@@ -1323,6 +1379,62 @@ mod m2_tests {
         assert_eq!(
             fs::read(SqliteControlStore::path(catalog.parent().unwrap())).unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn setup_post_probe_identity_keeps_original_end_and_failure_category() {
+        use agent_session_grep_adapters_sqlite::{
+            SqliteControlStore,
+            managed_locks::{ExclusiveGuard, LockKind},
+        };
+        let (_temp, catalog, _source, identity) = deadline_selection_fixture();
+        let root = catalog.parent().unwrap();
+        let before = fs::read(SqliteControlStore::path(root)).unwrap();
+        let guard = ExclusiveGuard::try_acquire(root, LockKind::ControlHandles).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(guard);
+        });
+        let admitted = validate_setup_identity(&identity, end);
+        release.join().unwrap();
+        admitted.unwrap();
+        assert!(Instant::now() < end);
+        assert_eq!(fs::read(SqliteControlStore::path(root)).unwrap(), before);
+
+        let guard = ExclusiveGuard::try_acquire(root, LockKind::ControlHandles).unwrap();
+        let end = Instant::now() + Duration::from_millis(50);
+        let busy = validate_setup_identity(&identity, end).unwrap_err();
+        assert!(Instant::now() >= end);
+        assert_eq!(busy.code, setup_hosts::SetupHostsErrorCode::Io);
+        assert_eq!(
+            setup_identity_reason(busy.code),
+            "setup_identity_unavailable"
+        );
+        let expired = validate_setup_identity(&identity, Instant::now()).unwrap_err();
+        assert_eq!(expired.code, setup_hosts::SetupHostsErrorCode::Io);
+        assert_eq!(fs::read(SqliteControlStore::path(root)).unwrap(), before);
+        drop(guard);
+
+        let (_replacement, replacement_catalog, _, _) = deadline_selection_fixture();
+        let replacement_root = replacement_catalog.parent().unwrap();
+        let replacement_bytes = fs::read(SqliteControlStore::path(replacement_root)).unwrap();
+        fs::rename(root, root.with_file_name("original data")).unwrap();
+        fs::rename(replacement_root, root).unwrap();
+        let changed = validate_setup_identity(&identity, Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(
+            changed.code,
+            setup_hosts::SetupHostsErrorCode::IdentityMismatch
+        );
+        assert_eq!(
+            setup_identity_reason(changed.code),
+            "setup_identity_changed"
+        );
+        assert_eq!(
+            fs::read(SqliteControlStore::path(root)).unwrap(),
+            replacement_bytes
         );
     }
 

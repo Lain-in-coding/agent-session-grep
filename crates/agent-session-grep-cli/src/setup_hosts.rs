@@ -148,14 +148,6 @@ impl SetupIdentity {
         Ok(control)
     }
 
-    pub(crate) fn writable_control(&self) -> PortResult<SqliteControlStore> {
-        self.validate()?;
-        let root = self.catalog.parent().ok_or_else(setup_changed)?;
-        let control = SqliteControlStore::open_existing_writable(root, &self.installation)?;
-        self.validate()?;
-        Ok(control)
-    }
-
     /// One checked admission using the caller's original end. Busy is returned
     /// to the bounded composition retry; identity mismatch is never retried.
     pub(crate) fn validate_before(&self, deadline: Instant) -> PortResult<()> {

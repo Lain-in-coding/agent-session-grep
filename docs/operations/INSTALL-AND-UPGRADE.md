@@ -437,6 +437,12 @@ leaves host configuration unattempted and preserves any catalog setup already
 completed. Per-host conflicts preserve the user's configuration and report
 incomplete registration.
 
+Setup rechecks the same catalog identity before later stages. If that identity
+cannot be verified within the command's original time allowance, it reports
+`setup_identity_unavailable`; `setup_identity_changed` identifies an observed
+replacement. A stage whose identity check fails remains incomplete.
+Inspect the completed stages before retrying the same explicit setup command.
+
 Private receipt locator inventories are published as
 `setup-hosts-<opaque-id>.json` beside the managed catalog, in its verified private
 directory. They reference the durable per-host transaction receipts for later
