@@ -2213,6 +2213,8 @@ fn checkpoint_admission(
     root: RootIdentity,
     end: Instant,
 ) -> PortResult<ReadPolicy> {
+    #[cfg(test)]
+    wal_tests::observe_admission_end(end);
     control.with_runtime_deadline(end, || {
         if !control.matches_root(root) || !authority.is_bound_to(control) {
             return Err(invalid());
@@ -2296,6 +2298,8 @@ fn checkpoint_catalog(
     control.validate_catalog_file(path)?;
     control.validate_live_root()?;
     report.wal_bytes_before = ManagedStore::wal_len(path)?;
+    #[cfg(test)]
+    wal_tests::observe_physical_attempt();
     let counts = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -3412,6 +3416,62 @@ pub(crate) mod wal_tests {
         static BEFORE_CHECKPOINT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         static AFTER_CLOSE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         static PRAGMAS: RefCell<Vec<(i64, i64, i64, i64)>> = const { RefCell::new(Vec::new()) };
+        static PREPARED_CHECKPOINT: RefCell<Option<PreparedCheckpoint>> = const { RefCell::new(None) };
+    }
+
+    struct PreparedCheckpoint {
+        end: Instant,
+        admissions: usize,
+        physical_attempts: usize,
+    }
+
+    struct ObservePreparedCheckpoint {
+        previous_end: Option<Instant>,
+        previous_observer: Option<PreparedCheckpoint>,
+    }
+
+    impl ObservePreparedCheckpoint {
+        fn start(end: Instant) -> Self {
+            Self {
+                previous_end: CONTROL_END.with(|slot| slot.replace(Some(end))),
+                previous_observer: PREPARED_CHECKPOINT.with(|slot| {
+                    slot.replace(Some(PreparedCheckpoint {
+                        end,
+                        admissions: 0,
+                        physical_attempts: 0,
+                    }))
+                }),
+            }
+        }
+
+        fn finish(self) -> (usize, usize) {
+            let observed = PREPARED_CHECKPOINT.with(|slot| slot.borrow_mut().take().unwrap());
+            (observed.admissions, observed.physical_attempts)
+        }
+    }
+
+    impl Drop for ObservePreparedCheckpoint {
+        fn drop(&mut self) {
+            CONTROL_END.with(|slot| slot.set(self.previous_end));
+            PREPARED_CHECKPOINT.with(|slot| *slot.borrow_mut() = self.previous_observer.take());
+        }
+    }
+
+    pub(super) fn observe_admission_end(end: Instant) {
+        PREPARED_CHECKPOINT.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(end, observed.end, "prepared checkpoint admission end");
+                observed.admissions += 1;
+            }
+        });
+    }
+
+    pub(super) fn observe_physical_attempt() {
+        PREPARED_CHECKPOINT.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.physical_attempts += 1;
+            }
+        });
     }
 
     pub(super) fn after_checkpoint() {
@@ -3958,10 +4018,29 @@ pub(crate) mod wal_tests {
                 .control
                 .validate_catalog_file(&fixture.catalog)
                 .unwrap();
+            // This fixture tests sidecar ownership, not 250ms throughput.
+            // Only admission receives this explicit preparation end; physical
+            // I/O and its final validation remain outside the runtime scope.
+            let end = SqliteControlStore::effective_runtime_deadline(
+                Instant::now() + Duration::from_secs(5),
+            );
+            let authority = fixture
+                .control
+                .with_runtime_deadline(end, || {
+                    fixture
+                        .control
+                        .bind_worker(&fixture.worker_lock, id("boot"))
+                })
+                .unwrap();
+            let observation = ObservePreparedCheckpoint::start(end);
             assert_eq!(
-                fixture.checkpoint().unwrap().outcome,
+                ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None,)
+                    .unwrap()
+                    .outcome,
                 WalCheckpointOutcome::Reset
             );
+            assert_eq!(observation.finish(), (2, 1));
+            assert!(CONTROL_END.with(|slot| slot.get().is_none()));
             fixture
                 .control
                 .validate_catalog_file(&fixture.catalog)
@@ -3971,10 +4050,51 @@ pub(crate) mod wal_tests {
             let alias = fixture.root.join("synthetic-alias");
             std::fs::hard_link(&sidecar, &alias).unwrap();
             let before = std::fs::read(&sidecar).unwrap();
-            assert!(fixture.checkpoint().is_err());
+            // The ordinary checkpoint rejects the real hardlink before any
+            // control admission or physical operation.
+            let observation = ObservePreparedCheckpoint::start(end);
+            CONTROL_END.with(|slot| slot.set(None));
+            assert!(matches!(
+                ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None,),
+                Err(PortError::Backend(_))
+            ));
+            assert_eq!(observation.finish(), (0, 0));
             assert_eq!(std::fs::read(&sidecar).unwrap(), before);
             assert!(alias.exists());
         }
+    }
+
+    #[test]
+    fn prepared_checkpoint_expiry_refuses_without_physical_work_and_restores_hook() {
+        let fixture = Fixture::new();
+        let _writer = fixture.seed();
+        let _reader = fixture.reader();
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        let before = std::fs::read(fixture.root.join("catalog.db-wal")).unwrap();
+        let expired = Instant::now();
+        let outer = ObservePreparedCheckpoint::start(expired);
+        {
+            let nested = ObservePreparedCheckpoint::start(expired);
+            let report =
+                ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None)
+                    .unwrap();
+            assert_eq!(
+                report.outcome,
+                WalCheckpointOutcome::Deferred(WalDeferral::Fence)
+            );
+            assert_eq!((report.log_frames, report.checkpointed_frames), (-1, -1));
+            assert_eq!(nested.finish(), (1, 0));
+        }
+        assert_eq!(CONTROL_END.with(Cell::get), Some(expired));
+        assert_eq!(outer.finish(), (0, 0));
+        assert!(CONTROL_END.with(|slot| slot.get().is_none()));
+        assert_eq!(
+            std::fs::read(fixture.root.join("catalog.db-wal")).unwrap(),
+            before
+        );
     }
 
     #[cfg(unix)]
