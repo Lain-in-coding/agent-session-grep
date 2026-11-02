@@ -87,6 +87,9 @@ impl Drop for PrivateFixture {
     }
 }
 fn run(db: &Path, args: &[&str]) -> Output {
+    run_at("unlabelled control operation", db, args)
+}
+fn run_at(phase: &'static str, db: &Path, args: &[&str]) -> Output {
     let owned_db = db.to_path_buf();
     let owned_args: Vec<_> = args.iter().map(|s| s.to_string()).collect();
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -98,19 +101,29 @@ fn run(db: &Path, args: &[&str]) -> Output {
             .output();
         let _sent = sender.send(output);
     });
+    let started = Instant::now();
     match receiver.recv_timeout(Duration::from_secs(8)) {
         Ok(output) => output.unwrap(),
-        Err(_) => {
+        Err(error) => {
+            eprintln!(
+                "synthetic CLI phase={phase} receive={error:?} elapsed={:?} before_cleanup",
+                started.elapsed()
+            );
             // Release only this test's worker through durable intent so a
             // leaked inherited pipe cannot hang the entire test executable.
-            let _stop = Command::new(BIN)
+            let stop = Command::new(BIN)
                 .args(["--robot", "--db"])
                 .arg(db)
                 .args(["background", "stop"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            panic!("CLI process/pipe lifetime exceeded the bounded command budget");
+            eprintln!(
+                "synthetic CLI phase={phase} cleanup_stop={:?}",
+                stop.map(|status| status.code())
+                    .map_err(|error| error.kind())
+            );
+            panic!("CLI process/pipe lifetime exceeded the bounded command budget: {phase}");
         }
     }
 }
@@ -254,13 +267,18 @@ fn setup_rejects_legacy_and_revoke_waits_for_real_emission_owner() {
     let temp = PrivateFixture::new();
     let legacy = temp.path().join("legacy.db");
     std::fs::write(&legacy, b"legacy marker").unwrap();
-    assert_eq!(run(&legacy, &["setup"]).status.code(), Some(9));
+    assert_eq!(
+        run_at("legacy_setup", &legacy, &["setup"]).status.code(),
+        Some(9)
+    );
     assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy marker");
     assert!(!temp.path().join("control.db").exists());
     let db = temp.path().join("private").join("catalog.db");
-    setup_paused(&db);
+    data(&run_at("managed_setup", &db, &["setup"]), 10);
+    data(&run_at("initial_pause", &db, &["background", "pause"]), 0);
     let selected = data(
-        &run(
+        &run_at(
+            "select_source",
             &db,
             &[
                 "sources",
@@ -274,7 +292,8 @@ fn setup_rejects_legacy_and_revoke_waits_for_real_emission_owner() {
     );
     let guard = acquire(db.parent().unwrap(), LockKind::PolicyEmission);
     let blocked = data(
-        &run(
+        &run_at(
+            "revoke_held_emission",
             &db,
             &["sources", "revoke", selected["id"].as_str().unwrap()],
         ),
@@ -284,7 +303,8 @@ fn setup_rejects_legacy_and_revoke_waits_for_real_emission_owner() {
     assert_eq!(blocked["denial_active"], true);
     drop(guard);
     let done = data(
-        &run(
+        &run_at(
+            "revoke_after_release",
             &db,
             &["sources", "revoke", selected["id"].as_str().unwrap()],
         ),
