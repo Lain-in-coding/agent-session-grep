@@ -10301,7 +10301,10 @@ mod control_deadline_tests {
         let mut schedule = SourceScheduleState::default();
         let boot = ObservationClock::new(Instant::now());
         let (first, cycle, full) = fixture.scheduled(&mut schedule, &boot);
-        assert!(first.unwrap());
+        assert!(
+            first.as_ref().is_ok_and(|complete| *complete),
+            "first={first:?} cycle={cycle:?}"
+        );
         assert_eq!(cycle.selections.len(), 2);
         assert!(fixture.latest(&full));
         assert_eq!(fixture.head_claims(), 2);

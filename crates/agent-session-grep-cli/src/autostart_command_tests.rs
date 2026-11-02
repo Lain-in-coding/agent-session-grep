@@ -655,6 +655,7 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
     // Prepare the package before measuring the native timeout path.
     let mut installation = Some(f.installation(true));
     let end = Instant::now() + Duration::from_secs(2);
+    let observation = ObserveDeadline::start(end);
     let mut native_called = false;
     let result = execute(
         f.catalog.to_str().unwrap(),
@@ -671,7 +672,12 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
             Err(native_manager::ErrorCode::Timeout.into())
         },
     );
-    assert!(native_called, "reason={:?}", result.reason);
+    let observed = observation.finish();
+    assert!(
+        native_called,
+        "deadline={observed:?} summary={}",
+        serde_json::to_string(&result).unwrap()
+    );
     assert_eq!(result.status, "incomplete");
     assert_eq!(result.reason, Some(Reason::Timeout));
     assert!(result.intent_recorded && result.private_receipt_recorded);

@@ -563,19 +563,19 @@ fn named_reallow_and_request_intersection_do_not_widen_policy() {
         .unwrap();
     assert_eq!(removed.value, exclusions[0]);
     assert!(removed.changed);
-    let restricted = store
-        .read_policy(RequestIntersection::Only(vec![region(
+    let restricted = retry_expected_success(|| {
+        store.read_policy(RequestIntersection::Only(vec![region(
             SearchProvider::Claude,
             "R/sub/F",
             RootKind::Exact,
         )]))
-        .unwrap();
+    })
+    .unwrap();
     assert!(allowed(&restricted, SearchProvider::Claude, "R/sub/F"));
     assert!(!allowed(&restricted, SearchProvider::Claude, "R/other"));
     assert!(!allowed(&restricted, SearchProvider::Codex, "R/sub/F"));
-    let empty = store
-        .read_policy(RequestIntersection::Only(vec![]))
-        .unwrap();
+    let empty =
+        retry_expected_success(|| store.read_policy(RequestIntersection::Only(vec![]))).unwrap();
     assert!(!allowed(&empty, SearchProvider::Claude, "R/sub/F"));
     assert!(
         store

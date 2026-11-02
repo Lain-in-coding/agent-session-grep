@@ -72,36 +72,51 @@ impl Fixture {
         let control =
             SqliteControlStore::create(&root, &id("private-installation"), DesiredUpdates::Running)
                 .unwrap();
+        // Fixture preparation precedes the actual request's measured wait.
+        // Keep each control admission on one finite preparation end.
+        let prepare_end = Instant::now() + Duration::from_secs(20);
         let selection = control
-            .add_selection(
-                current(&control),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: CanonicalLocator::from_path(&temp.path().canonicalize().unwrap())
+            .with_runtime_deadline(prepare_end, || {
+                control.add_selection(
+                    current(&control),
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Claude,
+                            locator: CanonicalLocator::from_path(
+                                &temp.path().canonicalize().unwrap(),
+                            )
                             .unwrap(),
-                        kind: RootKind::Root,
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(id("source-root")),
+                        now_ms: 1,
                     },
-                    root_identity: Some(id("source-root")),
-                    now_ms: 1,
-                },
-            )
+                )
+            })
             .unwrap()
             .value;
         let guard = lock(&root, LockKind::Background);
-        let worker = control.bind_worker(&guard, id("private-boot")).unwrap();
+        let worker = control
+            .with_runtime_deadline(prepare_end, || {
+                control.bind_worker(&guard, id("private-boot"))
+            })
+            .unwrap();
         control
-            .register_worker(current(&control), &worker, 1, 1)
+            .with_runtime_deadline(prepare_end, || {
+                control.register_worker(current(&control), &worker, 1, 1)
+            })
             .unwrap();
         let cycle = match control
-            .queue_cycle(
-                current(&control),
-                vec![SelectionRevision {
-                    selection_id: selection.id.clone(),
-                    revision: selection.revision,
-                    root_identity: id("source-root"),
-                }],
-            )
+            .with_runtime_deadline(prepare_end, || {
+                control.queue_cycle(
+                    current(&control),
+                    vec![SelectionRevision {
+                        selection_id: selection.id.clone(),
+                        revision: selection.revision,
+                        root_identity: id("source-root"),
+                    }],
+                )
+            })
             .unwrap()
             .value
         {
@@ -109,7 +124,9 @@ impl Fixture {
             _ => panic!("cycle"),
         };
         let cycle = control
-            .start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)
+            .with_runtime_deadline(prepare_end, || {
+                control.start_cycle(current(&control), &worker, cycle.token.cycle_seq, 2)
+            })
             .unwrap()
             .value;
         let message = entity(IdKind::Message, "message-0");
