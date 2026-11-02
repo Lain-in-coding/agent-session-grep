@@ -1,8 +1,4 @@
-"""Keep the cargo-audit zip exception in .cargo/audit.toml narrow and current.
-
-The exception is valid only while vulnerable zip (< 9.0.0) is reachable solely
-through the optional semantic-candle stack, which release builds never enable.
-"""
+"""Prevent removed ZIP vulnerabilities and stale audit exceptions returning."""
 from __future__ import annotations
 
 import re
@@ -15,7 +11,6 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
-ADVISORIES = {"RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"}
 CANDLE = {"candle-core", "candle-nn", "candle-transformers"}
 
 
@@ -48,22 +43,21 @@ class AuditExceptionTests(unittest.TestCase):
         self.vulnerable = {p["version"] for p in self.packages
                            if p["name"] == "zip" and major(p["version"]) < 9}
 
-    def test_ignore_list_is_exactly_the_zip_extract_advisories(self):
-        ignore = load(".cargo/audit.toml")["advisories"]["ignore"]
-        self.assertEqual(set(ignore), ADVISORIES)
-        self.assertEqual(len(ignore), len(ADVISORIES))
+    def test_audit_policies_have_no_advisory_exceptions(self):
+        for name in (".cargo/audit.toml", "deny.toml"):
+            with self.subTest(policy=name):
+                self.assertEqual(load(name)["advisories"]["ignore"], [])
 
-    def test_exception_is_removed_once_no_vulnerable_zip_is_locked(self):
-        self.assertTrue(self.vulnerable, "no zip < 9 is locked; delete the ignores in "
-                        ".cargo/audit.toml and this test")
+    def test_all_locked_zip_versions_are_fixed(self):
+        versions = {p["version"] for p in self.packages if p["name"] == "zip"}
+        self.assertTrue(versions, "the offline bundle verifier must remain covered")
+        self.assertEqual(self.vulnerable, set(), "ZIP < 9 requires a dependency fix")
 
-    def test_vulnerable_zip_is_reached_only_through_optional_candle(self):
-        self.assertEqual(dependents(self.packages, "zip", self.vulnerable), {"candle-core"})
-        workspace = {p["name"] for p in self.packages if "source" not in p}
+    def test_fixed_candle_stack_remains_optional(self):
         users = dependents(self.packages, "candle-core",
                            {p["version"] for p in self.packages if p["name"] == "candle-core"})
-        self.assertEqual(users & workspace, {"agent-session-grep-application"})
-        self.assertLessEqual(users - workspace, CANDLE)
+        self.assertIn("agent-session-grep-application", users)
+        self.assertLessEqual(users, CANDLE | {"agent-session-grep-application"})
         manifest = load("crates/agent-session-grep-application/Cargo.toml")
         for name in CANDLE:
             self.assertIs(manifest["dependencies"][name]["optional"], True)
