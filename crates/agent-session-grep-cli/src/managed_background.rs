@@ -2569,6 +2569,9 @@ struct ScheduleTestHooks {
     // early return between cycle start and completion.
     epoch_refusals: RefCell<Vec<(EpochSite, crate::update_state::EpochRefusal)>>,
     completion_end: std::cell::Cell<Option<Instant>>,
+    // None means the observation result has not reached completion preparation.
+    observation_result: std::cell::Cell<Option<&'static str>>,
+    completion_case: std::cell::Cell<Option<&'static str>>,
 }
 
 /// Where the worker asked for an epoch permit.
@@ -2614,6 +2617,20 @@ enum ScheduleTestEvent<'a> {
 
 #[cfg(test)]
 impl ScheduleTestHooks {
+    fn error_label(error: &PortError) -> &'static str {
+        match error {
+            PortError::WriterBusy(_) => "writer_busy",
+            PortError::DeadlineExceeded(_) => "deadline_exceeded",
+            PortError::InvalidRequest(_) => "invalid_request",
+            PortError::GenerationMismatch(_) => "generation_mismatch",
+            PortError::Backend(_) => "backend",
+            PortError::SourceIo(_) => "source_io",
+            PortError::SchemaIncompatible(_) => "schema_incompatible",
+            PortError::NotFound(_) => "not_found",
+            PortError::SnapshotChanged(_) => "snapshot_changed",
+        }
+    }
+
     fn event(&self, event: ScheduleTestEvent<'_>) -> PortResult<()> {
         if let Some(hook) = &self.on_event {
             return hook.borrow_mut()(event);
@@ -6361,6 +6378,10 @@ mod wal_worker_tests {
         original_end: Instant,
         error: Option<&PortError>,
     ) {
+        // Direct cycle fixtures do not install the real-worker TLS observer.
+        schedule
+            .observation_result
+            .set(Some(error.map_or("ok", ScheduleTestHooks::error_label)));
         HOOKS.with(|hooks| {
             if let Some(hooks) = hooks.borrow_mut().as_mut() {
                 if std::mem::take(&mut hooks.expire_completion_once) {
@@ -8530,6 +8551,8 @@ mod control_deadline_tests {
             on_event: Some(RefCell::new(Box::new(hook))),
             epoch_refusals: RefCell::default(),
             completion_end: Cell::new(None),
+            observation_result: Cell::new(None),
+            completion_case: Cell::new(None),
         }
     }
 
@@ -12019,6 +12042,7 @@ mod control_deadline_tests {
         boot: &ObservationClock,
     ) -> Option<PendingCycle> {
         let mut pending = None;
+        schedule.hooks.observation_result.set(None);
         schedule.hooks.completion_end.set(Some(Instant::now()));
         let result = run_cycle(
             &fixture.db,
@@ -12030,12 +12054,39 @@ mod control_deadline_tests {
             &mut pending,
             schedule,
         );
+        let consumed = schedule.hooks.completion_end.get().is_none();
+        let observation = schedule.hooks.observation_result.get();
         schedule.hooks.completion_end.set(None);
-        assert!(matches!(result, Err(PortError::WriterBusy(_))));
-        let intent = pending.as_ref().unwrap();
-        assert!(intent.observed.is_some());
-        assert!(!intent.completion_confirmed);
-        assert!(schedule.closed_idle_at.is_none());
+        let run = match &result {
+            Ok(CycleResult::Idle(_)) => "idle",
+            Ok(CycleResult::Work(_)) => "work",
+            Err(error) => ScheduleTestHooks::error_label(error),
+        };
+        let state = pending.as_ref().map(|intent| {
+            (
+                intent.finish,
+                intent.observed.is_some(),
+                intent.completion_confirmed,
+            )
+        });
+        let context = || {
+            format!(
+                "case={:?} run={run} observation={observation:?} completion_end_consumed={consumed} \
+                 pending_finish_observed_confirmed={state:?} closed_idle={} remaining={:?}",
+                schedule.hooks.completion_case.get(),
+                schedule.closed_idle_at.is_some(),
+                fixture.scope_end.saturating_duration_since(Instant::now()),
+            )
+        };
+        assert!(
+            matches!(result, Err(PortError::WriterBusy(_))),
+            "{}",
+            context()
+        );
+        let intent = pending.as_ref().unwrap_or_else(|| panic!("{}", context()));
+        assert!(intent.observed.is_some(), "{}", context());
+        assert!(!intent.completion_confirmed, "{}", context());
+        assert!(schedule.closed_idle_at.is_none(), "{}", context());
         pending
     }
 
@@ -12797,6 +12848,7 @@ mod control_deadline_tests {
             fixture.write_source("source.jsonl", SearchProvider::Claude, "terminal source");
             let boot = ObservationClock::new(Instant::now());
             let mut schedule = SourceScheduleState::default();
+            schedule.hooks.completion_case.set(Some(mismatch));
             let mut pending = expired_completion(&fixture, &mut schedule, &boot);
             let intent = pending.as_mut().unwrap();
             let token = intent.token.clone();
