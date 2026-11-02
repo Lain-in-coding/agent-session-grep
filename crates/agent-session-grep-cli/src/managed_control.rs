@@ -549,13 +549,14 @@ pub(crate) fn prepare_setup(db: &str) -> Result<Value, CliError> {
 }
 
 fn prepare_setup_before(db: &str, deadline: Instant) -> Result<Value, CliError> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
     let path = absolute(Path::new(db))?;
     validate_catalog_path(&path).map_err(port)?;
     let root = path.parent().ok_or_else(|| io("missing data root"))?;
     let control = setup_control(&path, root, deadline)?;
     // Retire matching creation records before the catalog can exist; a later
     // retry must never mistake stale records for recoverable policy.
-    retry_create_busy(deadline, || control.finish_create()).map_err(port)?;
+    retry_create_busy(deadline, || finish_setup_control(&control, deadline)).map_err(port)?;
     setup_catalog(&path, &control, deadline)?;
     let background = maybe_start(&path, &control, deadline);
     // Catalog and control state are already durable. An observation that the
@@ -570,6 +571,33 @@ fn prepare_setup_before(db: &str, deadline: Instant) -> Result<Value, CliError> 
     data["status"] = json!("incomplete");
     data["stages"] = json!({"catalog":"ready","history_selection":"use_sources_add","host_registration":"pending","background":"pending"});
     Ok(data)
+}
+
+fn finish_setup_control(control: &SqliteControlStore, deadline: Instant) -> Result<(), PortError> {
+    #[cfg(test)]
+    tests::observe_setup_receiver(tests::SetupReceiver::Finish, deadline);
+    control.finish_create_with_deadline(deadline)
+}
+
+fn open_setup_catalog(
+    path: &Path,
+    control: &SqliteControlStore,
+    deadline: Instant,
+) -> Result<ManagedStore, PortError> {
+    #[cfg(test)]
+    tests::observe_setup_receiver(tests::SetupReceiver::Open, deadline);
+    ManagedStore::open_with_deadline(path, control, deadline)
+}
+
+fn create_setup_catalog(
+    path: &Path,
+    control: &SqliteControlStore,
+    incarnation: ControlId,
+    deadline: Instant,
+) -> Result<ManagedStore, PortError> {
+    #[cfg(test)]
+    tests::observe_setup_receiver(tests::SetupReceiver::Create, deadline);
+    ManagedStore::create_with_deadline(path, control, incarnation, app_clock_ms(), deadline)
 }
 
 /// Open or create the control database for setup. Another first setup on the
@@ -670,11 +698,12 @@ fn setup_catalog(
     control: &SqliteControlStore,
     deadline: Instant,
 ) -> Result<(), CliError> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
     let incarnation = random_id("catalog")?;
     let mut first_attempt = true;
     loop {
         let opened = if path.exists() {
-            match ManagedStore::open(path, control) {
+            match open_setup_catalog(path, control, deadline) {
                 Ok(store) => {
                     drop(store);
                     return Ok(());
@@ -693,7 +722,9 @@ fn setup_catalog(
             )));
         }
         first_attempt = false;
-        match ManagedStore::create(path, control, incarnation.clone(), app_clock_ms()) {
+        #[cfg(test)]
+        tests::before_setup_create();
+        match create_setup_catalog(path, control, incarnation.clone(), deadline) {
             Ok(store) => {
                 drop(store);
                 return Ok(());
@@ -704,7 +735,7 @@ fn setup_catalog(
             // under the writer lease: a concurrent setup won. Open it, waiting
             // out only transient Busy (for example a vanishing sidecar).
             Err(PortError::GenerationMismatch(_)) => {
-                return retry_create_busy(deadline, || ManagedStore::open(path, control))
+                return retry_create_busy(deadline, || open_setup_catalog(path, control, deadline))
                     .map(drop)
                     .map_err(port);
             }
@@ -954,6 +985,224 @@ mod tests {
         /// thread. Production output keeps only the canonical code.
         pub(super) static LAST_PORT_ERROR: std::cell::RefCell<Option<String>> =
             const { std::cell::RefCell::new(None) };
+        static SETUP_OBSERVATION: std::cell::RefCell<Option<SetupObservation>> =
+            const { std::cell::RefCell::new(None) };
+        static BEFORE_SETUP_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum SetupReceiver {
+        Finish,
+        Open,
+        Create,
+    }
+
+    struct SetupObservation {
+        end: Instant,
+        previous: Instant,
+        probe: Instant,
+        counts: [usize; 3],
+        expire: Option<SetupReceiver>,
+    }
+
+    struct SetupRecording;
+
+    impl SetupRecording {
+        fn start(end: Instant, expire: Option<SetupReceiver>) -> Self {
+            let probe = end + Duration::from_secs(10);
+            SETUP_OBSERVATION.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(SetupObservation {
+                    end,
+                    previous: SqliteControlStore::effective_runtime_deadline(probe),
+                    probe,
+                    counts: [0; 3],
+                    expire,
+                });
+            });
+            Self
+        }
+
+        fn finish(self) -> [usize; 3] {
+            let observed = SETUP_OBSERVATION.with(|slot| slot.borrow_mut().take().unwrap());
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(observed.probe),
+                observed.previous
+            );
+            observed.counts
+        }
+    }
+
+    impl Drop for SetupRecording {
+        fn drop(&mut self) {
+            SETUP_OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+            BEFORE_SETUP_CREATE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn observe_setup_receiver(site: SetupReceiver, received: Instant) {
+        let expire = SETUP_OBSERVATION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let observed = slot.as_mut()?;
+            assert_eq!(received, observed.end, "setup receiving end: {site:?}");
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(observed.probe),
+                observed.previous,
+                "only the adapter's control read may own a new scope"
+            );
+            observed.counts[site as usize] += 1;
+            if observed.expire == Some(site) {
+                observed.expire = None;
+                Some(observed.end)
+            } else {
+                None
+            }
+        });
+        // The real receiver is still called after this end expires. Returning
+        // Busy here would not detect a call reverted to the legacy API.
+        if let Some(end) = expire {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            assert!(Instant::now() >= end);
+        }
+    }
+
+    pub(super) fn before_setup_create() {
+        let hook = BEFORE_SETUP_CREATE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn setup_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, SqliteControlStore) {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let installation = ControlId::parse("setup-original-end-installation").unwrap();
+        let control =
+            SqliteControlStore::create(&root, &installation, DesiredUpdates::Paused).unwrap();
+        (temp, root, catalog, control)
+    }
+
+    #[test]
+    fn setup_real_receivers_keep_original_end_for_new_existing_and_winner_catalogs() {
+        for nested in [false, true] {
+            let (_temp, _root, catalog, control) = setup_fixture();
+            let end = Instant::now() + COMMAND_BUDGET;
+            let requested = end
+                + if nested {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                };
+            let run = || {
+                let recording = SetupRecording::start(end, None);
+                let first = prepare_setup_before(catalog.to_str().unwrap(), requested).unwrap();
+                assert_eq!(recording.finish(), [1, 0, 1]);
+                assert_eq!(first["desired_updates"], "paused");
+                let before = open_setup_catalog(&catalog, &control, end).unwrap();
+                let incarnation = before.incarnation().clone();
+                drop(before);
+                let recording = SetupRecording::start(end, None);
+                let repeated = prepare_setup_before(catalog.to_str().unwrap(), requested).unwrap();
+                assert_eq!(recording.finish(), [1, 1, 0]);
+                assert_eq!(repeated["desired_updates"], "paused");
+                let after = open_setup_catalog(&catalog, &control, end).unwrap();
+                assert_eq!(after.incarnation(), &incarnation);
+                Ok(())
+            };
+            if nested {
+                control.with_runtime_deadline(end, run).unwrap();
+            } else {
+                run().unwrap();
+            }
+        }
+
+        let (_temp, root, catalog, control) = setup_fixture();
+        let end = Instant::now() + COMMAND_BUDGET;
+        let winner_control = open_control_before(&root, true, end).unwrap();
+        let winner_path = catalog.clone();
+        let winner = ControlId::parse("concurrent-winner").unwrap();
+        let winner_id = winner.clone();
+        let recording = SetupRecording::start(end, None);
+        BEFORE_SETUP_CREATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Publish after the real absent-path check and before this
+                // caller's create. Its GenerationMismatch must use the reopen.
+                drop(
+                    ManagedStore::create_with_deadline(
+                        &winner_path,
+                        &winner_control,
+                        winner_id,
+                        app_clock_ms(),
+                        end,
+                    )
+                    .unwrap(),
+                );
+            }));
+        });
+        setup_catalog(&catalog, &control, end).unwrap();
+        assert_eq!(recording.finish(), [0, 1, 1]);
+        let store = open_setup_catalog(&catalog, &control, end).unwrap();
+        assert_eq!(store.incarnation(), &winner);
+    }
+
+    #[test]
+    fn setup_expiry_at_real_api_boundaries_keeps_creation_records_and_catalog_state() {
+        for site in [
+            SetupReceiver::Finish,
+            SetupReceiver::Create,
+            SetupReceiver::Open,
+        ] {
+            let (_temp, root, catalog, control) = setup_fixture();
+            let installation = ControlId::parse("setup-original-end-installation").unwrap();
+            let intent = creation_intent_bytes(&root, installation.as_str(), "paused");
+            if site == SetupReceiver::Finish {
+                write_creation_record(&root, "control.db.creating.intent", &intent);
+                write_creation_record(&root, "control.db.creating.publish", &intent);
+            } else if site == SetupReceiver::Open {
+                drop(
+                    ManagedStore::create_with_deadline(
+                        &catalog,
+                        &control,
+                        ControlId::parse("existing-catalog").unwrap(),
+                        app_clock_ms(),
+                        Instant::now() + COMMAND_BUDGET,
+                    )
+                    .unwrap(),
+                );
+            }
+            let before = catalog.exists().then(|| std::fs::read(&catalog).unwrap());
+            let end = Instant::now() + COMMAND_BUDGET;
+            let recording = SetupRecording::start(end, Some(site));
+            let result = if site == SetupReceiver::Finish {
+                prepare_setup_before(catalog.to_str().unwrap(), end).map(|_| ())
+            } else {
+                setup_catalog(&catalog, &control, end)
+            };
+            assert_eq!(result.unwrap_err().0.code, CanonicalCode::WriterBusy);
+            let counts = recording.finish();
+            let expected = match site {
+                SetupReceiver::Finish => [1, 0, 0],
+                SetupReceiver::Create => [0, 0, 1],
+                // The original loop opens before checking the retry budget.
+                SetupReceiver::Open => [0, 2, 1],
+            };
+            assert_eq!(counts, expected, "{site:?}");
+            if site == SetupReceiver::Finish {
+                for name in ["control.db.creating.intent", "control.db.creating.publish"] {
+                    assert_eq!(std::fs::read(root.join(name)).unwrap(), intent);
+                }
+            }
+            if let Some(before) = before {
+                assert_eq!(std::fs::read(&catalog).unwrap(), before);
+            } else {
+                assert!(!catalog.exists(), "{site:?}");
+                assert!(!root.join("catalog.db.asg-managed-create").exists());
+            }
+            drop(ExclusiveGuard::try_acquire(&root, LockKind::CatalogHandles).unwrap());
+            drop(agent_session_grep_adapters_sqlite::WriterLease::try_acquire(&root).unwrap());
+        }
     }
 
     fn creation_intent_bytes(root: &Path, installation: &str, desired: &str) -> Vec<u8> {

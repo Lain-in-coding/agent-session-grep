@@ -436,6 +436,31 @@ impl ManagedStore {
         incarnation: ControlId,
         now_ms: i64,
     ) -> PortResult<Self> {
+        Self::create_inner(path, control, incarnation, now_ms, None)
+    }
+
+    /// Use the original request end only for the control admission read.
+    /// Catalog creation and its acknowledgement retain their existing ordering.
+    pub fn create_with_deadline(
+        path: &Path,
+        control: &SqliteControlStore,
+        incarnation: ControlId,
+        now_ms: i64,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        #[cfg(test)]
+        setup_deadline_tests::observe_entry(deadline);
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        Self::create_inner(path, control, incarnation, now_ms, Some(deadline))
+    }
+
+    fn create_inner(
+        path: &Path,
+        control: &SqliteControlStore,
+        incarnation: ControlId,
+        now_ms: i64,
+        deadline: Option<Instant>,
+    ) -> PortResult<Self> {
         validate_catalog_path(path)?;
         if now_ms < 0 || !path.is_absolute() {
             return Err(invalid());
@@ -443,7 +468,7 @@ impl ManagedStore {
         let root_path = path.parent().ok_or_else(invalid)?;
         let handles = acquire_handles(root_path)?;
         let root = handles.root_identity();
-        let policy = admission(control, root)?;
+        let policy = setup_admission(control, root, deadline)?;
         let lease = WriterLease::try_acquire(root_path)?;
         let resume = match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -497,7 +522,11 @@ impl ManagedStore {
             now_ms,
         )?;
         tx.commit().map_err(storage)?;
+        #[cfg(test)]
+        setup_deadline_tests::observe_commit();
         control.validate_catalog_file(path)?;
+        #[cfg(test)]
+        setup_deadline_tests::observe_validated();
         Ok(Self::from_parts(
             conn,
             Some(lease),
@@ -508,11 +537,23 @@ impl ManagedStore {
     }
 
     pub fn open(path: &Path, control: &SqliteControlStore) -> PortResult<Self> {
-        Self::open_existing(path, control, false)
+        Self::open_existing(path, control, false, None)
+    }
+
+    /// Read-only open with the original end at the control admission boundary.
+    pub fn open_with_deadline(
+        path: &Path,
+        control: &SqliteControlStore,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        #[cfg(test)]
+        setup_deadline_tests::observe_entry(deadline);
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        Self::open_existing(path, control, false, Some(deadline))
     }
 
     pub fn open_for_write(path: &Path, control: &SqliteControlStore) -> PortResult<Self> {
-        Self::open_existing(path, control, true)
+        Self::open_existing(path, control, true, None)
     }
 
     /// Try one physical reset at a boundary with no caller-owned catalog
@@ -628,11 +669,12 @@ impl ManagedStore {
         path: &Path,
         control: &SqliteControlStore,
         writable: bool,
+        deadline: Option<Instant>,
     ) -> PortResult<Self> {
         validate_catalog_path(path)?;
         control.validate_catalog_file(path)?;
         let handles = acquire_handles(path.parent().ok_or_else(invalid)?)?;
-        let policy = admission(control, handles.root_identity())?;
+        let policy = setup_admission(control, handles.root_identity(), deadline)?;
         if writable && control.lifecycle_status()?.desired_updates != DesiredUpdates::Running {
             return Err(PortError::WriterBusy(
                 "managed updates are paused or stopped".into(),
@@ -652,6 +694,8 @@ impl ManagedStore {
             store.inner.recover_interrupted()?;
         }
         control.validate_catalog_file(path)?;
+        #[cfg(test)]
+        setup_deadline_tests::observe_validated();
         Ok(store)
     }
 
@@ -2037,10 +2081,28 @@ impl Drop for ContextSqlDeadline<'_> {
     }
 }
 
+fn setup_admission(
+    control: &SqliteControlStore,
+    root: RootIdentity,
+    deadline: Option<Instant>,
+) -> PortResult<ReadPolicy> {
+    match deadline {
+        Some(deadline) => {
+            let result = control.with_runtime_deadline(deadline, || admission(control, root));
+            #[cfg(test)]
+            setup_deadline_tests::observe_restored(deadline);
+            result
+        }
+        None => admission(control, root),
+    }
+}
+
 fn admission(control: &SqliteControlStore, root: RootIdentity) -> PortResult<ReadPolicy> {
     if !control.matches_root(root) {
         return Err(invalid());
     }
+    #[cfg(test)]
+    setup_deadline_tests::observe_policy();
     let policy = control.read_policy(RequestIntersection::Selected)?;
     if policy.maintenance.state != MaintenanceState::Idle || policy.emission_blocked() {
         return Err(PortError::WriterBusy(
@@ -2301,6 +2363,301 @@ fn observation_manifest(
         relocation_json: "null".into(),
         operation_digest: digest,
     })
+}
+
+#[cfg(test)]
+mod setup_deadline_tests {
+    use super::*;
+
+    struct Observation {
+        requested: Instant,
+        expected: Instant,
+        previous: Instant,
+        probe: Instant,
+        // API entry, policy read, restored read, catalog commit, final validation.
+        counts: [usize; 5],
+        expire_after_commit: bool,
+    }
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<Observation>> = const { RefCell::new(None) };
+    }
+
+    struct Recording;
+
+    impl Recording {
+        fn start(requested: Instant, expected: Instant, expire_after_commit: bool) -> Self {
+            let probe = requested + Duration::from_secs(10);
+            let previous = SqliteControlStore::effective_runtime_deadline(probe);
+            OBSERVATION.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Observation {
+                    requested,
+                    expected,
+                    previous,
+                    probe,
+                    counts: [0; 5],
+                    expire_after_commit,
+                });
+            });
+            Self
+        }
+
+        fn finish(self) -> [usize; 5] {
+            let observed = OBSERVATION.with(|slot| slot.borrow_mut().take().unwrap());
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(observed.probe),
+                observed.previous,
+                "catalog entry must restore the caller's scope"
+            );
+            observed.counts
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn observe_entry(received: Instant) {
+        OBSERVATION.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(received, observed.requested, "catalog receiving end");
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(observed.probe),
+                    observed.previous,
+                    "the catalog entry must not own a whole-operation scope"
+                );
+                observed.counts[0] += 1;
+            }
+        });
+    }
+
+    pub(super) fn observe_policy() {
+        OBSERVATION.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(observed.probe),
+                    observed.expected,
+                    "the real read_policy call must receive the original effective end"
+                );
+                observed.counts[1] += 1;
+            }
+        });
+    }
+
+    pub(super) fn observe_restored(received: Instant) {
+        OBSERVATION.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(received, observed.expected);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(observed.probe),
+                    observed.previous,
+                    "admission must restore the scope before any catalog effect"
+                );
+                observed.counts[2] += 1;
+            }
+        });
+    }
+
+    pub(super) fn observe_commit() {
+        let expire = OBSERVATION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let observed = slot.as_mut()?;
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(observed.probe),
+                observed.previous,
+                "catalog COMMIT must not be inside the admission scope"
+            );
+            observed.counts[3] += 1;
+            observed.expire_after_commit.then_some(observed.expected)
+        });
+        if let Some(end) = expire {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            assert!(Instant::now() >= end);
+        }
+    }
+
+    pub(super) fn observe_validated() {
+        OBSERVATION.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(observed.probe),
+                    observed.previous,
+                    "final physical validation must retain the caller's scope"
+                );
+                observed.counts[4] += 1;
+            }
+        });
+    }
+
+    fn id(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, SqliteControlStore) {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let catalog = root.join("catalog.db");
+        let control = SqliteControlStore::create(
+            &root,
+            &id("setup-deadline-installation"),
+            DesiredUpdates::Paused,
+        )
+        .unwrap();
+        (temp, root, catalog, control)
+    }
+
+    fn assert_released(root: &Path) {
+        drop(ExclusiveGuard::try_acquire(root, LockKind::CatalogHandles).unwrap());
+        drop(WriterLease::try_acquire(root).unwrap());
+    }
+
+    #[test]
+    fn setup_create_and_open_keep_original_admission_end_and_restore_scope() {
+        for nested in [false, true] {
+            let (_temp, root, catalog, control) = fixture();
+            let before = control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(5), || {
+                    control.read_policy(RequestIntersection::Selected)
+                })
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            let requested = end
+                + if nested {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                };
+            let run = || -> PortResult<()> {
+                let recording = Recording::start(requested, end, false);
+                let store = ManagedStore::create_with_deadline(
+                    &catalog,
+                    &control,
+                    id("catalog"),
+                    1,
+                    requested,
+                )?;
+                assert_eq!(recording.finish(), [1, 1, 1, 1, 1]);
+                assert_eq!(store.installation, before.installation_id);
+                assert_eq!(store.incarnation(), &id("catalog"));
+                drop(store);
+                let recording = Recording::start(requested, end, false);
+                let store = ManagedStore::open_with_deadline(&catalog, &control, requested)?;
+                assert_eq!(recording.finish(), [1, 1, 1, 0, 1]);
+                assert_eq!(store.installation, before.installation_id);
+                assert_eq!(store.incarnation(), &id("catalog"));
+                drop(store);
+                assert_released(&root);
+                Ok(())
+            };
+            if nested {
+                control.with_runtime_deadline(end, run).unwrap();
+            } else {
+                run().unwrap();
+            }
+            let after = control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(5), || control.status())
+                .unwrap();
+            assert_eq!(after.policy.installation_id, before.installation_id);
+            assert_eq!(after.policy.control_seq, before.control_seq);
+            assert_eq!(after.policy.policy_epoch, before.policy_epoch);
+            assert_eq!(after.desired_updates, DesiredUpdates::Paused);
+        }
+    }
+
+    #[test]
+    fn expired_setup_admission_preserves_files_and_releases_handles() {
+        let (_temp, root, catalog, control) = fixture();
+        let expired = Instant::now() - Duration::from_millis(1);
+        let recording = Recording::start(expired, expired, false);
+        assert!(matches!(
+            ManagedStore::create_with_deadline(&catalog, &control, id("catalog"), 1, expired),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert_eq!(recording.finish(), [1, 0, 1, 0, 0]);
+        assert!(!catalog.exists());
+        assert!(!creation_intent_path(&catalog).exists());
+        assert_released(&root);
+
+        drop(
+            ManagedStore::create_with_deadline(
+                &catalog,
+                &control,
+                id("catalog"),
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let before = std::fs::read(&catalog).unwrap();
+        let intent_before = std::fs::read(creation_intent_path(&catalog)).unwrap();
+        let recording = Recording::start(expired, expired, false);
+        assert!(matches!(
+            ManagedStore::open_with_deadline(&catalog, &control, expired),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert_eq!(recording.finish(), [1, 0, 1, 0, 0]);
+        assert_eq!(std::fs::read(&catalog).unwrap(), before);
+        assert_eq!(
+            std::fs::read(creation_intent_path(&catalog)).unwrap(),
+            intent_before
+        );
+        assert_released(&root);
+    }
+
+    #[test]
+    fn setup_admission_keeps_wrong_root_and_corrupt_catalog_refusals() {
+        let (_temp, root, catalog, control) = fixture();
+        let (_other_temp, _other_root, _other_catalog, other_control) = fixture();
+        let end = Instant::now() + Duration::from_secs(5);
+        let recording = Recording::start(end, end, false);
+        assert!(matches!(
+            ManagedStore::create_with_deadline(&catalog, &other_control, id("catalog"), 1, end),
+            Err(PortError::InvalidRequest(_))
+        ));
+        assert_eq!(recording.finish(), [1, 0, 1, 0, 0]);
+        assert!(!catalog.exists());
+        assert!(!creation_intent_path(&catalog).exists());
+        assert_released(&root);
+
+        control.create_private_catalog_file(&catalog).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        let recording = Recording::start(end, end, false);
+        assert!(matches!(
+            ManagedStore::open_with_deadline(&catalog, &control, end),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert_eq!(recording.finish(), [1, 1, 1, 0, 0]);
+        assert_eq!(std::fs::metadata(&catalog).unwrap().len(), 0);
+        assert_released(&root);
+    }
+
+    #[test]
+    fn catalog_commit_is_not_reversed_when_admission_end_expires() {
+        let (_temp, root, catalog, control) = fixture();
+        let end = Instant::now() + Duration::from_secs(5);
+        let recording = Recording::start(end, end, true);
+        let store = ManagedStore::create_with_deadline(&catalog, &control, id("catalog"), 1, end)
+            .expect("a completed catalog commit must survive expiry of its earlier read end");
+        assert!(Instant::now() >= end);
+        assert_eq!(recording.finish(), [1, 1, 1, 1, 1]);
+        assert_eq!(store.installation, id("setup-deadline-installation"));
+        assert_eq!(store.incarnation(), &id("catalog"));
+        let generation = store.inspected_generation().unwrap();
+        drop(store);
+        let reopened = ManagedStore::open_with_deadline(
+            &catalog,
+            &control,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(reopened.incarnation(), &id("catalog"));
+        assert_eq!(reopened.inspected_generation().unwrap(), generation);
+        drop(reopened);
+        assert_released(&root);
+    }
 }
 
 #[cfg(test)]
