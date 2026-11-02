@@ -804,8 +804,126 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
     }
 }
 
+#[derive(Debug)]
+struct DeadlineObservation {
+    end: Instant,
+    checks: usize,
+    rejections: usize,
+    last_check: Option<(Instant, bool)>,
+}
+
+thread_local! {
+    static DEADLINE_OBSERVATION: RefCell<Option<DeadlineObservation>> = const { RefCell::new(None) };
+}
+
+struct ObserveDeadline;
+
+impl ObserveDeadline {
+    fn start(end: Instant) -> Self {
+        DEADLINE_OBSERVATION.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(DeadlineObservation {
+                end,
+                checks: 0,
+                rejections: 0,
+                last_check: None,
+            });
+        });
+        Self
+    }
+
+    fn finish(self) -> DeadlineObservation {
+        DEADLINE_OBSERVATION.with(|slot| slot.borrow_mut().take().unwrap())
+    }
+}
+
+impl Drop for ObserveDeadline {
+    fn drop(&mut self) {
+        DEADLINE_OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+pub(super) fn observe_deadline_check(end: Instant, checked_at: Instant, rejected: bool) {
+    DEADLINE_OBSERVATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(observed) = slot.as_mut() else {
+            return;
+        };
+        assert_eq!(end, observed.end, "deadline check must retain original end");
+        assert_eq!(rejected, checked_at >= observed.end);
+        observed.checks += 1;
+        observed.rejections += usize::from(rejected);
+        observed.last_check = Some((checked_at, rejected));
+    });
+}
+
 #[test]
-fn prepared_installation_completes_within_the_original_deadline() {
+fn deadline_predicate_refuses_equality_and_later_checks() {
+    let end = Instant::now();
+    let tick = Duration::from_nanos(1);
+    assert!(!deadline_reached(end - tick, end));
+    assert!(deadline_reached(end, end));
+    assert!(deadline_reached(end + tick, end));
+}
+
+#[test]
+fn prepared_installation_refuses_an_expired_original_two_second_end_at_entry() {
+    let f = Fixture::new(DesiredUpdates::Paused);
+    let _installation = f.installation(true);
+    let control = f.control();
+    let before = control_status(&control);
+    let store = f.store();
+    let receipt_before = store.latest_receipt().unwrap();
+    assert!(receipt_before.is_none());
+    let target = f.target();
+    assert!(!target.exists());
+    let entries = || {
+        fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let entries_before = entries();
+    // This proves real entry refusal, not two-second throughput or a natural
+    // post-commit timeout. All package and snapshot preparation precedes the end.
+    let end = Instant::now() + Duration::from_secs(2);
+    std::thread::sleep(end.saturating_duration_since(Instant::now()));
+    let observation = ObserveDeadline::start(end);
+    let result = execute(
+        f.catalog.to_str().unwrap(),
+        Options {
+            action: Action::Enable,
+            prefix: None,
+        },
+        end,
+        &mut |_| panic!("expired entry must precede package verification"),
+        &mut || panic!("expired entry must precede native location discovery"),
+        &mut |_, _, _| panic!("expired entry must precede every native call"),
+    );
+    let observed = observation.finish();
+    assert_eq!(observed.checks, 1, "{observed:?}");
+    assert_eq!(observed.rejections, 1, "{observed:?}");
+    let (checked_at, rejected) = observed.last_check.unwrap();
+    assert!(rejected && checked_at >= end);
+    assert_eq!(result.status, "incomplete");
+    assert_eq!(result.reason, Some(Reason::Timeout));
+    assert!(!result.installation_bound && !result.intent_recorded);
+    assert!(!result.private_receipt_recorded);
+    assert!(result.autostart_enabled.is_none() && result.desired_updates.is_none());
+    assert!(result.registration_present.is_none() && result.owned.is_none());
+    assert!(result.manager.is_none());
+    assert_eq!(control_status(&control), before);
+    assert_eq!(store.latest_receipt().unwrap(), receipt_before);
+    assert!(
+        entries() == entries_before,
+        "expired entry changed private files"
+    );
+    assert!(!target.exists() && !f.enabled.get() && f.calls.borrow().is_empty());
+    f.assert_unrelated();
+}
+
+#[test]
+fn prepared_installation_completes_with_the_default_budget() {
     let f = Fixture::new(DesiredUpdates::Paused);
     // The verifier returns an existing installation; package construction is
     // test preparation, not part of the command's original deadline.
@@ -818,7 +936,8 @@ fn prepared_installation_completes_within_the_original_deadline() {
         .unwrap()
         .0
         .clone();
-    let end = Instant::now() + Duration::from_secs(2);
+    let end = Instant::now() + BUDGET;
+    let observation = ObserveDeadline::start(end);
     let finished = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -833,11 +952,84 @@ fn prepared_installation_completes_within_the_original_deadline() {
             Ok(f.response_with_supervisor(args, &supervisor))
         },
     );
+    let observed = observation.finish();
+    assert!(observed.checks > 0, "{observed:?}");
+    assert_eq!(observed.rejections, 0, "{observed:?}");
     assert_eq!(finished.status, "complete", "reason={:?}", finished.reason);
+    assert!(finished.reason.is_none());
     assert!(finished.intent_recorded && finished.private_receipt_recorded);
+    assert!(finished.installation_bound);
+    let status = control_status(&f.control());
+    assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+    assert!(matches!(finished.desired_updates, Some(Desired::Paused)));
+    assert!(status.autostart_enabled);
+    assert_eq!(finished.autostart_enabled, Some(status.autostart_enabled));
+    let receipt = f.store().latest_receipt().unwrap().unwrap();
+    assert!(receipt.owned);
+    assert_eq!(receipt.state, ConfigurationState::Present);
+    assert_eq!(finished.owned, Some(receipt.owned));
+    assert_eq!(finished.registration_present, Some(true));
+    // Native file-image receipts bind the kind as well as the exact bytes.
+    let mut configuration = Sha256::new();
+    configuration.update(0_u32.to_le_bytes());
+    configuration.update(fs::read(f.target()).unwrap());
     assert_eq!(
-        control_status(&f.control()).desired_updates,
-        DesiredUpdates::Paused
+        receipt.configuration_sha256,
+        Some(format!("{:x}", configuration.finalize()))
+    );
+    let root_id = RootIdentity::read(&f.root).unwrap().control_id();
+    let prefix_id = RootIdentity::read(&f.prefix).unwrap().control_id();
+    let prefix: Value =
+        serde_json::from_slice(&fs::read(f.root.join("installation-prefix.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        prefix,
+        json!({
+            "schema": "asg.installation-prefix/v1",
+            "installation_id": status.policy.installation_id.as_str(),
+            "control_root_id": root_id.as_str(),
+            "prefix_root_id": prefix_id.as_str(),
+        })
+    );
+    let inventories: Vec<_> = fs::read_dir(&f.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("setup-autostart-") && name.ends_with(".json"))
+        })
+        .collect();
+    assert_eq!(inventories.len(), 1);
+    let inventory: Inventory = serde_json::from_slice(&fs::read(&inventories[0]).unwrap()).unwrap();
+    assert_eq!(inventory.schema, INVENTORY_SCHEMA);
+    assert_eq!(inventory.receipt, receipt);
+    assert!(inventory.location == f.location);
+    assert!(
+        inventory.journal_root
+            == journal_root(&f.location, &f.root, status.policy.installation_id.as_str())
+    );
+    let binding = inventory.binding.unwrap();
+    assert_eq!(binding.schema, "asg.setup-inventory-binding/v1");
+    assert_eq!(
+        binding.installation_id,
+        status.policy.installation_id.as_str()
+    );
+    assert_eq!(binding.control_root_id, root_id.as_str());
+    assert_eq!(
+        binding.created_policy_epoch,
+        status.policy.policy_epoch.get()
+    );
+    let manager = finished.manager.as_ref().unwrap();
+    assert!(manager.registration_present && manager.configured_command_verified);
+    assert_eq!(manager.enabled, Some(f.enabled.get()));
+    assert!(!manager.launch_requested);
+    assert!(
+        !f.calls.borrow().is_empty()
+            && f.calls
+                .borrow()
+                .iter()
+                .all(|args| !args.iter().any(|arg| arg == "start" || arg == "--now"))
     );
     f.assert_unrelated();
 }

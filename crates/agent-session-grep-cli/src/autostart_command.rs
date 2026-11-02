@@ -757,8 +757,16 @@ fn execute(
     summary
 }
 
+fn deadline_reached(now: Instant, end: Instant) -> bool {
+    now >= end
+}
+
 fn time(end: Instant) -> Result<(), Reason> {
-    if Instant::now() >= end {
+    let now = Instant::now();
+    let rejected = deadline_reached(now, end);
+    #[cfg(test)]
+    tests::observe_deadline_check(end, now, rejected);
+    if rejected {
         Err(Reason::Timeout)
     } else {
         Ok(())
