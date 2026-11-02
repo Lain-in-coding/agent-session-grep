@@ -1022,6 +1022,7 @@ fn windows_case_variants_and_verbatim_paths_cannot_bypass_denial() {
 #[test]
 fn concurrent_pause_and_revoke_cas_has_one_winner_and_retry_preserves_both() {
     use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
     let (_temp, root, store) = setup();
     let selected = store
         .add_selection(zero(), request(SearchProvider::Claude, "R", RootKind::Root))
@@ -1030,42 +1031,94 @@ fn concurrent_pause_and_revoke_cas_has_one_winner_and_retry_preserves_both() {
     let path = root.clone();
     let sync = barrier.clone();
     let expected = selected.control_seq;
+    let race_end = Instant::now() + Duration::from_secs(8);
     let first = std::thread::spawn(move || {
         let store = SqliteControlStore::open_existing_writable(&path, &id("installation")).unwrap();
         sync.wait();
-        store
-            .set_desired_updates(expected, DesiredUpdates::Paused)
-            .map(|_| ())
+        store.with_runtime_deadline(race_end, || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(race_end + Duration::from_secs(1)),
+                race_end
+            );
+            store
+                .set_desired_updates(expected, DesiredUpdates::Paused)
+                .map(|_| ())
+        })
     });
     let path = root.clone();
     let selection = selected.value.id.clone();
     let second = std::thread::spawn(move || {
         let store = SqliteControlStore::open_existing_writable(&path, &id("installation")).unwrap();
         barrier.wait();
-        store
-            .revoke_selection(expected, &selection, None, 50)
-            .map(|_| ())
+        store.with_runtime_deadline(race_end, || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(race_end + Duration::from_secs(1)),
+                race_end
+            );
+            store
+                .revoke_selection(expected, &selection, None, 50)
+                .map(|_| ())
+        })
     });
     let outcomes = [first.join().unwrap(), second.join().unwrap()];
-    assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
     assert_eq!(
-        outcomes
-            .iter()
-            .filter(|o| matches!(o, Err(PortError::GenerationMismatch(_))))
-            .count(),
-        1
+        outcomes.iter().filter(|o| o.is_ok()).count(),
+        1,
+        "one initial policy change must win: {outcomes:?}"
     );
-    let current = store.status().unwrap();
-    let paused = store
-        .set_desired_updates(current.policy.control_seq, DesiredUpdates::Paused)
-        .unwrap();
+    assert!(
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            Ok(()) | Err(PortError::GenerationMismatch(_) | PortError::WriterBusy(_))
+        )),
+        "unexpected policy refusal: {outcomes:?}"
+    );
+    let verify_end = Instant::now() + Duration::from_secs(8);
     store
-        .revoke_selection(paused.control_seq, &selected.value.id, None, 51)
+        .with_runtime_deadline(verify_end, || {
+            let after_race = store.status()?;
+            let jobs = store.purge_jobs()?;
+            assert_eq!(after_race.policy.control_seq.get(), expected.get() + 1);
+            let pause_won = outcomes[0].is_ok();
+            assert_eq!(
+                after_race.desired_updates == DesiredUpdates::Paused,
+                pause_won
+            );
+            assert_eq!(
+                allowed(&after_race.policy, SearchProvider::Claude, "R/F"),
+                pause_won
+            );
+            assert_eq!(jobs.len(), usize::from(!pause_won));
+
+            // Lock admission can precede stale-generation detection. After join,
+            // the same losing operation must reject the SAME original sequence.
+            let stale = if pause_won {
+                store
+                    .revoke_selection(expected, &selected.value.id, None, 50)
+                    .map(|_| ())
+            } else {
+                store
+                    .set_desired_updates(expected, DesiredUpdates::Paused)
+                    .map(|_| ())
+            };
+            assert!(
+                matches!(stale, Err(PortError::GenerationMismatch(_))),
+                "stale loser: {stale:?}"
+            );
+            assert_eq!(store.status()?, after_race);
+            assert_eq!(store.purge_jobs()?, jobs);
+
+            let paused =
+                store.set_desired_updates(after_race.policy.control_seq, DesiredUpdates::Paused)?;
+            store.revoke_selection(paused.control_seq, &selected.value.id, None, 51)?;
+            let final_state = store.status()?;
+            assert_eq!(final_state.policy.control_seq.get(), expected.get() + 2);
+            assert_eq!(final_state.desired_updates, DesiredUpdates::Paused);
+            assert!(!allowed(&final_state.policy, SearchProvider::Claude, "R/F"));
+            assert_eq!(store.purge_jobs()?.len(), 1);
+            Ok(())
+        })
         .unwrap();
-    let final_state = store.status().unwrap();
-    assert_eq!(final_state.desired_updates, DesiredUpdates::Paused);
-    assert!(!allowed(&final_state.policy, SearchProvider::Claude, "R/F"));
-    assert_eq!(store.purge_jobs().unwrap().len(), 1);
 }
 
 #[test]
