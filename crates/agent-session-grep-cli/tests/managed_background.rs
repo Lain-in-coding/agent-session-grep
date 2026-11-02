@@ -7,9 +7,10 @@ use agent_session_grep_adapters_sqlite::{
 use agent_session_grep_ports::{
     PortError,
     control::{
-        BackgroundControl, BarrierState, CanonicalLocator, ControlId, ControlStore, CycleState,
-        DesiredUpdates, LatestBarrier, MaintenanceFence, MaintenancePhase, MaintenanceState,
-        PurgeState, RequestIntersection, UpdateState,
+        BackgroundControl, BarrierState, CanonicalLocator, ConfirmationKind, ControlId,
+        ControlStore, CycleState, DesiredUpdates, LatestBarrier, MaintenanceFence,
+        MaintenancePhase, MaintenanceState, PendingConfirmation, PurgeState, RequestIntersection,
+        UpdateState,
     },
     managed::{ProjectionQuery, ProjectionRead},
 };
@@ -101,6 +102,234 @@ impl BoundedRead for SqliteControlStore {
         }
     }
 }
+
+fn wait_for_shrink_confirmation(
+    deadline: Instant,
+    digest: &str,
+    unavailable: &std::cell::Cell<u32>,
+    mut confirmation: impl FnMut(Instant) -> PortResult<Option<PendingConfirmation>>,
+    mut held: impl FnMut(Instant) -> PortResult<bool>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> PortResult<PendingConfirmation> {
+    let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+    unavailable.set(0);
+    loop {
+        let started = now();
+        if started >= deadline {
+            return Err(PortError::WriterBusy(
+                "synthetic shrink confirmation wait expired".into(),
+            ));
+        }
+        let read_end = deadline.min(started + Duration::from_secs(3));
+        let observed = loop {
+            match confirmation(read_end) {
+                Err(
+                    error @ (PortError::WriterBusy(_)
+                    | PortError::GenerationMismatch(_)
+                    | PortError::SnapshotChanged(_)),
+                ) if now() < read_end => {
+                    sleep(Duration::from_millis(10).min(read_end.saturating_duration_since(now())));
+                    if now() >= read_end {
+                        break Err(error);
+                    }
+                }
+                result => break result,
+            }
+        };
+        match observed {
+            Ok(Some(candidate))
+                if matches!(&candidate.kind, ConfirmationKind::Rewrite { candidate_digest }
+                    if candidate_digest.as_str() == digest) =>
+            {
+                // The candidate belongs only to this observation. A refused
+                // held read must not leave it available for a later poll.
+                if now() >= deadline {
+                    return Err(PortError::WriterBusy(
+                        "synthetic shrink confirmation wait expired".into(),
+                    ));
+                }
+                match held(deadline) {
+                    Ok(true) if now() < deadline => return Ok(candidate),
+                    Ok(true) => {
+                        return Err(PortError::WriterBusy(
+                            "synthetic shrink confirmation wait expired".into(),
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(PortError::WriterBusy(_)) => {
+                        unavailable.set(unavailable.get().saturating_add(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(_) => {}
+            Err(PortError::WriterBusy(_)) => {
+                unavailable.set(unavailable.get().saturating_add(1));
+            }
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if !remaining.is_zero() {
+            sleep(Duration::from_millis(50).min(remaining));
+        }
+    }
+}
+
+fn shrink_confirmation(cycle: i64) -> PendingConfirmation {
+    use agent_session_grep_ports::control::{ControlSeq, CycleSeq, PolicyEpoch};
+    PendingConfirmation {
+        kind: ConfirmationKind::Rewrite {
+            candidate_digest: ControlId::parse("expected-digest").unwrap(),
+        },
+        first_cycle: CycleSeq::new(cycle).unwrap(),
+        confirm_cycle: None,
+        worker_boot_id: ControlId::parse("synthetic-worker").unwrap(),
+        root_identity: ControlId::parse("synthetic-root").unwrap(),
+        policy_epoch: PolicyEpoch::new(1).unwrap(),
+        first_monotonic_ms: ControlSeq::new(1).unwrap(),
+    }
+}
+
+#[test]
+fn confirmation_wait_keeps_busy_unknown_and_requires_a_current_match() {
+    use std::cell::Cell;
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(20);
+    let clock = Cell::new(start);
+    let unavailable = Cell::new(0);
+    let calls = Cell::new(0);
+    let result = wait_for_shrink_confirmation(
+        deadline,
+        "expected-digest",
+        &unavailable,
+        |end| {
+            assert!(end <= deadline);
+            calls.set(calls.get() + 1);
+            clock.set(end);
+            Err(PortError::WriterBusy("synthetic refusal".into()))
+        },
+        |_| panic!("an unavailable confirmation cannot reach held evidence"),
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    );
+    assert!(matches!(result, Err(PortError::WriterBusy(_))));
+    assert_eq!(calls.get(), unavailable.get());
+    assert!(calls.get() > 1);
+    assert_eq!(clock.get(), deadline);
+
+    clock.set(start);
+    calls.set(0);
+    let held_calls = Cell::new(0);
+    let result = wait_for_shrink_confirmation(
+        deadline,
+        "expected-digest",
+        &unavailable,
+        |end| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => {
+                    clock.set(end);
+                    Err(PortError::WriterBusy("synthetic refusal".into()))
+                }
+                2 => Ok(Some(shrink_confirmation(1))),
+                3 => Ok(None),
+                4 => Ok(Some(shrink_confirmation(2))),
+                _ => panic!("unexpected confirmation observation"),
+            }
+        },
+        |end| {
+            assert_eq!(end, deadline);
+            held_calls.set(held_calls.get() + 1);
+            if held_calls.get() == 1 {
+                Err(PortError::WriterBusy("synthetic held refusal".into()))
+            } else {
+                Ok(true)
+            }
+        },
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    )
+    .unwrap();
+    assert_eq!(result, shrink_confirmation(2));
+    assert_eq!(
+        (calls.get(), held_calls.get(), unavailable.get()),
+        (4, 2, 2)
+    );
+}
+
+#[test]
+fn confirmation_wait_preserves_outer_end_and_starts_no_expired_reads() {
+    use std::cell::Cell;
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let control = SqliteControlStore::create(
+        &temp.path().join("control"),
+        &ControlId::parse("confirmation-caller").unwrap(),
+        DesiredUpdates::Paused,
+    )
+    .unwrap();
+    let outer = Instant::now() + Duration::from_secs(5);
+    let requested = outer + Duration::from_secs(20);
+    let unavailable = Cell::new(0);
+    control
+        .with_runtime_deadline(outer, || {
+            let result = wait_for_shrink_confirmation(
+                requested,
+                "expected-digest",
+                &unavailable,
+                |end| {
+                    assert!(end <= outer);
+                    control.with_runtime_deadline(end, || {
+                        assert_eq!(
+                            SqliteControlStore::effective_runtime_deadline(requested),
+                            end
+                        );
+                        assert_eq!(control.status()?.desired_updates, DesiredUpdates::Paused);
+                        Ok(Some(shrink_confirmation(1)))
+                    })
+                },
+                |end| {
+                    assert_eq!(end, outer);
+                    Ok(true)
+                },
+                Instant::now,
+                |_| panic!("a definite matching pair does not wait"),
+            )?;
+            assert_eq!(result, shrink_confirmation(1));
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                outer
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(requested),
+        requested
+    );
+    let expired = Instant::now() - Duration::from_millis(1);
+    let result = wait_for_shrink_confirmation(
+        expired,
+        "expected-digest",
+        &unavailable,
+        |_| panic!("expired wait must not read confirmation"),
+        |_| panic!("expired wait must not read held evidence"),
+        Instant::now,
+        |_| panic!("expired wait must not sleep"),
+    );
+    assert!(matches!(result, Err(PortError::WriterBusy(_))));
+    let result = wait_for_shrink_confirmation(
+        requested,
+        "expected-digest",
+        &unavailable,
+        |_| Err(PortError::SourceIo("synthetic hard failure".into())),
+        |_| panic!("hard errors must not read held evidence"),
+        Instant::now,
+        |_| panic!("hard errors must not retry"),
+    );
+    assert!(matches!(result, Err(PortError::SourceIo(_))));
+}
+
 impl Fixture {
     fn new(provider: &str) -> Self {
         Self::selected(provider, |root| {
@@ -709,8 +938,20 @@ impl Fixture {
     /// One bounded held-receipt observation with `text_state`'s contract.
     #[track_caller]
     fn held_receipt_state(&self) -> Result<bool, (&'static str, PortError)> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        self.held_receipt_state_before(Instant::now() + Duration::from_secs(2))
+    }
+    fn held_receipt_state_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<bool, (&'static str, PortError)> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
         loop {
+            if Instant::now() >= deadline {
+                return Err((
+                    "held receipt read",
+                    PortError::WriterBusy("synthetic held receipt end reached".into()),
+                ));
+            }
             let result = self.control_before(deadline).and_then(|control| {
                 control.with_runtime_deadline(deadline, || {
                     let store = ManagedStore::open(&self.db, &control)?;
@@ -1312,16 +1553,28 @@ fn valid_shrink_waits_for_two_verified_cycles_and_five_seconds_for_both_provider
         fs::write(&path, &retained).unwrap();
         let fingerprint = blake3::hash(&retained).to_hex().to_string();
         let digest = format!("digest_{:x}", Sha256::digest(fingerprint.as_bytes()));
-        let mut first = None;
-        f.wait(|f| {
-            let confirmation = c.bounded(|c| c.source_progress(&source_id)).and_then(|p| p.confirmation);
-            if let Some(candidate) = confirmation.filter(|candidate| matches!(&candidate.kind,
-                ConfirmationKind::Rewrite { candidate_digest } if candidate_digest.as_str() == digest)) {
-                first = Some(candidate);
-                f.sees_held_receipt()
-            } else { false }
+        let first = wait_for_shrink_confirmation(
+            Instant::now() + Duration::from_secs(20),
+            &digest,
+            &f.unavailable,
+            |read_end| {
+                c.with_runtime_deadline(read_end, || c.source_progress(&source_id))
+                    .map(|progress| progress.and_then(|progress| progress.confirmation))
+            },
+            |wait_end| {
+                let read_end = wait_end.min(Instant::now() + Duration::from_secs(2));
+                f.held_receipt_state_before(read_end)
+                    .map_err(|(_, error)| error)
+            },
+            Instant::now,
+            std::thread::sleep,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "synthetic shrink confirmation failed: {error:?}; unknown observations={}",
+                f.unavailable.get()
+            )
         });
-        let first = first.expect("matching durable confirmation was observed");
         assert!(matches!(first.kind, ConfirmationKind::Rewrite { .. }));
         assert!(f.has_text("shrinkremovedneedle"));
         std::thread::sleep(Duration::from_secs(2));
