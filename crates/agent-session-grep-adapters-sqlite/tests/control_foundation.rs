@@ -1084,25 +1084,16 @@ fn sqlite_writer_contention_is_bounded_and_never_partially_changes_policy() {
 
 #[test]
 fn repeated_revive_revoke_uses_latest_epoch_not_random_job_order() {
+    use std::time::{Duration, Instant};
     let (_temp, root, store) = setup();
-    let s = store
-        .add_selection(
-            zero(),
-            request(SearchProvider::Claude, "R/F", RootKind::Exact),
-        )
-        .unwrap();
-    let first = store
-        .revoke_selection(s.control_seq, &s.value.id, None, 20)
-        .unwrap();
-    let revived = store
-        .add_selection(
-            first.control_seq,
-            request(SearchProvider::Claude, "R/F", RootKind::Exact),
-        )
-        .unwrap();
-    let second = store
-        .revoke_selection(revived.control_seq, &s.value.id, None, 30)
-        .unwrap();
+    let seed_end = Instant::now() + Duration::from_secs(8);
+    let (selected, first, second, received) = seed_revive_revoke(
+        &store,
+        seed_end,
+        request(SearchProvider::Claude, "R/F", RootKind::Exact),
+    )
+    .unwrap();
+    assert_eq!(received, [seed_end; 4]);
     assert!(second.policy_epoch > first.policy_epoch);
     let conn = raw(&root);
     conn.execute(
@@ -1115,15 +1106,121 @@ fn repeated_revive_revoke_uses_latest_epoch_not_random_job_order() {
         [second.policy_epoch.get()],
     )
     .unwrap();
-    let again = store
-        .revoke_selection(second.control_seq, &s.value.id, None, 40)
+    let validation_end = Instant::now() + Duration::from_secs(8);
+    store
+        .with_runtime_deadline(validation_end, || {
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(
+                    validation_end + Duration::from_secs(1)
+                ),
+                validation_end
+            );
+            let again = store.revoke_selection(second.control_seq, &selected.id, None, 40)?;
+            assert!(!again.changed);
+            assert_eq!(again.control_seq, second.control_seq);
+            assert_eq!(again.value.intent, second.value.intent);
+            assert_eq!(again.value.purge_job.id, id("aaa_newer"));
+            assert_eq!(again.value.purge_job.policy_epoch, second.policy_epoch);
+            assert_eq!(store.purge_jobs()?.len(), 2);
+            assert_eq!(store.status()?.policy.exclusions.len(), 1);
+            Ok(())
+        })
         .unwrap();
-    assert!(!again.changed);
-    assert_eq!(again.value.intent, second.value.intent);
-    assert_eq!(again.value.purge_job.id, id("aaa_newer"));
-    assert_eq!(again.value.purge_job.policy_epoch, second.policy_epoch);
-    assert_eq!(store.purge_jobs().unwrap().len(), 2);
-    assert_eq!(store.status().unwrap().policy.exclusions.len(), 1);
+}
+
+type ReviveRevokeSeed = (
+    Selection,
+    ControlChange<Revocation>,
+    ControlChange<Revocation>,
+    [std::time::Instant; 4],
+);
+
+fn seed_revive_revoke(
+    store: &SqliteControlStore,
+    requested_end: std::time::Instant,
+    selection: SelectionRequest,
+) -> Result<ReviveRevokeSeed, PortError> {
+    use std::time::Duration;
+    let end = SqliteControlStore::effective_runtime_deadline(requested_end);
+    let probe = requested_end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = store.with_runtime_deadline(end, || {
+        let receive = |step| {
+            let received = SqliteControlStore::effective_runtime_deadline(probe);
+            assert_eq!(received, end, "revive/revoke fixture receiving end: {step}");
+            received
+        };
+        let first_add_end = receive("add");
+        let selected = store.add_selection(zero(), selection.clone())?;
+        let first_revoke_end = receive("first_revoke");
+        let first = store.revoke_selection(selected.control_seq, &selected.value.id, None, 20)?;
+        let revive_end = receive("revive");
+        let revived = store.add_selection(first.control_seq, selection)?;
+        let second_revoke_end = receive("second_revoke");
+        let second = store.revoke_selection(revived.control_seq, &selected.value.id, None, 30)?;
+        assert!(selected.changed && first.changed && revived.changed && second.changed);
+        assert_eq!(second.control_seq.get(), 4);
+        Ok((
+            selected.value,
+            first,
+            second,
+            [
+                first_add_end,
+                first_revoke_end,
+                revive_end,
+                second_revoke_end,
+            ],
+        ))
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    result
+}
+
+#[test]
+fn revive_revoke_seed_preserves_earlier_end_and_restores_after_refusal() {
+    use std::time::{Duration, Instant};
+    let (_temp, root, store) = setup();
+    let request = request(SearchProvider::Claude, "R/F", RootKind::Exact);
+    let before = control_rows(&root);
+    let expired = Instant::now();
+    assert!(matches!(
+        seed_revive_revoke(&store, expired, request.clone()),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(control_rows(&root) == before);
+
+    let outer = Instant::now() + Duration::from_secs(8);
+    let requested = outer + Duration::from_secs(8);
+    store
+        .with_runtime_deadline(outer, || {
+            let mut invalid = request.clone();
+            invalid.now_ms = -1;
+            assert!(matches!(
+                seed_revive_revoke(&store, requested, invalid),
+                Err(PortError::InvalidRequest(_))
+            ));
+            assert!(control_rows(&root) == before);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                outer
+            );
+            let (_, first, second, received) = seed_revive_revoke(&store, requested, request)?;
+            assert_eq!(received, [outer; 4]);
+            assert!(second.policy_epoch > first.policy_epoch);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                outer
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(requested),
+        requested
+    );
 }
 
 // Tests hold a real OS exclusive lifecycle lock. Production composition must
@@ -1989,24 +2086,205 @@ fn background_corrupt_rows_fail_closed_without_defaulting_to_current() {
         "UPDATE source_updates SET confirmation_boot_id='orphan'",
     ] {
         let (_temp, root, store, worker, s) = worker_setup();
-        set_catalog(&store, &worker, "catalog_a");
-        let b = latest(&store, &s, 140);
-        let c = store
-            .start_cycle(current(&store), &worker, b.required_cycle_seq, 141)
-            .unwrap()
-            .value;
-        store
-            .acknowledge_source(current(&store), &worker, source_ack(&c, &s, true))
-            .unwrap();
+        seed_corrupt_background(
+            &store,
+            &worker,
+            &s,
+            std::time::Instant::now() + std::time::Duration::from_secs(8),
+        )
+        .unwrap();
         raw(&root).execute_batch(sql).unwrap();
-        let error = store.background_status().unwrap_err();
-        assert!(matches!(error, PortError::SchemaIncompatible(_)), "{sql}");
-        assert!(!format!("{error:?}").contains("private-error-secret"));
+        let before = control_rows(&root);
+        store
+            .with_runtime_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(8),
+                || {
+                    let error = store.background_status().unwrap_err();
+                    assert!(matches!(error, PortError::SchemaIncompatible(_)), "{sql}");
+                    assert!(!format!("{error:?}").contains("private-error-secret"));
+                    assert!(
+                        matches!(
+                            SqliteControlStore::open_read_only(&root, &id("installation")),
+                            Err(PortError::SchemaIncompatible(_))
+                        ),
+                        "{sql}"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert!(
-            SqliteControlStore::open_read_only(&root, &id("installation")).is_err(),
-            "{sql}"
+            control_rows(&root) == before,
+            "corruption reads changed durable rows"
         );
     }
+}
+
+type CorruptSeed = (ObservationCycle, Vec<(&'static str, std::time::Instant)>);
+
+fn seed_corrupt_background(
+    store: &SqliteControlStore,
+    worker: &TestWorker,
+    selected: &SelectionRevision,
+    requested_end: std::time::Instant,
+) -> Result<CorruptSeed, PortError> {
+    use std::time::Duration;
+    let end = SqliteControlStore::effective_runtime_deadline(requested_end);
+    let probe = requested_end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = store.with_runtime_deadline(end, || {
+        let mut receivers = Vec::new();
+        let mut receive = |step| {
+            let received = SqliteControlStore::effective_runtime_deadline(probe);
+            assert_eq!(received, end, "corrupt fixture receiving end: {step}");
+            receivers.push((step, received));
+        };
+        let owner = id("recovery_owner");
+        receive("fence");
+        let initial_seq = store.status()?.policy.control_seq;
+        store.set_maintenance(
+            initial_seq,
+            &owner,
+            MaintenanceFence {
+                state: MaintenanceState::Recovering,
+                owner: Some(owner.clone()),
+                phase: Some(MaintenancePhase::Reconciling),
+            },
+        )?;
+        receive("reset");
+        store.reset_progress(
+            store.status()?.policy.control_seq,
+            worker,
+            &id("catalog_a"),
+            101,
+        )?;
+        receive("clear_fence");
+        store.set_maintenance(
+            store.status()?.policy.control_seq,
+            &owner,
+            MaintenanceFence::idle(),
+        )?;
+        receive("latest");
+        let admitted = store
+            .admit_latest(
+                store.status()?.policy.control_seq,
+                LatestRequest {
+                    selections: vec![selected.clone()],
+                    max_wait_ms: 1000,
+                    now_ms: 140,
+                },
+            )?
+            .value;
+        let LatestAdmission::Queued(barrier) = admitted else {
+            panic!("corrupt fixture latest admission was refused");
+        };
+        receive("start");
+        let cycle = store
+            .start_cycle(
+                store.status()?.policy.control_seq,
+                worker,
+                barrier.required_cycle_seq,
+                141,
+            )?
+            .value;
+        receive("acknowledge");
+        store.acknowledge_source(
+            store.status()?.policy.control_seq,
+            worker,
+            source_ack(&cycle, selected, true),
+        )?;
+        assert_eq!(
+            store.status()?.policy.control_seq.get(),
+            initial_seq.get() + 6
+        );
+        Ok((cycle, receivers))
+    });
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    result
+}
+
+#[test]
+fn corrupt_background_seed_keeps_original_end_and_restores_success_and_error() {
+    use std::time::{Duration, Instant};
+    let (_temp, root, store, worker, selected) = worker_setup();
+    let outer = Instant::now() + Duration::from_secs(8);
+    let requested = outer + Duration::from_secs(8);
+    store
+        .with_runtime_deadline(outer, || {
+            let (cycle, receivers) =
+                seed_corrupt_background(&store, &worker, &selected, requested)?;
+            assert_eq!(
+                receivers,
+                [
+                    "fence",
+                    "reset",
+                    "clear_fence",
+                    "latest",
+                    "start",
+                    "acknowledge"
+                ]
+                .into_iter()
+                .map(|step| (step, outer))
+                .collect::<Vec<_>>()
+            );
+            assert_eq!(cycle.state, CycleState::Observing);
+            assert_eq!(store.cycle(cycle.token.cycle_seq)?, cycle);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                outer
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(requested),
+        requested
+    );
+    let before = control_rows(&root);
+    let expired = Instant::now();
+    assert!(matches!(
+        seed_corrupt_background(&store, &worker, &selected, expired),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(control_rows(&root) == before);
+
+    let (_other_temp, other_root, other_store, _other_worker, other_selection) = worker_setup();
+    let error_end = Instant::now() + Duration::from_secs(8);
+    other_store
+        .with_runtime_deadline(error_end, || {
+            let result = seed_corrupt_background(
+                &other_store,
+                &worker,
+                &other_selection,
+                error_end + Duration::from_secs(8),
+            );
+            assert!(
+                matches!(result, Err(PortError::GenerationMismatch(_))),
+                "{result:?}"
+            );
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(error_end + Duration::from_secs(1)),
+                error_end
+            );
+            // The owned fence committed once; foreign authority cannot reset it.
+            assert_eq!(
+                other_store.status()?.policy.maintenance.state,
+                MaintenanceState::Recovering
+            );
+            assert_eq!(
+                raw(&other_root)
+                    .query_row("SELECT count(*) FROM cycles", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+    let probe = error_end + Duration::from_secs(1);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
 }
 
 #[test]
