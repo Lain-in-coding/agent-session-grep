@@ -646,7 +646,6 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
     let root = temp.path().join("private");
     let prefix = temp.path().join("installation");
     std::fs::create_dir(&prefix).unwrap();
-    let end = Instant::now() + Duration::from_secs(10);
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(
             &root,
@@ -675,6 +674,8 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
             LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
         )
     });
+    // Catalog preparation and worker reconciliation precede this bounded phase.
+    let end = Instant::now() + Duration::from_secs(10);
     {
         let guard = control_lock(&root, end).unwrap();
         let bound = control.bind_control_root(&guard).unwrap();
@@ -778,7 +779,6 @@ fn with_idle_admission(
     let root = temp.path().join("private");
     let prefix = temp.path().join("installation");
     std::fs::create_dir(&prefix).unwrap();
-    let end = Instant::now() + Duration::from_secs(10);
     let control = crate::retry_fixture_busy(|| {
         SqliteControlStore::create(
             &root,
@@ -807,6 +807,8 @@ fn with_idle_admission(
             LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
         )
     });
+    // Fixture registration has its own end; the test closure supplies its request end.
+    let end = Instant::now() + Duration::from_secs(10);
     {
         let guard = control_lock(&root, end).unwrap();
         let bound = control.bind_control_root(&guard).unwrap();

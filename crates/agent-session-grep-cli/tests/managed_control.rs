@@ -2,6 +2,7 @@
 use agent_session_grep_adapters_sqlite::{
     SqliteControlStore,
     managed_locks::{ExclusiveGuard, LockKind},
+    managed_store::ManagedStore,
 };
 use agent_session_grep_ports::{PortError, SearchProvider, control::*};
 use serde_json::{Value, json};
@@ -173,6 +174,64 @@ fn setup_paused(db: &Path) {
     data(&run(db, &["background", "pause"]), 0);
 }
 
+fn verify_empty_setup_snapshot(
+    db: &Path,
+    response: &Value,
+) -> (ControlStatus, Vec<PurgeJob>, ControlId) {
+    // A durable cold setup can exhaust its own observation end. This is a new
+    // read-only verification, never a retry or extension of that setup.
+    let end = Instant::now() + Duration::from_secs(5);
+    let control =
+        SqliteControlStore::open_current_read_only_with_deadline(db.parent().unwrap(), end)
+            .unwrap();
+    let snapshot = control
+        .with_runtime_deadline(end, || Ok((control.status()?, control.purge_jobs()?)))
+        .unwrap();
+    assert_eq!(snapshot.0.desired_updates, DesiredUpdates::Running);
+    assert_eq!(snapshot.0.policy.control_seq.get(), 0);
+    assert_eq!(snapshot.0.policy.policy_epoch.get(), 0);
+    assert_eq!(
+        snapshot.0.policy.request_intersection,
+        RequestIntersection::Selected
+    );
+    assert!(snapshot.0.policy.selections.is_empty());
+    assert!(snapshot.0.policy.exclusions.is_empty());
+    assert!(snapshot.0.policy.revocations.is_empty());
+    assert!(snapshot.1.is_empty());
+    assert!(!snapshot.0.autostart_enabled);
+    assert!(!snapshot.0.supervisor_failed);
+    assert_eq!(snapshot.0.restart_request_seq.get(), 0);
+    assert_eq!(snapshot.0.policy.maintenance.state, MaintenanceState::Idle);
+    // Control's incarnation is a worker-reconciled summary. Cold setup has
+    // no worker; verify the actual catalog identity through its read facade.
+    assert!(snapshot.0.catalog_incarnation.is_none());
+    let store = ManagedStore::open_with_deadline(db, &control, end).unwrap();
+    // Opening the facade verifies the catalog's installation against control.
+    let catalog_incarnation = store.incarnation().clone();
+    drop(store);
+    match response.get("control_seq") {
+        Some(sequence) => assert_eq!(
+            sequence.as_i64(),
+            Some(snapshot.0.policy.control_seq.get()),
+            "a present sequence must be a matching integer"
+        ),
+        None => assert_eq!(
+            response["effective_state"], "unknown",
+            "missing status is allowed only for the explicit unknown observation"
+        ),
+    }
+    assert_eq!(response["background_start"]["ready"], false);
+    assert_ne!(response["background_start"]["verified_running"], true);
+    assert!(
+        matches!(
+            response["background_start"]["reason"].as_str(),
+            Some("no_enabled_selections" | "control_unavailable")
+        ),
+        "an empty Running setup cannot claim another background state"
+    );
+    (snapshot.0, snapshot.1, catalog_incarnation)
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(8);
     while !predicate() {
@@ -192,8 +251,9 @@ fn setup_selection_pause_revoke_and_reopen_preserve_policy_and_sources() {
     let setup = data(&run(&db, &["setup"]), 10);
     assert_eq!(setup["stages"]["catalog"], "ready");
     assert_eq!(setup["stages"]["host_registration"], "pending");
+    let initial = verify_empty_setup_snapshot(&db, &setup);
     let again = data(&run(&db, &["setup"]), 10);
-    assert_eq!(again["control_seq"], setup["control_seq"]);
+    assert_eq!(verify_empty_setup_snapshot(&db, &again), initial);
     data(&run(&db, &["background", "pause"]), 0);
     let selected = data(
         &run(
@@ -694,7 +754,7 @@ fn selected_history_start_pause_resume_stop_uses_actual_worker_liveness() {
     std::fs::write(&source, &bytes).unwrap();
     let _stop = StopWorker(db.clone());
     let setup = data(&run(&db, &["setup"]), 10);
-    assert_eq!(setup["background_start"]["reason"], "no_enabled_selections");
+    verify_empty_setup_snapshot(&db, &setup);
     let selected = add(&db, &history);
     assert_eq!(selected["background_start"]["verified_running"], true);
     wait_until(|| {

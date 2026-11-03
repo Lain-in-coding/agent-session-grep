@@ -11514,10 +11514,39 @@ mod control_deadline_tests {
             let attempts = Rc::new(RefCell::new(Vec::new()));
             schedule.hooks = scheduler_hooks(elapsed.clone(), {
                 let attempts = attempts.clone();
+                let mut original_end = None;
+                let mut published = None;
+                let mut source_failure = None;
                 move |event| {
-                    if let ScheduleTestEvent::AfterAttempt(id, lane) = event {
-                        attempts.borrow_mut().push((id.clone(), lane));
-                        elapsed.set(SOURCE_OBSERVATION_BUDGET);
+                    match event {
+                        ScheduleTestEvent::BeforeAttempt(_, end, _) => original_end = Some(end),
+                        ScheduleTestEvent::Published(id, end) => {
+                            assert_eq!(original_end, Some(end), "publication keeps the source end");
+                            assert!(published.replace(id.clone()).is_none());
+                        }
+                        ScheduleTestEvent::SourceFailed {
+                            phase,
+                            error,
+                            remaining,
+                            ..
+                        } => {
+                            source_failure =
+                                Some((phase, ScheduleTestHooks::error_label(error), remaining));
+                        }
+                        ScheduleTestEvent::AfterAttempt(id, lane) => {
+                            assert!(
+                                source_failure.is_none(),
+                                "healthy publication fixture failed before expiry: {source_failure:?}"
+                            );
+                            assert_eq!(
+                                published.as_ref(),
+                                Some(id),
+                                "tail expiry requires a real publication, not just an attempt"
+                            );
+                            attempts.borrow_mut().push((id.clone(), lane));
+                            elapsed.set(SOURCE_OBSERVATION_BUDGET);
+                        }
+                        _ => {}
                     }
                     Ok(())
                 }
@@ -11551,9 +11580,9 @@ mod control_deadline_tests {
             for id in schedule.sources.keys().filter(|id| !started.contains(*id)) {
                 assert!(
                     fixture
-                        .control
-                        .source_progress(&ControlId::parse(id.as_str()).unwrap())
-                        .unwrap()
+                        .read_control(|control| {
+                            control.source_progress(&ControlId::parse(id.as_str()).unwrap())
+                        })
                         .is_none(),
                     "NotScheduled creates no fake failed attempts"
                 );

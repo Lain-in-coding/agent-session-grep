@@ -1703,6 +1703,22 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
         f.wait(|f| f.sees_text("scheduledproofneedle"));
         let initial = admit_latest_barrier(&f, 400);
         f.wait(|f| latest_satisfied(f, &initial));
+        // Barrier completion can precede another already owed source turn.
+        // Anchor only after the actual worker reports its accepted Idle.
+        let mut idle_after = None;
+        f.wait(|f| {
+            let status = f.control().bounded(|control| control.background_status());
+            if status.worker.state == UpdateState::Idle
+                && status.worker.error.is_none()
+                && status.worker.pid_hint == f.child.as_ref().map(Child::id)
+            {
+                idle_after = Some(status.next_cycle_seq.get() - 1);
+                true
+            } else {
+                false
+            }
+        });
+        let idle_after = idle_after.unwrap();
         let original = m2_sources(&f).pop().unwrap();
         let original_receipt = original.latest_receipt.clone().unwrap();
         let mut quiet_cycle = None;
@@ -1718,6 +1734,9 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
             sampled_next = number.get();
             let mut found = Vec::new();
             for seq in (1..number.get()).rev().take(8) {
+                if seq <= idle_after {
+                    break;
+                }
                 let cycle = control.bounded(|control| {
                     control.cycle(agent_session_grep_ports::control::CycleSeq::new(seq).unwrap())
                 });
@@ -1743,6 +1762,9 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
                     cycle.selections.iter().all(|s| s.discovery_complete),
                     cycle.selections.iter().find_map(|s| s.error),
                 ));
+                if matches!(cycle.state, CycleState::Queued | CycleState::Observing) {
+                    continue;
+                }
                 if cycle.state == CycleState::Partial
                     && cycle.selections.iter().all(|selection| {
                         selection.discovery_complete
@@ -1753,8 +1775,20 @@ fn plain_idle_discovery_keeps_receipts_and_real_counts_then_latest_requires_new_
                     })
                 {
                     found.push(cycle.token.cycle_seq);
+                    if found.len() == 2 {
+                        break;
+                    }
+                } else {
+                    // An older favorable pair cannot hide intervening work.
+                    found.clear();
+                    break;
                 }
             }
+            assert_eq!(
+                m2_sources(f)[0].latest_receipt.as_ref(),
+                Some(&original_receipt),
+                "receipt changed after the actual Idle anchor"
+            );
             if found.len() >= 2 {
                 quiet_cycle = found.first().copied();
                 true
