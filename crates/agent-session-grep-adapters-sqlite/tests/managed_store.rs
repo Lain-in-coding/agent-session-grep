@@ -691,6 +691,7 @@ fn partial_attempt_pins_namespace_across_reopen_without_publishing_content() {
     let mut complete = partial;
     complete.state = ObservationState::Complete;
     complete.revision_id = RevisionId::parse("complete-after-reopen").unwrap();
+    let publication_started = Instant::now();
     reopened
         .commit_source(
             &f.control,
@@ -698,7 +699,12 @@ fn partial_attempt_pins_namespace_across_reopen_without_publishing_content() {
             &f.batch("verified after reopen"),
             &complete,
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "namespace reopen publication failed after {:?}: {error:?}",
+                publication_started.elapsed()
+            )
+        });
     let hits = reopened
         .with_read(
             &f.control,
@@ -1252,40 +1258,49 @@ fn verified_recovery_retains_exact_original_evidence_while_paused() {
         f.control.status().unwrap().desired_updates,
         DesiredUpdates::Paused
     );
-    let store = ManagedStore::open(&f.catalog, &f.control).unwrap();
+    // A post-recovery request has its own ordinary read budget. The earlier
+    // maintenance end must not make either evidence or corruption assertions
+    // pass or fail without actually reading the recovered catalog.
+    let read_end = Instant::now() + Duration::from_secs(5);
+    let store = ManagedStore::open_with_deadline(&f.catalog, &f.control, read_end).unwrap();
     store
-        .with_read(&f.control, RequestIntersection::Selected, end, |read| {
-            let expired = || false;
-            let app = ManagedApp::new(
-                read,
-                ManagedRequestContext {
-                    intersection: ProjectionQuery::default(),
-                    budget: agent_session_grep_application::ResponseBudget::default(),
-                    now_ms: 10,
-                    current_repo: None,
-                    deadline_expired: &expired,
-                },
-            )
-            .unwrap();
-            let result = app
-                .handle(AppRequest::Get {
-                    id: entity(IdKind::Message),
-                })
+        .with_read(
+            &f.control,
+            RequestIntersection::Selected,
+            read_end,
+            |read| {
+                let expired = || false;
+                let app = ManagedApp::new(
+                    read,
+                    ManagedRequestContext {
+                        intersection: ProjectionQuery::default(),
+                        budget: agent_session_grep_application::ResponseBudget::default(),
+                        now_ms: 10,
+                        current_repo: None,
+                        deadline_expired: &expired,
+                    },
+                )
                 .unwrap();
-            assert!(result.partial.contains(&ManagedPartial::RetainedEvidence));
-            assert_eq!(
-                result.evidence[0].proof.revision.catalog_incarnation,
-                "catalog-one"
-            );
-            assert_eq!(read.scope_freshness(&[])?.pending_sources, 1);
-            assert_eq!(read.scope_freshness(&[])?.verified_sources, 0);
-            assert_eq!(
-                read.scope_freshness(&[])?.last_verified_observation_at_ms,
-                None
-            );
-            assert!(read.retained_revision_allowed(&result.evidence[0].proof.revision)?);
-            Ok(())
-        })
+                let result = app
+                    .handle(AppRequest::Get {
+                        id: entity(IdKind::Message),
+                    })
+                    .unwrap();
+                assert!(result.partial.contains(&ManagedPartial::RetainedEvidence));
+                assert_eq!(
+                    result.evidence[0].proof.revision.catalog_incarnation,
+                    "catalog-one"
+                );
+                assert_eq!(read.scope_freshness(&[])?.pending_sources, 1);
+                assert_eq!(read.scope_freshness(&[])?.verified_sources, 0);
+                assert_eq!(
+                    read.scope_freshness(&[])?.last_verified_observation_at_ms,
+                    None
+                );
+                assert!(read.retained_revision_allowed(&result.evidence[0].proof.revision)?);
+                Ok(())
+            },
+        )
         .unwrap();
     drop(store);
     let conn = Connection::open(&f.catalog).unwrap();
@@ -1295,13 +1310,17 @@ fn verified_recovery_retains_exact_original_evidence_while_paused() {
     )
     .unwrap();
     drop(conn);
-    let store = ManagedStore::open(&f.catalog, &f.control).unwrap();
-    assert!(
-        store
-            .with_read(&f.control, RequestIntersection::Selected, end, |read| read
-                .scope_freshness(&[]))
-            .is_err()
-    );
+    let read_end = Instant::now() + Duration::from_secs(5);
+    let store = ManagedStore::open_with_deadline(&f.catalog, &f.control, read_end).unwrap();
+    assert!(matches!(
+        store.with_read(
+            &f.control,
+            RequestIntersection::Selected,
+            read_end,
+            |read| { read.scope_freshness(&[]) }
+        ),
+        Err(PortError::SchemaIncompatible(_))
+    ));
 }
 
 #[test]

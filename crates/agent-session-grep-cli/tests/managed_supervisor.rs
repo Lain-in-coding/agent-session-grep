@@ -386,6 +386,48 @@ impl Drop for Harness<'_> {
     }
 }
 
+fn exhaustion_observed(state: SupervisorState, child: Option<u32>, exits: u8) -> bool {
+    assert_eq!(child, None, "exhausted supervisor started another child");
+    assert_eq!(exits, MAX_UNEXPECTED_EXITS, "exhaustion was reset");
+    match state {
+        SupervisorState::BackgroundFailed => true,
+        SupervisorState::Busy => false,
+        other => panic!("unexpected exhausted supervisor observation: {other:?}"),
+    }
+}
+
+#[test]
+fn exhaustion_observation_requires_failed_state_and_unchanged_ownership() {
+    assert!(!exhaustion_observed(
+        SupervisorState::Busy,
+        None,
+        MAX_UNEXPECTED_EXITS
+    ));
+    assert!(exhaustion_observed(
+        SupervisorState::BackgroundFailed,
+        None,
+        MAX_UNEXPECTED_EXITS
+    ));
+    for (state, child, exits) in [
+        (SupervisorState::Ready, None, MAX_UNEXPECTED_EXITS),
+        (SupervisorState::Backoff, None, MAX_UNEXPECTED_EXITS),
+        (SupervisorState::Running, Some(7), MAX_UNEXPECTED_EXITS),
+        (
+            SupervisorState::BackgroundFailed,
+            Some(7),
+            MAX_UNEXPECTED_EXITS,
+        ),
+        (SupervisorState::Busy, Some(7), MAX_UNEXPECTED_EXITS),
+        (SupervisorState::BackgroundFailed, None, 0),
+        (SupervisorState::Busy, None, 0),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| exhaustion_observed(state, child, exits)).is_err(),
+            "invalid exhaustion observation was accepted"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PauseSample {
     now: Instant,
@@ -994,17 +1036,23 @@ fn real_unexpected_exit_recovers_and_exhaustion_waits_for_explicit_start() {
             assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Backoff);
         }
     }
-    assert_eq!(
-        harness.supervisor.tick().unwrap(),
-        SupervisorState::BackgroundFailed
-    );
+    harness.until(|supervisor, state, _| {
+        exhaustion_observed(
+            state,
+            supervisor.child_id(),
+            supervisor.policy().unexpected_exits(),
+        )
+    });
     assert!(fixture.control().status().unwrap().supervisor_failed);
     let stable = fixture.control().status().unwrap().policy.control_seq;
     std::thread::sleep(seconds(2));
-    assert_eq!(
-        harness.supervisor.tick().unwrap(),
-        SupervisorState::BackgroundFailed
-    );
+    harness.until(|supervisor, state, _| {
+        exhaustion_observed(
+            state,
+            supervisor.child_id(),
+            supervisor.policy().unexpected_exits(),
+        )
+    });
     assert_eq!(
         fixture.control().status().unwrap().policy.control_seq,
         stable
