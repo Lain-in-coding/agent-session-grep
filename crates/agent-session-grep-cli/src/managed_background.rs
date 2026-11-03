@@ -7995,7 +7995,11 @@ mod wal_worker_tests {
                         Event::Checkpoint(Err(BackgroundFailure::Failed))
                     ));
                 } else {
-                    worker.checkpoint(WalCheckpointOutcome::Reset);
+                    let event = worker.next();
+                    assert!(
+                        matches!(&event, Event::Checkpoint(Ok(report)) if report.outcome == WalCheckpointOutcome::Reset),
+                        "stop cleanup preparation hard_error={hard_error} next_intent={next_intent}: {event:?}"
+                    );
                 }
                 let contender =
                     Connection::open(SqliteControlStore::path(fixture.db.parent().unwrap()))

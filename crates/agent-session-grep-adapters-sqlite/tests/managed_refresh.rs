@@ -16,7 +16,7 @@ use agent_session_grep_ports::{
 };
 use rusqlite::{Connection, types::Value};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -181,20 +181,27 @@ impl Fixture {
     }
 
     fn finish(&self, observation: &SourceObservation) {
+        let started = Instant::now();
+        let phase = Cell::new("operation_entry");
+        let received_end = Cell::new(None);
         let probe = end() + Duration::from_secs(30);
         let previous = SqliteControlStore::effective_runtime_deadline(probe);
         let mut calls = 0;
         let mut finish = |deadline| {
+            received_end.set(Some(deadline));
             assert_eq!(
                 SqliteControlStore::effective_runtime_deadline(probe),
                 deadline,
                 "fixture finish must enter its operation scope before bind"
             );
+            phase.set("bind_worker");
             let worker = self
                 .control
                 .bind_worker(&self.worker_lock, id("boot-one"))?;
+            phase.set("read_sequence");
             let before = self.control.status()?.policy.control_seq;
             calls += 1;
+            phase.set("finish_cycle");
             let finished = self.control.finish_cycle(
                 before,
                 &worker,
@@ -210,9 +217,19 @@ impl Fixture {
                 SqliteControlStore::effective_runtime_deadline(probe),
                 deadline
             );
+            phase.set("scope_return");
             Ok::<_, PortError>(())
         };
-        self.operation(&mut finish).unwrap();
+        self.operation(&mut finish).unwrap_or_else(|error| {
+            panic!(
+                "fixture finish failed: revision={} cycle={} phase={} elapsed={:?} end_expired={:?} calls={calls}: {error:?}",
+                observation.revision_id.as_str(),
+                observation.cycle_seq,
+                phase.get(),
+                started.elapsed(),
+                received_end.get().map(|end| Instant::now() >= end),
+            )
+        });
         assert_eq!(calls, 1);
         assert_eq!(
             SqliteControlStore::effective_runtime_deadline(probe),
