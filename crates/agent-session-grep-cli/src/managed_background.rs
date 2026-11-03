@@ -2669,6 +2669,7 @@ struct CycleSchedule<'a> {
     turns: BTreeMap<SourceId, SourceTurn>,
     queues: [BTreeSet<(u64, SourceId)>; 4],
     probes: BTreeSet<SourceId>,
+    pending_probes: VecDeque<SourceId>,
     expirations: BTreeSet<(Instant, SourceId)>,
     first_pending: usize,
     slice: u64,
@@ -2685,6 +2686,7 @@ impl<'a> CycleSchedule<'a> {
             turns: BTreeMap::new(),
             queues: Default::default(),
             probes: BTreeSet::new(),
+            pending_probes: VecDeque::new(),
             expirations: BTreeSet::new(),
             first_pending: 0,
             slice: 0,
@@ -2889,6 +2891,28 @@ impl<'a> CycleSchedule<'a> {
                 turn.probe && now < turn.original_end && (turn.first_pending || turn.revisitable)
             })
             .collect()
+    }
+
+    /// Select at most one original batch per scheduling iteration. Retain its
+    /// remaining identities while a newly dirty source takes its existing turn.
+    fn stage_probe_batch(&mut self, now: Instant) {
+        if self.pending_probes.is_empty() && !self.ready_active(now) {
+            let batch = self.probe_batch(now);
+            self.pending_probes.extend(batch);
+        }
+    }
+
+    fn next_probe(&mut self, now: Instant) -> Option<SourceId> {
+        if self.ready_active(now) {
+            return None;
+        }
+        while let Some(id) = self.pending_probes.pop_front() {
+            let turn = &self.turns[&id];
+            if turn.probe && now < turn.original_end && (turn.first_pending || turn.revisitable) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     fn next(&mut self, now: Instant) -> Option<ScheduledTurn> {
@@ -4360,8 +4384,6 @@ fn observe_cycle(
     let mut published_sources = BTreeMap::<usize, BTreeSet<SourceId>>::new();
     let mut independent_probe_failures = BTreeSet::new();
     let mut next_demand_poll = None;
-    // Set when this cycle's first source attempt starts.
-    let mut attempt_started = false;
     #[cfg(test)]
     scheduler.state.hooks.event(ScheduleTestEvent::Planned)?;
     loop {
@@ -4407,17 +4429,11 @@ fn observe_cycle(
                 }
             }
         }
-        // Registration already queued every source whose enumeration hint
-        // changed. Until this cycle's first attempt starts, serve a ready
-        // Active turn before the probe batch, which can admit up to
-        // SOURCE_HINT_BATCH other sources first. Probing resumes after it with
-        // unchanged budgets, window and rotation.
-        let probes = if !attempt_started && scheduler.ready_active(now) {
-            Vec::new()
-        } else {
-            scheduler.probe_batch(now)
-        };
-        for id in probes {
+        // An admitted hint can promote Active work before the rest of this
+        // batch. Preserve those pending probes and existing fairness credit,
+        // rather than finishing the whole batch before serving the source.
+        scheduler.stage_probe_batch(now);
+        while let Some(id) = scheduler.next_probe(scheduler.state.now()) {
             let group = shared.get(id.as_str()).ok_or_else(invalid)?;
             #[cfg(test)]
             scheduler
@@ -4454,6 +4470,9 @@ fn observe_cycle(
             }
         }
         let Some(turn) = scheduler.next(scheduler.state.now()) else {
+            if !scheduler.pending_probes.is_empty() {
+                continue;
+            }
             break;
         };
         let (id, lane) = match turn {
@@ -4514,7 +4533,6 @@ fn observe_cycle(
             continue;
         }
         scheduler.started(&id, lane)?;
-        attempt_started = true;
         if let Some(source) = missing.get(&id) {
             let outcome = observe_missing_source(
                 db,
@@ -10027,6 +10045,63 @@ mod control_deadline_tests {
     }
 
     #[test]
+    fn scheduler_newly_dirty_hint_runs_before_the_remaining_probe_batch() {
+        let fixture = CycleFixture::new();
+        let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "probehotbase");
+        let aging = fixture.write_source("aging.jsonl", SearchProvider::Claude, "probeagingbase");
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let (first, _) = fixture.production_cycle(&mut schedule, &boot);
+        assert!(first.unwrap().all_sources_attempted);
+        let hot_id = source_id_named(&fixture, "hot.jsonl");
+        let trace = Rc::new(RefCell::new(Vec::<(SourceId, Option<SourceLane>)>::new()));
+        let changed = Rc::new(RefCell::new(None::<SourceId>));
+        schedule.next_probe = None;
+        schedule.active_attempts = 0;
+        schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+            let trace = trace.clone();
+            let changed = changed.clone();
+            move |event| {
+                match event {
+                    ScheduleTestEvent::BeforeProbe(id, _) => {
+                        trace.borrow_mut().push((id.clone(), None));
+                        if changed.borrow().is_none() {
+                            let source = if id == &hot_id { &hot } else { &aging };
+                            append_record(
+                                source,
+                                SearchProvider::Claude,
+                                "probedirty",
+                                "newlydirtyprobe",
+                            );
+                            *changed.borrow_mut() = Some(id.clone());
+                        }
+                    }
+                    ScheduleTestEvent::BeforeAttempt(id, _, lane) => {
+                        trace.borrow_mut().push((id.clone(), Some(lane)));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+
+        let (second, _) = fixture.production_cycle(&mut schedule, &boot);
+
+        assert!(second.unwrap().catalog_complete);
+        let changed = changed.borrow().clone().expect("a hint was dirtied");
+        let order = trace.borrow();
+        assert_eq!(order[0], (changed.clone(), None));
+        assert_eq!(order[1], (changed.clone(), Some(SourceLane::Active)));
+        assert!(
+            order[2..]
+                .iter()
+                .any(|(id, lane)| id != &changed && lane.is_none()),
+            "the remaining selected probe must resume: {order:?}"
+        );
+        assert_eq!(fixture.hits("newlydirtyprobe"), 1);
+    }
+
+    #[test]
     fn scheduler_carried_two_active_credit_keeps_debt_and_probe_batch_first() {
         let fixture = CycleFixture::new();
         let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "creditbase");
@@ -10875,6 +10950,131 @@ mod control_deadline_tests {
             "persisted receipt cannot seed a new worker's timer"
         );
         assert_ne!(fixture.sources()[0].latest_receipt, prior.latest_receipt);
+    }
+
+    #[test]
+    fn scheduler_pending_probe_batch_keeps_window_rotation_and_debt_credit() {
+        let mut state = SourceScheduleState::default();
+        let start = Instant::now();
+        let ids = (0..465)
+            .map(|n| SourceId::parse(&format!("source-{n:03}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut cycle = CycleSchedule::new(&mut state);
+        for id in &ids {
+            cycle
+                .add_obligation(
+                    id,
+                    None,
+                    SourceLane::Verification,
+                    start + SOURCE_OBSERVATION_BUDGET,
+                    true,
+                    TurnObligation::ProbeOnly,
+                )
+                .unwrap();
+        }
+        for id in &ids[..16] {
+            cycle.state.remember_hot(id);
+        }
+        let cold = SourceId::parse("backfill-debt").unwrap();
+        cycle
+            .add(
+                &cold,
+                None,
+                SourceLane::Cold,
+                start + SOURCE_OBSERVATION_BUDGET,
+                false,
+            )
+            .unwrap();
+        cycle.stage_probe_batch(start);
+        let selected = cycle.pending_probes.clone();
+        assert_eq!(selected.len(), SOURCE_HINT_BATCH);
+        let first = cycle.next_probe(start).unwrap();
+        assert_eq!(selected.front(), Some(&first));
+        let original_ticket = cycle.state.sources[&first].ticket;
+        cycle.hint(
+            &first,
+            SourceHint {
+                len: 2,
+                mtime_ms: 2,
+            },
+            Some(1),
+        );
+        assert_eq!(cycle.state.sources[&first].ticket, original_ticket);
+        assert!(cycle.next_probe(start).is_none());
+        assert_eq!(
+            cycle.pending_probes,
+            selected.iter().skip(1).cloned().collect::<VecDeque<_>>()
+        );
+        cycle.stage_probe_batch(start + CADENCE);
+        assert_eq!(cycle.state.probes_in_window, SOURCE_HINT_BATCH);
+        let Some(ScheduledTurn::Attempt(id, lane)) = cycle.next(start) else {
+            panic!("dirty hint did not preserve its Active turn");
+        };
+        assert_eq!(id, first);
+        assert_eq!(lane, SourceLane::Active);
+        cycle.started(&id, lane).unwrap();
+        cycle.failed(&id);
+        let resumed = std::iter::from_fn(|| cycle.next_probe(start)).collect::<Vec<_>>();
+        assert_eq!(resumed, selected.into_iter().skip(1).collect::<Vec<_>>());
+        assert!(cycle.pending_probes.is_empty());
+        cycle.stage_probe_batch(start);
+        assert!(cycle.pending_probes.is_empty());
+        cycle.stage_probe_batch(start + CADENCE);
+        assert!(cycle.pending_probes.len() <= SOURCE_HINT_BATCH);
+        // Two carried Active attempts must still yield to the original debt,
+        // even when another admitted hint marks an Active source.
+        cycle.state.active_attempts = 2;
+        let second = cycle.next_probe(start + CADENCE).unwrap();
+        cycle.hint(
+            &second,
+            SourceHint {
+                len: 2,
+                mtime_ms: 2,
+            },
+            Some(1),
+        );
+        assert!(cycle.next_probe(start + CADENCE).is_some());
+        let Some(ScheduledTurn::Attempt(id, lane)) = cycle.next(start + CADENCE) else {
+            panic!("cold debt lost its carried fairness credit");
+        };
+        assert_eq!(id, cold);
+        assert_eq!(lane, SourceLane::Cold);
+    }
+
+    #[test]
+    fn scheduler_pending_probe_expiry_keeps_not_scheduled_ownership() {
+        let mut state = SourceScheduleState::default();
+        let start = Instant::now();
+        let end = start + CADENCE;
+        let mut cycle = CycleSchedule::new(&mut state);
+        let ids = [
+            SourceId::parse("probe-unowed").unwrap(),
+            SourceId::parse("probe-owed").unwrap(),
+        ];
+        for (id, obligation) in [
+            (&ids[0], TurnObligation::ProbeOnly),
+            (&ids[1], TurnObligation::Owed),
+        ] {
+            cycle
+                .add_obligation(id, None, SourceLane::Verification, end, true, obligation)
+                .unwrap();
+        }
+        let tickets = ids
+            .iter()
+            .map(|id| cycle.state.sources[id].ticket)
+            .collect::<Vec<_>>();
+        cycle.stage_probe_batch(start);
+        assert_eq!(cycle.pending_probes.len(), 2);
+        assert!(cycle.next_probe(end).is_none());
+        assert!(cycle.pending_probes.is_empty());
+        let Some(ScheduledTurn::NotScheduled(id)) = cycle.next(end) else {
+            panic!("the owed expiry must retain its original outcome");
+        };
+        assert_eq!(id, ids[1]);
+        assert!(cycle.next(end).is_none());
+        for (id, ticket) in ids.iter().zip(tickets) {
+            assert_eq!(cycle.state.sources[id].ticket, ticket);
+        }
     }
 
     #[test]
