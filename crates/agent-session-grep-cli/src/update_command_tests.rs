@@ -875,11 +875,24 @@ fn terminal_rollback_clears_discovery_under_its_owned_fence_and_repeats_read_onl
             ).unwrap();
             };
             insert();
+            let probe = end + Duration::from_secs(10);
+            let previous = SqliteControlStore::effective_runtime_deadline(probe);
+            let effective = SqliteControlStore::effective_runtime_deadline(end);
             assert_eq!(
-                finish_rollback(control, installation, &owner, root, &journal, end)
-                    .unwrap()
-                    .0,
+                with_update_deadline(control, end, || {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                        effective
+                    );
+                    finish_rollback(control, installation, &owner, root, &journal, end)
+                })
+                .unwrap()
+                .0,
                 Outcome::Success,
+            );
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous
             );
             let count = || {
                 conn.query_row("SELECT count(*) FROM discovery_receipts", [], |row| {
@@ -898,10 +911,20 @@ fn terminal_rollback_clears_discovery_under_its_owned_fence_and_repeats_read_onl
             // discard discovery started by the already restored program.
             insert();
             assert_eq!(
-                finish_rollback(control, installation, &owner, root, &journal, end)
-                    .unwrap()
-                    .0,
+                with_update_deadline(control, end, || {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                        effective
+                    );
+                    finish_rollback(control, installation, &owner, root, &journal, end)
+                })
+                .unwrap()
+                .0,
                 Outcome::Success,
+            );
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous
             );
             assert_eq!(count(), 1);
             assert_eq!(control.status().unwrap(), after);
