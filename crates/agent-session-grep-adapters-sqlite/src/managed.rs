@@ -2422,7 +2422,15 @@ impl ProjectionRead for ManagedRead<'_> {
         if expression.is_empty() {
             return Ok(page);
         }
-        let (count,total):(i64,i64)=self.transaction.query_row("SELECT COUNT(*),COALESCE(SUM(dl),0) FROM(SELECT p.session_id,p.search_digest,MAX(s.token_count) dl FROM qualified_session_metadata q JOIN source_session_projections p ON p.session_projection_rowid=q.rowid JOIN session_fts_stats s USING(session_projection_rowid) GROUP BY p.session_id,p.search_digest)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(sql)?;
+        // Preparing retains the original schema/column refusal even when no
+        // match needs this corpus aggregation to execute.
+        let mut census = self.transaction.prepare("SELECT COUNT(*),COALESCE(SUM(dl),0) FROM(SELECT p.session_id,p.search_digest,MAX(s.token_count) dl FROM qualified_session_metadata q JOIN source_session_projections p ON p.session_projection_rowid=q.rowid JOIN session_fts_stats s USING(session_projection_rowid) GROUP BY p.session_id,p.search_digest)").map_err(sql)?;
+        if !self.has_qualified_match(&expression, SearchMatchKind::Metadata)? {
+            return Ok(page);
+        }
+        let (count, total): (i64, i64) = census
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sql)?;
         if count < 0 || total < 0 {
             return Err(corrupt());
         }
@@ -3130,7 +3138,16 @@ impl ProjectionRead for ManagedRead<'_> {
                 truncated: false,
             });
         }
-        let (count,total):(i64,i64)=self.transaction.query_row("SELECT COUNT(*),COALESCE(SUM(dl),0) FROM(SELECT p.message_id,p.index_digest,MAX(s.token_count) dl FROM qualified_projections q JOIN source_projections p USING(projection_rowid) JOIN projection_fts_stats s USING(projection_rowid) GROUP BY p.message_id,p.index_digest)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(sql)?;
+        let mut census = self.transaction.prepare("SELECT COUNT(*),COALESCE(SUM(dl),0) FROM(SELECT p.message_id,p.index_digest,MAX(s.token_count) dl FROM qualified_projections q JOIN source_projections p USING(projection_rowid) JOIN projection_fts_stats s USING(projection_rowid) GROUP BY p.message_id,p.index_digest)").map_err(sql)?;
+        if !self.has_qualified_match(&expression, SearchMatchKind::Message)? {
+            return Ok(LexicalPage {
+                hits: Vec::new(),
+                truncated: false,
+            });
+        }
+        let (count, total): (i64, i64) = census
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sql)?;
         if count == 0 || total == 0 {
             return Ok(LexicalPage {
                 hits: Vec::new(),
@@ -3204,6 +3221,30 @@ impl ProjectionRead for ManagedRead<'_> {
 }
 
 impl ManagedRead<'_> {
+    /// Ranking statistics describe the complete permitted corpus. An exact
+    /// empty MATCH needs none of them, but must use the same qualified row set.
+    fn has_qualified_match(&self, expression: &str, kind: SearchMatchKind) -> PortResult<bool> {
+        self.check_deadline()?;
+        #[cfg(test)]
+        if EAGER_EMPTY_SEARCH.with(std::cell::Cell::get) {
+            return Ok(true);
+        }
+        let statement = match kind {
+            SearchMatchKind::Message => {
+                "SELECT EXISTS(SELECT 1 FROM projection_fts JOIN qualified_projections q ON q.projection_rowid=projection_fts.rowid WHERE projection_fts MATCH ?1)"
+            }
+            SearchMatchKind::Metadata => {
+                "SELECT EXISTS(SELECT 1 FROM session_metadata_fts JOIN qualified_session_metadata q ON q.rowid=session_metadata_fts.rowid WHERE session_metadata_fts MATCH ?1)"
+            }
+        };
+        let matched = self
+            .transaction
+            .query_row(statement, [expression], |row| row.get::<_, bool>(0))
+            .map_err(sql)?;
+        self.check_deadline()?;
+        Ok(matched)
+    }
+
     fn metadata_projection(&self, rowid: i64) -> PortResult<EntityProjection> {
         let row = self.transaction.query_row("SELECT e.payload,e.payload_digest,e.source_id,e.projection_id,e.revision_id,p.search_text,p.search_digest FROM source_session_projections p JOIN source_entity_projections e ON e.source_id=p.source_id AND e.entity_id=p.session_id AND e.kind='session' JOIN qualified_session_metadata q ON q.rowid=p.session_projection_rowid WHERE p.session_projection_rowid=?1",[rowid],|r|Ok(MetadataRow {
             payload:r.get(0)?, payload_digest:r.get(1)?, source:r.get(2)?,
@@ -3535,6 +3576,18 @@ impl ManagedRead<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SearchMatchKind {
+    Message,
+    Metadata,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Execute the retained ranking path even for an empty match.
+    static EAGER_EMPTY_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn graph_not_found() -> PortError {
     PortError::NotFound("managed context not found".into())
 }
@@ -3555,6 +3608,7 @@ mod entity_qualification_tests {
 
     thread_local! {
         static STATEMENTS: Cell<usize> = const { Cell::new(0) };
+        static SEARCH_CENSUS: Cell<usize> = const { Cell::new(0) };
     }
     fn trace(event: rusqlite::trace::TraceEvent<'_>) {
         if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
@@ -3570,6 +3624,23 @@ mod entity_qualification_tests {
         }
         let _reset = Reset(LEGACY_ENTITY_QUALIFICATION.replace(enabled));
         run()
+    }
+    fn eager_search<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                EAGER_EMPTY_SEARCH.set(self.0);
+            }
+        }
+        let _reset = Reset(EAGER_EMPTY_SEARCH.replace(enabled));
+        run()
+    }
+    fn census_trace(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql.contains("COALESCE(SUM(dl),0)")
+        {
+            SEARCH_CENSUS.set(SEARCH_CENSUS.get() + 1);
+        }
     }
     fn id(kind: IdKind, name: &str) -> StableId {
         StableId::native_checked(kind, name).unwrap()
@@ -3732,6 +3803,167 @@ mod entity_qualification_tests {
             serde_json::to_string(&kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>()).unwrap();
         read.transaction.prepare("SELECT q.entity_projection_rowid FROM qualified_entities q JOIN source_entity_projections e USING(entity_projection_rowid) WHERE kind IN(SELECT value FROM json_each(?1)) ORDER BY 1").unwrap()
             .query_map([kinds], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn empty_match_probe_preserves_eager_pages_and_scoped_ranking() {
+        let conn = catalog();
+        let mut sources = Vec::new();
+        for (name, provider, session, count) in [
+            ("a", SearchProvider::Claude, "shared", 8),
+            ("copy", SearchProvider::Claude, "shared", 8),
+            ("b", SearchProvider::Codex, "other", 5),
+            ("empty", SearchProvider::Claude, "empty", 0),
+            ("hidden", SearchProvider::Codex, "hidden", 12),
+        ] {
+            let (o, batch) = source(name, provider, session, count);
+            publish(&conn, &o, &batch);
+            sources.push(o);
+        }
+        let mut queries = vec![ProjectionQuery::default()];
+        let mut provider = ProjectionQuery::default();
+        provider.filters.providers.push(SearchProvider::Claude);
+        queries.push(provider);
+        let mut hidden_provider = ProjectionQuery::default();
+        hidden_provider
+            .filters
+            .providers
+            .push(SearchProvider::parse("hermes").unwrap());
+        queries.push(hidden_provider);
+        let system = ProjectionQuery {
+            include_system: true,
+            ..ProjectionQuery::default()
+        };
+        queries.push(system);
+        let mut sidechain = ProjectionQuery::default();
+        sidechain.facets.sidechain = SidechainFacet::MainOnly;
+        queries.push(sidechain);
+        let mut tool = ProjectionQuery::default();
+        tool.facets.tool_name = Some("Read".into());
+        queries.push(tool);
+        let mut time = ProjectionQuery::default();
+        time.filters.since = Some(agent_session_grep_ports::SearchInstant {
+            unix_seconds: 1_792_200_000,
+            nanosecond: 0,
+        });
+        queries.push(time);
+        for allowed in [&sources[..4], &sources[3..4]] {
+            for query in &queries {
+                for text in [
+                    "needle", "shared", "hidden", "nohit", "", "\u{24b6}", "nee*",
+                ] {
+                    for limit in [1, 3] {
+                        let lexical = || read(&conn, allowed).query_lexical(text, query, limit);
+                        assert_eq!(
+                            lexical().unwrap(),
+                            eager_search(true, lexical).unwrap(),
+                            "lexical {text:?}/{query:?}/{limit}"
+                        );
+                        let metadata =
+                            || read(&conn, allowed).query_session_metadata(text, query, limit);
+                        assert_eq!(
+                            metadata().unwrap(),
+                            eager_search(true, metadata).unwrap(),
+                            "metadata {text:?}/{query:?}/{limit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_match_avoids_census_but_nonempty_matches_keep_it() {
+        let conn = catalog();
+        let (o, batch) = source("a", SearchProvider::Claude, "shared", 32);
+        publish(&conn, &o, &batch);
+        let sources = [o];
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(census_trace),
+        );
+        for metadata in [false, true] {
+            let run = |text: &str| {
+                let reader = read(&conn, &sources);
+                if metadata {
+                    reader
+                        .query_session_metadata(text, &ProjectionQuery::default(), 3)
+                        .map(|page| page.hits.len())
+                } else {
+                    reader
+                        .query_lexical(text, &ProjectionQuery::default(), 3)
+                        .map(|page| page.hits.len())
+                }
+            };
+            SEARCH_CENSUS.set(0);
+            assert_eq!(run("nohit").unwrap(), 0);
+            assert_eq!(SEARCH_CENSUS.get(), 0);
+            SEARCH_CENSUS.set(0);
+            assert_eq!(eager_search(true, || run("nohit")).unwrap(), 0);
+            assert_eq!(SEARCH_CENSUS.get(), 1);
+            SEARCH_CENSUS.set(0);
+            assert!(run("needle").unwrap() > 0);
+            assert_eq!(SEARCH_CENSUS.get(), 1);
+        }
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+    }
+
+    #[test]
+    fn empty_match_probe_keeps_filter_disclosure_and_refuses_real_errors() {
+        let conn = catalog();
+        let (o, batch) = source("a", SearchProvider::Claude, "shared", 4);
+        publish(&conn, &o, &batch);
+        let sources = [o];
+        let mut filtered = ProjectionQuery::default();
+        filtered.facets.sidechain = SidechainFacet::SubagentOnly;
+        let metadata = || read(&conn, &sources).query_session_metadata("needle", &filtered, 3);
+        let page = metadata().unwrap();
+        assert!(page.hits.is_empty());
+        assert!(page.incomplete);
+        assert_eq!(page, eager_search(true, metadata).unwrap());
+
+        let mut reader = read(&conn, &sources);
+        reader.deadline = Instant::now() - Duration::from_millis(1);
+        for kind in [SearchMatchKind::Message, SearchMatchKind::Metadata] {
+            assert!(matches!(
+                reader.has_qualified_match("\"nohit\"", kind),
+                Err(PortError::WriterBusy(_))
+            ));
+        }
+        drop(reader);
+        conn.execute_batch("DROP TABLE projection_fts").unwrap();
+        assert!(matches!(
+            read(&conn, &sources).query_lexical("nohit", &ProjectionQuery::default(), 3),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+    }
+
+    #[test]
+    fn empty_match_keeps_original_census_schema_errors() {
+        for (table, metadata) in [("projection_fts_stats", false), ("session_fts_stats", true)] {
+            let conn = catalog();
+            let (o, batch) = source("a", SearchProvider::Claude, "shared", 4);
+            publish(&conn, &o, &batch);
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            let sources = [o];
+            let run = || {
+                let reader = read(&conn, &sources);
+                if metadata {
+                    reader
+                        .query_session_metadata("nohit", &ProjectionQuery::default(), 3)
+                        .map(|page| page.hits.len())
+                } else {
+                    reader
+                        .query_lexical("nohit", &ProjectionQuery::default(), 3)
+                        .map(|page| page.hits.len())
+                }
+            };
+            assert!(matches!(run(), Err(PortError::SchemaIncompatible(_))));
+            assert!(matches!(
+                eager_search(true, run),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+        }
     }
 
     #[test]
