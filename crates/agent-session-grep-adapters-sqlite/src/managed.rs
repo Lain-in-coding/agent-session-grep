@@ -585,12 +585,16 @@ fn prepare(batch: &SourceBatch, observation: &SourceObservation) -> PortResult<P
             return Err(invalid());
         }
     }
-    if output.messages.keys().any(|id| {
-        !output
-            .occurrences
-            .values()
-            .any(|o| o.placement.message_id.as_str() == id)
-    }) {
+    let covered_messages: BTreeSet<&str> = output
+        .occurrences
+        .values()
+        .map(|o| o.placement.message_id.as_str())
+        .collect();
+    if output
+        .messages
+        .keys()
+        .any(|id| !covered_messages.contains(id.as_str()))
+    {
         return Err(invalid());
     }
     for edge in &batch.edges {
@@ -3770,6 +3774,79 @@ mod entity_qualification_tests {
         }
         (o, batch)
     }
+
+    #[test]
+    fn prepare_coverage_preserves_fingerprints_with_multiple_occurrences_and_order() {
+        let (o, mut batch) = source("coverage", SearchProvider::Claude, "coverage-session", 3);
+        let mut expected = prepare(&batch, &o).unwrap().fingerprints().unwrap();
+        let first = &batch.placements[0];
+        let repeated = MessagePlacement::new(
+            first.session_id.clone(),
+            first.source_document_id.clone(),
+            first.message_id.clone(),
+            3,
+            false,
+            None,
+        );
+        let occurrence = OccurrenceData {
+            placement: repeated.clone(),
+            provider_id: o.binding.provider.as_str().into(),
+            project_id: Some("example.test/team/repo".into()),
+            timestamp: Some("2026-10-17T01:00:00Z".into()),
+            role: Role::User,
+        };
+        assert!(
+            expected
+                .insert(
+                    format!("o:{}", repeated.id.as_str()),
+                    digest(&[&encode(&occurrence).unwrap()]),
+                )
+                .is_none()
+        );
+        batch.placements.push(repeated);
+        for _ in 0..batch.placements.len() {
+            let prepared = prepare(&batch, &o).unwrap();
+            assert_eq!(prepared.messages.len(), 3);
+            assert_eq!(prepared.occurrences.len(), 4);
+            assert_eq!(prepared.fingerprints().unwrap(), expected);
+            batch.placements.rotate_left(1);
+        }
+        batch.entries.reverse();
+        batch.placements.reverse();
+        assert_eq!(
+            prepare(&batch, &o).unwrap().fingerprints().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn prepare_coverage_rejects_orphan_with_at_least_as_many_occurrences() {
+        let (o, mut batch) = source("coverage", SearchProvider::Claude, "coverage-session", 3);
+        batch.edges.clear();
+        assert_eq!(prepare(&batch, &o).unwrap().messages.len(), 3);
+        let orphan = batch.placements.remove(2);
+        for ordinal in [3, 4] {
+            let first = &batch.placements[0];
+            batch.placements.push(MessagePlacement::new(
+                first.session_id.clone(),
+                first.source_document_id.clone(),
+                first.message_id.clone(),
+                ordinal,
+                false,
+                None,
+            ));
+            assert!(batch.placements.len() >= 3);
+            assert!(matches!(
+                prepare(&batch, &o),
+                Err(PortError::InvalidRequest(message))
+                    if message == "invalid managed projection operation"
+            ));
+            batch.placements.push(orphan.clone());
+            assert!(prepare(&batch, &o).is_ok());
+            batch.placements.pop();
+        }
+    }
+
     fn publish(conn: &Connection, o: &SourceObservation, batch: &SourceBatch) {
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let generation: i64 = conn
