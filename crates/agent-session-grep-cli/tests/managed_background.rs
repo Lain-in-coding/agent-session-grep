@@ -3375,6 +3375,8 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
         .unwrap();
     let source_id = m2_source_for_path(&f, &source).binding.source_id;
     let source_id = ControlId::parse(source_id.as_str()).unwrap();
+    let metadata_id = m2_source_for_path(&f, &metadata).binding.source_id;
+    let metadata_id = ControlId::parse(metadata_id.as_str()).unwrap();
     let mut first = None;
     f.wait(|f| {
         let confirmation = f
@@ -3431,6 +3433,57 @@ fn m2_workbuddy_unrelated_metadata_churn_does_not_reset_delete_and_restore_proof
             ConfirmationKind::Rewrite { ref candidate_digest }
                 if candidate_digest.as_str().starts_with("metadata_")
         ));
+        if current.first_cycle != first.first_cycle
+            || current.first_monotonic_ms != first.first_monotonic_ms
+        {
+            eprintln!(
+                "synthetic metadata confirmation index={index} first={:?}/{:?} current={:?}/{:?} same_kind={} same_boot={} same_root={} same_policy={}",
+                first.first_cycle,
+                first.first_monotonic_ms,
+                current.first_cycle,
+                current.first_monotonic_ms,
+                current.kind == first.kind,
+                current.worker_boot_id == first.worker_boot_id,
+                current.root_identity == first.root_identity,
+                current.policy_epoch == first.policy_epoch,
+            );
+            let control = f.control();
+            let diagnostics =
+                control.with_runtime_deadline(Instant::now() + Duration::from_secs(3), || {
+                    let metadata = control.source_progress(&metadata_id)?;
+                    for number in first.first_cycle.get()..=cycle.token.cycle_seq.get() {
+                        let observed = control
+                            .cycle(agent_session_grep_ports::control::CycleSeq::new(number)?)?;
+                        eprintln!(
+                            "synthetic metadata cycle={number} state={:?} selections={:?}",
+                            observed.state,
+                            observed
+                                .selections
+                                .iter()
+                                .map(|selection| (
+                                    selection.discovery_complete,
+                                    selection.discovered_count,
+                                    selection.observed_count,
+                                    selection.committed_count,
+                                    selection.error,
+                                ))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    eprintln!(
+                        "synthetic metadata latest={:?}",
+                        metadata.map(|progress| (
+                            progress.last_observation.map(|token| token.cycle_seq),
+                            progress.update_state,
+                            progress.error,
+                        ))
+                    );
+                    Ok(())
+                });
+            if let Err(error) = diagnostics {
+                eprintln!("synthetic metadata diagnostics unavailable: {error:?}");
+            }
+        }
         assert_eq!(current.first_cycle, first.first_cycle);
         assert_eq!(current.first_monotonic_ms, first.first_monotonic_ms);
         assert!(f.has_text("wbsemanticoriginalneedle"));
