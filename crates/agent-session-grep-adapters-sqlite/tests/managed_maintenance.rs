@@ -2493,20 +2493,21 @@ fn has_table(path: &Path, name: &str) -> bool {
     .unwrap()
 }
 fn finish_fence(f: &Fixture, owner: &str) {
-    let installation = f
-        .control
-        .bind_installation(&f.prefix, &f.installation_lock)
-        .unwrap();
-    let guard = acquire(&f.root, LockKind::PolicyOwner);
-    let bound = f.control.bind_control_root(&guard).unwrap();
-    f.control
-        .clear_maintenance(
-            f.control.status().unwrap().policy.control_seq,
+    prepare(&f.control, end(), |end| {
+        let installation = f
+            .control
+            .bind_installation(&f.prefix, &f.installation_lock)?;
+        let guard = acquire_until(&f.root, LockKind::PolicyOwner, end);
+        let bound = f.control.bind_control_root(&guard)?;
+        f.control.clear_maintenance(
+            f.control.status()?.policy.control_seq,
             &id(owner),
             &bound,
             &installation,
-        )
-        .unwrap();
+        )?;
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
