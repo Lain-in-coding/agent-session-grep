@@ -8696,8 +8696,19 @@ fn relocate_sqlite_sources_preserve_every_native_session_and_resume_observation(
             );
             assert!(run(&db, &["context", id]).status.success());
         }
-        let out = run(&db, &["sync", new.join("sessions.db").to_str().unwrap()]);
-        assert!(out.status.success(), "{provider}: {}", stdout(&out));
+        let out = Command::new(BIN)
+            .args(["--db", &db, "--robot", "sync"])
+            .arg(new.join("sessions.db"))
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("ASG_DEBUG_ERRORS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{provider}: {} diagnostic={}",
+            stdout(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(relocation_session_ids(&db), sessions);
     }
 }

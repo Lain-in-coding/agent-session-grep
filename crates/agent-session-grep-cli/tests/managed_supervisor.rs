@@ -1030,10 +1030,10 @@ fn real_unexpected_exit_recovers_and_exhaustion_waits_for_explicit_start() {
     for n in 1..=MAX_UNEXPECTED_EXITS {
         harness.ready();
         crash_owned(&harness.supervisor);
-        harness.until(|s, _, _| s.child_id().is_none());
+        let exit_state = harness.until(|s, _, _| s.child_id().is_none());
         assert_eq!(harness.supervisor.policy().unexpected_exits(), n);
         if n < MAX_UNEXPECTED_EXITS {
-            assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Backoff);
+            assert_eq!(exit_state, SupervisorState::Backoff);
         }
     }
     harness.until(|supervisor, state, _| {
