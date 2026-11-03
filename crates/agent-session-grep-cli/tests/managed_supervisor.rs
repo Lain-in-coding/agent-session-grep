@@ -1196,10 +1196,19 @@ fn explicit_start_arriving_with_clean_exit_is_not_lost() {
     harness.ready();
     fixture.desired(DesiredUpdates::Stopped);
     let deadline = Instant::now() + seconds(5);
-    while fixture.control().background_status().unwrap().worker.state != UpdateState::Offline {
-        assert!(Instant::now() < deadline, "worker did not acknowledge stop");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    stop_ack_before(
+        deadline,
+        |end| {
+            let control = SqliteControlStore::open_current_read_only_with_deadline(
+                fixture.catalog.parent().unwrap(),
+                end,
+            )?;
+            control.with_runtime_deadline(end, || Ok(control.background_status()?.worker.state))
+        },
+        Instant::now,
+        std::thread::sleep,
+    )
+    .unwrap();
     // Keep the supervisor from observing the clean exit until the explicit
     // start arrives. Both facts must be consumed without losing the request.
     std::thread::sleep(Duration::from_millis(100));
@@ -1207,6 +1216,142 @@ fn explicit_start_arriving_with_clean_exit_is_not_lost() {
     fixture.start_request();
     harness.ready();
     assert_eq!(harness.supervisor.policy().unexpected_exits(), 0);
+}
+
+#[derive(Debug, Default)]
+struct StopAck {
+    reads: usize,
+    busy: usize,
+    last: Option<UpdateState>,
+}
+
+fn stop_ack_before(
+    requested_end: Instant,
+    mut read: impl FnMut(Instant) -> Result<UpdateState, PortError>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<StopAck, PortError> {
+    let end = SqliteControlStore::effective_runtime_deadline(requested_end);
+    let mut observed = StopAck::default();
+    loop {
+        if now() >= end {
+            return Err(stop_ack_timeout(&observed));
+        }
+        observed.reads += 1;
+        let result = read(end);
+        match &result {
+            Ok(state) => observed.last = Some(*state),
+            Err(PortError::WriterBusy(_)) => observed.busy += 1,
+            Err(_) => return result.map(|_| observed),
+        }
+        let sampled_at = now();
+        if sampled_at >= end {
+            return Err(stop_ack_timeout(&observed));
+        }
+        if matches!(result, Ok(UpdateState::Offline)) {
+            return Ok(observed);
+        }
+        sleep(Duration::from_millis(20).min(end.saturating_duration_since(sampled_at)));
+    }
+}
+
+fn stop_ack_timeout(observed: &StopAck) -> PortError {
+    PortError::WriterBusy(format!(
+        "stop acknowledgement deadline: reads={} busy={} last={:?}",
+        observed.reads, observed.busy, observed.last
+    ))
+}
+
+#[test]
+fn stop_ack_requires_observed_offline_under_the_same_end() {
+    let started = Instant::now();
+    let end = started + seconds(5);
+    let clock = std::cell::Cell::new(started);
+    let mut outcomes = std::collections::VecDeque::from([
+        Err(PortError::WriterBusy("synthetic busy".into())),
+        Ok(UpdateState::Idle),
+        Ok(UpdateState::Offline),
+    ]);
+    let observed = stop_ack_before(
+        end,
+        |received| {
+            assert_eq!(received, end);
+            outcomes.pop_front().expect("unexpected extra read")
+        },
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    )
+    .unwrap();
+    assert_eq!(observed.reads, 3);
+    assert_eq!(observed.busy, 1);
+    assert_eq!(observed.last, Some(UpdateState::Offline));
+    assert!(outcomes.is_empty());
+    assert_eq!(clock.get(), started + Duration::from_millis(40));
+}
+
+#[test]
+fn stop_ack_never_accepts_permanent_busy_or_a_non_offline_state() {
+    for state in [None, Some(UpdateState::Stopped), Some(UpdateState::Idle)] {
+        let started = Instant::now();
+        let end = started + Duration::from_millis(55);
+        let clock = std::cell::Cell::new(started);
+        let reads = std::cell::Cell::new(0);
+        let result = stop_ack_before(
+            end,
+            |received| {
+                assert_eq!(received, end);
+                reads.set(reads.get() + 1);
+                state.ok_or_else(|| PortError::WriterBusy("synthetic busy".into()))
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert_eq!(reads.get(), 3);
+        assert_eq!(clock.get(), end);
+    }
+}
+
+#[test]
+fn stop_ack_refuses_expired_entry_late_offline_and_hard_errors() {
+    let end = Instant::now();
+    assert!(matches!(
+        stop_ack_before(
+            end,
+            |_| panic!("expired entry performed a read"),
+            || end,
+            |_| panic!("expired entry waited")
+        ),
+        Err(PortError::WriterBusy(_))
+    ));
+    let started = Instant::now();
+    let end = started + seconds(5);
+    let clock = std::cell::Cell::new(started);
+    assert!(matches!(
+        stop_ack_before(
+            end,
+            |received| {
+                assert_eq!(received, end);
+                clock.set(end);
+                Ok(UpdateState::Offline)
+            },
+            || clock.get(),
+            |_| panic!("late Offline waited")
+        ),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(matches!(
+        stop_ack_before(
+            end,
+            |received| {
+                assert_eq!(received, end);
+                Err(PortError::SchemaIncompatible("synthetic corruption".into()))
+            },
+            || started,
+            |_| panic!("hard error waited")
+        ),
+        Err(PortError::SchemaIncompatible(_))
+    ));
 }
 
 #[cfg(unix)]

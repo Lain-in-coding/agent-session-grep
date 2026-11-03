@@ -2410,8 +2410,16 @@ mod frame_budget_tests {
                 DesiredUpdates::Running,
             )
             .unwrap();
-            let (messages, placements) = control
-                .with_runtime_deadline(Instant::now() + Duration::from_secs(5), || {
+            let preparation_end = Instant::now() + Duration::from_secs(5);
+            let probe = preparation_end + Duration::from_secs(5);
+            let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+            let effective_end = SqliteControlStore::effective_runtime_deadline(preparation_end);
+            let (selection, lock, cycle) = control
+                .with_runtime_deadline(preparation_end, || {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                        effective_end
+                    );
                     let selection = control
                         .add_selection(
                             control.status()?.policy.control_seq,
@@ -2450,6 +2458,14 @@ mod frame_budget_tests {
                             2,
                         )?
                         .value;
+                    Ok::<_, PortError>((selection, lock, cycle))
+                })
+                .unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous_end
+            );
+            let (messages, placements) = (|| {
                     let observation = SourceObservation {
                         binding: SourceBinding {
                             source_id: SourceId::parse("PRIVATE_SOURCE_SENTINEL")?,
@@ -2562,11 +2578,31 @@ mod frame_budget_tests {
                         batch.placements.push(placement);
                         messages.push(message);
                     }
-                    let store = ManagedStore::create(&db, &control, id("frame-catalog"), 1)?;
+                    let catalog_end = Instant::now() + Duration::from_secs(5);
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                        previous_end,
+                        "frame catalog creation cannot inherit control preparation"
+                    );
+                    let store = ManagedStore::create_with_deadline(
+                        &db,
+                        &control,
+                        id("frame-catalog"),
+                        1,
+                        catalog_end,
+                    )?;
+                    let worker = control.with_runtime_deadline(
+                        Instant::now() + Duration::from_secs(5),
+                        || control.bind_worker(&lock, id("frame-boot")),
+                    )?;
                     store.commit_source(&control, &worker, &batch, &observation)?;
-                    Ok((messages, placements))
-                })
+                    Ok::<_, PortError>((messages, placements))
+                })()
                 .unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous_end
+            );
             Self {
                 db,
                 session,
