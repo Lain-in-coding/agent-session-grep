@@ -129,6 +129,23 @@ impl RootIdentity {
         Ok(RootDirectory::open(root)?.identity)
     }
 
+    /// Read physical identity from the same live directory handle whose
+    /// security descriptor the caller just validated. This grants no lock or
+    /// permission and never exports the native volume or file identifiers.
+    #[cfg(windows)]
+    pub(crate) fn from_directory_handle(file: &File) -> PortResult<Self> {
+        if !file
+            .metadata()
+            .map_err(lock_io("root", "metadata"))?
+            .is_dir()
+        {
+            return Err(lock_invalid("root", "kind"));
+        }
+        platform::identity(file)
+            .map(Self)
+            .map_err(lock_io("root", "identity"))
+    }
+
     /// Compare a store with a live worker capability without exporting native
     /// volume/file identifiers. Aliases of the same opened root encode equally.
     /// This value never replaces the independently held OS lock.

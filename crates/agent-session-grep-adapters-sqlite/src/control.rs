@@ -1655,8 +1655,14 @@ impl SqliteControlStore {
 
     pub(crate) fn validate_live_root(&self) -> PortResult<()> {
         self.handle_lease.validate_admission(&self.private_root)?;
-        private_directory(&self.private_root, false)?;
-        if RootIdentity::read(&self.private_root)? != self.root_identity {
+        #[cfg(windows)]
+        let identity = private_directory_identity(&self.private_root)?;
+        #[cfg(not(windows))]
+        let identity = {
+            private_directory(&self.private_root, false)?;
+            RootIdentity::read(&self.private_root)?
+        };
+        if identity != self.root_identity {
             return Err(invalid());
         }
         Ok(())
@@ -3666,13 +3672,24 @@ fn private_directory(path: &Path, create: bool) -> PortResult<()> {
             Err(error) => return Err(io_error(error)),
         }
     }
+    let meta = private_directory_metadata(path)?;
+    verify_private(path, &meta)
+}
+
+fn private_directory_metadata(path: &Path) -> PortResult<fs::Metadata> {
     reject_links(path)?;
     let meta = fs::symlink_metadata(path)
         .map_err(|error| private_validation_io(error, "directory_metadata"))?;
     if !meta.is_dir() {
         return Err(private_validation_error("directory_kind", 0, false));
     }
-    verify_private(path, &meta)
+    Ok(meta)
+}
+
+#[cfg(windows)]
+fn private_directory_identity(path: &Path) -> PortResult<RootIdentity> {
+    private_directory_metadata(path)?;
+    windows_private::verify_directory_identity(path)
 }
 pub(crate) fn validate_private_owned_file(path: &Path) -> PortResult<()> {
     private_file(path)
@@ -6322,6 +6339,14 @@ mod windows_private {
         verify_handle(&file, false, false)
     }
 
+    pub(super) fn verify_directory_identity(
+        path: &Path,
+    ) -> PortResult<crate::managed_locks::RootIdentity> {
+        let file = open_for_verification(path, false)?;
+        verify_handle(&file, false, false)?;
+        crate::managed_locks::RootIdentity::from_directory_handle(&file)
+    }
+
     pub(super) fn verify_file(path: &Path, sidecar: bool) -> PortResult<()> {
         let file = open_for_verification(path, sidecar)?;
         verify_handle(&file, true, sidecar)
@@ -6681,6 +6706,58 @@ mod windows_private {
                 unsafe { SetFileSecurityW(path.as_ptr(), 0x80000004, descriptor.0) },
                 0
             );
+        }
+
+        #[test]
+        fn final_directory_identity_rechecks_privacy_after_each_acl_change() {
+            let (_temp, root, db) = setup();
+            let expected = crate::managed_locks::RootIdentity::read(&root).unwrap();
+            assert_eq!(
+                super::super::private_directory_identity(&root).unwrap(),
+                expected
+            );
+            allow_everyone(&root);
+            assert!(matches!(
+                super::super::private_directory_identity(&root),
+                Err(PortError::Backend(ref message)) if message.contains("security_ace_sid")
+            ));
+            let sid = User::current().unwrap().sid_text().unwrap();
+            set_protected_dacl(&root, &format!("D:P(A;;FA;;;{sid})"));
+            assert_eq!(
+                super::super::private_directory_identity(&root).unwrap(),
+                expected
+            );
+            assert!(matches!(
+                super::super::private_directory_identity(&db),
+                Err(PortError::Backend(ref message)) if message.contains("directory_kind")
+            ));
+            let other = root.parent().unwrap().join("other-private-root");
+            create_directory(&other).unwrap();
+            assert_ne!(
+                super::super::private_directory_identity(&other).unwrap(),
+                expected
+            );
+        }
+
+        #[test]
+        fn live_root_still_refuses_retirement_after_final_handle_validation() {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let root = temp.path().join("private");
+            let control = SqliteControlStore::create(
+                &root,
+                &ControlId::parse("synthetic-final-root").unwrap(),
+                DesiredUpdates::Paused,
+            )
+            .unwrap();
+            control.validate_live_root().unwrap();
+            let marker = root.join(crate::managed_control_lifetime::RETIREMENT_PENDING_MARKER);
+            drop(create_file(&marker).unwrap());
+            assert!(matches!(
+                control.validate_live_root(),
+                Err(PortError::SchemaIncompatible(_))
+            ));
+            fs::remove_file(&marker).unwrap();
+            control.validate_live_root().unwrap();
         }
 
         /// SQLite deletes WAL/SHM on its last close. While another handle
