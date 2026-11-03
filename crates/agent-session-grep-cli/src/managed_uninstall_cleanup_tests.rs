@@ -583,35 +583,120 @@ fn tail_handoff(fixture: &mut PackageFixture, keep: bool) -> (Journal, Seal) {
     (journal, seal)
 }
 #[cfg(windows)]
-fn tail_output(journal: &Journal) -> std::process::Output {
+fn observed_tail_output(
+    script: &Path,
+    parameters: serde_json::Value,
+) -> (std::process::Output, serde_json::Value) {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    let plan = journal.state.after_exit.as_ref().unwrap();
-    Command::new(system_powershell().unwrap())
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
-        .arg(
-            CanonicalLocator::from_path(&journal.root.join("helper/tail.ps1"))
-                .unwrap()
-                .as_str(),
-        )
-        .arg("-Prefix")
-        .arg(&journal.prefix)
-        .arg("-Catalog")
-        .arg(&journal.catalog)
-        .arg("-Nonce")
-        .arg(&plan.nonce)
-        .arg("-DeadlineTick")
-        .arg(plan.deadline_tick.unwrap().to_string())
-        .arg("-ReceiptSequence")
-        .arg(journal.state.sequence.to_string())
-        .arg("-ReceiptSha256")
-        .arg(journal.receipt_digest.as_ref().unwrap())
-        .arg("-SealSha256")
-        .arg(&plan.seal.digest)
+    let diagnostic = agent_session_grep_testkit::tempdir().unwrap();
+    let path = diagnostic.path().join("tail-diagnostic.json");
+    // Observe only after the original file returns. Never edit its manifested
+    // bytes, replay cleanup, replace its end or emit raw PowerShell errors.
+    let observer = r#"
+$Error.Clear()
+$parameters = @{}
+$decoded = ConvertFrom-Json -InputObject $env:ASG_TEST_TAIL_PARAMETERS
+foreach ($property in $decoded.PSObject.Properties) { $parameters[$property.Name] = $property.Value }
+& $env:ASG_TEST_TAIL_SCRIPT @parameters
+$tailExit = $LASTEXITCODE
+$records = @()
+foreach ($record in @($Error | Select-Object -First 4)) {
+    $exceptions = @()
+    $exception = $record.Exception
+    for ($depth = 0; $null -ne $exception -and $depth -lt 4; $depth++) {
+        $native = $null
+        if ($exception -is [ComponentModel.Win32Exception]) { $native = $exception.NativeErrorCode }
+        $exceptions += [ordered]@{
+            hresult = $exception.HResult
+            native = $native
+            io = $exception -is [IO.IOException]
+            security = $exception -is [Security.SecurityException]
+        }
+        $exception = $exception.InnerException
+    }
+    $records += [ordered]@{
+        line = $record.InvocationInfo.ScriptLineNumber
+        offset = $record.InvocationInfo.OffsetInLine
+        exceptions = $exceptions
+    }
+}
+try {
+    $summary = [ordered]@{ exit = $tailExit; error_count = $Error.Count; records = $records }
+    [IO.File]::WriteAllText($env:ASG_TEST_TAIL_DIAGNOSTIC, ($summary | ConvertTo-Json -Depth 6 -Compress))
+} catch {}
+exit $tailExit
+"#;
+    let output = Command::new(system_powershell().unwrap())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            observer,
+        ])
+        .env("ASG_TEST_TAIL_SCRIPT", script)
+        .env("ASG_TEST_TAIL_PARAMETERS", parameters.to_string())
+        .env("ASG_TEST_TAIL_DIAGNOSTIC", &path)
         .stdin(Stdio::null())
         .creation_flags(0x08000000)
         .output()
-        .unwrap()
+        .unwrap();
+    let bytes = fs::read(&path).expect("tail observation unavailable");
+    assert!(bytes.len() <= 8192, "tail observation oversized");
+    let observation: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("tail observation malformed");
+    assert_eq!(
+        observation["exit"].as_i64(),
+        output.status.code().map(i64::from)
+    );
+    if !output.status.success() {
+        eprintln!("tail observation: {observation}");
+    }
+    (output, observation)
+}
+
+#[cfg(windows)]
+#[test]
+fn tail_observer_preserves_exit_and_streams_after_a_caught_error() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let script = temp.path().join("synthetic.ps1");
+    fs::write(
+        &script,
+        b"param([int]$Value)\ntry { throw 'synthetic error' } catch {}\n[Console]::Out.Write('out'+$Value)\n[Console]::Error.Write('err'+$Value)\nexit 10\n",
+    )
+    .unwrap();
+    let (output, observation) = observed_tail_output(&script, json!({"Value": 7}));
+    assert_eq!(output.status.code(), Some(10));
+    assert_eq!(output.stdout, b"out7");
+    assert_eq!(output.stderr, b"err7");
+    assert!(observation["error_count"].as_u64().unwrap() > 0);
+    let records = observation["records"].as_array().unwrap();
+    assert!(!records.is_empty() && records.len() <= 4);
+    let evidence = observation.to_string();
+    assert!(!evidence.contains("synthetic error") && !evidence.contains("synthetic.ps1"));
+}
+
+#[cfg(windows)]
+fn tail_output(journal: &Journal) -> std::process::Output {
+    let plan = journal.state.after_exit.as_ref().unwrap();
+    observed_tail_output(
+        Path::new(
+            CanonicalLocator::from_path(&journal.root.join("helper/tail.ps1"))
+                .unwrap()
+                .as_str(),
+        ),
+        json!({
+            "Prefix": journal.prefix,
+            "Catalog": journal.catalog,
+            "Nonce": plan.nonce,
+            "DeadlineTick": plan.deadline_tick.unwrap(),
+            "ReceiptSequence": journal.state.sequence,
+            "ReceiptSha256": journal.receipt_digest.as_ref().unwrap(),
+            "SealSha256": plan.seal.digest,
+        }),
+    )
+    .0
 }
 #[cfg(windows)]
 #[test]
