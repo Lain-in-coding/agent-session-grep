@@ -708,26 +708,59 @@ pub fn cached_rustc_fixture(
         // The toolchain changed mid-build; keep this binary private.
         return staging.keep().join(name);
     }
+    publish_rustc_fixture(staging, &published, name, |_| {})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixturePublicationCheckpoint {
+    BinaryMiss,
+    RenameErrorBinaryMiss,
+}
+
+fn publish_rustc_fixture(
+    staging: tempfile::TempDir,
+    published: &Path,
+    name: &str,
+    mut checkpoint: impl FnMut(FixturePublicationCheckpoint),
+) -> PathBuf {
+    use std::fs;
+
+    let binary = published.join(name);
     for _ in 0..50 {
         // Check before renaming: on Unix, rename silently replaces an empty
         // directory, so an existing unusable entry would otherwise be lost.
         if binary.is_file() {
             return binary;
         }
-        if fs::symlink_metadata(&published).is_ok() {
+        checkpoint(FixturePublicationCheckpoint::BinaryMiss);
+        if fs::symlink_metadata(published).is_ok() {
+            // A complete winner may appear after the first binary miss.
+            if binary.is_file() {
+                return binary;
+            }
             break;
         }
-        match fs::rename(staging.path(), &published) {
+        match fs::rename(staging.path(), published) {
             Ok(()) => {
                 let _ = staging.keep();
                 return binary;
             }
-            // Another process won; its directory was complete before rename.
-            Err(_) if binary.is_file() => return binary,
-            // An unusable published entry is never replaced or deleted.
-            Err(_) if fs::symlink_metadata(&published).is_ok() => break,
-            // Windows refuses the rename while a scanner holds a child open.
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => {
+                // Another process won; its directory was complete before rename.
+                if binary.is_file() {
+                    return binary;
+                }
+                checkpoint(FixturePublicationCheckpoint::RenameErrorBinaryMiss);
+                if fs::symlink_metadata(published).is_ok() {
+                    if binary.is_file() {
+                        return binary;
+                    }
+                    // An unusable published entry is never replaced or deleted.
+                    break;
+                }
+                // Windows refuses the rename while a scanner holds a child open.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
     }
     staging.keep().join(name)
@@ -1222,6 +1255,81 @@ mod tests {
         assert_eq!(run_fixture(&first), "concurrent:same");
         assert_complete_publications(&cache, 1);
         root.close().unwrap();
+    }
+
+    fn assert_winner_published_after_binary_miss(target: FixturePublicationCheckpoint) {
+        let root = fixture_cache_root();
+        let cache = root.path().join("cache");
+        let source = root.path().join("source/fixture.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, fixture_source("publication")).unwrap();
+        let name = fixture_name();
+        let prepared = cached_rustc_fixture(
+            &root.path().join("prepared"),
+            &source,
+            &name,
+            &FIXTURE_ARGS,
+            &[(FIXTURE_ENV, "winner")],
+        );
+        assert_eq!(run_fixture(&prepared), "publication:winner");
+
+        std::fs::create_dir_all(&cache).unwrap();
+        let published = cache.join(prepared.parent().unwrap().file_name().unwrap());
+        let winner = root.path().join("winner");
+        std::fs::create_dir(&winner).unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".staging-")
+            .tempdir_in(&cache)
+            .unwrap();
+        for directory in [winner.as_path(), staging.path()] {
+            std::fs::copy(&prepared, directory.join(&name)).unwrap();
+            std::fs::copy(&source, directory.join("fixture.rs")).unwrap();
+        }
+        let staged_path = staging.path().to_path_buf();
+        let moved_loser = root.path().join("moved-loser");
+        let mut checkpoints = Vec::new();
+        let returned = publish_rustc_fixture(staging, &published, &name, |point| {
+            checkpoints.push(point);
+            if point == target {
+                // The callback only publishes a fixture compiled before the race.
+                std::fs::rename(&winner, &published).unwrap();
+            } else {
+                assert_eq!(point, FixturePublicationCheckpoint::BinaryMiss);
+                assert_eq!(target, FixturePublicationCheckpoint::RenameErrorBinaryMiss);
+                // Make the real rename fail before publishing the other winner.
+                std::fs::rename(&staged_path, &moved_loser).unwrap();
+            }
+        });
+        let expected_checkpoints = match target {
+            FixturePublicationCheckpoint::BinaryMiss => {
+                vec![FixturePublicationCheckpoint::BinaryMiss]
+            }
+            FixturePublicationCheckpoint::RenameErrorBinaryMiss => vec![
+                FixturePublicationCheckpoint::BinaryMiss,
+                FixturePublicationCheckpoint::RenameErrorBinaryMiss,
+            ],
+        };
+        assert_eq!(checkpoints, expected_checkpoints);
+        assert_eq!(returned, published.join(&name));
+        assert_eq!(run_fixture(&returned), "publication:winner");
+        assert!(
+            !staged_path.exists(),
+            "loser staging must not remain in cache"
+        );
+        assert_complete_publications(&cache, 1);
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn cached_rustc_fixture_rechecks_winner_after_initial_binary_miss() {
+        assert_winner_published_after_binary_miss(FixturePublicationCheckpoint::BinaryMiss);
+    }
+
+    #[test]
+    fn cached_rustc_fixture_rechecks_winner_after_rename_error_binary_miss() {
+        assert_winner_published_after_binary_miss(
+            FixturePublicationCheckpoint::RenameErrorBinaryMiss,
+        );
     }
 
     #[test]
