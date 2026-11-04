@@ -314,8 +314,13 @@ impl Fixture {
                 &observation.binding.source_path,
                 observation.binding.provider.as_str(),
             );
-            let namespace =
-                store.reserve_namespace(&self.control, &observation, &worker, &legacy)?;
+            let namespace = store.reserve_namespace_with_deadline(
+                &self.control,
+                &observation,
+                &worker,
+                &legacy,
+                deadline,
+            )?;
             *self.session.borrow_mut() = StableId::native_session_scoped(
                 &agent_session_grep_domain::SessionIdentityNamespace {
                     provider_id: observation.binding.provider.as_str(),

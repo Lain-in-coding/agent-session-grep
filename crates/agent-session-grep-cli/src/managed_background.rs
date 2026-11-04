@@ -3226,11 +3226,12 @@ fn observe_workbuddy_metadata(
     }
     verify_snapshot_with_deadline(&source.path, &snapshot, limit, end)?;
     let writer = ManagedStore::open_for_write(db, control)?;
-    let namespace = writer.reserve_namespace(
+    let namespace = writer.reserve_namespace_with_deadline(
         control,
         &observed,
         authority,
         &crate::installation_namespace(locator.as_str(), advisory.region.provider.as_str()),
+        end,
     )?;
     observed.binding.namespace_id = Some(namespace.namespace_id);
     for claim in claims {
@@ -5695,11 +5696,12 @@ fn observe_source(
             end,
         )?
     } else {
-        writer.reserve_namespace(
+        writer.reserve_namespace_with_deadline(
             control,
             &observation,
             authority,
             &crate::installation_namespace(locator.as_str(), advisory.region.provider.as_str()),
+            end,
         )?
     };
     observation.binding.namespace_id = Some(namespace.namespace_id);
@@ -5986,7 +5988,7 @@ fn observe_missing(
         state,
     )?;
     let writer = ManagedStore::open_for_write(db, control)?;
-    let namespace = writer.reserve_namespace(
+    let namespace = writer.reserve_namespace_with_deadline(
         control,
         &observation,
         authority,

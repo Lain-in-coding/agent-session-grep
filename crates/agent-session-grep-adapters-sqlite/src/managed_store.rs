@@ -750,11 +750,46 @@ impl ManagedStore {
         worker: &crate::control::LockedWorkerAuthority<'_>,
         legacy_input: &str,
     ) -> PortResult<SourceNamespace> {
+        self.reserve_namespace_inner(control, observation, worker, legacy_input)
+    }
+
+    /// Reserve parser identity under the source attempt's original end. Both
+    /// control authorization and catalog resolution inherit the earliest scope;
+    /// the reservation remains private memory until an observation commits.
+    pub fn reserve_namespace_with_deadline(
+        &self,
+        control: &SqliteControlStore,
+        observation: &SourceObservation,
+        worker: &crate::control::LockedWorkerAuthority<'_>,
+        legacy_input: &str,
+        deadline: Instant,
+    ) -> PortResult<SourceNamespace> {
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            self.with_context_sql_deadline(deadline, || {
+                crate::with_retryable_sql_interrupt(|| {
+                    self.reserve_namespace_inner(control, observation, worker, legacy_input)
+                })
+            })
+        })
+    }
+
+    fn reserve_namespace_inner(
+        &self,
+        control: &SqliteControlStore,
+        observation: &SourceObservation,
+        worker: &crate::control::LockedWorkerAuthority<'_>,
+        legacy_input: &str,
+    ) -> PortResult<SourceNamespace> {
         if self.inner._lease.is_none() {
             return Err(invalid());
         }
+        #[cfg(test)]
+        baseline_deadline_tests::observe_namespace_authorization();
         self.authorize_observation(control, worker, observation)?;
         let path = &observation.binding.source_path;
+        #[cfg(test)]
+        baseline_deadline_tests::observe_namespace_resolution(&self.inner.conn.borrow())?;
         let input = self.inner.resolve_or_allocate_installation_namespace(
             observation.binding.provider.as_str(),
             path,
@@ -2770,6 +2805,11 @@ mod baseline_deadline_tests {
         storage_error_calls: u32,
         storage_code: Option<rusqlite::ErrorCode>,
         storage_extended: Option<i32>,
+        namespace_authorizations: u32,
+        namespace_authorization_end: Option<Instant>,
+        interrupt_namespace_resolution: bool,
+        namespace_interrupt_installed: bool,
+        namespace_interrupt_hits: u32,
     }
 
     thread_local! {
@@ -2795,9 +2835,25 @@ mod baseline_deadline_tests {
                     storage_error_calls: 0,
                     storage_code: None,
                     storage_extended: None,
+                    namespace_authorizations: 0,
+                    namespace_authorization_end: None,
+                    interrupt_namespace_resolution: false,
+                    namespace_interrupt_installed: false,
+                    namespace_interrupt_hits: 0,
                 });
             });
             Self
+        }
+
+        fn start_with_namespace_interrupt(connection: &Connection) -> Self {
+            let recording = Self::start(connection);
+            OBSERVATIONS.with(|slot| {
+                slot.borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .interrupt_namespace_resolution = true;
+            });
+            recording
         }
 
         fn snapshot(&self) -> Observations {
@@ -2808,6 +2864,57 @@ mod baseline_deadline_tests {
         fn drop(&mut self) {
             OBSERVATIONS.with(|slot| slot.borrow_mut().take());
         }
+    }
+
+    pub(super) fn observe_namespace_authorization() {
+        OBSERVATIONS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.namespace_authorizations += 1;
+                observed.namespace_authorization_end =
+                    Some(SqliteControlStore::effective_runtime_deadline(
+                        Instant::now() + Duration::from_secs(60),
+                    ));
+            }
+        });
+    }
+
+    pub(super) fn observe_namespace_resolution(connection: &Connection) -> PortResult<()> {
+        if !OBSERVATIONS.with(|slot| slot.borrow().is_some()) {
+            return Ok(());
+        }
+        observe_query(
+            connection,
+            SqliteControlStore::effective_runtime_deadline(
+                Instant::now() + Duration::from_secs(60),
+            ),
+        )?;
+        let interrupt = OBSERVATIONS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|observed| observed.interrupt_namespace_resolution)
+        });
+        if interrupt {
+            connection
+                .progress_handler(1, Some(observe_namespace_interrupt))
+                .map_err(storage)?;
+            OBSERVATIONS.with(|slot| {
+                slot.borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .namespace_interrupt_installed = true;
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn observe_namespace_interrupt() -> bool {
+        OBSERVATIONS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.namespace_interrupt_hits =
+                    observed.namespace_interrupt_hits.saturating_add(1);
+            }
+        });
+        true
     }
 
     pub(super) fn observe_query(connection: &Connection, sql_end: Instant) -> PortResult<()> {
@@ -2986,7 +3093,13 @@ mod baseline_deadline_tests {
                         &observation.binding.source_path,
                         "claude-code",
                     );
-                let namespace = store.reserve_namespace(control, &observation, &worker, &legacy)?;
+                let namespace = store.reserve_namespace_with_deadline(
+                    control,
+                    &observation,
+                    &worker,
+                    &legacy,
+                    end,
+                )?;
                 observation.binding.namespace_id = Some(namespace.namespace_id);
                 let batch = publication_batch(&observation, "original deadline evidence");
                 let published = store.commit_source_with_context(
@@ -3141,6 +3254,235 @@ mod baseline_deadline_tests {
         assert_eq!(recording.snapshot().progress_calls, before);
         let probe = original_end + Duration::from_secs(10);
         assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    }
+
+    #[test]
+    fn namespace_deadline_expired_skips_authorization_and_resolution() {
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, _) = prepare_publication(&fixture);
+        let worker = fixture
+            .control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                fixture
+                    .control
+                    .bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        let prior = publication_evidence(&store);
+        let pending = store.inner.pending_installations.borrow().clone();
+        let recording = Recording::start(&store.inner.conn.borrow());
+        let end = Instant::now();
+        let result = store.reserve_namespace_with_deadline(
+            &fixture.control,
+            &observation,
+            &worker,
+            "unused-expired-input",
+            end,
+        );
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        let observed = recording.snapshot();
+        assert_eq!(observed.namespace_authorizations, 0);
+        assert_eq!(observed.query_calls, 0);
+        assert_eq!(*store.inner.pending_installations.borrow(), pending);
+        assert_eq!(publication_evidence(&store), prior);
+        assert_publication_handlers_restored(&store, &recording, end);
+    }
+
+    #[test]
+    fn namespace_deadline_keeps_earlier_scope_and_committed_identity() {
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, _) = prepare_publication(&fixture);
+        let control = &fixture.control;
+        let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
+            &observation.binding.source_path,
+            observation.binding.provider.as_str(),
+        );
+        let (worker, expected) = control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                let worker = control.bind_worker(&fixture.worker_lock, wal_tests::id("boot"))?;
+                let expected = store.reserve_namespace(control, &observation, &worker, &legacy)?;
+                Ok((worker, expected))
+            })
+            .unwrap();
+        let prior = publication_evidence(&store);
+        let pending = store.inner.pending_installations.borrow().clone();
+        let writes: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let recording = Recording::start(&store.inner.conn.borrow());
+        let outer = Instant::now() + Duration::from_secs(10);
+        let requested = outer + Duration::from_secs(10);
+        let actual = control
+            .with_runtime_deadline(outer, || {
+                let result = store.reserve_namespace_with_deadline(
+                    control,
+                    &observation,
+                    &worker,
+                    &legacy,
+                    requested,
+                )?;
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(requested),
+                    outer
+                );
+                Ok(result)
+            })
+            .unwrap();
+        assert_eq!(actual.namespace_id, expected.namespace_id);
+        assert_eq!(actual.input, expected.input);
+        let observed = recording.snapshot();
+        assert_eq!(observed.namespace_authorizations, 1);
+        assert_eq!(observed.namespace_authorization_end, Some(outer));
+        assert_eq!(observed.query_calls, 1);
+        let query = observed.query.expect("namespace resolution was reached");
+        assert!(query.same_connection);
+        assert_eq!(query.sql_end, outer);
+        assert_eq!(query.effective_end, outer);
+        assert_eq!(query.busy_timeout, 0);
+        assert!(observed.progress_calls > 0);
+        assert_eq!(observed.progress_end, Some(outer));
+        assert!(!observed.progress_end_changed);
+        assert!(!observed.interrupted);
+        assert!(!observed.retried);
+        assert_publication_handlers_restored(&store, &recording, outer);
+        assert_eq!(publication_evidence(&store), prior);
+        assert_eq!(*store.inner.pending_installations.borrow(), pending);
+        let after_writes: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_writes, writes,
+            "reservation must not persist identity or evidence"
+        );
+    }
+
+    #[test]
+    fn namespace_resolution_interrupt_is_busy_without_reserving_identity() {
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, _) = prepare_publication(&fixture);
+        let control = &fixture.control;
+        let worker = control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                control.bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        let legacy = agent_session_grep_application::relocation::legacy_installation_namespace(
+            &observation.binding.source_path,
+            observation.binding.provider.as_str(),
+        );
+        let prior = publication_evidence(&store);
+        let pending = store.inner.pending_installations.borrow().clone();
+        let namespaces_before: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT count(*) FROM installation_namespaces", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let writes_before: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let recording = Recording::start_with_namespace_interrupt(&store.inner.conn.borrow());
+        let end = Instant::now() + Duration::from_secs(10);
+        let result =
+            store.reserve_namespace_with_deadline(control, &observation, &worker, &legacy, end);
+        assert!(
+            matches!(result, Err(PortError::WriterBusy(_))),
+            "{result:?}"
+        );
+        let observed = recording.snapshot();
+        assert_eq!(observed.namespace_authorizations, 1);
+        assert_eq!(observed.namespace_authorization_end, Some(end));
+        assert_eq!(observed.query_calls, 1);
+        assert!(observed.namespace_interrupt_installed);
+        assert!(observed.namespace_interrupt_hits > 0);
+        assert_eq!(*store.inner.pending_installations.borrow(), pending);
+        assert_eq!(publication_evidence(&store), prior);
+        let namespaces_after: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT count(*) FROM installation_namespaces", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let writes_after: i64 = store
+            .inner
+            .conn
+            .borrow()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(namespaces_after, namespaces_before);
+        assert_eq!(writes_after, writes_before);
+        assert_publication_handlers_restored(&store, &recording, end);
+    }
+
+    #[test]
+    fn namespace_deadline_preserves_policy_and_source_refusals() {
+        let fixture = wal_tests::Fixture::new();
+        let (store, observation, _) = prepare_publication(&fixture);
+        let control = &fixture.control;
+        let worker = control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(10), || {
+                control.bind_worker(&fixture.worker_lock, wal_tests::id("boot"))
+            })
+            .unwrap();
+        let prior = publication_evidence(&store);
+        let pending = store.inner.pending_installations.borrow().clone();
+        for changed_epoch in [false, true] {
+            let mut refused = observation.clone();
+            if changed_epoch {
+                refused.policy_epoch += 1;
+            } else {
+                refused.binding.provider = SearchProvider::Codex;
+            }
+            let end = Instant::now() + Duration::from_secs(10);
+            let legacy_error = control
+                .with_runtime_deadline(end, || {
+                    store.reserve_namespace(control, &refused, &worker, "unused-refused-input")
+                })
+                .expect_err("legacy authorization must refuse");
+            let recording = Recording::start(&store.inner.conn.borrow());
+            let bounded_error = store
+                .reserve_namespace_with_deadline(
+                    control,
+                    &refused,
+                    &worker,
+                    "unused-refused-input",
+                    end,
+                )
+                .expect_err("bounded authorization must refuse");
+            match (legacy_error, bounded_error) {
+                (PortError::InvalidRequest(before), PortError::InvalidRequest(after))
+                    if !changed_epoch =>
+                {
+                    assert_eq!(before, after);
+                }
+                (PortError::GenerationMismatch(before), PortError::GenerationMismatch(after))
+                    if changed_epoch =>
+                {
+                    assert_eq!(before, after);
+                }
+                (before, after) => panic!("namespace refusal changed: {before:?}, {after:?}"),
+            }
+            let observed = recording.snapshot();
+            assert_eq!(observed.namespace_authorizations, 1);
+            assert_eq!(observed.namespace_authorization_end, Some(end));
+            assert_eq!(observed.query_calls, 0);
+            assert_publication_handlers_restored(&store, &recording, end);
+            assert_eq!(publication_evidence(&store), prior);
+            assert_eq!(*store.inner.pending_installations.borrow(), pending);
+        }
     }
 
     #[test]
