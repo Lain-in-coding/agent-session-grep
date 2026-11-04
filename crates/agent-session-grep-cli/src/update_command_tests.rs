@@ -975,141 +975,153 @@ fn terminal_rollback_clears_discovery_under_its_owned_fence_and_repeats_read_onl
     }
 }
 
-#[test]
-fn restart_failure_keeps_unfinished_journal_after_catalog_admission_reopens() {
-    use agent_session_grep_adapters_sqlite::managed_store::ManagedStore;
-    use agent_session_grep_ports::control::{
-        CycleAdmission, RootKind, ScopeRegion, SelectionRequest, SelectionRevision,
-    };
-    with_idle_admission(|control, installation, root, db, prefix, lock| {
-        let end = Instant::now() + Duration::from_secs(10);
-        control
-            .set_desired_updates(
-                control.status().unwrap().policy.control_seq,
-                DesiredUpdates::Running,
-            )
-            .unwrap();
-        let selected = control
-            .add_selection(
-                control.status().unwrap().policy.control_seq,
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: agent_session_grep_ports::SearchProvider::Claude,
-                        locator: agent_session_grep_ports::control::CanonicalLocator::from_path(
-                            root,
-                        )
-                        .unwrap(),
-                        kind: RootKind::Root,
-                    },
-                    root_identity: Some(ControlId::parse("source_root").unwrap()),
-                    now_ms: 2,
-                },
-            )
-            .unwrap()
-            .value;
-        let identity =
-            agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
-                control, db, end,
-            )
-            .unwrap();
-        let status = control.status().unwrap();
-        let owner = ControlId::parse("owner").unwrap();
-        let mut new = build_identity();
-        new.version = "0.2.0-beta.2".into();
-        new.relative_dir = format!("versions/{}-{}", new.version, "b".repeat(12));
-        let state = State::new(UpdateStart {
-            update_id: ControlId::parse("ordering_update").unwrap(),
-            owner: owner.clone(),
-            old: build_identity(),
-            new,
-            archive_sha256: "c".repeat(64),
-            manifest_sha256: "d".repeat(64),
-            old_pointer_generation: 1,
-            stable_launcher_sha256: "e".repeat(64),
-            catalog: db.to_path_buf(),
-            checkpoint: Checkpoint {
-                installation_id: identity.installation.as_str().into(),
-                policy_epoch: status.policy.policy_epoch.get() as u64,
-                control_seq: status.policy.control_seq.get() as u64,
-                desired_updates: "running".into(),
-                catalog_incarnation: identity.incarnation.as_str().into(),
-                catalog_generation: identity.generation,
-                catalog_schema: identity.schema,
-            },
-        })
+fn prepare_restart_warning_journal<'a>(
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    root: &Path,
+    db: &Path,
+    prefix: &Path,
+    lock: &'a ExclusiveGuard,
+    end: Instant,
+) -> (
+    ControlId,
+    Journal<'a>,
+    agent_session_grep_ports::control::Selection,
+) {
+    use agent_session_grep_ports::control::{RootKind, ScopeRegion, SelectionRequest};
+    control
+        .set_desired_updates(
+            control.status().unwrap().policy.control_seq,
+            DesiredUpdates::Running,
+        )
         .unwrap();
-        let mut journal = Journal::create(prefix, lock, state, end).unwrap();
-        journal.transition(Phase::Verified, end).unwrap();
-        set_fence(
+    let selected = control
+        .add_selection(
+            control.status().unwrap().policy.control_seq,
+            SelectionRequest {
+                region: ScopeRegion {
+                    provider: agent_session_grep_ports::SearchProvider::Claude,
+                    locator: agent_session_grep_ports::control::CanonicalLocator::from_path(root)
+                        .unwrap(),
+                    kind: RootKind::Root,
+                },
+                root_identity: Some(ControlId::parse("source_root").unwrap()),
+                now_ms: 2,
+            },
+        )
+        .unwrap()
+        .value;
+    let identity =
+        agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
+            control, db, end,
+        )
+        .unwrap();
+    let status = control.status().unwrap();
+    let owner = ControlId::parse("owner").unwrap();
+    let mut new = build_identity();
+    new.version = "0.2.0-beta.2".into();
+    new.relative_dir = format!("versions/{}-{}", new.version, "b".repeat(12));
+    let state = State::new(UpdateStart {
+        update_id: ControlId::parse("ordering_update").unwrap(),
+        owner: owner.clone(),
+        old: build_identity(),
+        new,
+        archive_sha256: "c".repeat(64),
+        manifest_sha256: "d".repeat(64),
+        old_pointer_generation: 1,
+        stable_launcher_sha256: "e".repeat(64),
+        catalog: db.to_path_buf(),
+        checkpoint: Checkpoint {
+            installation_id: identity.installation.as_str().into(),
+            policy_epoch: status.policy.policy_epoch.get() as u64,
+            control_seq: status.policy.control_seq.get() as u64,
+            desired_updates: "running".into(),
+            catalog_incarnation: identity.incarnation.as_str().into(),
+            catalog_generation: identity.generation,
+            catalog_schema: identity.schema,
+        },
+    })
+    .unwrap();
+    let mut journal = Journal::create(prefix, lock, state, end).unwrap();
+    journal.transition(Phase::Verified, end).unwrap();
+    set_fence(
+        control,
+        installation,
+        &owner,
+        root,
+        MaintenancePhase::Quiescing,
+        false,
+        end,
+    )
+    .unwrap();
+    journal.transition(Phase::Quiescing, end).unwrap();
+    let catalog =
+        MaintenanceCatalog::open_authorized(control, installation, &owner, db, end).unwrap();
+    journal.state.quiesced_checkpoint = Some(
+        quiesced_checkpoint(
+            &control.status().unwrap(),
+            catalog.identity(),
+            &journal.state.checkpoint,
+        )
+        .unwrap(),
+    );
+    // Production persists the post-drain checkpoint before the backup;
+    // a durable successor may not change both in one transition.
+    journal.save(end).unwrap();
+    let BackupOutcome::Created(backup) = catalog
+        .create_backup(
             control,
             installation,
             &owner,
-            root,
-            MaintenancePhase::Quiescing,
-            false,
+            &ControlId::parse("ordering_backup").unwrap(),
+            BackupPurpose::BetaRollback,
+            3,
+            end,
+        )
+        .unwrap()
+    else {
+        panic!("fixture backup refused")
+    };
+    drop(catalog);
+    journal.state.backup = Some(backup_reference(backup));
+    journal.transition(Phase::BackedUp, end).unwrap();
+    journal.state.staged = true;
+    journal.transition(Phase::Staged, end).unwrap();
+    journal.state.migrated = true;
+    journal.transition(Phase::Migrated, end).unwrap();
+    let pointer = journal
+        .state
+        .new
+        .pointer(journal.state.new_pointer_generation, "2026-10-31T00:00:00Z")
+        .unwrap();
+    journal
+        .replace_metadata(
+            MetadataFile::Current,
+            &serde_json::to_vec(&pointer).unwrap(),
             end,
         )
         .unwrap();
-        journal.transition(Phase::Quiescing, end).unwrap();
-        let catalog =
-            MaintenanceCatalog::open_authorized(control, installation, &owner, db, end).unwrap();
-        journal.state.quiesced_checkpoint = Some(
-            quiesced_checkpoint(
-                &control.status().unwrap(),
-                catalog.identity(),
-                &journal.state.checkpoint,
-            )
-            .unwrap(),
-        );
-        // Production persists the post-drain checkpoint before the backup;
-        // a durable successor may not change both in one transition.
-        journal.save(end).unwrap();
-        let BackupOutcome::Created(backup) = catalog
-            .create_backup(
-                control,
-                installation,
-                &owner,
-                &ControlId::parse("ordering_backup").unwrap(),
-                BackupPurpose::BetaRollback,
-                3,
-                end,
-            )
-            .unwrap()
-        else {
-            panic!("fixture backup refused")
-        };
-        drop(catalog);
-        journal.state.backup = Some(backup_reference(backup));
-        journal.transition(Phase::BackedUp, end).unwrap();
-        journal.state.staged = true;
-        journal.transition(Phase::Staged, end).unwrap();
-        journal.state.migrated = true;
-        journal.transition(Phase::Migrated, end).unwrap();
-        let pointer = journal
-            .state
-            .new
-            .pointer(journal.state.new_pointer_generation, "2026-10-31T00:00:00Z")
-            .unwrap();
-        journal
-            .replace_metadata(
-                MetadataFile::Current,
-                &serde_json::to_vec(&pointer).unwrap(),
-                end,
-            )
-            .unwrap();
-        journal.transition(Phase::Switched, end).unwrap();
-        journal.state.self_checked = true;
-        journal.transition(Phase::SelfChecked, end).unwrap();
+    journal.transition(Phase::Switched, end).unwrap();
+    journal.state.self_checked = true;
+    journal.transition(Phase::SelfChecked, end).unwrap();
 
+    (owner, journal, selected)
+}
+
+#[test]
+fn restart_failure_keeps_unfinished_journal_after_catalog_admission_reopens() {
+    use agent_session_grep_adapters_sqlite::managed_store::ManagedStore;
+    use agent_session_grep_ports::control::{CycleAdmission, SelectionRevision};
+    with_idle_admission(|control, installation, root, db, prefix, lock| {
+        let end = Instant::now() + Duration::from_secs(10);
+        let (owner, mut journal, selected) =
+            prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
         // This installation has no supervisor/package receipt. Restart must
         // fail without launching a process, after the actual completion seam
         // has cleared maintenance but before Complete can become durable.
-        assert_eq!(
-            finish_update(control, installation, &owner, root, &mut journal, end)
-                .unwrap()
-                .0,
-            Outcome::Partial,
-        );
+        let reply = finish_update(control, installation, &owner, root, &mut journal, end).unwrap();
+        assert_restart_warning_output(reply, "update.apply", "schema_incompatible");
+        assert!(!journal.state.resumed);
         assert_eq!(journal.state.phase, Phase::SelfChecked);
         assert_eq!(journal.state.error_code.as_deref(), Some("restart_failed"));
         assert!(!recovery_can_finish_active_update(&journal.state));
@@ -1322,4 +1334,497 @@ fn busy_admission_retries_never_outlive_the_original_request_end() {
         );
         assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
     });
+}
+
+const RESTART_PRIVATE_SENTINEL: &str =
+    "PRIVATE_RESTART_MESSAGE C:/synthetic-secret/root PID=424242\nINJECTED_LINE";
+
+fn assert_restart_warning_output(reply: UpdateReply, operation: &str, reason: &str) {
+    let mut emitted = 0;
+    let outcome = emit_update_reply(reply, |outcome, data, warnings| {
+        emitted += 1;
+        assert_eq!(outcome, Outcome::Partial);
+        assert_eq!(data["error_code"], "restart_failed");
+        assert_eq!(data["recovery_required"], true);
+        assert_eq!(data["freshness"], "unknown");
+        assert!(data.get("resumed").is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(&format!("Background restart failed (reason={reason}).")));
+        assert!(warnings[0].len() < 512);
+        assert!(!warnings[0].contains(['\n', '\r']));
+        let wire = protocol::success_envelope(
+            operation,
+            outcome,
+            data,
+            0,
+            &protocol::Page::default(),
+            warnings,
+            Some("restart-warning-test"),
+            RetrievalMode::Lexical,
+            &agent_session_grep_ports::RedactionStatus::default(),
+        );
+        let frame: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(frame["outcome"], "partial");
+        assert_eq!(frame["warnings"], json!(warnings));
+        let human = crate::human_warning_line(&warnings[0]);
+        assert!(human.starts_with("warning: Background restart failed"));
+        for private in [
+            "PRIVATE_RESTART_MESSAGE",
+            "synthetic-secret",
+            "424242",
+            "INJECTED_LINE",
+        ] {
+            assert!(
+                !wire.contains(private),
+                "private error entered machine output"
+            );
+            assert!(
+                !human.contains(private),
+                "private error entered human output"
+            );
+        }
+    });
+    assert_eq!(outcome, Outcome::Partial);
+    assert_eq!(emitted, 1);
+}
+
+fn restart_catalog_and_pointer(db: &Path, prefix: &Path) -> (Option<Vec<u8>>, (String, i64, i64)) {
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let catalog = connection.query_row(
+        "SELECT catalog_incarnation,active_generation,destructive_epoch FROM catalog_meta CROSS JOIN store_metadata WHERE catalog_meta.singleton=1 AND store_metadata.singleton=1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    let pointer = match std::fs::read(prefix.join("current.json")) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("synthetic pointer read failed: {error:?}"),
+    };
+    (pointer, catalog)
+}
+
+#[test]
+fn running_finish_update_retains_typed_restart_warning_and_original_end() {
+    use crate::native_manager::ErrorCode;
+    for (native, reason) in [
+        (ErrorCode::Unavailable, "capability_not_supported"),
+        (ErrorCode::Timeout, "deadline_exceeded"),
+        (ErrorCode::Busy, "writer_busy"),
+    ] {
+        with_idle_admission(|control, installation, root, db, prefix, lock| {
+            let end = Instant::now() + Duration::from_secs(10);
+            let (owner, mut journal, _) =
+                prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
+            let before = restart_catalog_and_pointer(db, prefix);
+            let policy = control.status().unwrap().policy;
+            let expected = journal.state.new.clone();
+            let outer = end - Duration::from_millis(1);
+            let probe = end + Duration::from_secs(1);
+            let prior_end = SqliteControlStore::effective_runtime_deadline(probe);
+            let expected_end = SqliteControlStore::effective_runtime_deadline(outer);
+            let mut calls = 0;
+            let reply = with_update_deadline(control, outer, || {
+                finish_update_with_resume(
+                    control,
+                    installation,
+                    &owner,
+                    root,
+                    &mut journal,
+                    end,
+                    |seen_control, seen_root, seen_journal, seen_identity, seen_end| {
+                        calls += 1;
+                        assert!(std::ptr::eq(seen_control, control));
+                        assert_eq!(seen_root, root);
+                        assert_eq!(seen_identity, &expected);
+                        assert_eq!(seen_journal.state.new, expected);
+                        assert_eq!(seen_end, end);
+                        assert_eq!(
+                            SqliteControlStore::effective_runtime_deadline(probe),
+                            expected_end
+                        );
+                        assert!(Instant::now() < expected_end);
+                        let mut error = native_restart_error(native.into());
+                        error.0.message = RESTART_PRIVATE_SENTINEL.into();
+                        Err(error)
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                prior_end
+            );
+            assert_restart_warning_output(reply, "update.apply", reason);
+            assert_eq!(journal.state.phase, Phase::SelfChecked);
+            assert!(!journal.state.resumed);
+            assert_eq!(journal.state.error_code.as_deref(), Some("restart_failed"));
+            let durable = Journal::open(prefix, lock, end).unwrap();
+            assert_eq!(durable.state, journal.state);
+            assert_eq!(restart_catalog_and_pointer(db, prefix), before);
+            let after = control.status().unwrap();
+            assert_eq!(after.desired_updates, DesiredUpdates::Running);
+            assert_eq!(after.policy.maintenance.state, MaintenanceState::Idle);
+            assert_eq!(after.policy.policy_epoch, policy.policy_epoch);
+            assert_eq!(after.policy.selections, policy.selections);
+        });
+    }
+}
+
+#[test]
+fn terminal_rollback_warning_is_current_only_and_never_rewrites_history() {
+    use crate::native_manager::ErrorCode;
+    for (native, reason) in [
+        (ErrorCode::Unavailable, "capability_not_supported"),
+        (ErrorCode::Timeout, "deadline_exceeded"),
+        (ErrorCode::Busy, "writer_busy"),
+    ] {
+        with_idle_admission(|control, installation, root, db, prefix, lock| {
+            let end = Instant::now() + Duration::from_secs(10);
+            let old_pointer = build_identity().pointer(1, "2026-10-31T00:00:00Z").unwrap();
+            std::fs::write(
+                prefix.join("current.json"),
+                serde_json::to_vec(&old_pointer).unwrap(),
+            )
+            .unwrap();
+            let (owner, mut journal, _) =
+                prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
+            journal.state.error_code = Some("restart_failed".into());
+            journal.transition(Phase::RollbackPending, end).unwrap();
+            journal.transition(Phase::Reconciling, end).unwrap();
+            journal.restore_metadata(end).unwrap();
+            journal.transition(Phase::RolledBack, end).unwrap();
+            let saved = std::fs::read(prefix.join("update/state.json")).unwrap();
+            let before = restart_catalog_and_pointer(db, prefix);
+            let expected = journal.state.old.clone();
+            let mut calls = 0;
+            let reply = with_update_deadline(control, end, || {
+                finish_rollback_with_resume(
+                    control,
+                    installation,
+                    &owner,
+                    root,
+                    &journal,
+                    end,
+                    |_, seen_root, seen_journal, seen_identity, seen_end| {
+                        calls += 1;
+                        assert_eq!(seen_root, root);
+                        assert_eq!(seen_identity, &expected);
+                        assert_eq!(seen_journal.state.old, expected);
+                        assert_eq!(seen_end, end);
+                        assert!(Instant::now() < seen_end);
+                        let mut error = native_restart_error(native.into());
+                        error.0.message = RESTART_PRIVATE_SENTINEL.into();
+                        Err(error)
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_restart_warning_output(reply, "update.recover", reason);
+            assert_eq!(
+                std::fs::read(prefix.join("update/state.json")).unwrap(),
+                saved
+            );
+            assert_eq!(restart_catalog_and_pointer(db, prefix), before);
+            // A separate explicit recovery can succeed; old durable text is not
+            // a new invocation warning or permission to rotate the catalog again.
+            let recovered = with_update_deadline(control, end, || {
+                finish_rollback_with_resume(
+                    control,
+                    installation,
+                    &owner,
+                    root,
+                    &journal,
+                    end,
+                    |_, _, _, seen_identity, seen_end| {
+                        calls += 1;
+                        assert_eq!(seen_identity, &expected);
+                        assert_eq!(seen_end, end);
+                        Ok(true)
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(calls, 2);
+            assert_eq!(recovered.0, Outcome::Success);
+            assert!(recovered.2.is_empty());
+            assert_eq!(
+                std::fs::read(prefix.join("update/state.json")).unwrap(),
+                saved
+            );
+            assert_eq!(restart_catalog_and_pointer(db, prefix), before);
+            for desired in [DesiredUpdates::Paused, DesiredUpdates::Stopped] {
+                control
+                    .set_desired_updates(control.status().unwrap().policy.control_seq, desired)
+                    .unwrap();
+                let paused =
+                    finish_rollback(control, installation, &owner, root, &journal, end).unwrap();
+                assert_eq!(paused.0, Outcome::Success);
+                assert!(paused.2.is_empty());
+                control
+                    .set_desired_updates(
+                        control.status().unwrap().policy.control_seq,
+                        DesiredUpdates::Running,
+                    )
+                    .unwrap();
+                let mut raced = 0;
+                let paused = finish_rollback_with_resume(
+                    control,
+                    installation,
+                    &owner,
+                    root,
+                    &journal,
+                    end,
+                    |_, _, _, seen_identity, seen_end| {
+                        raced += 1;
+                        assert_eq!(seen_identity, &expected);
+                        assert_eq!(seen_end, end);
+                        control
+                            .set_desired_updates(
+                                control.status().unwrap().policy.control_seq,
+                                desired,
+                            )
+                            .unwrap();
+                        Err(problem(CanonicalCode::WriterBusy, RESTART_PRIVATE_SENTINEL))
+                    },
+                )
+                .unwrap();
+                assert_eq!(raced, 1);
+                assert_eq!(paused.0, Outcome::Success);
+                assert!(paused.2.is_empty());
+                assert_eq!(control.status().unwrap().desired_updates, desired);
+                assert_eq!(
+                    std::fs::read(prefix.join("update/state.json")).unwrap(),
+                    saved
+                );
+                assert_eq!(restart_catalog_and_pointer(db, prefix), before);
+            }
+        });
+    }
+}
+
+#[test]
+fn pause_or_stop_before_or_racing_restart_emits_no_failure_warning() {
+    for desired in [DesiredUpdates::Paused, DesiredUpdates::Stopped] {
+        for racing in [false, true] {
+            with_idle_admission(|control, installation, root, db, prefix, lock| {
+                let end = Instant::now() + Duration::from_secs(10);
+                let (owner, mut journal, _) = prepare_restart_warning_journal(
+                    control,
+                    installation,
+                    root,
+                    db,
+                    prefix,
+                    lock,
+                    end,
+                );
+                let selections = control.status().unwrap().policy.selections;
+                let change_intent = || {
+                    control
+                        .set_desired_updates(control.status().unwrap().policy.control_seq, desired)
+                        .unwrap();
+                };
+                let reply = if racing {
+                    let mut calls = 0;
+                    let reply = finish_update_with_resume(
+                        control,
+                        installation,
+                        &owner,
+                        root,
+                        &mut journal,
+                        end,
+                        |_, _, _, _, seen_end| {
+                            calls += 1;
+                            assert_eq!(seen_end, end);
+                            change_intent();
+                            Err(problem(
+                                CanonicalCode::CapabilityNotSupported,
+                                RESTART_PRIVATE_SENTINEL,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(calls, 1);
+                    reply
+                } else {
+                    change_intent();
+                    // No package exists in this fixture: reaching native identity
+                    // inspection would fail, rather than silently proving no-start.
+                    finish_update(control, installation, &owner, root, &mut journal, end).unwrap()
+                };
+                assert_eq!(reply.0, Outcome::Success);
+                assert!(reply.2.is_empty());
+                assert_eq!(journal.state.phase, Phase::Complete);
+                assert!(!journal.state.resumed);
+                assert!(journal.state.error_code.is_none());
+                assert_eq!(control.status().unwrap().desired_updates, desired);
+                assert_eq!(control.status().unwrap().policy.selections, selections);
+            });
+        }
+    }
+}
+
+#[test]
+fn restart_warning_never_replaces_expiry_pair_refusal_or_failed_save() {
+    with_idle_admission(|control, installation, root, db, prefix, lock| {
+        let end = Instant::now() + Duration::from_secs(10);
+        let (owner, mut journal, _) =
+            prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
+        let saved = std::fs::read(prefix.join("update/state.json")).unwrap();
+        let mut calls = 0;
+        let expired = finish_update_with_resume(
+            control,
+            installation,
+            &owner,
+            root,
+            &mut journal,
+            Instant::now(),
+            |_, _, _, _, _| {
+                calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(expired.0.code, CanonicalCode::WriterBusy);
+        assert_eq!(calls, 0);
+        assert_eq!(
+            std::fs::read(prefix.join("update/state.json")).unwrap(),
+            saved
+        );
+        let schema = journal.state.new.catalog_schema;
+        let policy = control.status().unwrap().policy;
+        journal.state.new.catalog_schema = 1;
+        let mismatch = finish_update_with_resume(
+            control,
+            installation,
+            &owner,
+            root,
+            &mut journal,
+            end,
+            |_, _, _, _, _| {
+                calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.0.code, CanonicalCode::UpdateRecoveryRequired);
+        assert_eq!(control.status().unwrap().policy, policy);
+        journal.state.new.catalog_schema = schema;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            std::fs::read(prefix.join("update/state.json")).unwrap(),
+            saved
+        );
+        // A real refused save (occupied next slot), after a typed native error,
+        // must return the storage error instead of a warning-bearing Partial.
+        let next = prefix.join("update/state.next.json");
+        let error = finish_update_with_resume(
+            control,
+            installation,
+            &owner,
+            root,
+            &mut journal,
+            end,
+            |_, _, _, _, seen_end| {
+                calls += 1;
+                assert_eq!(seen_end, end);
+                update_state::write_new(&next, b"retained synthetic conflict").unwrap();
+                Err(problem(
+                    CanonicalCode::CapabilityNotSupported,
+                    RESTART_PRIVATE_SENTINEL,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.0.code, CanonicalCode::SchemaIncompatible);
+        assert!(journal.poisoned());
+        assert_eq!(
+            std::fs::read(prefix.join("update/state.json")).unwrap(),
+            saved
+        );
+        assert_eq!(std::fs::read(next).unwrap(), b"retained synthetic conflict");
+    });
+}
+
+#[test]
+fn post_restart_status_failure_stays_hard_and_cannot_emit_partial() {
+    with_idle_admission(|control, installation, root, db, prefix, lock| {
+        let end = Instant::now() + Duration::from_secs(10);
+        let (owner, mut journal, _) =
+            prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
+        let saved = std::fs::read(prefix.join("update/state.json")).unwrap();
+        let mut calls = 0;
+        let error = finish_update_with_resume(
+            control,
+            installation,
+            &owner,
+            root,
+            &mut journal,
+            end,
+            |_, _, _, _, _| {
+                calls += 1;
+                // Valid SQL, deliberately invalid synthetic schema: the real
+                // existing post-error status read must refuse before journal save.
+                let conn = rusqlite::Connection::open(root.join("control.db")).unwrap();
+                conn.pragma_update(None, "user_version", 999).unwrap();
+                Err(problem(
+                    CanonicalCode::CapabilityNotSupported,
+                    RESTART_PRIVATE_SENTINEL,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.0.code, CanonicalCode::SchemaIncompatible);
+        assert_eq!(
+            std::fs::read(prefix.join("update/state.json")).unwrap(),
+            saved
+        );
+    });
+}
+
+#[test]
+fn additional_restart_errors_keep_only_safe_reason_codes() {
+    for (code, reason) in [
+        (CanonicalCode::GenerationMismatch, "generation_mismatch"),
+        (
+            CanonicalCode::UpdateRecoveryRequired,
+            "update_recovery_required",
+        ),
+        (CanonicalCode::SourceIo, "unknown"),
+    ] {
+        with_idle_admission(|control, installation, root, db, prefix, lock| {
+            let end = Instant::now() + Duration::from_secs(10);
+            let (owner, mut journal, _) =
+                prepare_restart_warning_journal(control, installation, root, db, prefix, lock, end);
+            let mut calls = 0;
+            let reply = finish_update_with_resume(
+                control,
+                installation,
+                &owner,
+                root,
+                &mut journal,
+                end,
+                |_, _, _, _, seen_end| {
+                    calls += 1;
+                    assert_eq!(seen_end, end);
+                    Err(problem(code, RESTART_PRIVATE_SENTINEL))
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_restart_warning_output(reply, "update.recover", reason);
+            assert_eq!(
+                Journal::open(prefix, lock, end)
+                    .unwrap()
+                    .state
+                    .error_code
+                    .as_deref(),
+                Some("restart_failed")
+            );
+        });
+    }
 }
