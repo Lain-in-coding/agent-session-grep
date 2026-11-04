@@ -347,6 +347,11 @@ four native packages or Beta maturity; no provider is promoted here.
   failures under running intent still report partial `restart_failed`.
 - Avoid a duplicate Windows directory-handle metadata query while retaining
   fresh privacy checks and full 128-bit file identity.
+- Reuse the Windows root-open directory type from the same handle metadata
+  used to reject reparse effects, avoiding an immediate duplicate query.
+- Keep namespace authorization and SQL resolution inside the background
+  source attempt's original deadline. Deadline interruptions remain retryable
+  and cannot publish a new namespace or source evidence.
 - Apply the existing Windows sidecar-change classification when metadata
   access is denied. Confirmed transient refusals remain retryable within the
   original request deadline; permission and unknown failures stay hard errors.
