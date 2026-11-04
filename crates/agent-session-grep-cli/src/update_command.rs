@@ -159,6 +159,53 @@ fn state_report(state: &update_state::State) -> Value {
         "pointer_generation":state.new_pointer_generation,"cleanup_pending":state.cleanup_pending,
         "recovery_required":!state.phase.terminal(),"error_code":state.error_code,"freshness":"unknown"})
 }
+
+type UpdateReply = (Outcome, Value, Vec<String>);
+
+const RECORDED_RESTART_WARNING: &str = "Recorded restart failure (reason=unknown; no restart attempted by this invocation). Preserve state and inspect update status before recovery.";
+
+/// Invocation-only guidance: never expose native messages or infer a host cause.
+fn restart_warning(code: CanonicalCode) -> &'static str {
+    match code {
+        CanonicalCode::CapabilityNotSupported => {
+            "Background restart failed (reason=capability_not_supported). Preserve state; inspect asg update status for the same catalog and installation. Use asg update recover from a launch context whose background startup is verified. Do not repeat unchanged automatic startup."
+        }
+        CanonicalCode::DeadlineExceeded => {
+            "Background restart failed (reason=deadline_exceeded). Preserve state; inspect asg update status for the same catalog and installation. Explicitly recover when the blocking condition has been addressed."
+        }
+        CanonicalCode::WriterBusy => {
+            "Background restart failed (reason=writer_busy). Preserve state; inspect asg update status for the same catalog and installation. Explicitly recover after contention clears."
+        }
+        CanonicalCode::SchemaIncompatible => {
+            "Background restart failed (reason=schema_incompatible). Preserve state; inspect asg update status for the same catalog and installation and verify the installed package before recovery."
+        }
+        CanonicalCode::GenerationMismatch => {
+            "Background restart failed (reason=generation_mismatch). Preserve state; inspect current installation and policy status for the same catalog before recovery."
+        }
+        CanonicalCode::UpdateRecoveryRequired => {
+            "Background restart failed (reason=update_recovery_required). Preserve state; inspect asg update status for the same catalog and installation and verify installation/configuration before recovery."
+        }
+        _ => {
+            "Background restart failed (reason=unknown). Preserve state; inspect asg update status for the same catalog and installation before deciding the existing recovery action."
+        }
+    }
+}
+
+fn recorded_reply(outcome: Outcome, state: &State) -> UpdateReply {
+    let warnings = if state.error_code.as_deref() == Some("restart_failed") {
+        vec![RECORDED_RESTART_WARNING.to_owned()]
+    } else {
+        Vec::new()
+    };
+    (outcome, state_report(state), warnings)
+}
+
+fn emit_update_reply(reply: UpdateReply, emit: impl FnOnce(Outcome, Value, &[String])) -> Outcome {
+    let (outcome, data, warnings) = reply;
+    emit(outcome, data, &warnings);
+    outcome
+}
+
 pub(crate) fn run(
     db: &str,
     rest: &[String],
@@ -179,7 +226,7 @@ pub(crate) fn run(
             Action::Check => update_check::CHECK_DEADLINE,
             _ => Duration::from_secs(120),
         };
-    let (outcome, data) = match options.action {
+    let reply = match options.action {
         Action::Check => {
             if offline {
                 return Err(problem(
@@ -188,7 +235,11 @@ pub(crate) fn run(
                 ));
             }
             let installed = package_installation::installation(options.prefix.as_deref())?;
-            (Outcome::Success, check(&installed, options.channel, end)?)
+            (
+                Outcome::Success,
+                check(&installed, options.channel, end)?,
+                Vec::new(),
+            )
         }
         Action::Status => {
             let prefix = resolve_prefix(options.prefix.as_deref())?;
@@ -199,7 +250,7 @@ pub(crate) fn run(
             } else {
                 Outcome::Partial
             };
-            (outcome, state_report(&journal.state))
+            recorded_reply(outcome, &journal.state)
         }
         Action::Apply {
             archive,
@@ -215,18 +266,19 @@ pub(crate) fn run(
         )?,
         Action::Recover => recover(Path::new(db), options.prefix.as_deref(), end)?,
     };
-    emit_result(
-        operation,
-        mode,
-        outcome,
-        data,
-        started.elapsed().as_millis() as u64,
-        &protocol::Page::default(),
-        &[],
-        request_id,
-        RetrievalMode::Lexical,
-    );
-    Ok(outcome)
+    Ok(emit_update_reply(reply, |outcome, data, warnings| {
+        emit_result(
+            operation,
+            mode,
+            outcome,
+            data,
+            started.elapsed().as_millis() as u64,
+            &protocol::Page::default(),
+            warnings,
+            request_id,
+            RetrievalMode::Lexical,
+        );
+    }))
 }
 fn resolve_prefix(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     if let Some(prefix) = explicit {
@@ -922,7 +974,7 @@ fn apply(
     manifest: &Path,
     sums: &Path,
     end: Instant,
-) -> Result<(Outcome, Value), CliError> {
+) -> Result<UpdateReply, CliError> {
     let prefix = resolve_prefix(prefix)?;
     let lock = update_state::acquire_installation_lock(&prefix, end)?;
     if prefix
@@ -932,7 +984,7 @@ fn apply(
     {
         let old = Journal::open(&prefix, &lock, end)?;
         if !old.state.phase.terminal() {
-            return Ok((Outcome::Partial, state_report(&old.state)));
+            return Ok(recorded_reply(Outcome::Partial, &old.state));
         }
     }
     let mut installed = package_installation::inspect_installation_for_update(&prefix)?;
@@ -1619,7 +1671,33 @@ fn finish_update(
     root: &Path,
     journal: &mut Journal<'_>,
     end: Instant,
-) -> Result<(Outcome, Value), CliError> {
+) -> Result<UpdateReply, CliError> {
+    finish_update_with_resume(
+        control,
+        installation,
+        owner,
+        root,
+        journal,
+        end,
+        resume_background,
+    )
+}
+
+fn finish_update_with_resume(
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    owner: &ControlId,
+    root: &Path,
+    journal: &mut Journal<'_>,
+    end: Instant,
+    resume: impl FnOnce(
+        &SqliteControlStore,
+        &Path,
+        &Journal<'_>,
+        &VersionIdentity,
+        Instant,
+    ) -> Result<bool, CliError>,
+) -> Result<UpdateReply, CliError> {
     verify_catalog_program_pair(
         control,
         installation,
@@ -1630,22 +1708,26 @@ fn finish_update(
         end,
     )?;
     clear_fence(control, installation, owner, root, end)?;
-    match resume_background(control, root, journal, &journal.state.new, end) {
+    match resume(control, root, journal, &journal.state.new, end) {
         Ok(resumed) => journal.state.resumed = resumed,
-        Err(_) => {
+        Err(error) => {
             // A concurrent pause or stop is intentional, even when it races a
             // native start. Keep it rather than reporting it as restart failure.
             if control.status().map_err(port)?.desired_updates == DesiredUpdates::Running {
                 journal.state.error_code = Some("restart_failed".into());
                 journal.save(end)?;
-                return Ok((Outcome::Partial, state_report(&journal.state)));
+                return Ok((
+                    Outcome::Partial,
+                    state_report(&journal.state),
+                    vec![restart_warning(error.0.code).to_owned()],
+                ));
             }
             journal.state.resumed = false;
         }
     }
     journal.state.error_code = None;
     journal.transition(Phase::Complete, end)?;
-    Ok((Outcome::Success, state_report(&journal.state)))
+    Ok((Outcome::Success, state_report(&journal.state), Vec::new()))
 }
 fn finish_rollback(
     control: &SqliteControlStore,
@@ -1654,7 +1736,33 @@ fn finish_rollback(
     root: &Path,
     journal: &Journal<'_>,
     end: Instant,
-) -> Result<(Outcome, Value), CliError> {
+) -> Result<UpdateReply, CliError> {
+    finish_rollback_with_resume(
+        control,
+        installation,
+        owner,
+        root,
+        journal,
+        end,
+        resume_background,
+    )
+}
+
+fn finish_rollback_with_resume(
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    owner: &ControlId,
+    root: &Path,
+    journal: &Journal<'_>,
+    end: Instant,
+    resume: impl FnOnce(
+        &SqliteControlStore,
+        &Path,
+        &Journal<'_>,
+        &VersionIdentity,
+        Instant,
+    ) -> Result<bool, CliError>,
+) -> Result<UpdateReply, CliError> {
     if control.status().map_err(port)?.policy.maintenance.state != MaintenanceState::Idle {
         let mut catalog = MaintenanceCatalog::open_authorized(
             control,
@@ -1688,18 +1796,22 @@ fn finish_rollback(
         end,
     )?;
     clear_fence(control, installation, owner, root, end)?;
-    match resume_background(control, root, journal, &journal.state.old, end) {
-        Ok(_) => Ok((Outcome::Success, state_report(&journal.state))),
+    match resume(control, root, journal, &journal.state.old, end) {
+        Ok(_) => Ok((Outcome::Success, state_report(&journal.state), Vec::new())),
         Err(_) if control.status().map_err(port)?.desired_updates != DesiredUpdates::Running => {
-            Ok((Outcome::Success, state_report(&journal.state)))
+            Ok((Outcome::Success, state_report(&journal.state), Vec::new()))
         }
-        Err(_) => {
+        Err(error) => {
             // A terminal rollback record remains immutable. Re-running recover
             // may retry current desired startup without replaying rollback.
             let mut report = state_report(&journal.state);
             report["recovery_required"] = json!(true);
             report["error_code"] = json!("restart_failed");
-            Ok((Outcome::Partial, report))
+            Ok((
+                Outcome::Partial,
+                report,
+                vec![restart_warning(error.0.code).to_owned()],
+            ))
         }
     }
 }
@@ -1777,7 +1889,7 @@ fn verify_catalog_program_pair(
     })
 }
 
-fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<(Outcome, Value), CliError> {
+fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<UpdateReply, CliError> {
     let prefix = resolve_prefix(prefix)?;
     let lock = update_state::acquire_installation_lock(&prefix, end)?;
     let mut journal = Journal::open(&prefix, &lock, end)?;
@@ -1830,7 +1942,7 @@ fn recover(db: &Path, prefix: Option<&Path>, end: Instant) -> Result<(Outcome, V
                 end,
             )?;
             clear_fence(&control, &installation, &owner, root, end)?;
-            return Ok((Outcome::Success, state_report(&journal.state)));
+            return Ok((Outcome::Success, state_report(&journal.state), Vec::new()));
         }
         if matches!(journal.state.phase, Phase::Failed | Phase::RolledBack) {
             verify_active(
