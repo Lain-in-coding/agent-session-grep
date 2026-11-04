@@ -1,5 +1,61 @@
-#!/usr/bin/env pwsh
-# Offline verified package install with explicit host/history setup.
+<#
+.SYNOPSIS
+Installs or verifies an agent-session-grep managed candidate.
+
+.DESCRIPTION
+Validates an extracted package against its sibling manifest and SHA256SUMS,
+installs it into a dedicated prefix, and optionally registers selected
+assistants and histories with the installed setup command. This script is an
+offline first-install and same-package verification path. Use
+`asg --db <catalog> update apply --from <archive>` to upgrade an existing
+managed installation. When invoking the immutable application directly, also
+pass `--install-prefix <prefix>`.
+
+.PARAMETER Manifest
+Path to the package's sibling JSON manifest.
+
+.PARAMETER Checksums
+Path to the package's SHA256SUMS file.
+
+.PARAMETER Prefix
+Dedicated absent install prefix. The default is a user-local candidate prefix.
+
+.PARAMETER HostChoice
+One or more of: claude, codex, workbuddy, zcode, deepseek-harness, antigravity.
+
+.PARAMETER ClaudeHistory
+Explicit Claude Code history root or file; requires -HostChoice claude.
+
+.PARAMETER CodexHistory
+Explicit Codex history root or file; requires -HostChoice codex.
+
+.PARAMETER WorkBuddyHistory
+Explicit WorkBuddy history root or file; requires -HostChoice workbuddy.
+
+.PARAMETER ZCodeHistory
+Explicit ZCode history root or file; requires -HostChoice zcode.
+
+.PARAMETER DeepSeekHarnessHistory
+Explicit DeepSeek Harness history root or file; requires
+-HostChoice deepseek-harness.
+
+.PARAMETER AntigravityHistory
+Explicit Antigravity history root or file; requires -HostChoice antigravity.
+
+.PARAMETER Catalog
+Private managed catalog path for the selected setup.
+
+.PARAMETER NoAutostart
+Preserve existing login-autostart settings.
+
+.PARAMETER NoPath
+Skip the owned user PATH step.
+
+.EXAMPLE
+powershell -NoProfile -File .\package-install.ps1 `
+  -Manifest ..\agent-session-grep-v<VERSION>-x86_64-pc-windows-msvc.manifest.json `
+  -Checksums ..\SHA256SUMS -HostChoice claude -ClaudeHistory C:\path\to\history
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Manifest,
@@ -473,7 +529,7 @@ try {
         if (@(Get-ChildItem -LiteralPath $Prefix -Force).Count -gt 0) {
             Assert-File $receiptPath
             $receipt = Read-Metadata $receiptPath @('schema', 'product', 'version', 'target', 'source_commit', 'launcher_protocol', 'manifest_sha256', 'archive_sha256', 'package_files_sha256')
-            if ($receipt.schema -cne 'asg.package-install/v1' -or $receipt.product -cne 'agent-session-grep' -or $receipt.version -cne $pointer.version -or $receipt.target -cne $release.target -or $receipt.source_commit -cne $release.source_commit -or $receipt.launcher_protocol -ne 1 -or $receipt.manifest_sha256 -cne $manifestHash -or $receipt.package_files_sha256 -cne $metadata.install_manifest_sha256 -or $receipt.archive_sha256 -cne $metadata.archive.sha256) { throw 'unowned prefix or different package; upgrade is not implemented' }
+            if ($receipt.schema -cne 'asg.package-install/v1' -or $receipt.product -cne 'agent-session-grep' -or $receipt.version -cne $pointer.version -or $receipt.target -cne $release.target -or $receipt.source_commit -cne $release.source_commit -or $receipt.launcher_protocol -ne 1 -or $receipt.manifest_sha256 -cne $manifestHash -or $receipt.package_files_sha256 -cne $metadata.install_manifest_sha256 -or $receipt.archive_sha256 -cne $metadata.archive.sha256) { throw 'unowned prefix or different package; this installer only verifies the same package. Use the installed launcher with asg --db <catalog> update apply --from <archive> to upgrade, or select a new absent prefix.' }
             if (@(File-Names $Prefix).Count -ne $files.Count + 3) { throw 'installed file set changed' }
             if ((Hash (Join-Path $Prefix 'release.manifest.json')) -cne $manifestHash -or (Hash (Join-Path $Prefix 'SHA256SUMS')) -cne $checksumsHash) { throw 'installed release metadata changed' }
             foreach ($name in $files.Keys) {

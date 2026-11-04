@@ -339,6 +339,25 @@ Safe per-host summaries always retain `host_handshake: pending`, including
 after successful configuration and local ASG initialization. Failure of one
 host does not undo a completed edit for another selected host.
 
+### Verify host loading and historical retrieval
+
+Configuration success and `host_handshake: pending` do not prove that an
+assistant loaded the MCP server. Restart or reopen each selected assistant so it
+reloads MCP, then start a new native session and:
+
+1. Call `list_providers` with an empty argument object and confirm the expected
+   provider ID plus capability limits.
+2. Call `search_sessions` with a small query, explicit `providers` filter and
+   bounded `limit`; confirm that the response contains canonical session and
+   message IDs plus source/provenance evidence.
+3. Call `get_message` for one returned ID and verify that the original text is
+   present. For a currentness check, use the CLI's scoped `--latest` read only
+   as documented below; a configuration receipt or journal phase is not
+   freshness evidence.
+
+Keep retrieval output local. Report only synthetic or explicitly authorized
+excerpts when recording public acceptance evidence.
+
 ## Developer candidate: explicitly register selected hosts
 
 From the installed candidate, select each host whose user configuration may be
@@ -353,8 +372,10 @@ asg --db <catalog> setup --host claude --host codex
 `--host` accepts `claude`, `codex`, `workbuddy`, `zcode`, `deepseek-harness` and
 `antigravity`; duplicate choices fail before writes. `--history` accepts the
 six canonical provider IDs below, with `claude` retained as an alias for
-`claude-code`. Each history requires its corresponding selected host. The
-provider-specific worker integration remains under verification.
+`claude-code`. Each history requires its corresponding selected host. All six
+providers have implemented selected-source discovery and parsing routes; real
+host loading, lifecycle behaviour and end-to-end retrieval remain separate
+acceptance gates.
 
 The extracted-package installer forwards each explicit history choice after
 verifying the package:
@@ -448,8 +469,9 @@ Private receipt locator inventories are published as
 directory. They reference the durable per-host transaction receipts for later
 explicit recovery/removal and never appear in public output. Failed inventory
 publication is reported separately; existing host transaction journals remain
-available. Inventories and transaction artifacts are retained, with no automatic
-cleanup or completed managed-uninstall claim in this slice.
+available. Setup retains inventories and transaction artifacts; managed
+uninstall is the explicit cleanup path described earlier and does not remove
+unowned entries or provider histories.
 
 ## Developer candidate: native manager verification
 
@@ -516,6 +538,23 @@ asg --robot --db <catalog> update apply --from <archive>
 asg --robot --db <catalog> update status
 asg --robot --db <catalog> update recover
 ```
+
+For an end-to-end update check:
+
+1. Run `update check` and retain the selected version/tag plus exact
+   archive/manifest/checksum asset identities.
+2. Obtain those three assets from the same trusted build and inspect them with
+   this guide's archive validation rules.
+3. Run `update apply --from <archive>`, then inspect `update status`. A
+   terminal report is not sufficient by itself. Check both launchers with
+   `agent-session-grep --asg-launcher-info` and
+   `asg --asg-launcher-info`; compare their `generation`, `version`,
+   `source_commit`, `app_sha256`, `catalog_schema` and `control_schema`.
+   Then inspect `background status` and perform one scoped `--latest` evidence
+   read.
+4. If status requires recovery, use `update recover` with the same catalog and
+   installation prefix. Do not delete journals, backups, locks, pointers or
+   fences as a substitute.
 
 `check` returns `asg.update-check/v1` in the Robot envelope's `data`. Its status
 is `up_to_date` or `update_available`; the latter includes the selected version,

@@ -20,13 +20,15 @@ Experimental maturity and the optional semantic backend carries no quality claim
 Unsigned Actions artifacts are not Release assets or signed/notarized binary
 distribution.
 
-Managed public Beta development is in progress. This checkout includes selected
-history updates, scoped original evidence and user-triggered package-update
-commands; their complete installation and recovery acceptance remains pending.
-The [managed contracts](docs/contracts/CONTRACT-cli-robot-mcp-draft.md#12-managed-beta-contracts-implementation-in-progress)
-describe that work; they do not certify this checkout as a complete Beta.
-The published v0.1.0 installation instructions below remain the source path
-until a verified package is released.
+Managed public Beta development is in progress. This checkout implements the
+selected-source paths for all six launch assistants, scoped original evidence,
+background refresh, user-triggered package updates and recovery commands. The
+[managed contracts](docs/contracts/CONTRACT-cli-robot-mcp-draft.md#12-managed-beta-contracts-implementation-in-progress)
+and current install runbook describe those paths; they do not certify this
+checkout as a complete Beta. Six-host native loading, fixed-workload freshness,
+upgrade/recovery drills, retrieval quality and all four target packages remain
+separate acceptance gates. The published v0.1.0 source-release path remains an
+alternative.
 
 For isolated development profiles, `asg --db <new-private-dir>/catalog.db setup`
 initializes a managed catalog. A verified installed candidate also supports
@@ -34,8 +36,13 @@ initializes a managed catalog. A verified installed candidate also supports
 `--history claude <root>`/`--history codex <root>`, preserving unrelated host settings and
 registering its native login configuration. The same explicit registration
 command also accepts `workbuddy`, `zcode`, `deepseek-harness` and `antigravity`;
-provider-specific managed history integration remains in progress. Linux verifies the effective unit
-and exact program arguments through the user service manager; macOS verifies
+all six have implemented selected-history discovery and parsing paths.
+WorkBuddy also consumes explicitly selected lifecycle metadata, ZCode uses a
+logical DB/WAL snapshot, DeepSeek Harness selects the highest canonical
+generation, and Antigravity accepts supported transcripts and conversation DB
+sources. Actual host loading and lifecycle acceptance remain separate open
+validation gates. Linux verifies the effective unit and exact program arguments
+through the user service manager; macOS verifies
 its GUI manager and program arguments. Missing managers, configuration changes
 or timeouts leave setup incomplete (exit 10). Actual login and host model calls
 remain separate acceptance stages. `sources add --provider <id> <root-or-file>`,
@@ -99,7 +106,14 @@ schema. `agent-session-grep` solves this by:
 
 ## Quickstart
 
-Install from a repository checkout. The installers build the release binary and
+For a built Managed Beta candidate, obtain the archive, sibling manifest and
+`SHA256SUMS` for the current native target. Follow
+[Install and upgrade](docs/operations/INSTALL-AND-UPGRADE.md) to verify the
+extracted package, install both command names, select assistant histories and
+verify MCP loading after restarting the host. The artifacts are unsigned unless
+the release notes explicitly say otherwise.
+
+For source-checkout development, the installers build the release binary and
 install both `agent-session-grep` and `asg`; they print a PATH hint but do not
 edit PATH for you.
 

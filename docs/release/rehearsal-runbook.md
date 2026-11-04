@@ -108,7 +108,48 @@ attestations. Those identity-backed controls remain external release gates.
 
 ## 1. Install
 
-### 1.1 Build and install from source
+### 1.1 Install the extracted managed candidate
+
+Use this path for the Managed Beta candidate. On each native release runner,
+validate the archive, sibling manifest and `SHA256SUMS`; install only the
+current target into an absent dedicated prefix. Follow
+[Install and upgrade](../operations/INSTALL-AND-UPGRADE.md) rather than
+extracting the archive as a trusted operation.
+
+Select Claude Code and Codex first and complete installation, explicit history
+selection, automatic login registration, a new native-session MCP call,
+original-evidence retrieval and same-session continuation. Repeat the native
+flow for WorkBuddy, ZCode, DeepSeek Harness and Antigravity only after the first
+two complete cleanly. Record host loading separately from the installer's
+configuration receipt.
+
+After each host has published its synthetic history, run the fixed
+cross-retrieval ring
+Claude Code -> Codex -> DeepSeek Harness -> Antigravity -> WorkBuddy -> ZCode
+-> Claude Code. Interpret each `A -> B` step as host B retrieving the synthetic
+original published by host A. In B's same native session, call
+`search_sessions` for A's unique sentinel, call `get_message` with the returned
+canonical IDs, then call `get_session_context` with bounded item/message/byte
+limits. Record both ASG IDs, A's original provider/session identity, B's native
+tool calls and results, the exact sentinel quotation, and the cross-acknowledgement.
+Do not substitute a direct catalog read, a filename, a handoff label or another
+host's result for the native call.
+
+For the selected catalog, exercise the owned background worker, one scoped
+`--latest` evidence read, `update check`, a locally built compatible successor,
+`update apply`, `update status`, an intentional startup failure and
+`update recover`. Preserve the failed journal. A terminal journal phase without
+launcher, worker and retrieval evidence is not a successful recovery.
+
+**Expected evidence**: exact package identities; four-target archive validation;
+installer exit 0 for the current target; owned setup and login receipts; six
+native MCP/history/continuation results; background and latest observations;
+upgrade and recovery reports; cleanup receipts.
+
+**Run id**: record as `managed-install-<target>-<date>` and
+`managed-flow-<host>-<date>`.
+
+### 1.2 Build and install from source
 
 ```bash
 cargo build --release --locked
@@ -435,6 +476,26 @@ evidence.
 
 ## 13. Uninstall
 
+### 13.1 Managed candidate
+
+```text
+asg --db <catalog> uninstall --install-prefix <prefix>
+asg --db <catalog> uninstall --keep-data --install-prefix <prefix>
+```
+
+Run the default and keep-data modes in separate disposable catalogs. Drain
+owned workers and handles first. Default uninstall must remove only proven
+ASG-owned state; keep-data must retain catalog and policy while clearing
+continuations and pending cached state. Preserve the exact durable cleanup
+receipt and verify that provider histories and unowned host/login/PATH entries
+are untouched.
+
+**Expected evidence**: terminal cleanup state; exact remaining/removed path
+categories; owned host/login/PATH removal; provider-history checksums; a
+repeat-uninstall result without recursive or shared-parent deletion.
+
+### 13.2 Source-installed commands
+
 ```bash
 # Windows: pwsh scripts/install/uninstall.ps1
 # macOS/Linux: bash scripts/install/uninstall.sh
@@ -449,7 +510,8 @@ reports "not installed", exit 0); no directory recursively deleted.
 
 ## 14. Reinstall idempotency
 
-Repeat §1. Verify the second install succeeds identically. The rehearsal db is
+Repeat the selected §1 installation path. Verify the second install behaves
+identically for that path. The rehearsal db is
 untouched (install must not delete user data).
 
 **Run id**: `reinstall-<platform>-<date>`.
@@ -483,6 +545,7 @@ with no personal paths.
 | 0 | environment manifest | JSON |
 | 0a | unsigned target archives, manifests, dependency inventory, and checksums | ZIP/TAR.GZ + JSON/CSV/TXT |
 | 1 | install log | text |
+| 1a | managed package, setup, six-host and update/recovery receipts | JSON + text |
 | 2 | ingest robot envelope | JSON |
 | 3 | search robot envelope | JSON |
 | 4 | context robot envelope | JSON |
@@ -495,6 +558,7 @@ with no personal paths.
 | 11 | Gate D benchmark report | JSON |
 | 12 | materials checklist | markdown |
 | 13 | uninstall log | text |
+| 13a | default and keep-data managed cleanup receipts | JSON |
 | 14 | reinstall log | text |
 | 15 | go/no-go report | markdown |
 

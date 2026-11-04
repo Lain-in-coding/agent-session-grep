@@ -3,7 +3,7 @@
 > 对外可见的 Provider 状态清单，记录当前开发候选的实现事实；不是已完成 Beta 或原生宿主验收声明。
 > - 术语与晋级证据要求见 `../architecture/RFC-0002-provider-adapter-contract.md` §6。
 > - 本文件是**当前实现状态**的事实记录，不是承诺；晋级必须有证据，不由代码存在自动推断。
-> - 最后更新：2026-10-19（M2：WorkBuddy、ZCode、DeepSeek Harness 的独立 adapter 与合成证据登记为 Experimental，目标 Beta；既有平台、宿主、回滚及 owner 晋级门槛保持。2026-10-06 B5 与早期 14-provider 证据按原范围保留。）
+> - 最后更新：2026-11-05（M2：六个首发助手的 selected-source 路由、发现/解析实现与测试已登记；WorkBuddy、ZCode、DeepSeek Harness 仍为 Experimental，原生宿主加载、生命周期、四目标包及 owner 晋级门槛另行验收。2026-10-06 B5 与早期 14-provider 证据按原范围保留。）
 > - 权威数据源：`crates/agent-session-grep-ports/src/capability.rs` 的
 >   `ProviderCapabilityMatrix::current()`；本表与其保持一致，不一致以 capability.rs 为准。
 > - Beta 本地/外部缺口分账见 `PROVIDER-BETA-READINESS.md`（不得仅凭代码存在晋级）。
@@ -39,15 +39,15 @@
 | Tencent CodeBuddy | `tencent-codebuddy` | `tencent-codebuddy/cli-jsonl-v1` | **Experimental** | CLI OpenAI-style JSONL（`role`/`content`/`sessionId`），extension variant 待分层 + golden（`tests/golden.rs`） |
 | Cline | `cline` | `cline/api-conversation-history-v1` | **Experimental** | `api_conversation_history.json` JSON family + golden（`tests/golden.rs`） |
 | Aider | `aider` | `aider/chat-history-md-v1` | **Experimental** | Markdown chat history（`#### ` user prompts），`.aider.chat.history.md` 为候选 root 待核验 + golden（`tests/golden.rs`） |
-| WorkBuddy | `workbuddy` | `workbuddy/project-jsonl-v1` | **Experimental** | 与 Tencent CodeBuddy 独立；整数毫秒、正文空白、原生 ID、原始字节 span 与显式工具锚点。JSONL/删除状态合成证据见 `crates/agent-session-grep-provider-workbuddy/tests/provider.rs`、`crates/agent-session-grep-provider-workbuddy/tests/deletion_state.rs`；cloud 不等于空历史，softdelete/runtime 仍待接入 |
-| DeepSeek Harness | `deepseek-harness` | `deepseek-harness/session-jsonl-zstd-v4` | **Experimental** | 固定官方 v4 契约；标准多帧 zstd、有界解压、原生 message ID、torn-tail/损坏/未知必需记录回归。合成证据见 `crates/agent-session-grep-provider-dsh/tests/provider.rs`；最高代次发现与原生宿主验收仍待接入 |
-| ZCode | `zcode` | `zcode/sqlite-v1` | **Experimental** | session/message/part/session_entry 的逻辑 SQLite 图；可逆 `zcode:<native-id>` 消息来源身份、完整扫描/部分状态、私有 2/2 header 规范化。合成证据见 `crates/agent-session-grep-provider-zcode/tests/provider.rs`；真实发现、删除及宿主验收仍待接入 |
+| WorkBuddy | `workbuddy` | `workbuddy/project-jsonl-v1` | **Experimental** | 与 Tencent CodeBuddy 独立；整数毫秒、正文空白、原生 ID、原始字节 span 与显式工具锚点。selected-project JSONL 与显式 lifecycle metadata 路由见 `managed_source_discovery.rs` / `managed_source_parse.rs`；JSONL/删除状态测试见 provider crate。cloud 不等于空历史，真实宿主加载和 runtime 生命周期验收仍开放 |
+| DeepSeek Harness | `deepseek-harness` | `deepseek-harness/session-jsonl-zstd-v4` | **Experimental** | 固定官方 v4 契约；标准多帧 zstd、有界解压、原生 message ID、torn-tail/损坏/未知必需记录回归。selected-source 路由选择最高 canonical generation；真实宿主加载与生命周期验收仍开放 |
+| ZCode | `zcode` | `zcode/sqlite-v1` | **Experimental** | session/message/part/session_entry 的逻辑 SQLite 图；可逆 `zcode:<native-id>` 消息来源身份、完整扫描/部分状态、私有 2/2 header 规范化。selected-source discovery 与逻辑 DB/WAL snapshot 已接入；真实宿主加载、删除生命周期及端到端验收仍开放 |
 
 当前 17 个独立 provider 均为 **Experimental**。原有 14 个 provider 的 golden、
-property 与历史合成/e2e 记录保留原范围；2026-10-19 新登记的三家只有各自冻结
-adapter 的合成解析/逻辑快照证据，不继承历史 14 家或两宿主的验收结果。
-WorkBuddy 与 Tencent CodeBuddy 的身份及生命周期分开。M2 三家目标为 Beta，
-但真实发现、源生命周期、宿主调用、四目标包及 owner 晋级仍是独立未完成门槛。
+property 与历史合成/e2e 记录保留原范围。2026-10-19 新登记的三家现已接入
+managed selected-source 路由和后台调度；这些实现事实不继承历史 14 家或两宿主的
+验收结果。WorkBuddy 与 Tencent CodeBuddy 的身份及生命周期分开。M2 三家目标为
+Beta，但真实源生命周期、六宿主加载/调用、四目标包及 owner 晋级仍是独立门槛。
 
 ## Capability Matrix（逐字段，2026-10-19）
 
@@ -60,7 +60,7 @@ WorkBuddy 与 Tencent CodeBuddy 的身份及生命周期分开。M2 三家目标
 | probe | `native`（其余已实现 provider）；`partial`（deepseek-harness） | DSH 只以解压后的完整 v4 header 判候选，全部帧完整性与未知必需事件在 parse 校验；三家 variant 不与 CodeBuddy 合并 |
 | parse | `native`（既有 14 家）；`partial`（workbuddy/zcode/deepseek-harness） | 新三家只承诺受测格式与有界成功/失败：WB 活跃状态依赖逻辑 DB、ZCode 未知消息保留 incomplete、DSH torn tail 明示 incomplete，均非完整宿主覆盖 |
 | search | `native`（既有 14 家）；`partial`（workbuddy/zcode/deepseek-harness） | 已允许并成功提交的消息可走共享检索链；新三家完整来源覆盖与实时生命周期尚未验收 |
-| discover | `native`（既有 12 家已登记根）；`partial`（workbuddy/zcode/deepseek-harness）；`unsupported`（aider/cursor） | M2 的 partial 表示只验证部分格式/来源；JSONL、逻辑 DB/WAL、DSH 最高代次与真实删除覆盖要由发现层接入，不从 parser 或路径存在推断完成 |
+| discover | `native`（既有 12 家已登记根）；`partial`（workbuddy/zcode/deepseek-harness）；`unsupported`（aider/cursor） | M2 的 partial 表示 selected-source 发现路径已接入，但完整来源、删除/rewrite 生命周期与宿主验收尚未闭合；不从 parser 或路径存在推断完成 |
 | resume | `derived`（claude-code/codex/grok-build/pi/kimi-code/tencent-codebuddy/opencode/antigravity）；`unknown`（qoder/hermes/cursor/workbuddy/zcode/deepseek-harness）；`unsupported`（aider/cline/openclaw） | 原生 session ID/cwd 是观察值，不等于宿主可加载或 native resume 成功；新三家仍保留真实调用门槛 |
 | context | `native`（claude-code）；`unsupported`（其余当前 provider） | 当前字段指显式 message parent 图。ZCode 的 native session 父关系与 DSH delegationDepth 不伪造 message parent 边 |
 | handoff | `derived`（当前 17 个实现 provider） | 共享生成器消费允许的已落库 SearchHit/source placement，不按 provider 分支；Derived 是共同实现机制，新三家不继承历史 native/e2e 验收 |
@@ -137,7 +137,7 @@ manifest 均声明限制，见各 `crates/agent-session-grep-provider-*/src/lib.
 - **Hermes / Cline（整文档 JSON 类）**：单个 JSON 文档一次读入，无逐记录字节
   边界，故无文件内字节 span（round-trip 标 N/A）。Kimi Code 不属此列：wire.jsonl
   是行式 JSONL，逐消息 span 为真实字节区间（见上表 `source_span` 行）。
-- **WorkBuddy**：强 probe 需要已验证 hostKind 或 __codebuddyLocal marker；正文、native ID 与字节 span 保留。数据库 softdelete 优先于 JSONL 存在；cloud unavailable 与 orphan unknown 分开，不从读失败判删除。单记录 8 MiB、逻辑快照 128 MiB；批量 helper 一次解码，限 65,536 行与 32 MiB ID/cwd 内容，共用调用者 deadline，重复 ID 或畸形字段拒绝整批；当前 17 项 JSONL 与 16 项单 ID/批量状态测试为合成证据，非宿主验收。
+- **WorkBuddy**：强 probe 需要已验证 hostKind 或 __codebuddyLocal marker；正文、native ID 与字节 span 保留。selected-project JSONL 与显式 lifecycle metadata DB 分开选择；数据库 softdelete 优先于 JSONL 存在，cloud unavailable 与 orphan unknown 分开，不从读失败判删除。单记录 8 MiB、逻辑快照 128 MiB；批量 helper 一次解码，限 65,536 行与 32 MiB ID/cwd 内容，共用调用者 deadline，重复 ID 或畸形字段拒绝整批；真实宿主加载和 runtime 生命周期仍待验收。
 - **ZCode / DeepSeek Harness**：无文件内字节 span。ZCode 只接收已取得的逻辑 SQLite 图，中央 manifest 单独限 256 MiB（通用 SQLite 仍为 128 MiB），使用可逆 `zcode:<native-id>` 消息身份；未知部分消息不伪装完整扫描。DSH 只读 v4 串接 zstd，输入 128 MiB、解压总量 256 MiB、单记录与 decoder window 各 8 MiB；torn final frame 只恢复完整行且 incomplete，checksum/未知必需记录拒绝。替换记录是历史证据，非当前 model surface 重放。
 - **既有 14 家（关系模型与历史语料级回归记录）**：稳定 `Message` 与上下文
   `MessagePlacement` / `MessageEdge` 已分离，session-scoped graph、精确 placement

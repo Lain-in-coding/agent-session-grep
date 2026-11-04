@@ -213,8 +213,10 @@ required when no permitted rollback image remains.
 
 The required default managed uninstall must remove ASG-owned index/cache/backup
 state after draining owned components. Explicit keep-data must retain catalog
-and policy together, including pending purges. That workflow and keep-data are
-not yet implemented; the legacy source uninstaller does not supply them.
+and policy together, including pending purges. The managed CLI now implements
+both modes with bounded pending cleanup; the legacy source uninstaller remains a
+separate command and does not supply them. Actual managed-uninstall drills and
+native recovery remain acceptance gates.
 Original assistant histories must never be removed. Four native targets and all six required assistant flows, including
 actual retrieval quality/token/latency evidence and owner daily-use acceptance,
 remain release gates; foundation tests alone cannot close them.

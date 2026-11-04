@@ -113,9 +113,12 @@ identity fields match. The current equal-schema path retains the live catalog
 and reconciles metadata; it is not a general catalog backup-restore interface. The verified
 WAL-aware catalog backup excludes control and provider histories. Generic
 schema-changing restore and legacy-to-managed migration remain separate work.
-Setup history selection still uses `sources add` separately. Public background
-autostart enable/disable, managed uninstall/default purge and keep-data are not
-yet implemented.
+Program update and recovery never add or grant history permissions. Initial
+selection uses explicit `setup --host` / `--history`; later changes use
+`sources add` / `sources revoke`. Public background
+autostart enable/disable and managed uninstall/default purge plus keep-data are
+implemented with bounded pending cleanup; their actual native completion and
+recovery drills remain acceptance gates.
 
 The worker writes an incomplete discovery receipt before source I/O and only
 finalizes the exact current-cycle source set after complete verification.

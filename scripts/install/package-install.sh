@@ -416,7 +416,7 @@ if [ -e "$prefix" ]; then
     existing=$(find "$prefix" ! -path "$prefix" -print)
     if [ -n "$existing" ]; then
         regular "$prefix/package-install.json"
-        cmp -s "$receipt" "$prefix/package-install.json" || fail 'unowned prefix or different package; upgrade is not implemented'
+        cmp -s "$receipt" "$prefix/package-install.json" || fail 'unowned prefix or different package; this installer only verifies the same package. Use the installed launcher with asg --db <catalog> update apply --from <archive> to upgrade, or select a new absent prefix.'
         expected_count=$((record_count + 4)); validate_tree "$prefix"
         verify_programs "$prefix"
         validate_tree "$prefix"

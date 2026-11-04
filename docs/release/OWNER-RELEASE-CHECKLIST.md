@@ -25,11 +25,19 @@ commands, UTC times, exit status, and actual hosted job/artifact links.
 - Run the public privacy profile and credential/metadata checks against the
   exact candidate. A historical zero-findings report is not current evidence;
   immutable import snapshots and history need their own explicit review.
-- Repeat install, first run, in-place upgrade, uninstall, and second uninstall
-  using [the installation runbook](../operations/INSTALL-AND-UPGRADE.md).
+- Validate all four target archives and their per-target manifests against the
+  shared `SHA256SUMS`, recording every archive and manifest digest. Then repeat
+  managed-package install, first run, in-place upgrade, update status, failure
+  recovery, default uninstall, keep-data uninstall, reinstall, and second
+  uninstall using [the installation runbook](../operations/INSTALL-AND-UPGRADE.md).
   A synthetic successor version tests replacement mechanics, not compatibility
-  with another released version. Local Windows evidence is not hosted
-  cross-platform or clean-machine certification.
+  with another released version.
+- In separate native profiles, run MCP `list_providers`, provider-scoped
+  `search_sessions`, original-message retrieval and same-session continuation
+  for Claude Code, Codex, WorkBuddy, ZCode, DeepSeek Harness and Antigravity.
+  Configuration receipts and `host_handshake: pending` do not prove host
+  loading. Local Windows evidence is not hosted cross-platform or clean-machine
+  certification.
 
 ## 2. Obtain real CI and non-publishing artifact evidence
 
@@ -52,6 +60,12 @@ the same four architecture targets across three OS families:
 synthetic smoke, deterministic packaging, manifests, `SHA256SUMS`, and complete
 four-target bundle validation without publishing. Its unsigned Actions
 artifacts expire after 30 days and are not Release assets.
+
+For each six-host result, retain the native-session identity, exact package and
+source SHA, MCP `tools/list` result, `list_providers`, bounded evidence hits,
+canonical message/source identity, continuation result, process exit/cleanup
+and any `host_handshake: pending` limitation. Do not accept a second-hand label,
+configuration digest or screenshot text as proof of a native tool call.
 
 **Historical canonical checkpoint, 2026-10-09 UTC:**
 [release verification run 37956269837](https://github.com/Lain-in-coding/agent-session-grep/actions/runs/37956269837)
@@ -88,6 +102,10 @@ mandatory work as non-success, not proof by YAML presence.
   decision. Derived resume previews are not executed native-resume evidence.
   Keep the capability source, matrix, ledger, and drift tests in agreement;
   code existence and this reconciliation imply no promotion.
+- Preserve the fixed-workload initial-coverage and append results separately.
+  A successful source publication cycle, worker heartbeat or journal phase is
+  not complete-scope freshness. Record complete scopes, append samples,
+  retrieval latency/token use, failures and cleanup under the exact package.
 
 ## 4. Semantic, signing, and distribution boundaries
 
