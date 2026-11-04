@@ -183,6 +183,58 @@ impl Fixture {
                 .set_desired_updates(control.status()?.policy.control_seq, DesiredUpdates::Paused)
         });
     }
+    fn pause_and_drain_for_filter(&mut self) {
+        let end = Instant::now() + Duration::from_secs(3);
+        bounded_until(end, "stop filter worker", || {
+            let control = SqliteControlStore::open_current_writable_with_deadline(
+                self.db.parent().unwrap(),
+                end,
+            )?;
+            control.with_runtime_deadline(end, || {
+                control.set_desired_updates(
+                    control.status()?.policy.control_seq,
+                    DesiredUpdates::Stopped,
+                )
+            })
+        });
+        // The stop write's connection and shared control lease are closed.
+        // Wait only on the original child, keeping Drop's cleanup on failure.
+        loop {
+            assert!(
+                Instant::now() < end,
+                "filter worker did not exit before fixture end"
+            );
+            if let Some(status) = self.worker.as_mut().unwrap().try_wait().unwrap() {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "filter worker failed before quiescence: {status}"
+                );
+                break;
+            }
+            std::thread::sleep(
+                Duration::from_millis(10).min(end.saturating_duration_since(Instant::now())),
+            );
+        }
+        assert!(
+            Instant::now() < end,
+            "filter quiescence exhausted fixture end"
+        );
+        drop(self.worker.take());
+        bounded_until(end, "pause quiescent filter fixture", || {
+            let control = SqliteControlStore::open_current_writable_with_deadline(
+                self.db.parent().unwrap(),
+                end,
+            )?;
+            control.with_runtime_deadline(end, || {
+                control.set_desired_updates(
+                    control.status()?.policy.control_seq,
+                    DesiredUpdates::Paused,
+                )
+            })
+        });
+        assert!(Instant::now() < end, "filter pause exhausted fixture end");
+    }
     fn revoke(&self) {
         self.pause();
         let control = self.control();
@@ -448,7 +500,7 @@ fn tool_name_filters_preserve_exact_names_in_managed_cli_and_mcp() {
     fixture.start();
     let mut client = Client::connect(&fixture.db);
     client.wait_hit(&mut fixture, "orchid");
-    fixture.pause();
+    fixture.pause_and_drain_for_filter();
     for (index, name) in names.into_iter().enumerate() {
         let (_, value) = client.call(
             "search_sessions",

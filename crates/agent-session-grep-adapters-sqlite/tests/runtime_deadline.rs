@@ -699,16 +699,32 @@ fn source_row_and_policy_inventory_capacity_refuse_before_typed_decode() {
             }
         }
         tx.commit().unwrap();
-        assert_capacity(f.control.with_runtime_deadline(
-            Instant::now() + Duration::from_secs(2),
-            || {
-                if table == "source_updates" {
-                    f.control.read_policy(RequestIntersection::Selected)
-                } else {
-                    f.control.status().map(|status| status.policy)
-                }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let call_started = Instant::now();
+        let expired_before = call_started >= deadline;
+        let result = f.control.with_runtime_deadline(deadline, || {
+            if table == "source_updates" {
+                f.control.read_policy(RequestIntersection::Selected)
+            } else {
+                f.control.status().map(|status| status.policy)
+            }
+        });
+        let call_finished = Instant::now();
+        assert!(
+            matches!(&result, Err(PortError::Backend(reason))
+                if reason == "control runtime dependency capacity exceeded"),
+            "phase={} table={table} actual={:?} \
+             original_end_expired_before={expired_before} \
+             original_end_expired_after={} call_elapsed={:?}",
+            if table == "source_updates" {
+                "read_policy"
+            } else {
+                "status"
             },
-        ));
+            result.as_ref().map(|_| ()),
+            call_finished >= deadline,
+            call_finished.duration_since(call_started),
+        );
         assert!(
             conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
                 .get::<_, i64>(0))

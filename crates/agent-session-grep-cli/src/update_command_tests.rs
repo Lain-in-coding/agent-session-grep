@@ -238,6 +238,46 @@ fn metadata_check_timeout_does_not_claim_an_existing_update_journal() {
 }
 
 #[test]
+fn native_restart_failure_is_distinct_from_malformed_installation() {
+    use crate::native_manager::ErrorCode;
+
+    let unavailable = native_restart_error(ErrorCode::Unavailable.into());
+    assert_eq!(unavailable.0.code, CanonicalCode::CapabilityNotSupported);
+    assert!(!unavailable.0.code.retryable());
+    assert!(unavailable.0.message.contains("native manager unavailable"));
+    assert_eq!(
+        native_restart_error(ErrorCode::Timeout.into()).0.code,
+        CanonicalCode::DeadlineExceeded
+    );
+    assert_eq!(
+        native_restart_error(ErrorCode::Busy.into()).0.code,
+        CanonicalCode::WriterBusy
+    );
+    for code in [
+        ErrorCode::RecoveryRequired,
+        ErrorCode::Conflict,
+        ErrorCode::VerificationFailed,
+        ErrorCode::Failed,
+    ] {
+        let error = native_restart_error(code.into());
+        assert_eq!(error.0.code, CanonicalCode::UpdateRecoveryRequired);
+        assert!(!error.0.code.retryable());
+    }
+
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let prefix = temp.path().canonicalize().unwrap();
+    std::fs::write(prefix.join("package-install.json"), b"{").unwrap();
+    let malformed = package_installation::inspect_installation_for_update(&prefix)
+        .err()
+        .expect("malformed installation must fail before native restart");
+    assert_eq!(malformed.0.code, CanonicalCode::SchemaIncompatible);
+    for error in [unavailable, malformed] {
+        assert!(!error.0.message.contains(prefix.to_str().unwrap()));
+        assert!(!error.0.message.contains("package-install.json"));
+    }
+}
+
+#[test]
 fn post_drain_checkpoint_uses_latest_catalog_and_current_pause() {
     use agent_session_grep_adapters_sqlite::{
         SqliteControlStore, managed_maintenance::CatalogIdentity,

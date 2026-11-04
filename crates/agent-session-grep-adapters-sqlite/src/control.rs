@@ -12,6 +12,8 @@ use std::{
     sync::OnceLock,
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+pub(crate) use windows_private::VerifiedPrivateHandle;
 
 const VERSION: i64 = 2;
 /// Current private control schema. Keep VERSION literal for release source parsing.
@@ -3820,6 +3822,10 @@ fn verify_sidecars(path: &Path) -> PortResult<()> {
         match fs::symlink_metadata(&sidecar) {
             Ok(meta) => private_file_observed(&sidecar, &meta, true)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(5) => {
+                return Err(windows_private::sidecar_metadata_error(&sidecar, e));
+            }
             Err(e) => return Err(private_file_io_at(e, true, "sidecar_metadata")),
         }
     }
@@ -6091,8 +6097,8 @@ fn write_source(conn: &Connection, p: &SourceProgress) -> PortResult<()> {
 #[cfg(windows)]
 mod windows_private {
     use super::{
-        PortResult, io_error, private_file_io, private_file_io_at, private_validation_error,
-        private_validation_io, validation_changed,
+        PortError, PortResult, io_error, private_file_io, private_file_io_at,
+        private_validation_error, private_validation_io, validation_changed,
     };
     use std::{
         ffi::c_void,
@@ -6336,20 +6342,20 @@ mod windows_private {
     }
     pub(super) fn verify(path: &Path) -> PortResult<()> {
         let file = open_for_verification(path, false)?;
-        verify_handle(&file, false, false)
+        verify_handle(&file, false, false).map(drop)
     }
 
     pub(super) fn verify_directory_identity(
         path: &Path,
     ) -> PortResult<crate::managed_locks::RootIdentity> {
         let file = open_for_verification(path, false)?;
-        verify_handle(&file, false, false)?;
-        crate::managed_locks::RootIdentity::from_directory_handle(&file)
+        let verified = verify_handle(&file, false, false)?;
+        crate::managed_locks::RootIdentity::from_directory_handle(verified)
     }
 
     pub(super) fn verify_file(path: &Path, sidecar: bool) -> PortResult<()> {
         let file = open_for_verification(path, sidecar)?;
-        verify_handle(&file, true, sidecar)
+        verify_handle(&file, true, sidecar).map(drop)
     }
 
     pub(super) fn open_private_read(path: &Path) -> PortResult<File> {
@@ -6444,6 +6450,24 @@ mod windows_private {
         })
     }
 
+    /// Classify a denied sidecar metadata observation without admitting it.
+    /// An openable replacement or an ACL refusal keeps the original hard error.
+    pub(super) fn sidecar_metadata_error(path: &Path, error: std::io::Error) -> PortError {
+        let access_denied = error.raw_os_error() == Some(5);
+        let original = private_file_io_at(error, true, "sidecar_metadata");
+        if !access_denied {
+            return original;
+        }
+        match open_for_verification(path, true) {
+            Err(error @ PortError::WriterBusy(_)) => error,
+            Ok(file) => {
+                drop(file);
+                original
+            }
+            Err(_) => original,
+        }
+    }
+
     /// An elevated administrator's token makes BUILTIN\Administrators the
     /// default owner of everything created without an explicit owner: SQLite
     /// databases, sidecars and backup copies, and plain `std::fs` files such
@@ -6480,7 +6504,24 @@ mod windows_private {
         Ok(unsafe { EqualSid(owner, buffer.as_mut_ptr().cast()) } != 0)
     }
 
-    fn verify_handle(file: &File, regular_file: bool, sidecar: bool) -> PortResult<()> {
+    /// A fresh check tied to its borrowed handle, never a reusable permission.
+    /// Only this module can construct it; callers cannot supply a second File.
+    pub(crate) struct VerifiedPrivateHandle<'a> {
+        file: &'a File,
+        is_directory: bool,
+    }
+
+    impl<'a> VerifiedPrivateHandle<'a> {
+        pub(crate) fn into_directory(self) -> Option<&'a File> {
+            self.is_directory.then_some(self.file)
+        }
+    }
+
+    fn verify_handle(
+        file: &File,
+        regular_file: bool,
+        sidecar: bool,
+    ) -> PortResult<VerifiedPrivateHandle<'_>> {
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandle,
@@ -6633,7 +6674,10 @@ mod windows_private {
                 "handle_delete_pending",
             ));
         }
-        Ok(())
+        Ok(VerifiedPrivateHandle {
+            file,
+            is_directory: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        })
     }
 
     #[cfg(test)]
@@ -6740,6 +6784,51 @@ mod windows_private {
         }
 
         #[test]
+        fn verified_directory_identity_stays_bound_to_its_handle() {
+            use crate::managed_locks::RootIdentity;
+
+            let (_temp, root, _) = setup();
+            let other = root.parent().unwrap().join("other-private-root");
+            create_directory(&other).unwrap();
+            let expected = RootIdentity::read(&root).unwrap();
+            let other_expected = RootIdentity::read(&other).unwrap();
+            assert_ne!(expected, other_expected);
+
+            let opened = open_for_verification(&root, false).unwrap();
+            let other_opened = open_for_verification(&other, false).unwrap();
+            let verified = verify_handle(&opened, false, false).unwrap();
+            let other_verified = verify_handle(&other_opened, false, false).unwrap();
+            // Consume in reverse order: neither result can borrow the other's
+            // last-checked type or handle, and no second File argument exists.
+            assert_eq!(
+                RootIdentity::from_directory_handle(other_verified).unwrap(),
+                other_expected
+            );
+            assert_eq!(
+                RootIdentity::from_directory_handle(verified).unwrap(),
+                expected
+            );
+        }
+
+        #[test]
+        fn verified_directory_identity_keeps_kind_and_acl_error_order() {
+            let (_temp, _, db) = setup();
+            assert!(matches!(
+                verify_directory_identity(&db),
+                Err(PortError::SourceIo(ref detail))
+                    if detail == "managed lock storage or request is invalid (site=root, step=kind)"
+            ));
+            allow_everyone(&db);
+            // A fresh unsafe handle still fails privacy before directory-kind
+            // rejection, even after a previous successful privacy check.
+            assert!(matches!(
+                verify_directory_identity(&db),
+                Err(PortError::Backend(ref detail))
+                    if detail == "private storage validation failed (stage=security_ace_sid, sidecar=0, code=0)"
+            ));
+        }
+
+        #[test]
         fn live_root_still_refuses_retirement_after_final_handle_validation() {
             let temp = agent_session_grep_testkit::tempdir().unwrap();
             let root = temp.path().join("private");
@@ -6805,6 +6894,112 @@ mod windows_private {
                 matches!(verify_sidecars(&db), Err(PortError::Backend(ref detail))
                 if detail == "private storage validation failed (stage=handle_open, sidecar=1, code=5)")
             );
+        }
+
+        #[test]
+        fn sidecar_metadata_denial_uses_live_delete_pending_classifier() {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+            let (_temp, _root, db) = setup();
+            let wal = sidecar(&db, "-wal");
+            drop(create_file(&wal).unwrap());
+            let held = OpenOptions::new()
+                .access_mode(DELETE | 0x20000 | 0x80)
+                .share_mode(7)
+                .custom_flags(0x00200000)
+                .open(&wal)
+                .unwrap();
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: the owned disposable handle has DELETE access, and the
+            // payload and length match FileDispositionInfo.
+            assert_ne!(
+                unsafe {
+                    SetFileInformationByHandle(
+                        held.as_raw_handle(),
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                },
+                0
+            );
+            // Inject only the metadata denial; both classifier opens are real.
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(5)),
+                PortError::WriterBusy(ref detail)
+                    if detail == "private storage changed during validation (stage=handle_delete_pending, sidecar=1, code=303)"
+            ));
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(87)),
+                PortError::Backend(ref detail)
+                    if detail == "private storage validation failed (stage=sidecar_metadata, sidecar=1, code=87)"
+            ));
+            drop(held);
+            verify_sidecars(&db).unwrap();
+        }
+
+        #[test]
+        fn sidecar_metadata_denial_never_downgrades_acl_refusal() {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let (_temp, _root, db) = setup();
+            let wal = sidecar(&db, "-wal");
+            drop(create_file(&wal).unwrap());
+            deny_owner_read_control(&wal);
+            // The ACL denies the ordinary verification open, but zero access
+            // succeeds. This must not be confused with a delete-pending name.
+            drop(
+                OpenOptions::new()
+                    .access_mode(0)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(&wal)
+                    .unwrap(),
+            );
+            assert!(matches!(
+                open_for_verification(&wal, true),
+                Err(PortError::Backend(ref detail))
+                    if detail == "private storage validation failed (stage=handle_open, sidecar=1, code=5)"
+            ));
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(5)),
+                PortError::Backend(ref detail)
+                    if detail == "private storage validation failed (stage=sidecar_metadata, sidecar=1, code=5)"
+            ));
+        }
+
+        #[test]
+        fn sidecar_metadata_denial_never_admits_openable_replacements() {
+            let (_temp, root, db) = setup();
+            let wal = sidecar(&db, "-wal");
+            drop(create_file(&wal).unwrap());
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(5)),
+                PortError::Backend(ref detail)
+                    if detail == "private storage validation failed (stage=sidecar_metadata, sidecar=1, code=5)"
+            ));
+            fs::rename(&wal, root.join("saved-wal")).unwrap();
+            drop(create_file(&wal).unwrap());
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(5)),
+                PortError::Backend(ref detail)
+                    if detail == "private storage validation failed (stage=sidecar_metadata, sidecar=1, code=5)"
+            ));
+            allow_everyone(&wal);
+            drop(open_for_verification(&wal, true).unwrap());
+            assert!(matches!(
+                sidecar_metadata_error(&wal, io::Error::from_raw_os_error(5)),
+                PortError::Backend(ref detail)
+                    if detail == "private storage validation failed (stage=sidecar_metadata, sidecar=1, code=5)"
+            ));
+            assert!(matches!(
+                verify_sidecars(&db),
+                Err(PortError::Backend(ref detail))
+                    if detail == "private storage validation failed (stage=security_ace_sid, sidecar=1, code=0)"
+            ));
         }
 
         #[test]
