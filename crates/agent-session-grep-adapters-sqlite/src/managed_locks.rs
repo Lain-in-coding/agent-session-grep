@@ -187,20 +187,52 @@ struct RootDirectory {
     identity: RootIdentity,
 }
 
+/// One freshly opened root and the directory type observed from that same
+/// handle. The fields stay private so callers cannot pair the observation with
+/// a different file.
+#[cfg(windows)]
+struct OpenedRoot {
+    file: File,
+    is_directory: bool,
+}
+
+#[cfg(windows)]
+impl OpenedRoot {
+    fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    fn into_file(self) -> File {
+        self.file
+    }
+}
+
 impl RootDirectory {
     fn open(root: &Path) -> PortResult<Self> {
         // Resolve aliases once, then identify the opened directory itself.
         // Windows retains a non-delete-sharing handle; Unix opens children
         // relative to this descriptor, even if the directory is renamed.
         let path = fs::canonicalize(root).map_err(lock_io("root", "resolve"))?;
-        let file = platform::open_root(&path).map_err(lock_io("root", "open"))?;
-        if !file
-            .metadata()
-            .map_err(lock_io("root", "metadata"))?
-            .is_dir()
-        {
-            return Err(lock_invalid("root", "kind"));
-        }
+        #[cfg(windows)]
+        let file = {
+            let opened = platform::open_root(&path).map_err(lock_io("root", "open"))?;
+            if !opened.is_directory() {
+                return Err(lock_invalid("root", "kind"));
+            }
+            opened.into_file()
+        };
+        #[cfg(not(windows))]
+        let file = {
+            let file = platform::open_root(&path).map_err(lock_io("root", "open"))?;
+            if !file
+                .metadata()
+                .map_err(lock_io("root", "metadata"))?
+                .is_dir()
+            {
+                return Err(lock_invalid("root", "kind"));
+            }
+            file
+        };
         let identity =
             RootIdentity(platform::identity(&file).map_err(lock_io("root", "identity"))?);
         Ok(Self {
@@ -683,16 +715,20 @@ pub(crate) mod platform {
         io::Error::from(io::ErrorKind::InvalidInput)
     }
 
-    pub(super) fn open_root(path: &Path) -> io::Result<File> {
+    pub(super) fn open_root(path: &Path) -> io::Result<OpenedRoot> {
         let file = OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(reject());
         }
-        Ok(file)
+        Ok(OpenedRoot {
+            file,
+            is_directory: metadata.is_dir(),
+        })
     }
 
     pub(super) fn open_lock(root: &RootDirectory, name: &str, create: bool) -> io::Result<File> {
@@ -717,14 +753,14 @@ pub(crate) mod platform {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        if identity(&open_root(&root.path)?)? != identity(&root.file)? {
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)? {
             return Err(reject());
         }
         Ok(file)
     }
 
     pub(super) fn child_exists(root: &RootDirectory, name: &str) -> io::Result<bool> {
-        if identity(&open_root(&root.path)?)? != identity(&root.file)? {
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)? {
             return Err(reject());
         }
         match fs::symlink_metadata(root.path.join(name)) {
@@ -740,7 +776,7 @@ pub(crate) mod platform {
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(root.path.join(name))?;
-        if identity(&open_root(&root.path)?)? != identity(&root.file)?
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)?
             || !file.metadata()?.is_file()
         {
             return Err(reject());
@@ -750,7 +786,7 @@ pub(crate) mod platform {
     }
 
     pub(super) fn create_child_new(root: &RootDirectory, name: &str) -> io::Result<File> {
-        if identity(&open_root(&root.path)?)? != identity(&root.file)? {
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)? {
             return Err(reject());
         }
         crate::control::create_private_owned_file(&root.path.join(name))
@@ -764,7 +800,7 @@ pub(crate) mod platform {
     ) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-        if identity(&open_root(&root.path)?)? != identity(&root.file)? {
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)? {
             return Err(reject());
         }
         let source: Vec<u16> = root
@@ -800,7 +836,7 @@ pub(crate) mod platform {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
         };
-        if identity(&open_root(&root.path)?)? != identity(&root.file)? {
+        if identity(&open_root(&root.path)?.into_file())? != identity(&root.file)? {
             return Err(reject());
         }
         let path = root.path.join(name);
@@ -1334,6 +1370,31 @@ mod tests {
         assert_ne!(low, high);
         assert_ne!(low.binding(), high.binding());
         assert_ne!(low.control_id(), high.control_id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_open_binds_kind_to_the_same_handle() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let opened = platform::open_root(root.path()).unwrap();
+        assert!(opened.is_directory());
+        assert!(opened.into_file().metadata().unwrap().is_dir());
+
+        let ordinary = root.path().join("synthetic-ordinary-file");
+        fs::write(&ordinary, b"synthetic").unwrap();
+        let opened = platform::open_root(&ordinary).unwrap();
+        assert!(!opened.is_directory());
+        assert!(opened.into_file().metadata().unwrap().is_file());
+
+        let error = RootIdentity::read(&ordinary).unwrap_err();
+        assert!(
+            match &error {
+                PortError::SourceIo(message) => message.contains("(site=root, step=kind)"),
+                _ => false,
+            },
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&ordinary).unwrap(), b"synthetic");
     }
 
     #[test]
