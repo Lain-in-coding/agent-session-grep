@@ -76,6 +76,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// CLI 环境变量 `ASG_SEMANTIC_SIMILARITY_FLOOR`（显式注入，仅评测使用）。
 pub const SEMANTIC_SIMILARITY_FLOOR_DEFAULT: f32 = 0.2;
 
+thread_local! {
+    static RETRYABLE_SQL_INTERRUPT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Shared legacy SQL helpers lose the raw SQLite code at `backend`. A managed
+/// caller with a deadline progress handler may opt in for just its operation;
+/// unrelated legacy calls keep their existing interruption classification.
+fn with_retryable_sql_interrupt<T>(operation: impl FnOnce() -> PortResult<T>) -> PortResult<T> {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RETRYABLE_SQL_INTERRUPT.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(RETRYABLE_SQL_INTERRUPT.with(|slot| slot.replace(true)));
+    operation()
+}
+
 /// Translate adapter failures into the stable port error vocabulary.
 ///
 /// SQLite BUSY/LOCKED conditions are expected writer contention and therefore
@@ -83,6 +101,13 @@ pub const SEMANTIC_SIMILARITY_FLOOR_DEFAULT: f32 = 0.2;
 /// SQLite messages cannot escape through the protocol boundary.
 fn backend<E: std::fmt::Display + 'static>(e: E) -> PortError {
     let any = &e as &dyn Any;
+    if RETRYABLE_SQL_INTERRUPT.with(Cell::get)
+        && any.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+        })
+    {
+        return PortError::WriterBusy("managed catalog SQL was interrupted".into());
+    }
     if any.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
         matches!(
             error,
@@ -12146,6 +12171,36 @@ mod tests {
     fn non_contention_sqlite_failure_remains_backend() {
         let error = backend(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT));
         assert!(matches!(error, PortError::Backend(_)));
+    }
+
+    #[test]
+    fn managed_sql_interrupt_scope_is_narrow_and_restored() {
+        let interrupted = || backend(sqlite_failure(rusqlite::ffi::SQLITE_INTERRUPT));
+        assert!(matches!(interrupted(), PortError::Backend(_)));
+        let error: PortResult<()> = with_retryable_sql_interrupt(|| {
+            assert!(matches!(interrupted(), PortError::WriterBusy(_)));
+            with_retryable_sql_interrupt(|| {
+                assert!(matches!(interrupted(), PortError::WriterBusy(_)));
+                Ok(())
+            })?;
+            assert!(matches!(interrupted(), PortError::WriterBusy(_)));
+            assert!(matches!(
+                backend(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT)),
+                PortError::Backend(_)
+            ));
+            assert!(matches!(backend("interrupted"), PortError::Backend(_)));
+            Err(interrupted())
+        });
+        assert!(matches!(error, Err(PortError::WriterBusy(_))));
+        assert!(matches!(interrupted(), PortError::Backend(_)));
+        with_retryable_sql_interrupt(|| Ok(())).unwrap();
+        assert!(matches!(interrupted(), PortError::Backend(_)));
+        let panic = std::panic::catch_unwind(|| {
+            let _: PortResult<()> =
+                with_retryable_sql_interrupt(|| panic!("synthetic SQL scope unwind"));
+        });
+        assert!(panic.is_err());
+        assert!(matches!(interrupted(), PortError::Backend(_)));
     }
 
     type SourceState = (u64, Vec<(String, Vec<u8>)>, Vec<(String, String)>, String);

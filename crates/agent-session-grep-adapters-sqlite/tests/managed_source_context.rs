@@ -1784,7 +1784,7 @@ fn facade_context_manifest_noop_pause_and_currentness_use_real_control_and_outbo
         f.provider.as_str(),
     );
     let namespace = store
-        .reserve_namespace(&f.control, &observation, &worker, &legacy)
+        .reserve_namespace_with_deadline(&f.control, &observation, &worker, &legacy, deadline())
         .unwrap();
     observation.binding.namespace_id = Some(namespace.namespace_id.clone());
     let mut b = batch(&observation, Some("original facade evidence"), "native");
@@ -1892,7 +1892,7 @@ fn facade_real_context_apply_failure_leaves_no_partial_source_or_authority() {
         f.provider.as_str(),
     );
     let namespace = store
-        .reserve_namespace(&f.control, &observation, &worker, &legacy)
+        .reserve_namespace_with_deadline(&f.control, &observation, &worker, &legacy, deadline())
         .unwrap();
     observation.binding.namespace_id = Some(namespace.namespace_id);
     let mut b = batch(&observation, Some("failure original"), "native");
@@ -1934,7 +1934,7 @@ fn facade_real_context_apply_failure_leaves_no_partial_source_or_authority() {
     // The failed content transaction never committed a namespace assignment.
     // Re-stage that reservation after restart; do not reuse ephemeral authority.
     let namespace = store
-        .reserve_namespace(&f.control, &observation, &worker, &legacy)
+        .reserve_namespace_with_deadline(&f.control, &observation, &worker, &legacy, deadline())
         .unwrap();
     observation.binding.namespace_id = Some(namespace.namespace_id);
     store
@@ -2152,7 +2152,7 @@ fn facade_complete_discovery_respects_unresolved_context_and_original_expired_de
         f.provider.as_str(),
     );
     let namespace = store
-        .reserve_namespace(&f.control, &observation, &worker, &legacy)
+        .reserve_namespace_with_deadline(&f.control, &observation, &worker, &legacy, deadline())
         .unwrap();
     observation.binding.namespace_id = Some(namespace.namespace_id);
     let mut b = batch(&observation, Some("permitted original"), "native");
