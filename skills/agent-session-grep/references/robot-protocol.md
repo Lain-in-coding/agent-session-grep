@@ -8,7 +8,7 @@ use synthetic placeholders and are not valid stored IDs.
 ## Managed and legacy behavior
 
 Managed reads use permitted original-source projections and disclose freshness.
-The selected Claude/Codex worker updates history independently of queries; no
+The managed worker updates selected history independently of queries; no
 MCP tool starts ingestion or grants permission. `latest: true` with optional
 `max_wait_ms` (0..30000, default 5000) requests a post-admission source/discovery
 receipt within the original request budget. An unmet barrier returns permitted
@@ -83,13 +83,16 @@ Missing/corrupt managed control fails closed rather than revealing legacy facts.
 `update check` explicitly uses the package-verified versioned HTTPS metadata
 helper. `update apply --from <archive>` is offline and also requires its sibling
 manifest and `SHA256SUMS`; the current candidate path requires a newer SemVer
-with catalog22/control2, or a verified catalog21/control2 to22/control2 migration.
-Other schema paths are refused before maintenance. Schema rollback restores the
-exact21 backup before publishing the old program pointer. `update status` inspects the retained
+with matching catalog22/control2 schemas in both programs. Other schema paths
+are refused before maintenance. Exact catalog21 backup restore remains an
+internal contract for future verified schema-changing execution. `update status` inspects the retained
 journal; `update recover` reconciles the recorded installation/catalog, retaining
 current pause/revoke policy and freshness unknown until re-observation. Owned `background autostart enable|disable` controls future login registration
-without changing desired updates. Managed uninstall/keep-data and CLI
-legacy-to-managed migration remain under implementation.
+without changing desired updates. Managed uninstall/keep-data is implemented with
+bounded pending cleanup; CLI `migrate` implements explicit legacy-to-managed copying
+to a new private side path, initially paused with no selected histories. Merged
+legacy facts remain hidden until selected sources are reimported; native
+migration/recovery acceptance remains open.
 Installed configuration or local tests do not establish host loading, six-host/
 four-target native coverage or measured five-second acceptance.
 

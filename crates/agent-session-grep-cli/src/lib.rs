@@ -1522,7 +1522,7 @@ RELOCATION:
     --alias-ttl-days <n>     退休位置兼容期（默认 90，范围 1..365）
 
 FILTER (search):
-    --provider claude|claude-code|codex  限定 provider（可重复，多个取值按 OR 合并）
+    --provider <id> (参见 providers；claude 是 claude-code 的别名)  限定 provider（可重复，多个取值按 OR 合并）
     --since <time>         起始时间（含）；RFC3339/ISO-8601 绝对值或 1h/1d/1w 相对量
     --until <time>         结束时间（不含）；语法同 --since
     --repo <slug>          限定会话仓库（host/owner/name 三段 slug，逐字相等；
@@ -1555,7 +1555,7 @@ GLOBAL（全局 flag 放在命令名之前；子命令 flag 如 --max-items 放�
     --robot                等价 --output json，无颜色/进度（stdout 只输出协议）
     --no-color             接受但无效果：human 输出本就不着色（供 NO_COLOR 习惯的调用方）
     --request-id <id>      robot 调用方关联 id，原样回显于每个 frame（A-Za-z0-9._:- 计 1-128 字符）
-    --offline              拒绝任何需要联网的显式操作（fail-closed；当前所有命令本地执行，本 flag 是稳定显式模式，doctor/hook 会如实上报）
+    --offline              拒绝任何需要联网的显式操作（fail-closed；显式 update check 访问公开 HTTPS 发布元数据；普通读取、MCP 和后台历史处理保持离线，本 flag 是稳定显式模式，doctor/hook 会如实上报）
     -h, --help             打印本帮助
     -V, --version          打印版本
 
@@ -1693,7 +1693,7 @@ fn subcommand_help_text(cmd: &str) -> &'static str {
             "search <query>：全文检索历史会话，按相关性降序返回命中。\n\
                      示例：agent-session-grep --db <path> search 配置备份\n\
                      flag（放子命令后）：--max-items <n> 页大小、--cursor <token> 翻页、--max-bytes <n> 预算；\n\
-                     过滤：--provider claude|claude-code|codex（可重复，OR）、--since/--until <RFC3339 或 1h|1d|1w>（半开区间 [since, until)）、\n\
+                     过滤：--provider <id> (参见 providers；claude 是 claude-code 的别名)（可重复，OR）、--since/--until <RFC3339 或 1h|1d|1w>（半开区间 [since, until)）、\n\
                      --repo <host/owner/name>（会话仓库 slug，逐字相等；与 status 的 repos 清单一致）；\n\
                      managed 范围为所选历史与上述过滤的交集；--latest [--max-wait-ms 0..30000] 等待新观察，暂停不会被恢复；\n\
                      检索模式：--mode lexical|semantic|hybrid（默认 lexical）。semantic/hybrid 需先跑 `index embeddings`；\n\
@@ -1745,7 +1745,7 @@ fn subcommand_help_text(cmd: &str) -> &'static str {
                   Claude Code 直接读 stdout 当协议，所以本命令不套 envelope（--robot/--output 无效），\n\
                   不加 --enable 时 stdout 一个字节都不写（不注入任何历史）；运行事实走 stderr；\n\
                   flag：--enable 启用注入、--max-tokens <n> 预算（默认 2000）；\n\
-                  --provider claude|claude-code|codex（可重复，OR 限定 provider）、--decay-days <n>（只注入最近 N 天）、\n\
+                  --provider <id> (参见 providers；claude 是 claude-code 的别名)（可重复，OR 限定 provider）、--decay-days <n>（只注入最近 N 天）、\n\
                   --repo <host/owner/name>（只注入该仓库的历史；与 search --repo 同语义）；\n\
                   注入文本经跨边界脱敏（ADR-0009）；全局 --offline 时如实上报 offline 字段。"
         }

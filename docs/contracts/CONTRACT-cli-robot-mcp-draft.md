@@ -260,7 +260,7 @@ helper pair, native headers, current/release metadata and the candidate's
 content-free build-info. Unsigned hashes are consistency evidence, not publisher
 authentication.
 
-The current package has 19 payload records plus `PACKAGE-MANIFEST.tsv`. Its 12
+The current package has 20 payload records plus `PACKAGE-MANIFEST.tsv`. Its 12
 metadata fields include `supervisor` and `supervisor_sha256`; helpers are normal
 hash-bound file records under the immutable version. Windows supervisor headers
 must identify the x64 GUI subsystem. `release.json` keeps its strict existing
@@ -316,13 +316,13 @@ receipt chain before replacing its supervisor command, and rollback reconciles
 the original owned command. Unowned/changed/ambiguous registration is not adopted;
 autostart is not newly enabled. Manager reload/readback is distinct from a login
 receipt. Explicit selected-host setup remains available for registration/host
-repair. Native two-version recovery, schema-changing/legacy
 repair. A Windows x64 private same-schema two-version rollback/recover drill has
 passed; schema-changing/legacy migration, other native targets, managed
 uninstall, six-host flows and measured latency acceptance remain separate open
-requirements. Setup history selection continues
-through separate `sources add`; public background autostart enable/disable,
-managed uninstall/default purge and keep-data are still unimplemented.
+requirements. Selected-host `setup --history` accepts all six confirmed providers;
+later changes use `sources add/revoke`. Owned `background autostart enable|disable`
+and managed default/keep-data `uninstall` are implemented with bounded pending
+cleanup; actual native completion/recovery and public release acceptance remain open.
 
 ### Current development control commands
 
@@ -496,8 +496,11 @@ absent from the live file enumeration. A repaired source progress mirror can
 recover a committed receipt from an earlier worker boot; it remains partial
 until another verified observation and cannot restore permissions or pause.
 
-The current background worker supports selected Claude/Codex JSONL roots and
-exact files; other provider adapters do not establish managed background coverage.
+The current background worker implements selected-source paths for Claude
+Code/Codex JSONL, WorkBuddy JSONL with separately selected lifecycle metadata,
+ZCode logical SQLite/WAL, DeepSeek Harness checksummed compressed v4 streams and
+supported Antigravity full transcript or conversation DB sources. All six remain
+Experimental; actual six-host runtime coverage is still under verification.
 It holds its independent OS lifecycle lock for its full lifetime and polls at a
 one-second ordinary cadence. Pause stays resident without source I/O;
 stop or maintenance causes intentional exit 0 and releases catalog/lifecycle
