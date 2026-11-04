@@ -10,7 +10,7 @@ that content.
 | Version / source | Publication |
 |---|---|
 | v0.1.0 | Published source release; GitHub-generated source archives, no uploaded assets or prebuilt binaries |
-| Current checkout | Unreleased changes beyond v0.1.0, even when the workspace version is still 0.1.0 |
+| Current checkout | Unreleased `0.2.0-beta.9` Managed Beta candidate beyond v0.1.0; this version is not a tag, Release, or maturity certification |
 
 ## Reporting a vulnerability
 

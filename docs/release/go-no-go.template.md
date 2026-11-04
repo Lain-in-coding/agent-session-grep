@@ -51,6 +51,8 @@
 | LICENSE present and correct | <pass/fail> | <file ref> |
 | Third-party attributions complete | <pass/fail> | <file ref> |
 | Fixture provenance documented | <pass/fail> | <notes> |
+| Four target archives, manifests and SHA256SUMS validated | <pass/fail> | <receipt ref> |
+| Managed install/update/recovery/uninstall receipts complete | <pass/fail> | <receipt ref> |
 
 **Residual materials risks**: <list or "none identified">
 
@@ -78,11 +80,37 @@ The TUI snapshot checks the structural projection, not interactive terminal UX.
 
 ## 5. Provider evidence
 
+### 5.1 Managed package and six-host core flow
+
+| Check | Status | Evidence |
+|---|---|---|
+| `x86_64-pc-windows-msvc` install and native flow | <pass/fail> | <run/evidence ref> |
+| `x86_64-unknown-linux-gnu` install and native flow | <pass/fail> | <run/evidence ref> |
+| `x86_64-apple-darwin` install and native flow | <pass/fail> | <run/evidence ref> |
+| `aarch64-apple-darwin` install and native flow | <pass/fail> | <run/evidence ref> |
+| Claude Code MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| Codex MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| WorkBuddy MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| ZCode MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| DeepSeek Harness MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| Antigravity MCP invocation/history retrieval/continuation | <pass/fail> | <native receipt ref> |
+| Six-host cross-retrieval ring | <pass/fail> | <ring receipt ref> |
+| Selected-history background refresh | <pass/fail> | <status/latest evidence ref> |
+| User-triggered upgrade and intentional failure recovery | <pass/fail> | <journal/recovery ref> |
+| Managed default uninstall removes only owned state | <pass/fail> | <cleanup receipt ref> |
+| Managed keep-data uninstall retains catalog and policy | <pass/fail> | <cleanup receipt ref> |
+| Reinstall and repeated cleanup are idempotent | <pass/fail> | <run receipt ref> |
+
+### 5.2 Provider evidence
+
 | Provider | Tier | Evidence | Notes |
 |---|---|---|---|
 | Claude Code | <certified/GA/beta/experimental> | <evidence ref> | |
 | Codex | <certified/GA/beta/experimental> | <evidence ref> | |
-| <...> | | | |
+| WorkBuddy | <certified/GA/beta/experimental> | <evidence ref> | |
+| ZCode | <certified/GA/beta/experimental> | <evidence ref> | |
+| DeepSeek Harness | <certified/GA/beta/experimental> | <evidence ref> | |
+| Antigravity | <certified/GA/beta/experimental> | <evidence ref> | |
 
 ---
 
