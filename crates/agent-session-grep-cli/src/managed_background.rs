@@ -2550,6 +2550,19 @@ impl SourceScheduleState {
 type ScheduleEventHook = Box<dyn FnMut(ScheduleTestEvent<'_>) -> PortResult<()>>;
 
 #[cfg(test)]
+type InventoryEventHook = Box<dyn FnMut(InventoryTestEvent<'_>) -> PortResult<()>>;
+
+#[cfg(test)]
+enum InventoryTestEvent<'a> {
+    BeforeOpen(Instant),
+    Opened(Instant),
+    Sources(Instant),
+    SourcesRead(Instant, &'a BTreeMap<String, BackgroundSource>),
+    BeforeProgress(Instant),
+    Finished(Instant),
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 enum SourceAttemptPhase {
     #[default]
@@ -2566,6 +2579,10 @@ struct ScheduleTestHooks {
     probe_due: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     // Consumed only by final discover; never extends the original root end.
     final_discovery_end: Option<std::rc::Rc<std::cell::Cell<Option<Instant>>>>,
+    // Consumed before inventory admission; may only shorten its original end.
+    inventory_end: std::cell::Cell<Option<Instant>>,
+    // Inventory observations do not change existing scheduler event streams.
+    on_inventory: Option<RefCell<InventoryEventHook>>,
     epoch_lock_prefix: Option<PathBuf>,
     source_phase: std::cell::Cell<SourceAttemptPhase>,
     on_event: Option<RefCell<ScheduleEventHook>>,
@@ -2633,6 +2650,13 @@ impl ScheduleTestHooks {
             PortError::NotFound(_) => "not_found",
             PortError::SnapshotChanged(_) => "snapshot_changed",
         }
+    }
+
+    fn inventory_event(&self, event: InventoryTestEvent<'_>) -> PortResult<()> {
+        if let Some(hook) = &self.on_inventory {
+            return hook.borrow_mut()(event);
+        }
+        Ok(())
     }
 
     fn event(&self, event: ScheduleTestEvent<'_>) -> PortResult<()> {
@@ -4144,16 +4168,45 @@ fn observe_cycle(
     schedule: &mut SourceScheduleState,
     epoch_plan_allowed: bool,
 ) -> PortResult<CycleOutcome> {
-    let store = ManagedStore::open(db, control)?;
+    let inventory_end =
+        SqliteControlStore::effective_runtime_deadline(Instant::now() + SOURCE_OBSERVATION_BUDGET);
+    #[cfg(test)]
+    let inventory_end = schedule
+        .hooks
+        .inventory_end
+        .take()
+        .map_or(inventory_end, |end| inventory_end.min(end));
+    #[cfg(test)]
+    schedule
+        .hooks
+        .inventory_event(InventoryTestEvent::BeforeOpen(inventory_end))?;
+    // This scopes control admission only, not catalog open or catalog SQL.
+    let store = ManagedStore::open_with_deadline(db, control, inventory_end)?;
+    #[cfg(test)]
+    schedule
+        .hooks
+        .inventory_event(InventoryTestEvent::Opened(inventory_end))?;
     let incarnation = store.incarnation().clone();
-    let known = store
-        .background_sources(control)?
+    let known = control
+        .with_runtime_deadline(inventory_end, || {
+            #[cfg(test)]
+            schedule
+                .hooks
+                .inventory_event(InventoryTestEvent::Sources(inventory_end))?;
+            store.background_sources(control)
+        })?
         .into_iter()
         .map(|s| (s.binding.source_path.clone(), s))
         .collect::<BTreeMap<_, _>>();
+    #[cfg(test)]
+    schedule
+        .hooks
+        .inventory_event(InventoryTestEvent::SourcesRead(inventory_end, &known))?;
     schedule.prepare(policy, &incarnation, authority.boot_id())?;
-    let inventory_end =
-        SqliteControlStore::effective_runtime_deadline(Instant::now() + SOURCE_OBSERVATION_BUDGET);
+    #[cfg(test)]
+    schedule
+        .hooks
+        .inventory_event(InventoryTestEvent::BeforeProgress(inventory_end))?;
     let progress = control
         .with_runtime_deadline(inventory_end, || control.source_progress_inventory())?
         .into_iter()
@@ -4167,6 +4220,10 @@ fn observe_cycle(
     let demands = control.with_runtime_deadline(inventory_end, || control.latest_demands())?;
     schedule.update_demands(demands, policy, schedule.now())?;
     drop(store);
+    #[cfg(test)]
+    schedule
+        .hooks
+        .inventory_event(InventoryTestEvent::Finished(inventory_end))?;
     // Phase 1: fence and enumerate every participating root independently
     // before publishing any source claim.
     let mut roots = Vec::with_capacity(selections.len());
@@ -8962,6 +9019,8 @@ mod control_deadline_tests {
             now: Some(elapsed),
             probe_due: None,
             final_discovery_end: None,
+            inventory_end: Cell::new(None),
+            on_inventory: None,
             epoch_lock_prefix: None,
             source_phase: Cell::new(SourceAttemptPhase::Prepare),
             on_event: Some(RefCell::new(Box::new(hook))),
@@ -8969,6 +9028,334 @@ mod control_deadline_tests {
             completion_end: Cell::new(None),
             observation_result: Cell::new(None),
             completion_case: Cell::new(None),
+        }
+    }
+
+    mod worker_inventory_tests {
+        use super::*;
+        use rusqlite::{Connection, types::Value};
+
+        #[derive(Clone, Copy)]
+        enum Case {
+            CatalogBusy,
+            Expired,
+            Nested,
+            Success,
+        }
+
+        #[derive(Default)]
+        struct Trace {
+            events: Vec<(&'static str, Instant, Instant)>,
+            known: Vec<BackgroundSource>,
+        }
+
+        fn catalog_rows(conn: &Connection) -> [Vec<Vec<Value>>; 6] {
+            [
+                "SELECT * FROM store_metadata",
+                "SELECT * FROM source_bindings ORDER BY source_id",
+                "SELECT * FROM source_heads ORDER BY source_id",
+                "SELECT * FROM source_revision_receipts ORDER BY revision_id",
+                "SELECT * FROM discovery_receipts ORDER BY cycle_seq,selection_id",
+                "SELECT * FROM discovery_sources ORDER BY cycle_seq,selection_id,source_id",
+            ]
+            .map(|sql| {
+                let mut statement = conn.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            })
+        }
+
+        fn assert_sources(actual: &[BackgroundSource], expected: &[BackgroundSource]) {
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(
+                    (
+                        &actual.binding,
+                        &actual.latest_receipt,
+                        actual.indexed_len,
+                        actual.superseded
+                    ),
+                    (
+                        &expected.binding,
+                        &expected.latest_receipt,
+                        expected.indexed_len,
+                        expected.superseded
+                    ),
+                );
+            }
+        }
+
+        fn inventory_prefix_case(case: Case) {
+            let fixture = CycleFixture::new();
+            let path = fixture.write_source("inventory.jsonl", SearchProvider::Claude, "inventory");
+            let source_before = std::fs::read(&path).unwrap();
+            let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+            // A real publication is preparation only. Its outer scope must end
+            // before the direct observe_cycle call that exposes this gap.
+            let (seed, _) = fixture.ordinary(&mut SourceScheduleState::default(), &boot);
+            assert!(seed.unwrap().all_sources_attempted);
+            let expected_sources = fixture.sources();
+            assert_eq!(expected_sources.len(), 1);
+            assert!(
+                expected_sources[0]
+                    .latest_receipt
+                    .as_ref()
+                    .unwrap()
+                    .published
+            );
+            let worker = fixture.worker();
+            let CycleAdmission::Queued(queued) =
+                control_change_before(&fixture.control, fixture.scope_end, |seq| {
+                    fixture
+                        .control
+                        .queue_cycle(seq, vec![selection_revision(&fixture.selection)?])
+                })
+                .unwrap()
+                .value
+            else {
+                panic!("inventory fixture cycle was not queued");
+            };
+            let cycle = fixture.start(&worker, &queued);
+            let policy =
+                fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+            let control_before = fixture.read_control(|control| {
+                Ok((
+                    control.status()?,
+                    control.background_status()?,
+                    control.cycle(cycle.token.cycle_seq)?,
+                ))
+            });
+            let root = fixture.db.parent().unwrap().to_path_buf();
+            let blocker = Rc::new(Connection::open(&fixture.db).unwrap());
+            blocker.busy_timeout(Duration::ZERO).unwrap();
+            // WAL EXCLUSIVE does not block readers. Change only this prepared
+            // synthetic catalog, with no managed catalog connection left open.
+            let mode: String = blocker
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+            let rows_before = catalog_rows(&blocker);
+            let catalog_before = std::fs::read(&fixture.db).unwrap();
+            let control_file = SqliteControlStore::path(&root);
+            let control_bytes = std::fs::read(&control_file).unwrap();
+            let blocked = matches!(case, Case::CatalogBusy | Case::Nested);
+            let trace = Rc::new(RefCell::new(Trace::default()));
+            let started = Instant::now();
+            let outer = started + Duration::from_secs(10);
+            let requested = match case {
+                Case::Expired => Some(started - Duration::from_millis(1)),
+                Case::CatalogBusy => Some(outer),
+                Case::Nested => Some(outer + Duration::from_secs(5)),
+                Case::Success => None,
+            };
+            let probe = started + Duration::from_secs(60);
+            let previous = SqliteControlStore::effective_runtime_deadline(probe);
+            assert_eq!(
+                previous, probe,
+                "fixture preparation must restore its outer scope"
+            );
+            let mut schedule = SourceScheduleState::default();
+            schedule.hooks.inventory_end.set(requested);
+            schedule.hooks.on_inventory = Some(RefCell::new(Box::new({
+                let trace = trace.clone();
+                let blocker = blocker.clone();
+                let root = root.clone();
+                move |event| {
+                    let (stage, end) = match event {
+                        InventoryTestEvent::BeforeOpen(end) => ("before_open", end),
+                        InventoryTestEvent::Opened(end) => ("opened", end),
+                        InventoryTestEvent::Sources(end) => ("sources", end),
+                        InventoryTestEvent::SourcesRead(end, sources) => {
+                            trace.borrow_mut().known = sources.values().cloned().collect();
+                            ("sources_read", end)
+                        }
+                        InventoryTestEvent::BeforeProgress(end) => ("before_progress", end),
+                        InventoryTestEvent::Finished(end) => ("finished", end),
+                    };
+                    // Record rather than assert here: removing the scope must
+                    // still reach the real locked catalog SQL before failing.
+                    trace.borrow_mut().events.push((
+                        stage,
+                        end,
+                        SqliteControlStore::effective_runtime_deadline(probe),
+                    ));
+                    if stage == "opened" && blocked {
+                        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                    }
+                    if stage == "finished" {
+                        drop(ExclusiveGuard::try_acquire(
+                            &root,
+                            LockKind::CatalogHandles,
+                        )?);
+                        // Only this test stops after the real inventory, before
+                        // root discovery can create any new durable evidence.
+                        return Err(PortError::InvalidRequest(
+                            "inventory prefix complete".into(),
+                        ));
+                    }
+                    Ok(())
+                }
+            })));
+            let mut observe = || {
+                observe_cycle(
+                    &fixture.db,
+                    &fixture.control,
+                    &worker,
+                    &policy,
+                    std::slice::from_ref(&fixture.selection),
+                    &cycle,
+                    &boot,
+                    &mut schedule,
+                    false,
+                )
+            };
+            let result = if matches!(case, Case::Nested) {
+                fixture
+                    .control
+                    .with_runtime_deadline(outer, || {
+                        let result = observe();
+                        let restored = SqliteControlStore::effective_runtime_deadline(probe);
+                        Ok((result, restored))
+                    })
+                    .map(|(result, restored)| {
+                        assert_eq!(restored, outer);
+                        result
+                    })
+                    .unwrap()
+            } else {
+                observe()
+            };
+            let returned = Instant::now();
+            // Release the actual blocker before result or state assertions.
+            let lock_held = !blocker.is_autocommit();
+            if lock_held {
+                blocker.execute_batch("ROLLBACK").unwrap();
+            }
+            assert_eq!(
+                lock_held, blocked,
+                "the real catalog lock was acquired after open"
+            );
+            assert!(blocker.is_autocommit());
+            blocker.execute_batch("BEGIN EXCLUSIVE; ROLLBACK").unwrap();
+            drop(ExclusiveGuard::try_acquire(&root, LockKind::CatalogHandles).unwrap());
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous
+            );
+            assert!(schedule.hooks.inventory_end.get().is_none());
+            assert!(
+                catalog_rows(&blocker) == rows_before,
+                "inventory changed catalog evidence"
+            );
+            assert!(
+                std::fs::read(&fixture.db).unwrap() == catalog_before,
+                "catalog bytes changed"
+            );
+            assert!(
+                std::fs::read(&control_file).unwrap() == control_bytes,
+                "control bytes changed"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), source_before);
+            let control_after = fixture.read_control(|control| {
+                Ok((
+                    control.status()?,
+                    control.background_status()?,
+                    control.cycle(cycle.token.cycle_seq)?,
+                ))
+            });
+            assert_eq!(control_after, control_before);
+            // Drop the callback's connection owner and prove the fixture closes
+            // its last raw SQLite handle before a separate healthy read.
+            drop(schedule);
+            Rc::try_unwrap(blocker)
+                .unwrap_or_else(|_| panic!("inventory callback retained the blocker"))
+                .close()
+                .unwrap();
+            assert_sources(&fixture.sources(), &expected_sources);
+            match case {
+                Case::CatalogBusy | Case::Nested => assert!(
+                    matches!(&result, Err(PortError::WriterBusy(reason)) if reason == "managed catalog is busy"),
+                    "expected the actual catalog SQL refusal: {result:?}",
+                ),
+                Case::Expired => assert!(matches!(result, Err(PortError::WriterBusy(_)))),
+                Case::Success => assert!(
+                    matches!(&result, Err(PortError::InvalidRequest(reason)) if reason == "inventory prefix complete"),
+                    "inventory did not finish before root discovery: {result:?}",
+                ),
+            }
+            let trace = trace.borrow();
+            let expected_stages: &[&str] = match case {
+                Case::Expired => &["before_open"],
+                Case::CatalogBusy | Case::Nested => &["before_open", "opened", "sources"],
+                Case::Success => &[
+                    "before_open",
+                    "opened",
+                    "sources",
+                    "sources_read",
+                    "before_progress",
+                    "finished",
+                ],
+            };
+            assert_eq!(
+                trace.events.iter().map(|event| event.0).collect::<Vec<_>>(),
+                expected_stages
+            );
+            let end = trace.events[0].1;
+            if let Some(requested) = requested {
+                assert_eq!(
+                    end,
+                    if matches!(case, Case::Nested) {
+                        outer
+                    } else {
+                        requested
+                    }
+                );
+            } else {
+                assert!(end >= started + SOURCE_OBSERVATION_BUDGET);
+                assert!(end <= returned + SOURCE_OBSERVATION_BUDGET);
+            }
+            for (stage, received, active) in &trace.events {
+                assert_eq!(*received, end, "inventory renewed its end at {stage}");
+                let expected = if *stage == "sources" {
+                    end
+                } else if matches!(case, Case::Nested) {
+                    outer
+                } else {
+                    previous
+                };
+                assert_eq!(*active, expected, "inventory scope at {stage}");
+            }
+            if matches!(case, Case::Success) {
+                assert_sources(&trace.known, &expected_sources);
+            } else {
+                assert!(trace.known.is_empty());
+            }
+        }
+
+        #[test]
+        fn worker_inventory_catalog_busy_keeps_original_end() {
+            inventory_prefix_case(Case::CatalogBusy);
+        }
+
+        #[test]
+        fn worker_inventory_expired_entry_stops_before_catalog_open_completes() {
+            inventory_prefix_case(Case::Expired);
+        }
+
+        #[test]
+        fn worker_inventory_nested_end_and_error_restore() {
+            inventory_prefix_case(Case::Nested);
+        }
+
+        #[test]
+        fn worker_inventory_success_restores_before_roots() {
+            inventory_prefix_case(Case::Success);
         }
     }
 
