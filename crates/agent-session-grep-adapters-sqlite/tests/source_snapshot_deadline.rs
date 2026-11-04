@@ -236,10 +236,19 @@ fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal(
         )
         .unwrap();
     assert_eq!(hash_file(&path), before_db);
-    assert!(matches!(
-        verify_snapshot_with_deadline(&path, &snapshot, SQLITE_256_MIB, deadline),
-        Err(PortError::SnapshotChanged(_))
-    ));
+    let call_started = Instant::now();
+    let expired_before = call_started >= deadline;
+    let result = verify_snapshot_with_deadline(&path, &snapshot, SQLITE_256_MIB, deadline);
+    let call_finished = Instant::now();
+    assert!(
+        matches!(&result, Err(PortError::SnapshotChanged(_))),
+        "phase=verify_after_wal_insert actual={:?} \
+         original_end_expired_before={expired_before} \
+         original_end_expired_after={} call_elapsed={:?}",
+        result.as_ref().map(|_| ()),
+        call_finished >= deadline,
+        call_finished.duration_since(call_started),
+    );
     let next = capture_with_deadline(&path, SQLITE_256_MIB, deadline).unwrap();
     writer
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")

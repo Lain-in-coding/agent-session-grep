@@ -129,18 +129,16 @@ impl RootIdentity {
         Ok(RootDirectory::open(root)?.identity)
     }
 
-    /// Read physical identity from the same live directory handle whose
-    /// security descriptor the caller just validated. This grants no lock or
-    /// permission and never exports the native volume or file identifiers.
+    /// Consume the handle-bound type check from the fresh security validation.
+    /// Identity still comes from that handle's full native file ID. This grants
+    /// no lock or permission and never exports native identifiers.
     #[cfg(windows)]
-    pub(crate) fn from_directory_handle(file: &File) -> PortResult<Self> {
-        if !file
-            .metadata()
-            .map_err(lock_io("root", "metadata"))?
-            .is_dir()
-        {
-            return Err(lock_invalid("root", "kind"));
-        }
+    pub(crate) fn from_directory_handle(
+        verified: crate::control::VerifiedPrivateHandle<'_>,
+    ) -> PortResult<Self> {
+        let file = verified
+            .into_directory()
+            .ok_or_else(|| lock_invalid("root", "kind"))?;
         platform::identity(file)
             .map(Self)
             .map_err(lock_io("root", "identity"))
@@ -1321,6 +1319,21 @@ mod tests {
         assert!(!format!("{token:?}").contains(token.as_str()));
         assert!(!token.as_str().contains(&root.path().display().to_string()));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn control_root_identity_preserves_high_file_id_bits() {
+        let low = RootIdentity(PhysicalIdentity {
+            volume: 7,
+            file: 11,
+        });
+        let high = RootIdentity(PhysicalIdentity {
+            volume: 7,
+            file: (1_u128 << 96) | 11,
+        });
+        assert_ne!(low, high);
+        assert_ne!(low.binding(), high.binding());
+        assert_ne!(low.control_id(), high.control_id());
     }
 
     #[test]

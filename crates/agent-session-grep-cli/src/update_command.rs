@@ -1487,6 +1487,30 @@ fn active_identity_matches(
 ) -> bool {
     actual == expected && actual_generation == expected_generation
 }
+fn native_restart_error(error: crate::native_manager::ManagerError) -> CliError {
+    use crate::native_manager::ErrorCode;
+    let (code, reason) = match error.code {
+        ErrorCode::Unavailable => (CanonicalCode::CapabilityNotSupported, "unavailable"),
+        ErrorCode::Timeout => (CanonicalCode::DeadlineExceeded, "deadline exceeded"),
+        ErrorCode::Busy => (CanonicalCode::WriterBusy, "busy"),
+        ErrorCode::RecoveryRequired => (CanonicalCode::UpdateRecoveryRequired, "recovery required"),
+        ErrorCode::Conflict => (
+            CanonicalCode::UpdateRecoveryRequired,
+            "configuration changed",
+        ),
+        ErrorCode::VerificationFailed => (
+            CanonicalCode::UpdateRecoveryRequired,
+            "restart identity unverified",
+        ),
+        ErrorCode::Failed => (CanonicalCode::UpdateRecoveryRequired, "restart failed"),
+    };
+    problem(
+        code,
+        &format!(
+            "native manager {reason}; preserve current state and inspect update recovery status"
+        ),
+    )
+}
 fn resume_background(
     control: &SqliteControlStore,
     root: &Path,
@@ -1552,12 +1576,12 @@ fn resume_background(
             end,
             &mut || allowed(true),
         )
-        .map_err(package_installation::invalid_install)?;
+        .map_err(native_restart_error)?;
     } else {
         crate::native_manager::spawn_detached_for_update(&registration, end, &mut || {
             allowed(false)
         })
-        .map_err(package_installation::invalid_install)?;
+        .map_err(native_restart_error)?;
     }
     let ready_end = std::cmp::min(end, Instant::now() + Duration::from_secs(5));
     loop {

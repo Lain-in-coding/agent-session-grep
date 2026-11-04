@@ -343,6 +343,13 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Preserve native-manager error categories during update restart handling;
+  failures under running intent still report partial `restart_failed`.
+- Avoid a duplicate Windows directory-handle metadata query while retaining
+  fresh privacy checks and full 128-bit file identity.
+- Apply the existing Windows sidecar-change classification when metadata
+  access is denied. Confirmed transient refusals remain retryable within the
+  original request deadline; permission and unknown failures stay hard errors.
 - Optional semantic dependencies use Candle 0.11.1 and ZIP 9.1.3, removing
   the transitive ZIP version affected by RUSTSEC-2026-0429. The offline
   bundle verifier uses the same fixed ZIP version. Semantic inference
