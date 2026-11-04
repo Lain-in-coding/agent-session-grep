@@ -46,36 +46,100 @@ impl Fixture {
         let selected = temp.path().join("synthetic-selected");
         fs::create_dir(&selected).unwrap();
         let db = root.join("catalog.db");
-        let control = SqliteControlStore::create(
+        // Reuse create's existing 30-second allowance for all preparation,
+        // retaining any earlier caller end. The probe only observes scope state.
+        let requested_end = Instant::now() + Duration::from_secs(30);
+        let probe_end = requested_end + Duration::from_secs(1);
+        let previous_end = SqliteControlStore::effective_runtime_deadline(probe_end);
+        let prepare_end = SqliteControlStore::effective_runtime_deadline(requested_end);
+        let control = SqliteControlStore::create_with_deadline(
             &root,
             &id("synthetic-installation"),
             DesiredUpdates::Running,
+            prepare_end,
         )
         .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            previous_end
+        );
         let selection = control
-            .add_selection(
-                ControlSeq::new(0).unwrap(),
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Codex,
-                        locator: CanonicalLocator::from_path(&selected).unwrap(),
-                        kind: RootKind::Root,
+            .with_runtime_deadline(prepare_end, || {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe_end),
+                    prepare_end
+                );
+                control.add_selection(
+                    ControlSeq::new(0).unwrap(),
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Codex,
+                            locator: CanonicalLocator::from_path(&selected).unwrap(),
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(id("synthetic-selected-root")),
+                        now_ms: 1,
                     },
-                    root_identity: Some(id("synthetic-selected-root")),
-                    now_ms: 1,
-                },
-            )
+                )
+            })
             .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe_end),
+            previous_end
+        );
         let background = lock(&root, LockKind::Background);
         {
             let worker = control
-                .bind_worker(&background, id("synthetic-boot"))
+                .with_runtime_deadline(prepare_end, || {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe_end),
+                        prepare_end
+                    );
+                    let worker = control.bind_worker(&background, id("synthetic-boot"))?;
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe_end),
+                        prepare_end
+                    );
+                    control.register_worker(
+                        selection.control_seq,
+                        &worker,
+                        std::process::id(),
+                        2,
+                    )?;
+                    Ok(worker)
+                })
                 .unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                previous_end
+            );
+            // Scope only catalog admission; a trailing control tick must not
+            // replace a committed catalog result with a timeout.
+            let store = ManagedStore::create_with_deadline(
+                &db,
+                &control,
+                id("synthetic-catalog"),
+                3,
+                prepare_end,
+            )
+            .unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                previous_end
+            );
             control
-                .register_worker(selection.control_seq, &worker, std::process::id(), 2)
+                .with_runtime_deadline(prepare_end, || {
+                    assert_eq!(
+                        SqliteControlStore::effective_runtime_deadline(probe_end),
+                        prepare_end
+                    );
+                    store.reconcile_progress(&control, &worker)
+                })
                 .unwrap();
-            let store = ManagedStore::create(&db, &control, id("synthetic-catalog"), 3).unwrap();
-            store.reconcile_progress(&control, &worker).unwrap();
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe_end),
+                previous_end
+            );
         }
         Self {
             _temp: temp,
