@@ -1833,25 +1833,18 @@ fn nested_purge_catalog_handle_drain_uses_earlier_end_and_resumes_same_job() {
         }
     };
     let started = Instant::now();
-    let result = f
-        .control
-        .with_runtime_deadline(started + Duration::from_millis(40), || {
-            run(
-                &f.control,
-                &f.catalog,
-                &owner,
-                None,
-                20,
-                started + Duration::from_secs(1),
-            )
-        });
-    let elapsed = started.elapsed();
+    let earlier_end = started + Duration::from_millis(40);
+    let requested_end = started + Duration::from_secs(1);
+    let result = f.control.with_runtime_deadline(earlier_end, || {
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested_end),
+            earlier_end,
+            "purge observation renewed the earlier runtime end"
+        );
+        run(&f.control, &f.catalog, &owner, None, 20, requested_end)
+    });
     drop(held);
     assert!(matches!(result, Err(PortError::WriterBusy(_))));
-    assert!(
-        elapsed < Duration::from_millis(200),
-        "nested catalog drain elapsed: {elapsed:?}"
-    );
     let progress = f.control.purge_job_status(&job).unwrap();
     assert_ne!(progress.job.state, PurgeState::Complete);
     assert_eq!(

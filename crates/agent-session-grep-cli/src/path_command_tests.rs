@@ -661,19 +661,31 @@ mod registry {
         });
         assert!(hit);
         assert_eq!(report.status, "incomplete");
-        let status = SqliteControlStore::open_current_read_only(&f.root)
-            .unwrap()
-            .status()
-            .unwrap();
+        let end = Instant::now() + FIXTURE_BUDGET;
+        let probe = end + Duration::from_secs(1);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let control =
+            SqliteControlStore::open_current_read_only_with_deadline(&f.root, end).unwrap();
         let before = windows::read(&registry.subkey).unwrap();
-        let inventory = inspect_owned_artifacts(
-            &f.root,
-            RootIdentity::read(&f.root).unwrap(),
-            &status.policy.installation_id,
-            status.policy.policy_epoch,
-            Instant::now() + FIXTURE_BUDGET,
-        )
-        .unwrap();
+        let (status, inventory) = control
+            .with_runtime_deadline(end, || {
+                assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                let status = control.status()?;
+                let inventory = inspect_owned_artifacts(
+                    &f.root,
+                    RootIdentity::read(&f.root).unwrap(),
+                    &status.policy.installation_id,
+                    status.policy.policy_epoch,
+                    end,
+                );
+                Ok((status, inventory))
+            })
+            .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        let inventory = inventory.unwrap();
         assert_eq!(inventory.installation, status.policy.installation_id);
         assert!(inventory.root == RootIdentity::read(&f.root).unwrap());
         assert_eq!(inventory.policy_epoch, status.policy.policy_epoch);
@@ -698,15 +710,20 @@ mod registry {
         );
         assert!(windows::read(&registry.subkey).unwrap() == before);
         let bad = PolicyEpoch::new(status.policy.policy_epoch.get() + 1).unwrap();
+        let end = Instant::now() + FIXTURE_BUDGET;
         assert_eq!(
-            inspect_owned_artifacts(
-                &f.root,
-                RootIdentity::read(&f.root).unwrap(),
-                &status.policy.installation_id,
-                bad,
-                Instant::now() + FIXTURE_BUDGET
-            )
-            .err(),
+            control
+                .with_runtime_deadline(end, || {
+                    Ok(inspect_owned_artifacts(
+                        &f.root,
+                        RootIdentity::read(&f.root).unwrap(),
+                        &status.policy.installation_id,
+                        bad,
+                        end,
+                    ))
+                })
+                .unwrap()
+                .err(),
             Some(PathReason::IdentityChanged)
         );
         assert!(
@@ -908,18 +925,29 @@ mod shell {
         retained.seek(SeekFrom::Start(0)).unwrap();
         retained.write_all(b"retained user change").unwrap();
         retained.sync_all().unwrap();
-        let status = SqliteControlStore::open_current_read_only(&f.root)
-            .unwrap()
-            .status()
+        let end = Instant::now() + Duration::from_secs(3);
+        let probe = end + Duration::from_secs(1);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let control =
+            SqliteControlStore::open_current_read_only_with_deadline(&f.root, end).unwrap();
+        let inventory = control
+            .with_runtime_deadline(end, || {
+                assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                let status = control.status()?;
+                Ok(inspect_owned_artifacts(
+                    &f.root,
+                    RootIdentity::read(&f.root).unwrap(),
+                    &status.policy.installation_id,
+                    status.policy.policy_epoch,
+                    end,
+                ))
+            })
             .unwrap();
-        let inventory = inspect_owned_artifacts(
-            &f.root,
-            RootIdentity::read(&f.root).unwrap(),
-            &status.policy.installation_id,
-            status.policy.policy_epoch,
-            Instant::now() + Duration::from_secs(3),
-        )
-        .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        let inventory = inventory.unwrap();
         assert!(inventory.settings_conflicts);
         assert!(inventory.artifacts.iter().any(|artifact| artifact.class
             == PathArtifactClass::LiveUserSettings

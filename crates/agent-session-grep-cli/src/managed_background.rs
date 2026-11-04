@@ -5996,6 +5996,7 @@ fn observe_missing(
             &prior.binding.source_path,
             advisory.region.provider.as_str(),
         ),
+        end,
     )?;
     observation.binding.namespace_id = Some(namespace.namespace_id);
     if let Some(authority_transition) = &mut context.authority {
@@ -6163,6 +6164,7 @@ mod wal_worker_tests {
         completion_end: Instant,
         expired_before_completion: bool,
         observation_error: Option<String>,
+        observation_error_kind: Option<&'static str>,
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -6454,6 +6456,7 @@ mod wal_worker_tests {
                     completion_end,
                     expired_before_completion: Instant::now() >= completion_end,
                     observation_error: error.map(|error| format!("{error:?}")),
+                    observation_error_kind: error.map(ScheduleTestHooks::error_label),
                 });
             }
         });
@@ -7691,6 +7694,19 @@ mod wal_worker_tests {
                 .unwrap()
                 .expired_before_completion
         );
+        let initial_completion = initial.completion.as_ref().unwrap();
+        assert!(initial_completion.observation_error.is_none());
+        assert!(initial_completion.observation_error_kind.is_none());
+        assert!(
+            initial_completion
+                .intent
+                .observed
+                .as_ref()
+                .expect("the pre-pause cycle must have a successful observation")
+                .outcome
+                .idle()
+        );
+        assert_eq!(initial.pending.as_ref(), Some(&initial_completion.intent));
         let original = initial.pending.as_ref().unwrap().token.clone();
         let next = fixture.control.background_status().unwrap().next_cycle_seq;
         fixture.desired(DesiredUpdates::Paused);
@@ -7699,8 +7715,113 @@ mod wal_worker_tests {
         worker.advance();
         worker.checkpoint(WalCheckpointOutcome::Reset);
         fixture.desired(DesiredUpdates::Running);
+        let end = Instant::now() + Duration::from_secs(20);
+        let rows_before_resume = fixture.publication_rows();
+        let progress_before_resume = fixture
+            .control
+            .with_runtime_deadline(end, || fixture.control.source_progress_inventory())
+            .unwrap();
+        let mut expected_next = fixture
+            .control
+            .with_runtime_deadline(end, || {
+                Ok(fixture.control.background_status()?.next_cycle_seq)
+            })
+            .unwrap();
+        assert!(Instant::now() < end, "resume preparation end expired");
+        let mut failed_tokens = Vec::new();
         worker.advance_expiring_completion();
-        let first = worker.next();
+        let mut first = None;
+        // The injected completion expiry follows a real successful observation.
+        // A refused observation cannot supply that proof. Advance only unchanged
+        // unobserved Busy work, inside this one preparation end and event bound.
+        for event_index in 0..8 {
+            let event = worker.next_before(end);
+            let Event::Boundary(WorkerBoundary::Busy, Some(snapshot)) = &event else {
+                panic!("expected a resumed observation boundary, got {event:?}");
+            };
+            assert_eq!(snapshot.checkpoints, 1);
+            assert!(snapshot.closed_idle_at.is_none());
+            let (status, progress) = fixture
+                .control
+                .with_runtime_deadline(end, || {
+                    Ok((
+                        fixture.control.background_status()?,
+                        fixture.control.source_progress_inventory()?,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(
+                status.worker.boot_id.as_ref(),
+                Some(&original.worker_boot_id)
+            );
+            assert_eq!(status.worker.state, UpdateState::Busy);
+            assert_eq!(status.worker.error, Some(BackgroundFailure::Busy));
+            for token in &failed_tokens {
+                if snapshot.pending.as_ref().map(|pending| &pending.token) != Some(token) {
+                    let cycle = fixture
+                        .control
+                        .with_runtime_deadline(end, || fixture.control.cycle(token.cycle_seq))
+                        .unwrap();
+                    assert_eq!(cycle.token, *token);
+                    assert_eq!(cycle.state, CycleState::Aborted);
+                    assert!(cycle.completed_at_ms.is_some());
+                }
+            }
+            if snapshot
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.intent.observed.is_some())
+            {
+                let completion = snapshot.completion.as_ref().unwrap();
+                assert!(completion.observation_error.is_none());
+                assert!(completion.observation_error_kind.is_none());
+                assert!(completion.intent.observed.as_ref().unwrap().outcome.idle());
+                assert_eq!(
+                    snapshot.pending.as_ref().unwrap().token,
+                    completion.intent.token
+                );
+                assert_eq!(
+                    completion.intent.token.worker_boot_id,
+                    original.worker_boot_id
+                );
+                assert_ne!(completion.intent.token, original);
+                assert!(!failed_tokens.contains(&completion.intent.token));
+                first = Some(event);
+                break;
+            }
+            assert_eq!(fixture.publication_rows(), rows_before_resume);
+            assert_eq!(progress, progress_before_resume);
+            assert_eq!(snapshot.sources, initial.sources);
+            if let Some(pending) = &snapshot.pending {
+                let completion = snapshot.completion.as_ref().unwrap();
+                assert_eq!(completion.observation_error_kind, Some("writer_busy"));
+                assert_eq!(pending, &completion.intent);
+                assert_eq!(pending.finish, CycleFinish::Aborted);
+                assert!(pending.observed.is_none());
+                assert!(!pending.completion_confirmed);
+                assert_ne!(pending.token, original);
+                assert_eq!(pending.token.worker_boot_id, original.worker_boot_id);
+                if !failed_tokens.contains(&pending.token) {
+                    assert!(status.next_cycle_seq > expected_next);
+                    expected_next = status.next_cycle_seq;
+                    failed_tokens.push(pending.token.clone());
+                } else {
+                    assert_eq!(status.next_cycle_seq, expected_next);
+                }
+            } else {
+                assert_eq!(snapshot.stage, IdleStage::Activity);
+                assert_eq!(status.next_cycle_seq, expected_next);
+            }
+            assert!(
+                Instant::now() < end,
+                "resumed observation preparation expired"
+            );
+            if event_index == 7 {
+                break;
+            }
+            worker.advance_expiring_completion();
+        }
+        let first = first.expect("no successful resumed observation within eight events");
         let Event::Boundary(WorkerBoundary::Busy, Some(resumed_snapshot)) = &first else {
             panic!("expected the resumed completion to expire, got {first:?}");
         };
@@ -7720,7 +7841,7 @@ mod wal_worker_tests {
                 row.get(0)
             })
             .unwrap();
-        let proof = fixture.idle_from(&worker, first);
+        let proof = fixture.idle_from_before(&worker, first, end, |_| {});
         assert!(proof.busy_boundaries >= 1);
         assert_eq!(proof.checkpoints, 1);
         assert_eq!(
@@ -8527,6 +8648,25 @@ mod control_deadline_tests {
                 &mut trace,
                 |_, _| Ok(()),
             );
+            if let Err(error) = &result {
+                eprintln!(
+                    "production cycle refused: phase={} runs={} accepts={} error={error:?} \
+                     observation={:?} source_phase={:?} closed_idle={} pending={:?} \
+                     remaining={:?}",
+                    trace.phase,
+                    trace.runs,
+                    trace.acceptances,
+                    schedule.hooks.observation_result.get(),
+                    schedule.hooks.source_phase.get(),
+                    schedule.closed_idle_at.is_some(),
+                    pending.as_ref().map(|intent| (
+                        intent.finish,
+                        intent.observed.is_some(),
+                        intent.completion_confirmed
+                    )),
+                    self.scope_end.saturating_duration_since(Instant::now())
+                );
+            }
             assert!(
                 pending.is_none(),
                 "production completion must acknowledge its cycle: phase={} \
