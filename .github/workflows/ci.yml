@@ -42,6 +42,13 @@ jobs:
     name: test (${{ matrix.os }})
     needs: [source]
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      # Retain file/line backtraces without full debug images in every test
+      # binary. The test profile inherits dev; release settings are untouched.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     strategy:
       fail-fast: false
       matrix:
@@ -91,12 +98,14 @@ jobs:
       - name: Cache cargo registry and target
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
+          # Keep the required step name for existing job admission controls.
+          # Restoring a full debug target exhausted the hosted Linux disk
+          # before checks ran. Cache dependency sources in a fresh namespace.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-v2-
 
       - name: Format check
         run: cargo fmt --all --check

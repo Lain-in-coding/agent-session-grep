@@ -656,6 +656,59 @@ class NativeBashCIWiringTests(unittest.TestCase):
                         self.test_root_suite_requires_and_exports_its_native_bash()
 
 
+class QualityCacheFootprintTests(unittest.TestCase):
+    def test_quality_restores_only_dependency_sources_in_a_new_namespace(self):
+        found = [block for block in steps("ci.yml", "test")
+                 if re.search(r"(?m)^name: Cache cargo registry and target$", block)]
+        self.assertEqual(len(found), 1)
+        block = found[0]
+        paths = re.search(r"(?m)^          path: \|\n((?:            [^\n]+\n)+)", block)
+        self.assertIsNotNone(paths)
+        self.assertEqual([line.strip() for line in paths[1].splitlines()],
+                         ["~/.cargo/registry", "~/.cargo/git"])
+        prefix = "${{ runner.os }}-${{ runner.arch }}-cargo-registry-v2-"
+        self.assertIn("          key: " + prefix + "${{ hashFiles('**/Cargo.lock') }}\n", block)
+        self.assertIn("          restore-keys: " + prefix + "\n", block)
+        self.assertNotIn("enableCrossOsArchive: true", block)
+
+    def test_quality_build_settings_are_scoped_and_release_profile_is_preserved(self):
+        text = read_workflow("ci.yml")
+        quality = job("ci.yml", "test")
+        header = quality.split("    steps:\n", 1)[0]
+        for variable, value in (("CARGO_BUILD_JOBS", "4"), ("CARGO_INCREMENTAL", "0"),
+                                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only")):
+            assignment = f'      {variable}: "{value}"\n'
+            self.assertIn(assignment, header)
+            self.assertEqual(text.count(variable + ":"), 1)
+        self.assertNotIn("CARGO_PROFILE_RELEASE", text)
+        self.assertNotIn("RUSTFLAGS:", text)
+        self.assertNotIn("RUSTDOCFLAGS:", text)
+
+    def test_legacy_target_cache_and_missing_footprint_settings_are_rejected(self):
+        original = read_workflow("ci.yml")
+        cases = (
+            ("            ~/.cargo/git\n", "            ~/.cargo/git\n            target\n", "cache"),
+            ("-cargo-registry-v2-", "-cargo-", "cache"),
+            ('      CARGO_INCREMENTAL: "0"\n', "", "settings"),
+            ('      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+             '      CARGO_PROFILE_DEV_DEBUG: "full"\n', "settings"),
+            ('      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"\n', "", "settings"),
+        )
+        reader = read_workflow
+        for before, after, check in cases:
+            with self.subTest(change=before):
+                self.assertIn(before, original)
+                mutated = original.replace(before, after, 1)
+                with patch(__name__ + ".read_workflow", side_effect=lambda name:
+                           mutated if name == "ci.yml" else reader(name)):
+                    with self.assertRaises(AssertionError):
+                        if check == "cache":
+                            self.test_quality_restores_only_dependency_sources_in_a_new_namespace()
+                        else:
+                            self.test_quality_build_settings_are_scoped_and_release_profile_is_preserved()
+
+
 class SourceCommitControlTests(unittest.TestCase):
     def test_full_nonzero_lowercase_sha_is_preserved(self):
         control, _ = load_step("release.yml", "prepare", "release")
