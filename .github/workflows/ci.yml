@@ -52,7 +52,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Hosted arm64 capacity can leave required macOS jobs unacquired for
+        # longer than the 15-minute queue limit. Keep mandatory quality on the
+        # available Intel image; release verification still builds, smokes and
+        # packages the aarch64-apple-darwin target on macos-15.
+        os: [ubuntu-latest, windows-latest, macos-15-intel]
     steps:
       - name: Checkout exact source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -174,7 +178,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-15-intel]
     steps:
       - name: Checkout exact source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -525,6 +529,6 @@ jobs:
                   event = json.load(event_file, object_pairs_hook=unique_object)
               api_head = expected_api_head(os.environ["EVENT_NAME"], event, os.environ["GITHUB_SHA"])
               expected = [f"{kind} ({runner})" for kind in ("test", "installer smoke")
-                          for runner in ("ubuntu-latest", "windows-latest", "macos-latest")]
+                          for runner in ("ubuntu-latest", "windows-latest", "macos-15-intel")]
               expected.extend(["Cargo dependency audit", "validate exact CI source", "resolve audit source"])
               require_jobs(load_jobs(api_get, os.environ["GITHUB_REPOSITORY"], run_id, attempt), expected, run_id, attempt, api_head)

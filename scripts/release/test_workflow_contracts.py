@@ -428,7 +428,7 @@ def gate_event(event_name, event):
 def expected_gate_leaves(name):
     if name == "ci.yml":
         leaves = [f"{kind} ({runner})" for kind in ("test", "installer smoke")
-                  for runner in ("ubuntu-latest", "windows-latest", "macos-latest")]
+                  for runner in ("ubuntu-latest", "windows-latest", "macos-15-intel")]
         return leaves + ["Cargo dependency audit", "validate exact CI source", "resolve audit source"]
     kind = "build" if name == "release.yml" else "verify"
     return [kind + " " + target for target in TARGETS] + [
@@ -1862,7 +1862,7 @@ class ArtifactValidationTests(unittest.TestCase):
 class RequiredStepEvidenceTests(unittest.TestCase):
     def test_control_required_step_policy_matches_independent_inventory(self):
         leaves = [f"{kind} ({runner})" for kind in ("test", "installer smoke")
-                  for runner in ("ubuntu-latest", "windows-latest", "macos-latest")]
+                  for runner in ("ubuntu-latest", "windows-latest", "macos-15-intel")]
         leaves += ["Cargo dependency audit", *SPECIAL_STEPS]
         leaves += [kind + " " + target for kind in ("build", "verify") for target in TARGETS]
         for workflow, ident, control in gate_controls():
@@ -1872,7 +1872,7 @@ class RequiredStepEvidenceTests(unittest.TestCase):
 
     def test_green_jobs_cannot_hide_skipped_missing_duplicate_or_failed_commands(self):
         leaves = ["test (ubuntu-latest)", "installer smoke (windows-latest)",
-                  "installer smoke (ubuntu-latest)", "installer smoke (macos-latest)",
+                  "installer smoke (ubuntu-latest)", "installer smoke (macos-15-intel)",
                   "Cargo dependency audit", *SPECIAL_STEPS, "build " + TARGETS[0], "verify " + TARGETS[3]]
         for workflow, ident, control in gate_controls():
             for leaf in leaves:
@@ -1899,7 +1899,7 @@ class RequiredStepEvidenceTests(unittest.TestCase):
 
     def test_opposite_os_branches_and_post_actions_may_be_skipped(self):
         for workflow, ident, control in gate_controls():
-            for runner in ("windows-latest", "ubuntu-latest", "macos-latest"):
+            for runner in ("windows-latest", "ubuntu-latest", "macos-15-intel"):
                 leaf = f"installer smoke ({runner})"
                 good = job_record(leaf)
                 opposite = "unix" if runner == "windows-latest" else "windows"
@@ -2382,7 +2382,7 @@ class WorkflowBoundaryTests(unittest.TestCase):
             match = re.search(r"(?m)^        os: \[([^\]]+)\]$", block)
             self.assertIsNotNone(match)
             runners = [item.strip() for item in match[1].split(",")]
-            self.assertCountEqual(runners, ["ubuntu-latest", "windows-latest", "macos-latest"])
+            self.assertCountEqual(runners, ["ubuntu-latest", "windows-latest", "macos-15-intel"])
         quality = job("ci.yml", "test")
         for command in (
             "cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace",
