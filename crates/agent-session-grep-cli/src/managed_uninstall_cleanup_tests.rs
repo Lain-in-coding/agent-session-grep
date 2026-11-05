@@ -57,17 +57,139 @@ fn exact_exit_lock_blocks_then_acquires_without_reading_another_windows_lock() {
     assert!(start.elapsed() < Duration::from_secs(1));
     drop(owner);
     let acquired = exit_lock(&root, &proof, &policy(), deadline(), true).unwrap();
-    assert_eq!(platform::identity(&acquired._file).unwrap(), proof.identity);
+    acquired
+        .validate_current(&root, &proof, &policy(), deadline())
+        .unwrap();
     assert!(matches!(
         exit_lock(&root, &proof, &policy(), deadline(), false),
         Err(Reason::AfterExitCleanupPending)
     ));
     drop(acquired);
     let reacquired = exit_lock(&root, &proof, &policy(), deadline(), false).unwrap();
-    assert_eq!(
-        platform::identity(&reacquired._file).unwrap(),
-        proof.identity
+    reacquired
+        .validate_current(&root, &proof, &policy(), deadline())
+        .unwrap();
+}
+
+#[test]
+fn held_exit_guard_validation_requires_original_role_root_and_deadline() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("private");
+    let other = temp.path().canonicalize().unwrap().join("other");
+    private_root(&root);
+    private_root(&other);
+    for relative in ["parent-exit.lock", "runner-exit.lock"] {
+        private_file(&root.join(relative), b"");
+    }
+    let parent = private_proof(&root, "parent-exit.lock", &policy(), deadline()).unwrap();
+    let runner = private_proof(&root, "runner-exit.lock", &policy(), deadline()).unwrap();
+    let guard = exit_lock(&root, &parent, &policy(), deadline(), false).unwrap();
+    for _ in 0..3 {
+        guard
+            .validate_current(&root, &parent, &policy(), deadline())
+            .unwrap();
+        let contender = platform::open_file(&root.join(&parent.relative)).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+    }
+    assert!(matches!(
+        guard.validate_current(&root, &runner, &policy(), deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert!(matches!(
+        guard.validate_current(&other, &parent, &policy(), deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert!(matches!(
+        guard.validate_current(&root, &parent, &policy(), Instant::now()),
+        Err(Reason::Deadline)
+    ));
+    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+    assert_eq!(fs::metadata(root.join(&parent.relative)).unwrap().len(), 0);
+    drop(guard);
+    let contender = platform::open_file(&root.join(&parent.relative)).unwrap();
+    contender.try_lock().unwrap();
+}
+
+#[test]
+fn held_exit_guard_validation_rejects_same_bytes_replacement_and_missing_name() {
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("private");
+    private_root(&root);
+    let path = root.join("parent-exit.lock");
+    let old = root.join("original-lock");
+    private_file(&path, b"");
+    let proof = private_proof(&root, "parent-exit.lock", &policy(), deadline()).unwrap();
+    let guard = exit_lock(&root, &proof, &policy(), deadline(), false).unwrap();
+    match fs::rename(&path, &old) {
+        Ok(()) => {}
+        #[cfg(windows)]
+        Err(error) => {
+            assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+            guard
+                .validate_current(&root, &proof, &policy(), deadline())
+                .unwrap();
+            return;
+        }
+        #[cfg(not(windows))]
+        Err(error) => panic!("{error}"),
+    }
+    assert!(
+        guard
+            .validate_current(&root, &proof, &policy(), deadline())
+            .is_err()
     );
+    assert!(!path.exists());
+    private_file(&path, b"");
+    assert!(matches!(
+        guard.validate_current(&root, &proof, &policy(), deadline()),
+        Err(Reason::FileChanged)
+    ));
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(
+        guard
+            .validate_current(&root, &proof, &policy(), deadline())
+            .is_err()
+    );
+    assert!(path.is_dir() && old.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn held_exit_guard_validation_rejects_link_aliases() {
+    use std::os::unix::fs::symlink;
+    let temp = agent_session_grep_testkit::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("private");
+    private_root(&root);
+    let path = root.join("parent-exit.lock");
+    let old = root.join("original-lock");
+    private_file(&path, b"");
+    let proof = private_proof(&root, "parent-exit.lock", &policy(), deadline()).unwrap();
+    let guard = exit_lock(&root, &proof, &policy(), deadline(), false).unwrap();
+    fs::rename(&path, &old).unwrap();
+    symlink(&old, &path).unwrap();
+    assert!(
+        guard
+            .validate_current(&root, &proof, &policy(), deadline())
+            .is_err()
+    );
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    fs::remove_file(&path).unwrap();
+    fs::hard_link(&old, &path).unwrap();
+    assert!(
+        guard
+            .validate_current(&root, &proof, &policy(), deadline())
+            .is_err()
+    );
+    assert_eq!(fs::metadata(&old).unwrap().len(), 0);
 }
 #[test]
 fn replaced_empty_lock_inode_never_proves_original_owner_exit() {
@@ -431,6 +553,125 @@ impl PackageFixture {
         (install, journal)
     }
 }
+#[test]
+fn held_installation_guard_validation_requires_kind_and_pinned_prefix() {
+    let fixture = PackageFixture::new(false);
+    let (_install, journal) = fixture.journal(true);
+    let installation =
+        update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+    validate_installation_guard(&journal, &installation, deadline()).unwrap();
+    validate_installation_guard(&journal, &installation, deadline()).unwrap();
+    let other_kind = ExclusiveGuard::try_acquire(&fixture.prefix, LockKind::Background).unwrap();
+    assert!(matches!(
+        validate_installation_guard(&journal, &other_kind, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    let other_root = fixture
+        ._temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("other-prefix");
+    private_root(&other_root);
+    let other_installation =
+        update_state::acquire_installation_lock(&other_root, deadline()).unwrap();
+    assert!(matches!(
+        validate_installation_guard(&journal, &other_installation, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert!(matches!(
+        validate_installation_guard(&journal, &installation, Instant::now()),
+        Err(Reason::Deadline)
+    ));
+}
+
+#[test]
+fn held_writer_proof_preserves_diagnostics_and_rejects_another_root() {
+    let fixture = PackageFixture::new(false);
+    let (_install, journal) = fixture.journal(true);
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let mut writer = WriterLease::try_acquire(&fixture.root).unwrap();
+    let before = writer.read_record().unwrap();
+    assert!(!before.is_empty());
+    for _ in 0..2 {
+        let proof = writer_proof(&journal, &mut writer, &seal.policy, deadline()).unwrap();
+        assert_eq!(proof.size, before.len() as u64);
+        assert_eq!(
+            proof.digest,
+            format!("{:x}", Sha256::digest(before.as_bytes()))
+        );
+        assert_eq!(
+            proof.identity,
+            platform::identity(&platform::open_file(writer.path()).unwrap()).unwrap()
+        );
+        assert_eq!(writer.read_record().unwrap(), before);
+        assert!(matches!(
+            WriterLease::try_acquire(&fixture.root),
+            Err(PortError::WriterBusy(_))
+        ));
+    }
+    let other_root = fixture
+        ._temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("other-data");
+    private_root(&other_root);
+    let mut other_writer = WriterLease::try_acquire(&other_root).unwrap();
+    let other_before = other_writer.read_record().unwrap();
+    assert!(matches!(
+        writer_proof(&journal, &mut other_writer, &seal.policy, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(other_writer.read_record().unwrap(), other_before);
+    assert_eq!(writer.read_record().unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn held_writer_proof_rejects_intermediate_handle_after_name_is_restored() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = PackageFixture::new(false);
+    let (_install, journal) = fixture.journal(true);
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let mut writer = WriterLease::try_acquire(&fixture.root).unwrap();
+    let before = writer.read_record().unwrap();
+    let receipt_before = fs::read(journal.receipt_path()).unwrap();
+    let state_before = serde_json::to_vec(&journal.state).unwrap();
+    let held_identity = platform::identity(&platform::open_file(writer.path()).unwrap()).unwrap();
+    let original = fixture.root.join("original-writer");
+    let replacement = fixture.root.join("replacement-writer");
+    let result = writer_proof_with_open(&journal, &mut writer, &seal.policy, deadline(), |path| {
+        // The production path has already validated A and read its record.
+        // Open equal-byte B, then restore A before either post-read check.
+        fs::rename(path, &original).unwrap();
+        private_file(path, before.as_bytes());
+        let candidate = platform::open_file(path).unwrap();
+        assert_ne!(platform::identity(&candidate).unwrap(), held_identity);
+        assert_eq!(candidate.metadata().unwrap().len(), before.len() as u64);
+        fs::rename(path, &replacement).unwrap();
+        fs::rename(&original, path).unwrap();
+        assert_eq!(candidate.metadata().unwrap().nlink(), 1);
+        Ok(candidate)
+    });
+    // Both ordinary name checks see A; only comparing the actual proof handle
+    // rejects B. Without that comparison this returns A's digest with B's inode.
+    assert!(matches!(result, Err(Reason::IdentityChanged)));
+    writer.validate_current(&fixture.root).unwrap();
+    assert_eq!(writer.read_record().unwrap(), before);
+    assert_eq!(fs::read(&replacement).unwrap(), before.as_bytes());
+    assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt_before);
+    assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state_before);
+    let contender = platform::open_file(writer.path()).unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    ));
+    drop(writer);
+    contender.try_lock().unwrap();
+}
+
 #[test]
 fn immutable_helper_seal_is_manifest_bound_and_private_copy_is_exact() {
     let fixture = PackageFixture::new(true);
