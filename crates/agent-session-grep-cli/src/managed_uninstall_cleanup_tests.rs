@@ -171,25 +171,28 @@ impl PackageFixture {
             )
         });
         let catalog = root.join("catalog.db");
-        let store =
-            ManagedStore::create(&catalog, &control, id("synthetic-uninstall-catalog"), 1).unwrap();
-        let worker_lock = acquire(
-            &root,
-            LockKind::Background,
-            deadline(),
-            Reason::BackgroundDrainPending,
-        )
-        .unwrap();
-        let worker = control
-            .bind_worker(&worker_lock, id("synthetic-worker-boot"))
-            .unwrap();
+        // Setup control calls share one explicit end. Without a caller scope,
+        // each call receives only the short implicit busy allowance.
         control
-            .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
+            .with_runtime_deadline(deadline(), || {
+                let store =
+                    ManagedStore::create(&catalog, &control, id("synthetic-uninstall-catalog"), 1)?;
+                let worker_lock = acquire(
+                    &root,
+                    LockKind::Background,
+                    deadline(),
+                    Reason::BackgroundDrainPending,
+                )
+                .unwrap();
+                let worker = control.bind_worker(&worker_lock, id("synthetic-worker-boot"))?;
+                control.register_worker(control.status()?.policy.control_seq, &worker, 1, 1)?;
+                store.reconcile_progress(&control, &worker)?;
+                drop(worker);
+                drop(worker_lock);
+                drop(store);
+                Ok(())
+            })
             .unwrap();
-        store.reconcile_progress(&control, &worker).unwrap();
-        drop(worker);
-        drop(worker_lock);
-        drop(store);
         let installation_lock =
             update_state::acquire_installation_lock(&prefix, deadline()).unwrap();
         let policy_owner = acquire(
