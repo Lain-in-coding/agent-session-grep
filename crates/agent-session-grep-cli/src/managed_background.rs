@@ -2671,6 +2671,7 @@ struct SourceTurn {
     original_end: Instant,
     first_pending: bool,
     lane: Option<SourceLane>,
+    published_at_start: bool,
     probe: bool,
     revisitable: bool,
     last_slice: Option<u64>,
@@ -2753,6 +2754,7 @@ impl<'a> CycleSchedule<'a> {
                 original_end: end,
                 first_pending: matches!(obligation, TurnObligation::Owed),
                 lane: None,
+                published_at_start: published_baseline(prior),
                 probe,
                 revisitable: matches!(obligation, TurnObligation::ProbeOnly),
                 last_slice: None,
@@ -3103,7 +3105,8 @@ impl<'a> CycleSchedule<'a> {
         debt.owed = false;
         debt.last_full_verified = Some(now);
         let turn = self.turns.get_mut(id).expect("registered source turn");
-        // probe is false for sources first imported in this cycle.
+        // Keep existing authority; exact work may arm only while other first turns remain.
+        turn.probe |= turn.published_at_start && self.first_pending > 0;
         turn.revisitable = turn.probe && success.revisitable;
         if turn.revisitable {
             self.probes.insert(id.clone());
@@ -9973,9 +9976,14 @@ mod control_deadline_tests {
 
             let second_probes = Rc::new(Cell::new(0));
             let second_attempts = Rc::new(Cell::new(0));
+            let second_publications = Rc::new(Cell::new(0));
+            let probe_due = Rc::new(Cell::new(false));
+            schedule.hooks.probe_due = Some(probe_due.clone());
             schedule.hooks.on_event = Some(RefCell::new(Box::new({
                 let probes = Rc::clone(&second_probes);
                 let attempts = Rc::clone(&second_attempts);
+                let publications = Rc::clone(&second_publications);
+                let probe_due = probe_due.clone();
                 move |event| {
                     match event {
                         ScheduleTestEvent::BeforeProbe(..) => {
@@ -9983,6 +9991,14 @@ mod control_deadline_tests {
                         }
                         ScheduleTestEvent::BeforeAttempt(..) => {
                             attempts.set(attempts.get() + 1);
+                        }
+                        ScheduleTestEvent::Published(..) => {
+                            publications.set(publications.get() + 1);
+                        }
+                        ScheduleTestEvent::AfterAttempt(..) => {
+                            assert_eq!(publications.get(), attempts.get());
+                            // Entry cadence alone can hide an incorrectly armed final probe.
+                            probe_due.set(true);
                         }
                         _ => {}
                     }
@@ -9993,6 +10009,8 @@ mod control_deadline_tests {
             let (second, second_cycle) = fixture.production_cycle(&mut schedule, &boot);
             assert_eq!(second_probes.get(), 0, "provider={provider:?}");
             assert_eq!(second_attempts.get(), 1, "provider={provider:?}");
+            assert_eq!(second_publications.get(), 1, "provider={provider:?}");
+            assert!(!probe_due.get(), "the final due pass must be exercised");
 
             let second = second.unwrap();
             assert!(second.idle());
@@ -10576,11 +10594,53 @@ mod control_deadline_tests {
             // Dirtied after its last service in cycle N.
             append_record(&hot, SearchProvider::Claude, "carried", "carriedappend");
             let trace = Rc::new(RefCell::new(Vec::new()));
-            schedule.hooks = probe_attempt_trace(&trace);
+            let probe_due = Rc::new(Cell::new(false));
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let trace = trace.clone();
+                let probe_due = probe_due.clone();
+                let hot_id = hot_id.clone();
+                let mut ends = BTreeMap::new();
+                let mut published = BTreeSet::new();
+                let mut succeeded = BTreeSet::new();
+                move |event| {
+                    match event {
+                        ScheduleTestEvent::BeforeProbe(id, end) => {
+                            if exact {
+                                assert!(
+                                    succeeded.contains(id),
+                                    "exact probes require a successful first turn"
+                                );
+                                assert_eq!(ends.get(id), Some(&end));
+                            }
+                            trace.borrow_mut().push((id.clone(), None));
+                        }
+                        ScheduleTestEvent::BeforeAttempt(id, end, lane) => {
+                            if let Some(original) = ends.insert(id.clone(), end) {
+                                assert_eq!(end, original);
+                            }
+                            trace.borrow_mut().push((id.clone(), Some(lane)));
+                        }
+                        ScheduleTestEvent::Published(id, end) => {
+                            assert_eq!(ends.get(id), Some(&end));
+                            published.insert(id.clone());
+                        }
+                        ScheduleTestEvent::AfterAttempt(id, _) => {
+                            assert!(published.contains(id));
+                            succeeded.insert(id.clone());
+                            if *id == hot_id {
+                                probe_due.set(true);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            });
+            schedule.hooks.probe_due = Some(probe_due);
             // Cycle N's probe window must not hide the first batch of N+1.
             schedule.next_probe = None;
 
-            let (second, _) = fixture.production_cycle(&mut schedule, &boot);
+            let (second, cycle) = fixture.production_cycle(&mut schedule, &boot);
 
             assert!(second.unwrap().catalog_complete, "exact={exact}");
             let order = trace.borrow();
@@ -10589,21 +10649,29 @@ mod control_deadline_tests {
                 Some((hot_id, Some(SourceLane::Active))),
                 "exact={exact}: the carried source remains first: {order:?}"
             );
-            if exact {
-                assert!(
-                    order.iter().all(|(_, lane)| lane.is_some()),
-                    "unbound exact work must not schedule hint probes: {order:?}"
-                );
-            } else {
-                assert!(
-                    order[1..].iter().any(|(_, lane)| lane.is_none()),
-                    "granted epochs still resume probing after the first attempt: {order:?}"
-                );
-            }
+            assert!(
+                order[1..].iter().any(|(_, lane)| lane.is_none()),
+                "eligible probes resume after the first success: exact={exact}, {order:?}"
+            );
             assert_eq!(fixture.hits("carriedappend"), 1);
             let refusals = schedule.hooks.epoch_refusals.borrow();
             if exact {
                 assert_eq!(*refusals, [(EpochSite::Plan, EpochRefusal::Unverified)]);
+                assert_eq!(cycle.state, CycleState::Committed);
+                let selection = &cycle.selections[0];
+                assert_eq!(
+                    (
+                        selection.discovered_count,
+                        selection.observed_count,
+                        selection.committed_count
+                    ),
+                    (2, 2, 2)
+                );
+                assert!(fixture.sources().iter().all(|source| {
+                    source.latest_receipt.as_ref().is_some_and(|receipt| {
+                        receipt.published && receipt.cycle_seq == cycle.token.cycle_seq.get()
+                    })
+                }));
             } else {
                 assert!(refusals.is_empty(), "granted permits record nothing");
             }
@@ -11765,6 +11833,375 @@ mod control_deadline_tests {
             .unwrap();
         assert!(schedule.demands[&b.id].retired);
         assert_eq!(schedule.demands[&b.id].service_end, b_end);
+    }
+
+    fn assert_exact_warm_append_revisit(provider: SearchProvider) {
+        let fixture = CycleFixture::new_for_provider(provider);
+        let warm = fixture.write_source("warm.jsonl", provider, "exactwarmbaseline");
+        if provider == SearchProvider::Codex {
+            let header = serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"session_id": "scheduler-session"}
+            });
+            let mut bytes = serde_json::to_vec(&header).unwrap();
+            bytes.push(b'\n');
+            bytes.extend(synthetic_record(
+                provider,
+                "warm.jsonl",
+                "exactwarmbaseline",
+            ));
+            std::fs::write(&warm, bytes).unwrap();
+        }
+        let original = std::fs::read(&warm).unwrap();
+        let exact = crate::managed_control::source_selection(provider, &warm).unwrap();
+        let exact = control_change_before(&fixture.control, fixture.scope_end, |seq| {
+            fixture.control.add_selection(seq, exact.clone())
+        })
+        .unwrap()
+        .value;
+        let mut schedule = SourceScheduleState::default();
+        let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+        let (first, _) = fixture.production_cycle(&mut schedule, &boot);
+        assert!(first.unwrap().idle());
+        let prior = fixture.sources().pop().unwrap();
+        assert!(published_baseline(Some(&prior)));
+        let read_text = |text: &str| {
+            fixture
+                .control
+                .with_runtime_deadline(fixture.scope_end, || {
+                    ManagedStore::open(&fixture.db, &fixture.control)?.with_read(
+                        &fixture.control,
+                        RequestIntersection::Selected,
+                        fixture.scope_end,
+                        |read| read.query_lexical(text, &ProjectionQuery::default(), 10),
+                    )
+                })
+                .unwrap()
+        };
+        let before = read_text("exactwarmbaseline");
+        assert!(!before.truncated);
+        assert_eq!(before.hits.len(), 1);
+        let baseline = &before.hits[0].projection;
+        assert_eq!(baseline.message.text, "exactwarmbaseline");
+        assert_eq!(baseline.proof.source_id, prior.binding.source_id);
+        let session = &baseline
+            .occurrence
+            .as_ref()
+            .unwrap()
+            .data
+            .placement
+            .session_id;
+        let cold_paths = [
+            fixture.write_source("cold-one.jsonl", provider, "firstcoldhistory"),
+            fixture.write_source("cold-two.jsonl", provider, "secondcoldhistory"),
+        ];
+        let warm_id = prior.binding.source_id.clone();
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let probe_due = Rc::new(Cell::new(false));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        let visits = Rc::new(Cell::new(0));
+        let original_end = Rc::new(Cell::new(None));
+        schedule.hooks = scheduler_hooks(elapsed.clone(), {
+            let trace = trace.clone();
+            let failures = failures.clone();
+            let visits = visits.clone();
+            let original_end = original_end.clone();
+            let probe_due = probe_due.clone();
+            let warm_id = warm_id.clone();
+            let warm = warm.clone();
+            let mut publications = 0;
+            let mut cold_attempts = 0;
+            move |event| {
+                let point = match event {
+                    ScheduleTestEvent::BeforeProbe(id, end) => {
+                        assert_eq!(*id, warm_id, "cold sources cannot acquire probes");
+                        assert!(visits.get() > 0, "no probe before the first exact success");
+                        assert_eq!(original_end.get(), Some(end));
+                        assert!(Instant::now() + elapsed.get() < end);
+                        Some((id.clone(), "probe"))
+                    }
+                    ScheduleTestEvent::BeforeAttempt(id, end, _) => {
+                        if *id == warm_id {
+                            if let Some(original) = original_end.get() {
+                                assert_eq!(end, original);
+                            }
+                            original_end.set(Some(end));
+                        } else {
+                            cold_attempts += 1;
+                        }
+                        Some((id.clone(), "attempt"))
+                    }
+                    ScheduleTestEvent::Published(id, end) => {
+                        if *id == warm_id {
+                            assert_eq!(original_end.get(), Some(end));
+                            publications += 1;
+                        }
+                        Some((id.clone(), "published"))
+                    }
+                    ScheduleTestEvent::AfterAttempt(id, _) => {
+                        if *id == warm_id {
+                            assert!(failures.borrow().is_empty());
+                            assert_eq!(publications, visits.get() + 1);
+                            if visits.get() == 0 {
+                                assert!(cold_attempts < 2, "another first turn is still owed");
+                                append_record(
+                                    &warm,
+                                    provider,
+                                    "exact-revisit-append",
+                                    "exactafterfirstturn",
+                                );
+                                probe_due.set(true);
+                                elapsed.set(elapsed.get() + CADENCE);
+                            }
+                            visits.set(visits.get() + 1);
+                        }
+                        Some((id.clone(), "after"))
+                    }
+                    ScheduleTestEvent::SourceFailed {
+                        id,
+                        phase,
+                        error,
+                        revisit,
+                        remaining,
+                    } => {
+                        failures.borrow_mut().push((
+                            *id == warm_id,
+                            phase,
+                            failure(error),
+                            revisit,
+                            remaining.as_millis(),
+                        ));
+                        Some((id.clone(), "failed"))
+                    }
+                    ScheduleTestEvent::BeforeDiscoveryPublication { epoch } => {
+                        assert!(!epoch, "exact discovery never acquires an epoch permit");
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(point) = point {
+                    trace.borrow_mut().push(point);
+                }
+                Ok(())
+            }
+        });
+        schedule.hooks.probe_due = Some(probe_due);
+        schedule.next_probe = None;
+
+        let (result, cycle) = fixture.production_cycle(&mut schedule, &boot);
+        let outcome = result.unwrap();
+        let order = trace.borrow();
+        assert_eq!(
+            visits.get(),
+            2,
+            "provider={provider:?}: the appended warm source needs two real publications; \
+             order={order:?}, failures={:?}",
+            failures.borrow()
+        );
+        assert!(failures.borrow().is_empty());
+        let positions = |id: &SourceId, point| {
+            order
+                .iter()
+                .enumerate()
+                .filter(|(_, (source, kind))| source == id && *kind == point)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let attempts = positions(&warm_id, "attempt");
+        let publications = positions(&warm_id, "published");
+        let successes = positions(&warm_id, "after");
+        let probes = positions(&warm_id, "probe");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(publications.len(), 2);
+        assert_eq!(successes.len(), 2);
+        assert!(!probes.is_empty());
+        assert!(attempts[0] < publications[0] && publications[0] < successes[0]);
+        assert!(successes[0] < probes[0] && probes[0] < attempts[1]);
+        assert!(attempts[1] < publications[1] && publications[1] < successes[1]);
+        let sources = fixture.sources();
+        assert_eq!(sources.len(), 3);
+        let mut last_cold_attempt = 0;
+        for path in &cold_paths {
+            let cold = sources
+                .iter()
+                .find(|source| Path::new(&source.binding.source_path) == path)
+                .unwrap();
+            let id = &cold.binding.source_id;
+            let attempts = positions(id, "attempt");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(positions(id, "published").len(), 1);
+            assert_eq!(positions(id, "after").len(), 1);
+            assert!(positions(id, "probe").is_empty());
+            last_cold_attempt = last_cold_attempt.max(attempts[0]);
+        }
+        assert!(
+            successes[1] < last_cold_attempt,
+            "the second warm publication precedes completion of cold work: {order:?}"
+        );
+        assert!(outcome.idle() && outcome.all_sources_attempted);
+        assert_eq!(cycle.state, CycleState::Committed);
+        let current = sources
+            .iter()
+            .find(|source| source.binding.source_id == warm_id)
+            .unwrap();
+        assert_eq!(current.binding, prior.binding);
+        let head = current.latest_receipt.as_ref().unwrap();
+        let old_head = prior.latest_receipt.as_ref().unwrap();
+        assert!(head.published);
+        assert_eq!(head.cycle_seq, cycle.token.cycle_seq.get());
+        assert_ne!(head.revision_id, old_head.revision_id);
+        assert_ne!(head.digest, old_head.digest);
+        let appended = synthetic_record(provider, "exact-revisit-append", "exactafterfirstturn");
+        let expected = [original, appended].concat();
+        assert_eq!(std::fs::read(&warm).unwrap(), expected);
+        assert_eq!(current.indexed_len, Some(expected.len() as u64));
+        assert_eq!(
+            head.digest,
+            capture_with_deadline(
+                &warm,
+                agent_session_grep_ports::SQLITE_MAX_SOURCE_BYTES,
+                original_end.get().unwrap().min(fixture.scope_end),
+            )
+            .unwrap()
+            .fingerprint
+        );
+        let retained = read_text("exactwarmbaseline");
+        assert!(!retained.truncated);
+        assert_eq!(retained.hits.len(), 1);
+        let retained = &retained.hits[0].projection;
+        assert_eq!(retained.message, baseline.message);
+        assert_eq!(retained.proof, baseline.proof);
+        assert_eq!(
+            &retained
+                .occurrence
+                .as_ref()
+                .unwrap()
+                .data
+                .placement
+                .session_id,
+            session
+        );
+        let appended = read_text("exactafterfirstturn");
+        assert!(!appended.truncated);
+        assert_eq!(appended.hits.len(), 1);
+        let appended = &appended.hits[0].projection;
+        assert_eq!(appended.message.text, "exactafterfirstturn");
+        assert_ne!(appended.message.id, baseline.message.id);
+        assert_eq!(appended.proof.source_id, warm_id);
+        assert_eq!(appended.proof.revision, *head);
+        assert_eq!(
+            &appended
+                .occurrence
+                .as_ref()
+                .unwrap()
+                .data
+                .placement
+                .session_id,
+            session
+        );
+
+        let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+        let warm_publications: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revision_receipts
+                 WHERE source_id=?1 AND cycle_seq=?2 AND published=1 AND started_control_seq=?3",
+                rusqlite::params![
+                    warm_id.as_str(),
+                    cycle.token.cycle_seq.get(),
+                    cycle.started_control_seq.unwrap().get()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            warm_publications, 2,
+            "both warm receipts belong to this cycle"
+        );
+        assert_eq!(cycle.selections.len(), 2);
+        for selection in &cycle.selections {
+            let parent = selection.selection.selection_id == fixture.selection.id;
+            if !parent {
+                assert_eq!(selection.selection.selection_id, exact.id);
+            }
+            let count = if parent { 3 } else { 1 };
+            assert_eq!(
+                (
+                    selection.discovered_count,
+                    selection.observed_count,
+                    selection.committed_count
+                ),
+                (count, count, count)
+            );
+            assert!(selection.discovery_complete && selection.error.is_none());
+            let mut expected = sources
+                .iter()
+                .filter(|source| parent || source.binding.source_id == warm_id)
+                .map(|source| {
+                    (
+                        source.binding.source_id.as_str().to_owned(),
+                        source
+                            .latest_receipt
+                            .as_ref()
+                            .unwrap()
+                            .revision_id
+                            .as_str()
+                            .to_owned(),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            let members = conn
+                .prepare(
+                    "SELECT s.source_id,s.revision_id,COALESCE(
+                       r.source_id=s.source_id AND r.published=1 AND r.cycle_seq=d.cycle_seq
+                       AND r.started_control_seq=d.started_control_seq
+                       AND r.worker_boot_id=d.worker_boot_id
+                       AND r.catalog_incarnation=d.catalog_incarnation
+                       AND r.policy_epoch=d.policy_epoch AND h.latest_receipt_id=s.revision_id
+                       AND c.selection_revision=d.selection_revision
+                       AND c.root_identity=d.root_identity,0)
+                     FROM discovery_receipts d
+                     JOIN discovery_sources s ON s.cycle_seq=d.cycle_seq AND s.selection_id=d.selection_id
+                     LEFT JOIN source_revision_receipts r ON r.revision_id=s.revision_id
+                     LEFT JOIN source_heads h ON h.source_id=s.source_id
+                     LEFT JOIN receipt_selection_claims c
+                       ON c.revision_id=s.revision_id AND c.selection_id=s.selection_id
+                     WHERE d.cycle_seq=?1 AND d.selection_id=?2 AND d.complete=1
+                     ORDER BY s.source_id",
+                )
+                .unwrap()
+                .query_map(
+                    rusqlite::params![
+                        cycle.token.cycle_seq.get(),
+                        selection.selection.selection_id.as_str()
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                members, expected,
+                "exact membership must use final claimed heads"
+            );
+        }
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Plan, EpochRefusal::Unverified)]
+        );
+    }
+
+    #[test]
+    fn scheduler_exact_warm_append_revisits_before_cold_completion_claude() {
+        assert_exact_warm_append_revisit(SearchProvider::Claude);
+    }
+
+    #[test]
+    fn scheduler_exact_warm_append_revisits_before_cold_completion_codex() {
+        assert_exact_warm_append_revisit(SearchProvider::Codex);
     }
 
     #[test]
