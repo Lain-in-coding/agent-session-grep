@@ -4621,10 +4621,16 @@ pub(crate) mod wal_tests {
         }
         let fixture = Fixture::new();
         let foreign = Fixture::new();
+        // Bind the synthetic foreign worker before exercising checkpoint refusal.
+        let preparation_end = Instant::now() + Duration::from_secs(30);
         let authority = foreign
             .control
-            .bind_worker(&foreign.worker_lock, id("foreign-boot"))
-            .unwrap();
+            .with_runtime_deadline(preparation_end, || {
+                foreign
+                    .control
+                    .bind_worker(&foreign.worker_lock, id("foreign-boot"))
+            })
+            .expect("foreign worker fixture preparation");
         assert!(matches!(
             ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None),
             Err(PortError::InvalidRequest(_))
