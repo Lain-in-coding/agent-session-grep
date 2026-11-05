@@ -479,6 +479,41 @@ impl Guard {
     }
 }
 
+/// Inspect the writer's held and named file without acquiring a second lease.
+/// Writer diagnostics are nonempty, so RootDirectory::open_lock's empty-file
+/// contract is deliberately not used. No contents are read through `named`.
+pub(crate) fn validate_writer_file(root: &Path, held: &File) -> PortResult<()> {
+    let directory = RootDirectory::open(root)?;
+    let named = platform::open_lock(&directory, "writer.lock", false)
+        .map_err(lock_io("writer_current", "open"))?;
+    validate_writer_handle(held, &named)?;
+    if RootIdentity::read(root)? != directory.identity {
+        return Err(lock_invalid("writer_current", "replaced"));
+    }
+    Ok(())
+}
+
+/// Bind an already opened metadata/proof handle to the retained writer file.
+/// This does not open, lock, read or write either file, or validate its path/root.
+pub(crate) fn validate_writer_handle(held: &File, candidate: &File) -> PortResult<()> {
+    for file in [held, candidate] {
+        if !file
+            .metadata()
+            .map_err(lock_io("writer_current", "metadata"))?
+            .is_file()
+        {
+            return Err(lock_invalid("writer_current", "kind"));
+        }
+        platform::validate_lock(file).map_err(lock_io("writer_current", "links"))?;
+    }
+    if platform::identity(held).map_err(lock_io("writer_current", "held_identity"))?
+        != platform::identity(candidate).map_err(lock_io("writer_current", "named_identity"))?
+    {
+        return Err(lock_invalid("writer_current", "replaced"));
+    }
+    Ok(())
+}
+
 fn validate_child_name(name: &str) -> PortResult<()> {
     if name.is_empty()
         || name.len() > 128
@@ -588,7 +623,8 @@ impl ExclusiveGuard {
     }
 
     /// Recheck the actual root and persistent lock inode; never acquires anew.
-    pub(crate) fn validate_current(&self, root: &Path) -> PortResult<()> {
+    /// The caller must separately check the expected lock kind and pinned root.
+    pub fn validate_current(&self, root: &Path) -> PortResult<()> {
         self.0.validate_current(root)
     }
 
@@ -1311,6 +1347,62 @@ mod tests {
     }
 
     #[test]
+    fn held_guard_validation_keeps_the_original_os_lock() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
+        let kind = LockKind::Background;
+        let guard = acquire(|| ExclusiveGuard::try_acquire(root.path(), kind.clone()));
+        for _ in 0..3 {
+            guard.validate_current(root.path()).unwrap();
+            assert_os_exclusive_busy(root.path(), &kind);
+        }
+        assert!(guard.validate_current(other.path()).is_err());
+        assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(root.path().join(kind.filename()))
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(guard);
+        let directory = RootDirectory::open(root.path()).unwrap();
+        let contender = directory.open_lock(&kind, false, "test").unwrap();
+        assert!(FileExt::try_lock_exclusive(&contender).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_guard_validation_rejects_replaced_missing_and_linked_names() {
+        use std::os::unix::fs::symlink;
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let kind = LockKind::Background;
+        let guard = acquire(|| ExclusiveGuard::try_acquire(root.path(), kind.clone()));
+        let path = root.path().join(kind.filename());
+        let old = root.path().join("original-lock");
+        fs::rename(&path, &old).unwrap();
+        assert!(guard.validate_current(root.path()).is_err());
+        assert!(!path.exists());
+        fs::write(&path, []).unwrap();
+        assert!(guard.validate_current(root.path()).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(guard.validate_current(root.path()).is_err());
+        fs::remove_dir(&path).unwrap();
+        symlink(&old, &path).unwrap();
+        assert!(guard.validate_current(root.path()).is_err());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&old, &path).unwrap();
+        assert!(guard.validate_current(root.path()).is_err());
+        assert_eq!(fs::metadata(&old).unwrap().len(), 0);
+    }
+
+    #[test]
     fn racing_first_creations_of_one_lock_name_all_open_it() {
         // Concurrent first setups on a new private root race to create the
         // same lock names, and every racer must receive the file. macOS answers
@@ -1578,6 +1670,15 @@ mod tests {
         );
         assert_busy(ExclusiveGuard::try_acquire(&short, LockKind::PolicyOwner));
         assert!(fs::remove_file(root.path().join(LockKind::PolicyOwner.filename())).is_err());
+        assert!(
+            fs::rename(
+                root.path().join(LockKind::PolicyOwner.filename()),
+                root.path().join("replaced-lock")
+            )
+            .is_err()
+        );
+        holder.validate_current(root.path()).unwrap();
+        assert_os_exclusive_busy(root.path(), &LockKind::PolicyOwner);
         for code in [32, 33] {
             assert_busy(classify_lock_result(Err(io::Error::from_raw_os_error(
                 code,

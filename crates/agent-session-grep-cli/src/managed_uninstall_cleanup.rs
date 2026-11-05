@@ -2,7 +2,9 @@
 //! The native parent retains one noninheritable OS lock until process exit; the
 //! child must acquire that SAME inode before changing any planned payload file.
 use super::*;
-use agent_session_grep_adapters_sqlite::managed_purge::PrivateArtifactClass;
+use agent_session_grep_adapters_sqlite::{
+    control::INSTALLATION_LOCK_KEY, managed_locks::JobLockKey, managed_purge::PrivateArtifactClass,
+};
 use std::io::Write;
 
 const CHILD: &str = "__managed-uninstall-cleanup";
@@ -793,7 +795,50 @@ pub(super) fn schedule(
 /// expose the file or implement Deref/Clone: callers must not unlock a borrowed
 /// exit capability or keep a duplicate alive after this guard is dropped.
 struct ExitGuard {
-    _file: File,
+    file: File,
+    root: RootIdentity,
+    relative: String,
+}
+
+impl ExitGuard {
+    fn validate_current(
+        &self,
+        base: &Path,
+        proof: &OwnedFile,
+        policy: &TerminalPolicy,
+        end: Instant,
+    ) -> Result<(), Reason> {
+        time(end)?;
+        if self.relative != proof.relative
+            || proof.size != 0
+            || proof.digest != EMPTY_SHA
+            || RootIdentity::read(base).map_err(|_| Reason::IdentityChanged)? != self.root
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        let metadata = self.file.metadata().map_err(|_| Reason::FileChanged)?;
+        if !metadata.is_file()
+            || metadata.len() != 0
+            || platform::identity(&self.file).map_err(|_| Reason::FileChanged)? != proof.identity
+        {
+            return Err(Reason::FileChanged);
+        }
+        // Verify the named empty file without reading bytes through another
+        // handle to a Windows mandatory lock. This also rejects linked aliases.
+        let path = base.join(&proof.relative);
+        package_installation::ordinary(&path).map_err(|_| Reason::IdentityChanged)?;
+        let current = platform::open_file(&path).map_err(|_| Reason::FileChanged)?;
+        if current.metadata().map_err(|_| Reason::FileChanged)?.len() != 0
+            || platform::identity(&current).map_err(|_| Reason::FileChanged)? != proof.identity
+        {
+            return Err(Reason::FileChanged);
+        }
+        verify(base, proof, policy, end, false)?;
+        if RootIdentity::read(base).map_err(|_| Reason::IdentityChanged)? != self.root {
+            return Err(Reason::IdentityChanged);
+        }
+        time(end)
+    }
 }
 
 fn exit_lock(
@@ -813,6 +858,7 @@ fn exit_lock(
         if policy.overlaps(&path)? {
             return Err(Reason::SourceOverlap);
         }
+        let root = RootIdentity::read(base).map_err(|_| Reason::IdentityChanged)?;
         let file = platform::open_file(&path).map_err(|_| Reason::FileLocked)?;
         // Query metadata before acquisition; reading a byte through another
         // handle to an exclusive Windows lock would fail instead of waiting.
@@ -823,13 +869,13 @@ fn exit_lock(
         }
         match file.try_lock() {
             Ok(()) => {
-                let current = platform::open_file(&path).map_err(|_| Reason::FileChanged)?;
-                if platform::identity(&current).map_err(|_| Reason::FileChanged)? != proof.identity
-                    || file.metadata().map_err(|_| Reason::FileChanged)?.len() != 0
-                {
-                    return Err(Reason::FileChanged);
-                }
-                return Ok(ExitGuard { _file: file });
+                let guard = ExitGuard {
+                    file,
+                    root,
+                    relative: proof.relative.clone(),
+                };
+                guard.validate_current(base, proof, policy, end)?;
+                return Ok(guard);
             }
             Err(fs::TryLockError::WouldBlock) if wait => {
                 std::thread::sleep(
@@ -947,12 +993,31 @@ fn run_child(
     }
     result
 }
+fn validate_installation_guard(
+    journal: &Journal,
+    installation: &ExclusiveGuard,
+    end: Instant,
+) -> Result<(), Reason> {
+    journal.validate_roots(end)?;
+    let kind = LockKind::MaintenanceJob(
+        JobLockKey::parse(INSTALLATION_LOCK_KEY).map_err(|_| Reason::IdentityChanged)?,
+    );
+    if installation.kind() != &kind || installation.root_identity() != journal.prefix_identity {
+        return Err(Reason::IdentityChanged);
+    }
+    installation
+        .validate_current(&journal.prefix)
+        .map_err(|_| Reason::IdentityChanged)?;
+    time(end)
+}
+
 fn finalize(
     journal: &mut Journal,
     seal: &Seal,
     installation: &ExclusiveGuard,
     end: Instant,
 ) -> Result<(), Reason> {
+    validate_installation_guard(journal, installation, end)?;
     let mut guards = drain_owners(journal, end)?;
     let writer_proof = writer_proof(journal, &mut guards._writer, &seal.policy, end)?;
     let _history = acquire(
@@ -1373,27 +1438,58 @@ fn writer_proof(
     policy: &TerminalPolicy,
     end: Instant,
 ) -> Result<OwnedFile, Reason> {
+    writer_proof_with_open(journal, writer, policy, end, |path| {
+        platform::open_file(path).map_err(|_| Reason::FileLocked)
+    })
+}
+
+fn writer_proof_with_open(
+    journal: &Journal,
+    writer: &mut WriterLease,
+    policy: &TerminalPolicy,
+    end: Instant,
+    open_file: impl FnOnce(&Path) -> Result<fs::File, Reason>,
+) -> Result<OwnedFile, Reason> {
     time(end)?;
     let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
-    if writer.path() != root.join("writer.lock") || policy.overlaps(writer.path())? {
+    if writer.path() != root.join("writer.lock")
+        || RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != journal.data_identity
+        || policy.overlaps(writer.path())?
+    {
         return Err(Reason::IdentityChanged);
     }
+    writer
+        .validate_current(root)
+        .map_err(|_| Reason::IdentityChanged)?;
     // Read diagnostics through the held lease handle. Windows denies a second
     // byte-reading handle while this actual exclusive lock remains live.
     let record = writer.read_record().map_err(|_| Reason::FileLocked)?;
     if record.len() > 1024 {
         return Err(Reason::UnclassifiedOwnedArtifact);
     }
-    let file = platform::open_file(writer.path()).map_err(|_| Reason::FileLocked)?;
+    let file = open_file(writer.path())?;
     if file.metadata().map_err(|_| Reason::FileChanged)?.len() != record.len() as u64 {
         return Err(Reason::FileChanged);
     }
-    Ok(OwnedFile {
+    let proof = OwnedFile {
         relative: "writer.lock".into(),
         digest: format!("{:x}", Sha256::digest(record.as_bytes())),
         size: record.len() as u64,
         identity: platform::identity(&file).map_err(|_| Reason::FileChanged)?,
-    })
+    };
+    // A name can switch A -> B -> A between the current-name checks. Bind the
+    // actual proof handle to the same retained handle that supplied the record.
+    writer
+        .validate_proof_file(&file)
+        .map_err(|_| Reason::IdentityChanged)?;
+    writer
+        .validate_current(root)
+        .map_err(|_| Reason::IdentityChanged)?;
+    if RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != journal.data_identity {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)?;
+    Ok(proof)
 }
 fn account_private(
     journal: &Journal,

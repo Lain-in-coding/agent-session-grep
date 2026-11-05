@@ -155,6 +155,23 @@ impl WriterLease {
         &self.path
     }
 
+    /// Verify this retained writer handle still owns the current named file.
+    /// This neither acquires a lock nor reads/writes diagnostic contents.
+    /// A composite capability must also validate its pinned physical data root.
+    pub fn validate_current(&self, root: &Path) -> PortResult<()> {
+        if self.path != root.join("writer.lock") {
+            return Err(PortError::SourceIo("writer lease binding changed".into()));
+        }
+        crate::managed_locks::validate_writer_file(root, &self.file)
+    }
+
+    /// Verify a caller's already opened proof file is this retained locked file.
+    /// Only metadata is inspected; neither handle is locked, read or exposed.
+    /// Callers must also validate the current name and pinned physical root.
+    pub fn validate_proof_file(&self, candidate: &File) -> PortResult<()> {
+        crate::managed_locks::validate_writer_handle(&self.file, candidate)
+    }
+
     /// 读回本进程写入的 lease record（同一持锁句柄，避免 Windows error 33）。
     pub fn read_record(&mut self) -> PortResult<String> {
         self.file.seek(SeekFrom::Start(0)).map_err(backend)?;
@@ -209,6 +226,102 @@ mod tests {
         let rec = lease.read_record().unwrap();
         assert!(rec.contains("pid="), "record={rec}");
         assert!(rec.contains("fencing_token="), "record={rec}");
+    }
+
+    #[test]
+    fn held_writer_validation_preserves_nonempty_diagnostics_and_os_lock() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
+        let mut lease = WriterLease::try_acquire(root.path()).unwrap();
+        let before = lease.read_record().unwrap();
+        assert!(!before.is_empty());
+        // Bypass the in-process path registry: validation must not release the
+        // actual OS lock when its independently opened metadata handle closes.
+        let mut contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease.path())
+            .unwrap();
+        for _ in 0..3 {
+            lease.validate_current(root.path()).unwrap();
+            lease.validate_proof_file(&contender).unwrap();
+            assert!(matches!(
+                lock_exclusive(&contender),
+                Err(PortError::WriterBusy(_))
+            ));
+            assert_eq!(lease.read_record().unwrap(), before);
+        }
+        assert!(lease.validate_current(other.path()).is_err());
+        assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+        let unrelated_path = other.path().join("proof-candidate");
+        std::fs::write(&unrelated_path, &before).unwrap();
+        let unrelated = File::open(&unrelated_path).unwrap();
+        assert!(lease.validate_proof_file(&unrelated).is_err());
+        assert_eq!(lease.read_record().unwrap(), before);
+        drop(lease);
+        lock_exclusive(&contender).unwrap();
+        contender.seek(SeekFrom::Start(0)).unwrap();
+        let mut after = String::new();
+        contender.read_to_string(&mut after).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn held_writer_validation_rejects_same_bytes_on_a_different_inode() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let mut lease = WriterLease::try_acquire(root.path()).unwrap();
+        let before = lease.read_record().unwrap();
+        let path = root.path().join("writer.lock");
+        let old = root.path().join("original-writer");
+        match std::fs::rename(&path, &old) {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(error) => {
+                // Some Windows filesystems deny replacement of the locked
+                // image. Assert that protection instead of claiming injection.
+                assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+                lease.validate_current(root.path()).unwrap();
+                assert_eq!(lease.read_record().unwrap(), before);
+                return;
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("{error}"),
+        }
+        assert!(lease.validate_current(root.path()).is_err());
+        assert!(!path.exists());
+        std::fs::write(&path, &before).unwrap();
+        assert!(lease.validate_current(root.path()).is_err());
+        assert_eq!(lease.read_record().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(lease.validate_current(root.path()).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_writer_validation_rejects_symlink_and_hardlink_without_repair() {
+        use std::os::unix::fs::symlink;
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let mut lease = WriterLease::try_acquire(root.path()).unwrap();
+        let before = lease.read_record().unwrap();
+        let path = root.path().join("writer.lock");
+        let old = root.path().join("original-writer");
+        std::fs::rename(&path, &old).unwrap();
+        symlink(&old, &path).unwrap();
+        assert!(lease.validate_current(root.path()).is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&old, &path).unwrap();
+        assert!(lease.validate_current(root.path()).is_err());
+        assert_eq!(lease.read_record().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]
