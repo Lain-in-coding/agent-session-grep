@@ -2807,7 +2807,9 @@ impl<'a> CycleSchedule<'a> {
 
     fn hint(&mut self, id: &SourceId, hint: SourceHint, indexed_len: Option<u64>) {
         let turn = &self.turns[id];
-        if !turn.probe || (!turn.first_pending && !turn.revisitable) {
+        // A probe-less owed turn can still use remembered dirtiness to prioritize
+        // its exact attempt; it cannot enter probe_batch without probe authority.
+        if !turn.first_pending && (!turn.probe || !turn.revisitable) {
             return;
         }
         let debt = self
@@ -4394,7 +4396,7 @@ fn observe_cycle(
             prior,
             lane,
             group.original_end,
-            plain_source(group) && published,
+            epoch_plan_allowed && plain_source(group) && published,
             if full_due || latest_due {
                 TurnObligation::Owed
             } else {
@@ -9953,44 +9955,72 @@ mod control_deadline_tests {
 
     #[test]
     fn scheduler_unverified_package_pays_real_exact_work_on_every_cycle() {
-        let fixture = CycleFixture::new();
-        let path = fixture.write_source("exact.jsonl", SearchProvider::Claude, "exactfallback");
-        let original = std::fs::read(&path).unwrap();
-        let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
-        let mut schedule = SourceScheduleState::default();
-        let (first, first_cycle) = fixture.production_cycle(&mut schedule, &boot);
-        assert!(first.unwrap().all_sources_attempted);
-        assert_exact_discovery(&fixture, &first_cycle);
-        let before = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+        for provider in [SearchProvider::Claude, SearchProvider::Codex] {
+            let fixture = CycleFixture::new_for_provider(provider);
+            let path = fixture.write_source("exact.jsonl", provider, "exactfallback");
+            let original = std::fs::read(&path).unwrap();
+            let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+            let mut schedule = SourceScheduleState::default();
+            let (first, first_cycle) = fixture.production_cycle(&mut schedule, &boot);
+            assert!(first.unwrap().all_sources_attempted);
+            assert_exact_discovery(&fixture, &first_cycle);
+            let before = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+            assert!(
+                before.published,
+                "exact publication must become the probe baseline"
+            );
+            schedule.next_probe = None;
 
-        let (second, second_cycle) = fixture.production_cycle(&mut schedule, &boot);
+            let second_probes = Rc::new(Cell::new(0));
+            let second_attempts = Rc::new(Cell::new(0));
+            schedule.hooks.on_event = Some(RefCell::new(Box::new({
+                let probes = Rc::clone(&second_probes);
+                let attempts = Rc::clone(&second_attempts);
+                move |event| {
+                    match event {
+                        ScheduleTestEvent::BeforeProbe(..) => {
+                            probes.set(probes.get() + 1);
+                        }
+                        ScheduleTestEvent::BeforeAttempt(..) => {
+                            attempts.set(attempts.get() + 1);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            })));
 
-        let second = second.unwrap();
-        assert!(second.idle());
-        assert!(second.all_sources_attempted);
-        assert_eq!(second_cycle.state, CycleState::Committed);
-        let selection = &second_cycle.selections[0];
-        assert_eq!(
-            (
-                selection.discovered_count,
-                selection.observed_count,
-                selection.committed_count
-            ),
-            (1, 1, 1)
-        );
-        let after = fixture.sources().pop().unwrap().latest_receipt.unwrap();
-        assert_ne!(after.revision_id, before.revision_id);
-        assert_eq!(after.cycle_seq, second_cycle.token.cycle_seq.get());
-        assert_exact_discovery(&fixture, &second_cycle);
-        assert_eq!(std::fs::read(path).unwrap(), original);
-        // Planning refuses each cycle; an exact plan never asks at commit.
-        assert_eq!(
-            *schedule.hooks.epoch_refusals.borrow(),
-            [
-                (EpochSite::Plan, EpochRefusal::Unverified),
-                (EpochSite::Plan, EpochRefusal::Unverified),
-            ]
-        );
+            let (second, second_cycle) = fixture.production_cycle(&mut schedule, &boot);
+            assert_eq!(second_probes.get(), 0, "provider={provider:?}");
+            assert_eq!(second_attempts.get(), 1, "provider={provider:?}");
+
+            let second = second.unwrap();
+            assert!(second.idle());
+            assert!(second.all_sources_attempted);
+            assert_eq!(second_cycle.state, CycleState::Committed);
+            let selection = &second_cycle.selections[0];
+            assert_eq!(
+                (
+                    selection.discovered_count,
+                    selection.observed_count,
+                    selection.committed_count
+                ),
+                (1, 1, 1)
+            );
+            let after = fixture.sources().pop().unwrap().latest_receipt.unwrap();
+            assert_ne!(after.revision_id, before.revision_id);
+            assert_eq!(after.cycle_seq, second_cycle.token.cycle_seq.get());
+            assert_exact_discovery(&fixture, &second_cycle);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            // Planning refuses each cycle; an exact plan never asks at commit.
+            assert_eq!(
+                *schedule.hooks.epoch_refusals.borrow(),
+                [
+                    (EpochSite::Plan, EpochRefusal::Unverified),
+                    (EpochSite::Plan, EpochRefusal::Unverified),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -10529,7 +10559,7 @@ mod control_deadline_tests {
     }
 
     #[test]
-    fn scheduler_dirty_carry_over_is_served_before_the_cycles_first_probe_batch() {
+    fn scheduler_dirty_carry_over_keeps_exact_order_without_unbound_hint_probes() {
         for exact in [false, true] {
             let fixture = CycleFixture::new();
             let hot = fixture.write_source("hot.jsonl", SearchProvider::Claude, "carriedbase");
@@ -10555,14 +10585,21 @@ mod control_deadline_tests {
             assert!(second.unwrap().catalog_complete, "exact={exact}");
             let order = trace.borrow();
             assert_eq!(
-                order.first(),
-                Some(&(hot_id, Some(SourceLane::Active))),
-                "exact={exact}: the carried attempt precedes every probe: {order:?}"
+                order.first().map(|(id, lane)| (id.clone(), *lane)),
+                Some((hot_id, Some(SourceLane::Active))),
+                "exact={exact}: the carried source remains first: {order:?}"
             );
-            assert!(
-                order[1..].iter().any(|(_, lane)| lane.is_none()),
-                "exact={exact}: probing resumes after the first attempt: {order:?}"
-            );
+            if exact {
+                assert!(
+                    order.iter().all(|(_, lane)| lane.is_some()),
+                    "unbound exact work must not schedule hint probes: {order:?}"
+                );
+            } else {
+                assert!(
+                    order[1..].iter().any(|(_, lane)| lane.is_none()),
+                    "granted epochs still resume probing after the first attempt: {order:?}"
+                );
+            }
             assert_eq!(fixture.hits("carriedappend"), 1);
             let refusals = schedule.hooks.epoch_refusals.borrow();
             if exact {
