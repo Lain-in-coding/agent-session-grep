@@ -17,7 +17,10 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use toml_edit::{DocumentMut, Item, TableLike};
+use toml_edit::Item;
+
+#[path = "host_config_toml.rs"]
+mod codex_toml;
 
 const KEY: &str = "agent-session-grep";
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -461,7 +464,7 @@ fn content(path: &Path) -> Result<Option<Vec<u8>>> {
 struct Document {
     host: Host,
     value: Value,
-    toml: Option<DocumentMut>,
+    toml: Option<codex_toml::Document>,
     cordis: Option<cordis::Document>,
     bom: bool,
     crlf: bool,
@@ -482,11 +485,8 @@ impl Document {
         };
         let (value, toml, cordis) = match host {
             Host::Codex => {
-                let doc = normalized
-                    .parse::<DocumentMut>()
-                    .map_err(|_| ErrorCode::Malformed)?;
-                let value = toml_edit::de::from_document::<Value>(doc.clone())
-                    .map_err(|_| ErrorCode::Malformed)?;
+                let doc = codex_toml::Document::parse(text)?;
+                let value = doc.value.clone();
                 (value, Some(doc), None)
             }
             Host::DeepSeekHarness => {
@@ -523,7 +523,24 @@ impl Document {
             .and_then(|v| v.get(KEY))
             .cloned()
     }
-    fn render(mut self, desired: &Option<Value>, unrelated: &Value) -> Result<Vec<u8>> {
+    fn codex_proof(&self, intended: &Document) -> Result<bool> {
+        match (&self.toml, &intended.toml) {
+            (Some(before), Some(after)) if self.bom == intended.bom => {
+                before.verify_intended(after)
+            }
+            (Some(_), _) => Err(ErrorCode::Unsupported.into()),
+            _ => Ok(false),
+        }
+    }
+    fn render(self, desired: &Option<Value>, unrelated: &Value) -> Result<Vec<u8>> {
+        self.render_with_donors(desired, unrelated, &[])
+    }
+    fn render_with_donors(
+        self,
+        desired: &Option<Value>,
+        unrelated: &Value,
+        donors: &[&Document],
+    ) -> Result<Vec<u8>> {
         let mut final_value = unrelated.clone();
         if desired.is_some() || parent(&self.value, self.host.parent_path()).is_some() {
             let mut object = final_value.as_object_mut().ok_or(ErrorCode::Malformed)?;
@@ -543,15 +560,22 @@ impl Document {
                 }
             }
         }
-        let text = if let Some(doc) = &mut self.toml {
-            merge_toml(doc.as_table_mut(), &self.value, &final_value)?;
-            doc.to_string()
+        let text = if let Some(doc) = &self.toml {
+            if desired.is_none()
+                && doc.has_explicit_parent()
+                && final_value.get("mcp_servers").is_none()
+            {
+                final_value["mcp_servers"] = json!({});
+            }
+            let donors: Vec<_> = donors.iter().filter_map(|doc| doc.toml.as_ref()).collect();
+            String::from_utf8(doc.render(&final_value, &donors)?)
+                .map_err(|_| ErrorCode::Malformed)?
         } else if let Some(doc) = &self.cordis {
             doc.render(desired, unrelated)?
         } else {
             serde_json::to_string_pretty(&final_value).map_err(io)? + "\n"
         };
-        let text = if self.crlf {
+        let text = if self.crlf && self.host != Host::Codex {
             text.replace('\n', "\r\n")
         } else {
             text
@@ -1017,37 +1041,6 @@ fn toml_item(value: &Value) -> Result<Item> {
         .cloned()
         .ok_or_else(|| ErrorCode::Malformed.into())
 }
-fn merge_toml(table: &mut dyn TableLike, before: &Value, after: &Value) -> Result<()> {
-    let before = before.as_object().ok_or(ErrorCode::Malformed)?;
-    let after = after.as_object().ok_or(ErrorCode::Malformed)?;
-    for key in before.keys() {
-        if !after.contains_key(key) {
-            table.remove(key);
-        }
-    }
-    for (key, value) in after {
-        if before.get(key) == Some(value) {
-            continue;
-        }
-        if let (Some(old), Some(nested)) = (
-            before.get(key).filter(|v| v.is_object()),
-            table.get_mut(key).and_then(Item::as_table_like_mut),
-        ) && value.is_object()
-        {
-            merge_toml(nested, old, value)?;
-            continue;
-        }
-        let mut replacement = toml_item(value)?;
-        if let (Some(old), Some(new)) = (
-            table.get(key).and_then(Item::as_value),
-            replacement.as_value_mut(),
-        ) {
-            *new.decor_mut() = old.decor().clone();
-        }
-        table.insert(key, replacement);
-    }
-    Ok(())
-}
 fn merge_values(
     base: Option<&Value>,
     left: Option<&Value>,
@@ -1461,6 +1454,7 @@ impl HostConfigStore {
                 Some(hash(&bytes)),
                 EditStatus::Unchanged,
                 false,
+                false,
             );
             journal.phase = Phase::Settled;
             journal.receipt = Some(receipt.clone());
@@ -1487,6 +1481,7 @@ impl HostConfigStore {
         before: Option<String>,
         status: EditStatus,
         displaced: bool,
+        codex_formatting_changed: bool,
     ) -> HostConfigReceipt {
         HostConfigReceipt {
             schema: "asg.host-config-receipt/v1".into(),
@@ -1498,7 +1493,8 @@ impl HostConfigStore {
             before_sha256: before,
             after_sha256: hash(bytes),
             owned_value_sha256: node_hash(&journal.desired).ok().flatten(),
-            formatting_changed: self.host.is_json() && status != EditStatus::Unchanged,
+            formatting_changed: (self.host.is_json() && status != EditStatus::Unchanged)
+                || codex_formatting_changed,
             displaced_verification: displaced,
             directory_sync_supported: cfg!(unix),
         }
@@ -1545,12 +1541,12 @@ impl HostConfigStore {
                 }
                 let planned = Document::parse(self.host, &intended)?;
                 let merged = merge_values(
-                    Some(&without_node(original.value, self.host)),
+                    Some(&without_node(original.value.clone(), self.host)),
                     Some(&without_node(latest.value.clone(), self.host)),
-                    Some(&without_node(planned.value, self.host)),
+                    Some(&without_node(planned.value.clone(), self.host)),
                 )?
                 .ok_or(ErrorCode::Conflict)?;
-                intended = latest.render(&journal.desired, &merged)?;
+                intended = latest.render_with_donors(&journal.desired, &merged, &[&planned])?;
             }
             if let Some(s) = &before {
                 write_new(&base.join(format!("{index}-preimage")), &s.bytes)?;
@@ -1610,7 +1606,7 @@ impl HostConfigStore {
                 None => return self.terminal(journal, ErrorCode::Conflict),
             };
             let reconciled = self.reconcile(journal, index, displaced.as_deref(), &current);
-            let reconciled = match reconciled {
+            let (reconciled, formatting_changed) = match reconciled {
                 Ok(v) => v,
                 Err(e) => return self.terminal(journal, e.code),
             };
@@ -1635,6 +1631,7 @@ impl HostConfigStore {
                     journal.attempts.first().and_then(|a| a.before.clone()),
                     status,
                     before.is_some(),
+                    formatting_changed,
                 );
                 journal.receipt = Some(receipt.clone());
                 journal.phase = Phase::Verified;
@@ -1656,7 +1653,7 @@ impl HostConfigStore {
         index: usize,
         displaced: Option<&[u8]>,
         current: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, bool)> {
         let base = self.root.join(&journal.id);
         let preimage = content(&base.join(format!("{index}-preimage")))?;
         if preimage.as_ref().map(|b| hash(b)) != journal.attempts[index].before {
@@ -1672,6 +1669,70 @@ impl HostConfigStore {
         if hash(&intended) != journal.attempts[index].intended {
             return Err(ErrorCode::Conflict.into());
         }
+        let formatting_changed = if self.host == Host::Codex && index > 0 {
+            let previous = &journal.attempts[index - 1];
+            let previous_current = match &previous.live {
+                Some(digest) => content(&base.join(format!("{}-live-{digest}", index - 1)))?,
+                None => None,
+            };
+            if previous_current.as_ref().map(|bytes| hash(bytes)) != previous.live {
+                return Err(ErrorCode::Conflict.into());
+            }
+            let previous_displaced = content(&base.join(format!("{}-displaced", index - 1)))?;
+            if previous_displaced.as_ref().map(|bytes| hash(bytes)) != previous.displaced {
+                return Err(ErrorCode::Conflict.into());
+            }
+            let previous_preimage = content(&base.join(format!("{}-preimage", index - 1)))?;
+            if previous_preimage.as_ref().map(|bytes| hash(bytes)) != previous.before {
+                return Err(ErrorCode::Conflict.into());
+            }
+            let no_effect = previous_displaced.is_none()
+                && previous_current.as_ref().map(|bytes| hash(bytes)) == previous.before;
+            let displaced_only = previous_current.is_none() && previous_displaced.is_some();
+            if no_effect || displaced_only {
+                let recovery_base = if no_effect {
+                    previous_current.as_deref()
+                } else {
+                    previous_displaced.as_deref()
+                };
+                let recovery_doc = Document::parse(self.host, recovery_base.unwrap_or_default())?;
+                if recovery_doc.node() != journal.expected
+                    || (no_effect && preimage.as_deref() != recovery_base)
+                    || (displaced_only && preimage.is_some())
+                {
+                    return Err(ErrorCode::Conflict.into());
+                }
+                recovery_doc.codex_proof(&intended_doc)?
+            } else {
+                let previous_current = previous_current.ok_or(ErrorCode::Conflict)?;
+                let (planned, changed) = self.reconcile(
+                    journal,
+                    index - 1,
+                    previous_displaced.as_deref(),
+                    &previous_current,
+                )?;
+                let original = Document::parse(self.host, &previous_current)?;
+                let planned = Document::parse(self.host, &planned)?;
+                let merged = merge_values(
+                    Some(&without_node(original.value.clone(), self.host)),
+                    Some(&without_node(before.value.clone(), self.host)),
+                    Some(&without_node(planned.value.clone(), self.host)),
+                )?
+                .ok_or(ErrorCode::Conflict)?;
+                let rebuilt = if preimage.as_deref() == Some(previous_current.as_slice()) {
+                    planned.render_with_donors(&journal.desired, &merged, &[&before])?
+                } else {
+                    Document::parse(self.host, preimage.as_deref().unwrap_or_default())?
+                        .render_with_donors(&journal.desired, &merged, &[&planned])?
+                };
+                if rebuilt != intended {
+                    return Err(ErrorCode::Unsupported.into());
+                }
+                changed
+            }
+        } else {
+            before.codex_proof(&intended_doc)?
+        };
         let displaced_doc = match displaced {
             Some(bytes) => Document::parse(self.host, bytes)?,
             None => Document::empty(self.host)?,
@@ -1689,12 +1750,12 @@ impl HostConfigStore {
             return Err(ErrorCode::Conflict.into());
         }
         let original =
-            self.with_fallback_servers(journal, without_node(before.value, self.host))?;
+            self.with_fallback_servers(journal, without_node(before.value.clone(), self.host))?;
         let external = self.with_fallback_servers(
             journal,
             without_node(displaced_doc.value.clone(), self.host),
         )?;
-        let intended_values = without_node(intended_doc.value, self.host);
+        let intended_values = without_node(intended_doc.value.clone(), self.host);
         let live_values = without_node(current_doc.value.clone(), self.host);
         let merged = merge_values(Some(&original), Some(&external), Some(&intended_values))?
             .ok_or(ErrorCode::Conflict)?;
@@ -1710,14 +1771,18 @@ impl HostConfigStore {
                 && displaced != preimage.as_deref()
                 && current == intended)
         {
-            return Ok(current.to_vec());
+            return Ok((current.to_vec(), formatting_changed));
         }
         // If the live file is still our exact output, use the external document
         // as the formatting base so its comments/order survive the retry.
         if current == intended {
-            displaced_doc.render(&journal.desired, &merged)
+            displaced_doc
+                .render_with_donors(&journal.desired, &merged, &[&current_doc, &intended_doc])
+                .map(|bytes| (bytes, formatting_changed))
         } else {
-            current_doc.render(&journal.desired, &merged)
+            current_doc
+                .render_with_donors(&journal.desired, &merged, &[&displaced_doc, &intended_doc])
+                .map(|bytes| (bytes, formatting_changed))
         }
     }
     fn observe_artifacts(&self, journal: &mut Journal, index: usize) -> Result<Option<Vec<u8>>> {
@@ -1962,10 +2027,11 @@ impl HostConfigStore {
         if displaced.is_none() && attempt.before.is_some() {
             return self.terminal(&mut journal, ErrorCode::Conflict);
         }
-        let intended = match self.reconcile(&journal, index, displaced.as_deref(), &current) {
-            Ok(v) => v,
-            Err(e) => return self.terminal(&mut journal, e.code),
-        };
+        let (intended, formatting_changed) =
+            match self.reconcile(&journal, index, displaced.as_deref(), &current) {
+                Ok(v) => v,
+                Err(e) => return self.terminal(&mut journal, e.code),
+            };
         if self.artifacts_changed(&journal)?
             || content(&self.target)?.as_deref() != Some(current.as_slice())
         {
@@ -1983,6 +2049,7 @@ impl HostConfigStore {
                 journal.attempts[0].before.clone(),
                 status,
                 displaced.is_some(),
+                formatting_changed,
             );
             journal.receipt = Some(receipt.clone());
             journal.phase = Phase::Verified;
