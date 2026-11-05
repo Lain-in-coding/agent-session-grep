@@ -87,6 +87,13 @@ struct TailResult {
     complete: bool,
     reason: String,
 }
+/// Classification of the recorded acknowledgement, not proof that current
+/// owners have drained or that reinstall may activate a new lifecycle.
+#[derive(Debug, PartialEq, Eq)]
+enum TailReceiptCompletion {
+    Complete,
+    Pending,
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootPins {
@@ -782,13 +789,20 @@ pub(super) fn schedule(
     journal.save_before_deadline(end)?;
     Ok(journal.state.report)
 }
+/// Only `exit_lock` constructs this after acquiring the verified inode. Do not
+/// expose the file or implement Deref/Clone: callers must not unlock a borrowed
+/// exit capability or keep a duplicate alive after this guard is dropped.
+struct ExitGuard {
+    _file: File,
+}
+
 fn exit_lock(
     base: &Path,
     proof: &OwnedFile,
     policy: &TerminalPolicy,
     end: Instant,
     wait: bool,
-) -> Result<File, Reason> {
+) -> Result<ExitGuard, Reason> {
     if proof.size != 0 || proof.digest != EMPTY_SHA {
         return Err(Reason::IdentityChanged);
     }
@@ -815,7 +829,7 @@ fn exit_lock(
                 {
                     return Err(Reason::FileChanged);
                 }
-                return Ok(file);
+                return Ok(ExitGuard { _file: file });
             }
             Err(fs::TryLockError::WouldBlock) if wait => {
                 std::thread::sleep(
@@ -1581,7 +1595,7 @@ fn validated_tail_result(
     seal: &Seal,
     sequence: u64,
     end: Instant,
-) -> Result<Option<TailResult>, Reason> {
+) -> Result<Option<TailReceiptCompletion>, Reason> {
     if sequence == 0 || sequence > journal.state.sequence {
         return Err(Reason::IdentityChanged);
     }
@@ -1598,19 +1612,32 @@ fn validated_tail_result(
     )
     .map_err(|_| Reason::IdentityChanged)?
     .ok_or(Reason::IdentityChanged)?;
+    let completion = classify_tail_receipt(&result, &receipt_bytes, &seal.owner, sequence)?;
+    let _proof = private_proof(&journal.root, &relative, &seal.policy, end)?;
+    Ok(Some(completion))
+}
+
+/// Classify the decoded tail against exact old state bytes without I/O.
+/// Live absence, root, policy and inventory checks remain in the inspector.
+fn classify_tail_receipt(
+    result: &TailResult,
+    receipt_bytes: &[u8],
+    owner: &Owner,
+    sequence: u64,
+) -> Result<TailReceiptCompletion, Reason> {
     let state: DeferredCleanup =
-        serde_json::from_slice(&receipt_bytes).map_err(|_| Reason::IdentityChanged)?;
+        serde_json::from_slice(receipt_bytes).map_err(|_| Reason::IdentityChanged)?;
     let plan = state.after_exit.as_ref().ok_or(Reason::IdentityChanged)?;
     if result.schema != "asg.uninstall-tail-result/v1"
-        || result.nonce != seal.owner.nonce
+        || result.nonce != owner.nonce
         || result.seal_sha256 != plan.seal.digest
         || result.receipt_sequence != sequence
-        || result.receipt_sha256 != format!("{:x}", Sha256::digest(&receipt_bytes))
+        || result.receipt_sha256 != format!("{:x}", Sha256::digest(receipt_bytes))
         || Some(result.deadline_tick) != plan.deadline_tick
         || plan.tail_handoff_sequence != Some(sequence)
         || !plan.payload_complete
         || !plan.tail_pending
-        || state.owner != seal.owner
+        || &state.owner != owner
         || state.sequence != sequence
         || !matches!(
             result.reason.as_str(),
@@ -1621,8 +1648,11 @@ fn validated_tail_result(
     {
         return Err(Reason::IdentityChanged);
     }
-    let _proof = private_proof(&journal.root, &relative, &seal.policy, end)?;
-    Ok(Some(result))
+    Ok(if result.complete {
+        TailReceiptCompletion::Complete
+    } else {
+        TailReceiptCompletion::Pending
+    })
 }
 fn tail_result_proofs(
     journal: &Journal,
@@ -1663,20 +1693,29 @@ fn tail_result_proofs(
     }
     Ok(proofs)
 }
-fn consume_tail_result(journal: &mut Journal, seal: &Seal, end: Instant) -> Result<bool, Reason> {
+/// Read-only inspection for the existing tail recovery path. The returned
+/// report is an in-memory projection, not a reinstall or lock capability.
+/// In particular, default recovery still accepts its existing pending marker;
+/// completed-only admission needs separate published-marker and borrowed-guard
+/// validation before it can authorize any new lifecycle.
+fn inspect_tail_completion(
+    journal: &Journal,
+    seal: &Seal,
+    end: Instant,
+) -> Result<Option<Report>, Reason> {
     let plan = journal
         .state
         .after_exit
-        .clone()
+        .as_ref()
         .ok_or(Reason::AfterExitCleanupPending)?;
     let Some(sequence) = plan.tail_handoff_sequence else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(result) = validated_tail_result(journal, seal, sequence, end)? else {
-        return Ok(false);
+    let Some(completion) = validated_tail_result(journal, seal, sequence, end)? else {
+        return Ok(None);
     };
-    if !result.complete {
-        return Ok(false);
+    if completion != TailReceiptCompletion::Complete {
+        return Ok(None);
     }
     // Observed absence is necessary in addition to the durable acknowledgement.
     // A replaced helper image, unknown file or new owner keeps cleanup Pending.
@@ -1703,12 +1742,21 @@ fn consume_tail_result(journal: &mut Journal, seal: &Seal, end: Instant) -> Resu
     if !account_package(journal, seal, end)? {
         return Err(Reason::UnclassifiedOwnedArtifact);
     }
-    journal.state.report.after_exit_cleanup_pending = false;
-    journal.state.report.recovery_entry_recorded = false;
+    let mut report = journal.state.report.clone();
+    report.after_exit_cleanup_pending = false;
+    report.recovery_entry_recorded = false;
+    clear_completed_reasons(&mut report);
+    Ok(Some(report))
+}
+
+fn consume_tail_result(journal: &mut Journal, seal: &Seal, end: Instant) -> Result<bool, Reason> {
+    let Some(report) = inspect_tail_completion(journal, seal, end)? else {
+        return Ok(false);
+    };
+    journal.state.report = report;
     if let Some(plan) = journal.state.after_exit.as_mut() {
         plan.tail_pending = false;
     }
-    clear_completed_reasons(&mut journal.state.report);
     journal
         .save(end)
         .map_err(|_| Reason::AfterExitCleanupPending)?;
