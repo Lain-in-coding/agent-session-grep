@@ -57,7 +57,17 @@ fn exact_exit_lock_blocks_then_acquires_without_reading_another_windows_lock() {
     assert!(start.elapsed() < Duration::from_secs(1));
     drop(owner);
     let acquired = exit_lock(&root, &proof, &policy(), deadline(), true).unwrap();
-    assert_eq!(platform::identity(&acquired).unwrap(), proof.identity);
+    assert_eq!(platform::identity(&acquired._file).unwrap(), proof.identity);
+    assert!(matches!(
+        exit_lock(&root, &proof, &policy(), deadline(), false),
+        Err(Reason::AfterExitCleanupPending)
+    ));
+    drop(acquired);
+    let reacquired = exit_lock(&root, &proof, &policy(), deadline(), false).unwrap();
+    assert_eq!(
+        platform::identity(&reacquired._file).unwrap(),
+        proof.identity
+    );
 }
 #[test]
 fn replaced_empty_lock_inode_never_proves_original_owner_exit() {
@@ -583,6 +593,83 @@ fn tail_handoff(fixture: &mut PackageFixture, keep: bool) -> (Journal, Seal) {
     (journal, seal)
 }
 #[cfg(windows)]
+#[test]
+fn tail_receipt_classification_does_not_turn_recorded_completion_into_live_absence() {
+    let mut fixture = PackageFixture::new(true);
+    let (journal, seal) = tail_handoff(&mut fixture, true);
+    let plan = journal.state.after_exit.as_ref().unwrap();
+    let sequence = plan.tail_handoff_sequence.unwrap();
+    let receipt_path = journal.root.join(format!("state-{sequence:06}.json"));
+    let receipt_bytes = fs::read(&receipt_path).unwrap();
+    let before = serde_json::to_vec(&journal.state).unwrap();
+    let result_path = journal
+        .root
+        .join(format!("helper/tail-result-{sequence:06}.json"));
+    assert!(
+        validated_tail_result(&journal, &seal, sequence, deadline())
+            .unwrap()
+            .is_none()
+    );
+    let mut result = json!({
+        "schema": "asg.uninstall-tail-result/v1",
+        "nonce": journal.state.owner.nonce,
+        "seal_sha256": plan.seal.digest,
+        "receipt_sequence": sequence,
+        "receipt_sha256": format!("{:x}", Sha256::digest(&receipt_bytes)),
+        "deadline_tick": plan.deadline_tick.unwrap(),
+        "tail_removed": true,
+        "runner_removed": false,
+        "complete": false,
+        "reason": "runner_cleanup_pending"
+    });
+    private_file(&result_path, &serde_json::to_vec(&result).unwrap());
+    assert_eq!(
+        validated_tail_result(&journal, &seal, sequence, deadline()).unwrap(),
+        Some(TailReceiptCompletion::Pending)
+    );
+    assert!(
+        inspect_tail_completion(&journal, &seal, deadline())
+            .unwrap()
+            .is_none()
+    );
+    result["runner_removed"] = json!(true);
+    result["complete"] = json!(true);
+    result["reason"] = json!("complete");
+    let complete_bytes = serde_json::to_vec(&result).unwrap();
+    fs::write(&result_path, &complete_bytes).unwrap();
+    assert_eq!(
+        validated_tail_result(&journal, &seal, sequence, deadline()).unwrap(),
+        Some(TailReceiptCompletion::Complete)
+    );
+    assert!(matches!(
+        inspect_tail_completion(&journal, &seal, deadline()),
+        Err(Reason::AfterExitCleanupPending)
+    ));
+    assert_eq!(serde_json::to_vec(&journal.state).unwrap(), before);
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+    assert_eq!(fs::read(&result_path).unwrap(), complete_bytes);
+    assert!(journal.root.join(&plan.runner.relative).exists());
+    assert!(
+        journal
+            .root
+            .join(&plan.tail.as_ref().unwrap().relative)
+            .exists()
+    );
+
+    // Even whitespace changes the exact acknowledged receipt bytes. A
+    // semantically identical JSON document is not the recorded preimage.
+    let mut changed_receipt = receipt_bytes;
+    changed_receipt.push(b'\n');
+    fs::write(&receipt_path, &changed_receipt).unwrap();
+    assert!(matches!(
+        validated_tail_result(&journal, &seal, sequence, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(fs::read(&receipt_path).unwrap(), changed_receipt);
+    assert_eq!(fs::read(&result_path).unwrap(), complete_bytes);
+}
+
+#[cfg(windows)]
 fn observed_tail_output(
     script: &Path,
     parameters: serde_json::Value,
@@ -723,7 +810,34 @@ fn actual_windows_tail_default_deletes_only_exact_planned_helpers_and_consumes_r
         journal.root.join("helper/tail-source.ps1").exists()
             && fixture.root.join(RETIREMENT_MARKER).exists()
     );
+    let state_before = serde_json::to_vec(&journal.state).unwrap();
+    let receipt_before = fs::read(journal.receipt_path()).unwrap();
+    let marker_before = fs::read(fixture.root.join(RETIREMENT_MARKER)).unwrap();
+    let inspected = inspect_tail_completion(&journal, &seal, deadline())
+        .unwrap()
+        .unwrap();
+    assert!(!inspected.after_exit_cleanup_pending);
+    assert!(journal.state.report.after_exit_cleanup_pending);
+    assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state_before);
+    assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt_before);
+    assert_eq!(
+        fs::read(fixture.root.join(RETIREMENT_MARKER)).unwrap(),
+        marker_before
+    );
+    let unknown = journal.root.join("helper/unrelated.json");
+    private_file(&unknown, b"unrelated retained bytes");
+    assert!(matches!(
+        inspect_tail_completion(&journal, &seal, deadline()),
+        Err(Reason::UnclassifiedOwnedArtifact)
+    ));
+    assert_eq!(fs::read(&unknown).unwrap(), b"unrelated retained bytes");
+    assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt_before);
+    fs::remove_file(unknown).unwrap();
     assert!(consume_tail_result(&mut journal, &seal, deadline()).unwrap());
+    assert_eq!(
+        serde_json::to_vec(&journal.state.report).unwrap(),
+        serde_json::to_vec(&inspected).unwrap()
+    );
     assert!(!journal.state.report.after_exit_cleanup_pending);
     assert!(!fixture.catalog.exists() && !SqliteControlStore::path(&fixture.root).exists());
     assert_eq!(
@@ -749,7 +863,21 @@ fn actual_windows_tail_keep_data_preserves_catalog_policy_and_exact_deny_snapsho
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
+    let state_before = serde_json::to_vec(&journal.state).unwrap();
+    let receipt_before = fs::read(journal.receipt_path()).unwrap();
+    let inspected = inspect_tail_completion(&journal, &seal, deadline())
+        .unwrap()
+        .unwrap();
+    assert!(!inspected.after_exit_cleanup_pending);
+    assert!(journal.state.report.after_exit_cleanup_pending);
+    assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state_before);
+    assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt_before);
+    assert_eq!(fs::read(&fixture.catalog).unwrap(), catalog);
     assert!(consume_tail_result(&mut journal, &seal, deadline()).unwrap());
+    assert_eq!(
+        serde_json::to_vec(&journal.state.report).unwrap(),
+        serde_json::to_vec(&inspected).unwrap()
+    );
     let control = SqliteControlStore::open_current_read_only(&fixture.root).unwrap();
     assert_eq!(control.status().unwrap(), before);
     assert_eq!(fs::read(&fixture.catalog).unwrap(), catalog);
