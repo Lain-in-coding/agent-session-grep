@@ -99,100 +99,131 @@ impl Fixture {
             )
         });
         let catalog = root.join("catalog.db");
-        let selected = control
-            .add_selection(
-                control_status(&control).policy.control_seq,
-                SelectionRequest {
-                    region: ScopeRegion {
-                        provider: SearchProvider::Claude,
-                        locator: CanonicalLocator::from_path(&source_dir).unwrap(),
-                        kind: RootKind::Root,
-                    },
-                    root_identity: Some(id("synthetic-root")),
-                    now_ms: 1,
-                },
-            )
-            .unwrap()
-            .value;
-        let background = lock(&root, LockKind::Background);
+        // Synthetic preparation shares one dedicated end. Without a caller
+        // scope, each control call receives only a short implicit runtime end;
+        // 30 s also covers the fixture lock retries, which may take 10 s.
+        let preparation_end = Instant::now() + Duration::from_secs(30);
+        let (selected, background) = control
+            .with_runtime_deadline(preparation_end, || {
+                let selected = control
+                    .add_selection(
+                        control_status(&control).policy.control_seq,
+                        SelectionRequest {
+                            region: ScopeRegion {
+                                provider: SearchProvider::Claude,
+                                locator: CanonicalLocator::from_path(&source_dir).unwrap(),
+                                kind: RootKind::Root,
+                            },
+                            root_identity: Some(id("synthetic-root")),
+                            now_ms: 1,
+                        },
+                    )
+                    .unwrap()
+                    .value;
+                let background = lock(&root, LockKind::Background);
+                Ok((selected, background))
+            })
+            .expect("uninstall fixture selection preparation");
         let worker = control
-            .bind_worker(&background, id("synthetic-boot"))
-            .unwrap();
-        control
-            .register_worker(control_status(&control).policy.control_seq, &worker, 1, 1)
-            .unwrap();
-        let cycle = match control
-            .queue_cycle(
-                control_status(&control).policy.control_seq,
-                vec![SelectionRevision {
-                    selection_id: selected.id.clone(),
-                    revision: selected.revision,
-                    root_identity: id("synthetic-root"),
-                }],
-            )
-            .unwrap()
-            .value
-        {
-            CycleAdmission::Queued(cycle) => cycle,
-            other => panic!("unexpected fixture cycle {other:?}"),
-        };
+            .with_runtime_deadline(preparation_end, || {
+                control.bind_worker(&background, id("synthetic-boot"))
+            })
+            .expect("uninstall fixture worker binding");
         let cycle = control
-            .start_cycle(
-                control_status(&control).policy.control_seq,
-                &worker,
-                cycle.token.cycle_seq,
-                2,
-            )
-            .unwrap()
-            .value;
-        let store = ManagedStore::create(&catalog, &control, id("synthetic-catalog"), 1).unwrap();
-        let session = StableId::native_checked(IdKind::Session, "synthetic-session").unwrap();
-        let document = StableId::native_checked(IdKind::Document, "synthetic-document").unwrap();
-        let message = StableId::native_checked(IdKind::Message, "synthetic-message").unwrap();
-        let path = CanonicalLocator::from_path(&source)
-            .unwrap()
-            .as_str()
-            .to_owned();
-        let digest = "synthetic-document-digest";
-        let batch = SourceBatch {
-            source_path: path.clone(), entries: vec![
-                (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()]})).unwrap(), String::new()),
-                (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":digest,"len":64})).unwrap(), String::new()),
-                (message.clone(), serde_json::to_vec(&json!({"role":"user","text":"owned synthetic corpus needle","timestamp":null})).unwrap(), "owned synthetic corpus needle".into())],
-            placements: vec![MessagePlacement::new(session, document, message, 0, false, None)],
-            edges: vec![], activities: vec![], usage_events: vec![], relation_complete: true,
-            len_bytes: Some(64), fingerprint: Some(digest.into()), provider_id: Some("claude-code".into()), resume_claims: vec![],
-        };
-        let observation = SourceObservation {
-            binding: SourceBinding {
-                source_id: SourceId::parse("synthetic-source").unwrap(),
-                source_path: path,
-                provider: SearchProvider::Claude,
-                namespace_id: None,
-                root_identity: "synthetic-root".into(),
-            },
-            revision_id: RevisionId::parse("synthetic-revision").unwrap(),
-            revision_digest: digest.into(),
-            parser_version: 1,
-            state: ObservationState::Complete,
-            cycle_seq: cycle.token.cycle_seq.get(),
-            worker_boot_id: "synthetic-boot".into(),
-            catalog_incarnation: "synthetic-catalog".into(),
-            policy_epoch: cycle.policy_epoch.get(),
-            started_control_seq: cycle.started_control_seq.unwrap().get(),
-            observed_at_ms: 3,
-            committed_at_ms: 4,
-            selections: vec![SelectionProof {
-                selection_id: selected.id.as_str().into(),
-                selection_revision: selected.revision.get(),
-                root_identity: "synthetic-root".into(),
-            }],
-            repositories: vec![],
-        };
-        store
-            .commit_source(&control, &worker, &batch, &observation)
-            .unwrap();
-        store.reconcile_progress(&control, &worker).unwrap();
+            .with_runtime_deadline(preparation_end, || {
+                control
+                    .register_worker(control_status(&control).policy.control_seq, &worker, 1, 1)
+                    .unwrap();
+                let cycle = match control
+                    .queue_cycle(
+                        control_status(&control).policy.control_seq,
+                        vec![SelectionRevision {
+                            selection_id: selected.id.clone(),
+                            revision: selected.revision,
+                            root_identity: id("synthetic-root"),
+                        }],
+                    )
+                    .unwrap()
+                    .value
+                {
+                    CycleAdmission::Queued(cycle) => cycle,
+                    other => panic!("unexpected fixture cycle {other:?}"),
+                };
+                let cycle = control
+                    .start_cycle(
+                        control_status(&control).policy.control_seq,
+                        &worker,
+                        cycle.token.cycle_seq,
+                        2,
+                    )
+                    .unwrap()
+                    .value;
+                Ok(cycle)
+            })
+            .expect("uninstall fixture cycle preparation");
+        let store = ManagedStore::create_with_deadline(
+            &catalog,
+            &control,
+            id("synthetic-catalog"),
+            1,
+            preparation_end,
+        )
+        .unwrap();
+        control
+            .with_runtime_deadline(preparation_end, || {
+                let session =
+                    StableId::native_checked(IdKind::Session, "synthetic-session").unwrap();
+                let document =
+                    StableId::native_checked(IdKind::Document, "synthetic-document").unwrap();
+                let message =
+                    StableId::native_checked(IdKind::Message, "synthetic-message").unwrap();
+                let path = CanonicalLocator::from_path(&source)
+                    .unwrap()
+                    .as_str()
+                    .to_owned();
+                let digest = "synthetic-document-digest";
+                let batch = SourceBatch {
+                    source_path: path.clone(), entries: vec![
+                        (session.clone(), serde_json::to_vec(&json!({"documents":[document.as_str()]})).unwrap(), String::new()),
+                        (document.clone(), serde_json::to_vec(&json!({"provider":"claude-code","variant":"synthetic-v1","fingerprint":digest,"len":64})).unwrap(), String::new()),
+                        (message.clone(), serde_json::to_vec(&json!({"role":"user","text":"owned synthetic corpus needle","timestamp":null})).unwrap(), "owned synthetic corpus needle".into())],
+                    placements: vec![MessagePlacement::new(session, document, message, 0, false, None)],
+                    edges: vec![], activities: vec![], usage_events: vec![], relation_complete: true,
+                    len_bytes: Some(64), fingerprint: Some(digest.into()), provider_id: Some("claude-code".into()), resume_claims: vec![],
+                };
+                let observation = SourceObservation {
+                    binding: SourceBinding {
+                        source_id: SourceId::parse("synthetic-source").unwrap(),
+                        source_path: path,
+                        provider: SearchProvider::Claude,
+                        namespace_id: None,
+                        root_identity: "synthetic-root".into(),
+                    },
+                    revision_id: RevisionId::parse("synthetic-revision").unwrap(),
+                    revision_digest: digest.into(),
+                    parser_version: 1,
+                    state: ObservationState::Complete,
+                    cycle_seq: cycle.token.cycle_seq.get(),
+                    worker_boot_id: "synthetic-boot".into(),
+                    catalog_incarnation: "synthetic-catalog".into(),
+                    policy_epoch: cycle.policy_epoch.get(),
+                    started_control_seq: cycle.started_control_seq.unwrap().get(),
+                    observed_at_ms: 3,
+                    committed_at_ms: 4,
+                    selections: vec![SelectionProof {
+                        selection_id: selected.id.as_str().into(),
+                        selection_revision: selected.revision.get(),
+                        root_identity: "synthetic-root".into(),
+                    }],
+                    repositories: vec![],
+                };
+                store
+                    .commit_source(&control, &worker, &batch, &observation)
+                    .unwrap();
+                store.reconcile_progress(&control, &worker).unwrap();
+                Ok(())
+            })
+            .expect("uninstall fixture control preparation");
         drop(store);
         drop(worker);
         drop(background);
@@ -207,21 +238,33 @@ impl Fixture {
             path_calls: Cell::new(0),
         };
         drop(fixture.installation());
-        let prefix_lock =
-            update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
-        let policy_lock = lock(&fixture.root, LockKind::PolicyOwner);
-        let bound = fixture.control.bind_control_root(&policy_lock).unwrap();
+        // The prefix binding and pause belong to the same preparation end.
         fixture
             .control
-            .record_verified_installation_prefix(&fixture.prefix, &prefix_lock, &bound, deadline())
-            .unwrap();
-        fixture
-            .control
-            .set_desired_updates(
-                control_status(&fixture.control).policy.control_seq,
-                DesiredUpdates::Paused,
-            )
-            .unwrap();
+            .with_runtime_deadline(preparation_end, || {
+                let prefix_lock =
+                    update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+                let policy_lock = lock(&fixture.root, LockKind::PolicyOwner);
+                let bound = fixture.control.bind_control_root(&policy_lock).unwrap();
+                fixture
+                    .control
+                    .record_verified_installation_prefix(
+                        &fixture.prefix,
+                        &prefix_lock,
+                        &bound,
+                        deadline(),
+                    )
+                    .unwrap();
+                fixture
+                    .control
+                    .set_desired_updates(
+                        control_status(&fixture.control).policy.control_seq,
+                        DesiredUpdates::Paused,
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .expect("uninstall fixture prefix binding");
         fixture
     }
     fn installation(&self) -> Installation {

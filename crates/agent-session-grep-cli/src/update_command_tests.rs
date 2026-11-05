@@ -694,19 +694,35 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
         )
     });
     let db = root.join("catalog.db");
-    let store =
-        ManagedStore::create(&db, &control, ControlId::parse("catalog").unwrap(), 1).unwrap();
-    {
-        let worker_lock =
-            crate::retry_fixture_busy(|| ExclusiveGuard::try_acquire(&root, LockKind::Background));
-        let worker = control
-            .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
-            .unwrap();
-        control
-            .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
-            .unwrap();
-        store.reconcile_progress(&control, &worker).unwrap();
-    }
+    // Synthetic preparation shares one dedicated end. Without a caller scope,
+    // each control call receives only a short implicit runtime end; 30 s also
+    // covers the fixture worker lock retry, which may take 10 s.
+    let preparation_end = Instant::now() + Duration::from_secs(30);
+    let store = ManagedStore::create_with_deadline(
+        &db,
+        &control,
+        ControlId::parse("catalog").unwrap(),
+        1,
+        preparation_end,
+    )
+    .unwrap();
+    control
+        .with_runtime_deadline(preparation_end, || {
+            {
+                let worker_lock = crate::retry_fixture_busy(|| {
+                    ExclusiveGuard::try_acquire(&root, LockKind::Background)
+                });
+                let worker = control
+                    .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
+                    .unwrap();
+                control
+                    .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
+                    .unwrap();
+                store.reconcile_progress(&control, &worker).unwrap();
+            }
+            Ok(())
+        })
+        .expect("update fixture catalog preparation");
     drop(store);
     let lock = crate::retry_fixture_busy(|| {
         ExclusiveGuard::try_acquire(
@@ -723,7 +739,11 @@ fn completion_checks_the_catalog_under_its_owned_fence_before_clear() {
             .record_verified_installation_prefix(&prefix, &lock, &bound, end)
             .unwrap();
     }
-    let installation = control.bind_installation(&prefix, &lock).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end.min(end), || {
+            control.bind_installation(&prefix, &lock)
+        })
+        .expect("update fixture installation binding");
     let owner = ControlId::parse("owner").unwrap();
     let expected = build_identity();
     let initial = inspect_catalog_identity(&control, &db, end).unwrap();
@@ -827,19 +847,35 @@ fn with_idle_admission(
         )
     });
     let db = root.join("catalog.db");
-    let store =
-        ManagedStore::create(&db, &control, ControlId::parse("catalog").unwrap(), 1).unwrap();
-    {
-        let worker_lock =
-            crate::retry_fixture_busy(|| ExclusiveGuard::try_acquire(&root, LockKind::Background));
-        let worker = control
-            .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
-            .unwrap();
-        control
-            .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
-            .unwrap();
-        store.reconcile_progress(&control, &worker).unwrap();
-    }
+    // Synthetic preparation shares one dedicated end. Without a caller scope,
+    // each control call receives only a short implicit runtime end; 30 s also
+    // covers the fixture worker lock retry, which may take 10 s.
+    let preparation_end = Instant::now() + Duration::from_secs(30);
+    let store = ManagedStore::create_with_deadline(
+        &db,
+        &control,
+        ControlId::parse("catalog").unwrap(),
+        1,
+        preparation_end,
+    )
+    .unwrap();
+    control
+        .with_runtime_deadline(preparation_end, || {
+            {
+                let worker_lock = crate::retry_fixture_busy(|| {
+                    ExclusiveGuard::try_acquire(&root, LockKind::Background)
+                });
+                let worker = control
+                    .bind_worker(&worker_lock, ControlId::parse("boot").unwrap())
+                    .unwrap();
+                control
+                    .register_worker(control.status().unwrap().policy.control_seq, &worker, 1, 1)
+                    .unwrap();
+                store.reconcile_progress(&control, &worker).unwrap();
+            }
+            Ok(())
+        })
+        .expect("idle admission fixture catalog preparation");
     drop(store);
     let lock = crate::retry_fixture_busy(|| {
         ExclusiveGuard::try_acquire(
@@ -856,7 +892,11 @@ fn with_idle_admission(
             .record_verified_installation_prefix(&prefix, &lock, &bound, end)
             .unwrap();
     }
-    let installation = control.bind_installation(&prefix, &lock).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end.min(end), || {
+            control.bind_installation(&prefix, &lock)
+        })
+        .expect("idle admission fixture installation binding");
     test(&control, &installation, &root, &db, &prefix, &lock);
 }
 
