@@ -652,11 +652,13 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
         &mut |_, _, _| panic!(),
     );
     assert_eq!(expired.reason, Some(Reason::Timeout));
-    // Prepare the package before measuring the native timeout path.
+    // Package construction precedes the normal command budget. This branch
+    // injects a native Timeout; it does not require natural command expiry.
     let mut installation = Some(f.installation(true));
-    let end = Instant::now() + Duration::from_secs(2);
+    let started = Instant::now();
+    let end = started + BUDGET;
     let observation = ObserveDeadline::start(end);
-    let mut native_called = false;
+    let mut native_calls = 0;
     let result = execute(
         f.catalog.to_str().unwrap(),
         Options {
@@ -667,20 +669,28 @@ fn original_deadline_and_native_timeout_preserve_partial_completed_stages() {
         &mut |_| Ok(installation.take().unwrap()),
         &mut || Ok(f.location.clone()),
         &mut |_, _, deadline| {
+            native_calls += 1;
             assert_eq!(deadline, end);
-            native_called = true;
             Err(native_manager::ErrorCode::Timeout.into())
         },
     );
     let observed = observation.finish();
-    assert!(
-        native_called,
-        "deadline={observed:?} summary={}",
+    let diagnostic = format!(
+        "phase=native_timeout native_calls={native_calls} installations={} elapsed={:?} remaining={:?} deadline={observed:?} summary={}",
+        f.installations.get(),
+        started.elapsed(),
+        end.saturating_duration_since(Instant::now()),
         serde_json::to_string(&result).unwrap()
     );
-    assert_eq!(result.status, "incomplete");
-    assert_eq!(result.reason, Some(Reason::Timeout));
-    assert!(result.intent_recorded && result.private_receipt_recorded);
+    assert_eq!(native_calls, 1, "{diagnostic}");
+    assert!(observed.checks > 0, "{diagnostic}");
+    assert_eq!(observed.rejections, 0, "{diagnostic}");
+    assert_eq!(result.status, "incomplete", "{diagnostic}");
+    assert_eq!(result.reason, Some(Reason::Timeout), "{diagnostic}");
+    assert!(
+        result.intent_recorded && result.private_receipt_recorded,
+        "{diagnostic}"
+    );
     assert_eq!(result.autostart_enabled, Some(true));
     assert!(f.target().exists());
     assert_eq!(
