@@ -1056,11 +1056,12 @@ fn owned_systemd_disable_checks_command_before_stop_and_readback_before_removal(
     let change = f.change();
     let sibling = f.directory.join("unrelated.service");
     fs::write(&sibling, b"unrelated native settings").unwrap();
-    let end = Instant::now() + Duration::from_secs(2);
+    let action_started = Instant::now();
+    let end = action_started + Duration::from_secs(2);
     let mut enabled = true;
     let mut calls = Vec::new();
     let mut checks = 0;
-    let disabled = disable_owned(
+    let result = disable_owned(
         &f.store,
         &change.receipt,
         &f.registration,
@@ -1084,8 +1085,29 @@ fn owned_systemd_disable_checks_command_before_stop_and_readback_before_removal(
             }
             Ok(response)
         },
-    )
-    .unwrap();
+    );
+    let disabled = result.unwrap_or_else(|error| {
+        let last_action = calls.last().map_or("none", |args| {
+            [
+                ("LoadUnit", "load_unit"),
+                ("NeedDaemonReload", "unit_properties"),
+                ("ExecStart", "exec_start"),
+                ("stop", "stop"),
+                ("disable", "disable"),
+                ("daemon-reload", "daemon_reload"),
+            ]
+            .into_iter()
+            .find_map(|(argument, tag)| args.iter().any(|arg| arg == argument).then_some(tag))
+            .unwrap_or("other")
+        });
+        panic!(
+            "owned systemd disable failed: code={:?} calls={} last_action={last_action} \
+             checks={checks} enabled={enabled} action_elapsed={:?}",
+            error.code,
+            calls.len(),
+            action_started.elapsed()
+        )
+    });
     assert_eq!(disabled.change.receipt.state, ConfigurationState::Absent);
     assert!(!disabled.summary.registration_present);
     assert!(disabled.summary.stop_requested);

@@ -442,10 +442,42 @@ fn profiles_with_the_same_native_session_id_stay_separate_sources() {
         1700000011.0,
     );
 
-    for source in [&profile_a, &profile_b] {
+    for (profile, source) in [("a", &profile_a), ("b", &profile_b)] {
         let path = source.to_string_lossy().into_owned();
-        let sync = run(&db, &["sync", &path]);
-        assert!(sync.status.success(), "sync failed: {}", stdout(&sync));
+        let sync = Command::new(BIN)
+            .arg("--db")
+            .arg(&db)
+            .arg("--robot")
+            .args(["sync", path.as_str()])
+            .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+            .env("ASG_DEBUG_ERRORS", "1")
+            .output()
+            .expect("failed to spawn agent-session-grep binary");
+        let stderr = String::from_utf8_lossy(&sync.stderr);
+        // Only the existing path-free snapshot diagnostic may enter this failure.
+        let source_io = stderr.lines().find(|line| {
+            if line.len() > 512 {
+                return false;
+            }
+            let Some(detail) = line.strip_prefix("debug [source_io]: source I/O failure: phase=")
+            else {
+                return false;
+            };
+            let Some((phase, fields)) = detail.split_once(" source snapshot unavailable: ") else {
+                return false;
+            };
+            matches!(phase, "capture" | "open_snapshot" | "verify")
+                && (fields.starts_with("site=") || fields.starts_with("reason="))
+                && fields
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b" _=(),-".contains(&byte))
+        });
+        assert!(
+            sync.status.success(),
+            "sync failed: profile={profile} exit={:?} source_io={source_io:?} stdout={}",
+            sync.status.code(),
+            stdout(&sync)
+        );
         let frame = parse_first_line(&sync);
         assert_eq!(frame["data"]["committed"], 1, "{frame}");
     }
