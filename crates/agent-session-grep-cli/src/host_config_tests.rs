@@ -84,6 +84,685 @@ fn install_update_remove_only_owned_json_node() {
 }
 
 #[test]
+fn codex_byte_preservation_retained_mixed_eol() {
+    let initial = concat!(
+        "model = 'synthetic'\r\n",
+        "model_provider = 'local'\r\n",
+        "model_reasoning_effort = 'high'\r\n",
+        "\r\n",
+        "[model_providers.local]\r\n",
+        "name = 'synthetic provider'\r\n",
+        "base_url = 'http://127.0.0.1:1/v1'\r\n",
+        "wire_api = 'responses'\r\n",
+        "env_key = 'SYNTHETIC_TOKEN'\r\n",
+        "\n",
+        "[skills]\n",
+        "include_instructions = false\n",
+        "\n",
+        "[skills.bundled]\n",
+        "enabled = false\n",
+        "\n",
+        "[cloud.skills]\n",
+        "enabled = false\n",
+        "\n",
+        "[features]\n",
+        "skill_search = false\n",
+    );
+    assert_eq!(initial.matches("\r\n").count(), 9);
+    assert_eq!(initial.matches('\n').count(), 21);
+    let f = Fixture::new(Host::Codex, Some(initial));
+    let receipt = f.store.install(&f.registration(), None).unwrap();
+    let installed = fs::read(&f.config).unwrap();
+    assert!(
+        installed.ends_with(initial.as_bytes()),
+        "install changed the original mixed-EOL configuration"
+    );
+    assert_eq!(
+        f.document().node(),
+        Some(f.registration().value(Host::Codex))
+    );
+    assert!(!receipt.formatting_changed);
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(fs::read(&f.config).unwrap(), initial.as_bytes());
+}
+
+#[test]
+fn codex_byte_preservation_parent_forms_roundtrip() {
+    for initial in [
+        "",
+        "\u{feff}",
+        "# keep\r\nmodel = 'synthetic'",
+        "[mcp_servers]\r\n# keep LF\n",
+        "# keep\r\n[mcp_servers.other]\ncommand = 'other'",
+        "'mcp_servers'.'other'.command = 'other'\r\n# keep\n",
+        "mcp_servers = { }\r\n# keep\n",
+        "mcp_servers = { other = {command = 'other'} }\r\n# keep\n",
+        "mcp_servers = { other = {command = 'other'},\r\n# keep comma, trivia\n}\n",
+        "\u{feff}model = '''first\r\n[not.a.header]\nsecond'''\r\nitems = [\n  'comma,inside',\r\n  '# keep',\n]\n",
+    ] {
+        let f = Fixture::new(Host::Codex, Some(initial));
+        let registration = f.registration();
+        let receipt = f.store.install(&registration, None).unwrap();
+        assert_eq!(f.document().node(), Some(registration.value(Host::Codex)));
+        assert!(!receipt.formatting_changed);
+        let stable = fs::read(&f.config).unwrap();
+        let again = f.store.install(&registration, Some(&receipt)).unwrap();
+        assert_eq!(again.status, EditStatus::Unchanged);
+        assert_eq!(fs::read(&f.config).unwrap(), stable);
+        let mut changed = registration;
+        changed.args.push("--synthetic".into());
+        let updated = f.store.install(&changed, Some(&again)).unwrap();
+        assert_eq!(f.document().node(), Some(changed.value(Host::Codex)));
+        assert!(!updated.formatting_changed);
+        f.store.remove(&updated).unwrap();
+        assert_eq!(
+            fs::read(&f.config).unwrap(),
+            initial.as_bytes(),
+            "{initial:?}"
+        );
+    }
+}
+
+#[test]
+fn codex_byte_preservation_inline_removal_comma_positions() {
+    let owned = "agent-session-grep = {command = 'asg', args = []}";
+    for (contents, remaining) in [
+        (
+            format!("{owned}, left = {{command = 'keep'}}"),
+            " left = {command = 'keep'}",
+        ),
+        (
+            format!("left = {{command = 'keep'}}, {owned}"),
+            "left = {command = 'keep'} ",
+        ),
+        (
+            format!("left = {{command = 'keep'}}, {owned}, right = {{command = 'also'}}"),
+            "left = {command = 'keep'},  right = {command = 'also'}",
+        ),
+        (owned.into(), ""),
+    ] {
+        let initial = format!("mcp_servers = {{ {contents} }} # keep\r\nfooter = 'preserve'\n");
+        let doc = Document::parse(Host::Codex, initial.as_bytes()).unwrap();
+        let unrelated = without_node(doc.value.clone(), Host::Codex);
+        let removed = doc.render(&None, &unrelated).unwrap();
+        assert_eq!(
+            removed,
+            format!("mcp_servers = {{ {remaining} }} # keep\r\nfooter = 'preserve'\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn codex_byte_preservation_inline_trailing_comma() {
+    let owned = "agent-session-grep = { command = 'asg', args = [], }";
+    for (contents, remaining) in [
+        (
+            format!("{owned}, # preserve comma, comment\r\n"),
+            " # preserve comma, comment\r\n",
+        ),
+        (
+            format!("other = {{command = 'keep'}}, {owned}, # tail\r\n"),
+            "other = {command = 'keep'},  # tail\r\n",
+        ),
+        (
+            format!("{owned}, other = {{command = 'keep'}},\n"),
+            " other = {command = 'keep'},\n",
+        ),
+    ] {
+        let initial = format!("mcp_servers = {{ {contents} }} # keep\nmodel = 'synthetic'\r\n");
+        assert!(
+            initial.parse::<toml_edit::DocumentMut>().is_ok(),
+            "the original pinned parser must accept the fixture"
+        );
+        let document = Document::parse(Host::Codex, initial.as_bytes()).unwrap();
+        let unrelated = without_node(document.value.clone(), Host::Codex);
+        let removed = document.render(&None, &unrelated).unwrap();
+        assert_eq!(
+            removed,
+            format!("mcp_servers = {{ {remaining} }} # keep\nmodel = 'synthetic'\r\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn codex_byte_preservation_direct_owned_forms() {
+    for initial in [
+        "mcp_servers.'agent-session-grep'.command = 'old'\r\nmcp_servers.'agent-session-grep'.args = []\n# keep\r\nmodel = 'synthetic'\n",
+        "[\"mcp_servers\".\"agent-session-grep\"]\r\ncommand = 'old' # keep inline\nargs = []\r\n# footer\n[mcp_servers.other]\ncommand = 'keep'\r\n",
+        "mcp_servers = { 'agent-session-grep' = { command = 'old', args = [] }, other = { command = '''keep\r\nfake,table\n''' } }\r\n",
+    ] {
+        let doc = Document::parse(Host::Codex, initial.as_bytes()).unwrap();
+        let target = Some(json!({"command": "new", "args": ["--db", "synthetic"]}));
+        let unrelated = without_node(doc.value.clone(), Host::Codex);
+        let bytes = doc.render(&target, &unrelated).unwrap();
+        let updated = Document::parse(Host::Codex, &bytes).unwrap();
+        assert_eq!(updated.node(), target);
+        assert!(
+            !Document::parse(Host::Codex, initial.as_bytes())
+                .unwrap()
+                .codex_proof(&updated)
+                .unwrap()
+        );
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("# keep") || text.contains("fake,table\n"));
+    }
+}
+
+#[test]
+fn codex_byte_preservation_eol_races_keep_observed_basis() {
+    for point in [
+        TestPoint::BeforeRead,
+        TestPoint::Prepared,
+        TestPoint::Exchanged,
+    ] {
+        let initial = "# original\r\nmodel = 'synthetic'\n";
+        let external = "# external\nmodel = 'synthetic'\r\n# repeated\n# repeated\r\n";
+        let f = Fixture::new(Host::Codex, Some(initial));
+        let mut changed = false;
+        let receipt = f
+            .store
+            .change(
+                Some(f.registration().value(Host::Codex)),
+                None,
+                &mut |observed| {
+                    if std::mem::discriminant(&point) == std::mem::discriminant(&observed)
+                        && !changed
+                    {
+                        if matches!(point, TestPoint::Exchanged) {
+                            let root = fs::read_dir(&f.store.root)
+                                .unwrap()
+                                .filter_map(|entry| entry.ok())
+                                .find(|entry| entry.file_type().unwrap().is_dir())
+                                .unwrap()
+                                .path();
+                            fs::write(root.join("0-displaced"), external).unwrap();
+                        } else {
+                            fs::write(&f.config, external).unwrap();
+                        }
+                        changed = true;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(!receipt.formatting_changed);
+        f.store.remove(&receipt).unwrap();
+        assert_eq!(fs::read(&f.config).unwrap(), external.as_bytes());
+    }
+}
+
+#[test]
+fn codex_byte_preservation_donor_structure_add_remove_and_aot() {
+    let before = "model = 'old'\r\nobsolete = 'drop'\n[existing]\nvalue = 'keep'\r\n";
+    let external = concat!(
+        "model = 'old'\r\n",
+        "[existing]\nvalue = 'keep'\r\n",
+        "[profiles.new]\r\nmodel = '''first\r\nsecond\n'''\n",
+        "[[history]]\nname = 'one'\r\n",
+        "[[history]]\r\nname = 'two'\n",
+    );
+    let base = Document::parse(Host::Codex, before.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, external.as_bytes()).unwrap();
+    let mut target = donor.value.clone();
+    target["model"] = json!("live");
+    let current = Document::parse(
+        Host::Codex,
+        b"model = 'live'\r\nobsolete = 'drop'\n[existing]\nvalue = 'keep'\r\n",
+    )
+    .unwrap();
+    let merged = merge_values(Some(&base.value), Some(&donor.value), Some(&current.value))
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged, target);
+    let rendered = current
+        .render_with_donors(&None, &merged, &[&donor])
+        .unwrap();
+    let text = std::str::from_utf8(&rendered).unwrap();
+    assert!(text.contains("[profiles.new]\r\nmodel = '''first\r\nsecond\n'''\n"));
+    assert!(text.contains("[[history]]\nname = 'one'\r\n[[history]]\r\nname = 'two'\n"));
+    assert!(text.ends_with("[existing]\nvalue = 'keep'\r\n"));
+    assert!(!text.contains("obsolete"));
+    assert_eq!(
+        Document::parse(Host::Codex, &rendered).unwrap().value,
+        target
+    );
+}
+
+#[test]
+fn codex_byte_preservation_retry_structural_donor() {
+    let initial = "model = 'original'\r\n[existing]\nvalue = 'keep'\r\n";
+    let external = concat!(
+        "model = 'original'\r\n[existing]\nvalue = 'keep'\r\n",
+        "[profiles.new]\nmodel = 'added'\r\n",
+        "[[history]]\nname = 'one'\r\n",
+        "[[history]]\r\nname = 'two'\n",
+    );
+    let f = Fixture::new(Host::Codex, Some(initial));
+    let mut prepared = 0;
+    let receipt = f
+        .store
+        .change(
+            Some(f.registration().value(Host::Codex)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Prepared) {
+                    prepared += 1;
+                    if prepared == 1 {
+                        fs::write(&f.config, external).unwrap();
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(receipt.attempts, 2);
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(fs::read(&f.config).unwrap(), external.as_bytes());
+}
+
+#[test]
+fn codex_byte_preservation_donor_dotted_object_addition() {
+    let original = "# base\r\nmodel = 'live'\n";
+    let source = "# base\r\nmodel = 'old'\nprofiles.new.model = 'x'\r\n";
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let mut desired = donor.value.clone();
+    desired["model"] = json!("live");
+    let bytes = current
+        .render_with_donors(&None, &desired, &[&donor])
+        .unwrap();
+    assert!(bytes.ends_with(original.as_bytes()));
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("profiles.new.model = 'x'\r\n")
+    );
+    assert_eq!(Document::parse(Host::Codex, &bytes).unwrap().value, desired);
+}
+
+#[test]
+fn codex_byte_preservation_donor_relative_records_and_descendant_sections() {
+    let original = "[profiles]\r\n# existing\nold = 'keep'\r\n[unrelated]\nvalue = 'stay'\n";
+    let source = concat!(
+        "[profiles]\r\n# existing\nold = 'keep'\r\n",
+        "# selected\nnew.model = 'x'\r\n",
+        "[profiles.new.options]\n# descendant\r\nflag = true\n",
+        "[unrelated]\nvalue = 'stay'\n",
+    );
+    assert!(original.parse::<toml_edit::DocumentMut>().is_ok());
+    assert!(source.parse::<toml_edit::DocumentMut>().is_ok());
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let bytes = current
+        .render_with_donors(&None, &donor.value, &[&donor])
+        .unwrap();
+    assert_eq!(
+        bytes,
+        concat!(
+            "[profiles]\r\n# selected\nnew.model = 'x'\r\n",
+            "# existing\nold = 'keep'\r\n",
+            "[profiles.new.options]\n# descendant\r\nflag = true\n",
+            "[unrelated]\nvalue = 'stay'\n",
+        )
+        .as_bytes()
+    );
+    assert_eq!(
+        Document::parse(Host::Codex, &bytes).unwrap().value,
+        donor.value
+    );
+}
+
+#[test]
+fn codex_byte_preservation_donor_parent_without_final_newline() {
+    let original = "[profiles]";
+    let source = "[profiles]\nnew.model = 'x'\n";
+    assert!(original.parse::<toml_edit::DocumentMut>().is_ok());
+    assert!(source.parse::<toml_edit::DocumentMut>().is_ok());
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let bytes = current
+        .render_with_donors(&None, &donor.value, &[&donor])
+        .unwrap();
+    assert_eq!(bytes, source.as_bytes());
+    assert_eq!(
+        Document::parse(Host::Codex, &bytes).unwrap().value,
+        donor.value
+    );
+}
+
+#[test]
+fn codex_byte_preservation_donor_siblings_share_empty_parent() {
+    codex_donor_siblings_at_parent("[profiles]\n");
+}
+
+#[test]
+fn codex_byte_preservation_donor_siblings_share_parent_without_newline() {
+    codex_donor_siblings_at_parent("[profiles]");
+}
+
+fn codex_donor_siblings_at_parent(original: &str) {
+    let source = concat!(
+        "[profiles]\n",
+        "# first\n",
+        "a.model = 'x'\r\n",
+        "# second\r\n",
+        "b.model = 'y'\n",
+        "[profiles.a.options]\nflag = true\r\n",
+        "[profiles.b.options]\r\nflag = false\n",
+    );
+    assert!(original.parse::<toml_edit::DocumentMut>().is_ok());
+    assert!(source.parse::<toml_edit::DocumentMut>().is_ok());
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let bytes = current
+        .render_with_donors(&None, &donor.value, &[&donor])
+        .unwrap();
+    assert_eq!(bytes, source.as_bytes());
+    assert_eq!(
+        Document::parse(Host::Codex, &bytes).unwrap().value,
+        donor.value
+    );
+}
+
+#[test]
+fn codex_byte_preservation_donor_mixed_scope_retry_preserves_later_edit() {
+    let initial = "model = 'original'\r\n[profiles]\nold = 'keep'\r\n";
+    let external =
+        format!("{initial}new.model = 'x'\n[profiles.new.options]\r\n# retained\nflag = true\r\n");
+    let f = Fixture::new(Host::Codex, Some(initial));
+    let mut prepared = 0;
+    let receipt = f
+        .store
+        .change(
+            Some(f.registration().value(Host::Codex)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Prepared) {
+                    prepared += 1;
+                    if prepared == 1 {
+                        fs::write(&f.config, &external).unwrap();
+                    }
+                }
+                if matches!(point, TestPoint::Exchanged) && prepared == 2 {
+                    let live = fs::read_to_string(&f.config).unwrap();
+                    fs::write(
+                        &f.config,
+                        live.replace("model = 'original'", "model = 'later'"),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(receipt.attempts, 2);
+    assert_eq!(f.document().value["profiles"]["new"]["model"], "x");
+    assert_eq!(
+        f.document().value["profiles"]["new"]["options"]["flag"],
+        true
+    );
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(
+        fs::read(&f.config).unwrap(),
+        external
+            .replace("model = 'original'", "model = 'later'")
+            .as_bytes()
+    );
+}
+
+#[test]
+fn codex_byte_preservation_donor_explicit_table_into_inline_parent() {
+    let original = "profiles = { old = { model = 'keep' } }\r\nmodel = 'live'\n";
+    let source = "model = 'old'\n[profiles.old]\nmodel = 'keep'\n[profiles.new]\r\n# donor comment\nmodel = '''first\r\nsecond\n'''\r\n";
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let mut desired = donor.value.clone();
+    desired["model"] = json!("live");
+    let bytes = current
+        .render_with_donors(&None, &desired, &[&donor])
+        .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.starts_with("profiles = {"));
+    assert!(text.ends_with(" old = { model = 'keep' } }\r\nmodel = 'live'\n"));
+    assert!(text.contains("# donor comment\n"));
+    assert!(text.contains("'''first\r\nsecond\n'''"));
+    assert_eq!(Document::parse(Host::Codex, &bytes).unwrap().value, desired);
+}
+
+#[test]
+fn codex_byte_preservation_donor_internal_comments() {
+    let original = "# base\r\nmodel = 'keep'\n";
+    let added = "[profiles.new]\r\n# before model\nmodel = 'x'\r\n\n# before args\r\nargs = ['one',\n 'two']\n# donor footer\r\n";
+    let source = format!("{original}{added}");
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, source.as_bytes()).unwrap();
+    let desired = donor.value.clone();
+    let bytes = current
+        .render_with_donors(&None, &desired, &[&donor])
+        .unwrap();
+    assert_eq!(bytes, source.as_bytes());
+}
+
+#[test]
+fn codex_byte_preservation_donor_aot_replace_delete_and_nested_delete() {
+    let original = "model = 'keep'\r\n[profiles.remove]\nmodel = 'old'\r\n[profiles.keep]\nmodel = 'stay'\n[[history]]\r\nname = 'old'\n";
+    let external = "model = 'keep'\r\n[profiles.keep]\nmodel = 'stay'\n[[history]]\n# selected element\r\nname = 'new'\r\n[[history]]\r\nname = 'second'\n";
+    let current = Document::parse(Host::Codex, original.as_bytes()).unwrap();
+    let donor = Document::parse(Host::Codex, external.as_bytes()).unwrap();
+    let desired = donor.value.clone();
+    let bytes = current
+        .render_with_donors(&None, &desired, &[&donor])
+        .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains(
+        "[[history]]\n# selected element\r\nname = 'new'\r\n[[history]]\r\nname = 'second'\n"
+    ));
+    assert!(text.contains("[profiles.keep]\nmodel = 'stay'\n"));
+    assert!(!text.contains("profiles.remove"));
+    assert_eq!(Document::parse(Host::Codex, &bytes).unwrap().value, desired);
+    let current = Document::parse(Host::Codex, &bytes).unwrap();
+    let mut removed = current.value.clone();
+    removed.as_object_mut().unwrap().remove("history");
+    let bytes = current.render_with_donors(&None, &removed, &[]).unwrap();
+    assert!(!std::str::from_utf8(&bytes).unwrap().contains("[[history]]"));
+    assert_eq!(Document::parse(Host::Codex, &bytes).unwrap().value, removed);
+}
+
+#[test]
+fn codex_byte_preservation_unexchanged_recovery_new_file() {
+    codex_unexchanged_recovery(None, false);
+}
+
+#[test]
+fn codex_byte_preservation_unexchanged_recovery_existing_file() {
+    codex_unexchanged_recovery(Some("# preserve\r\nmodel = 'original'\n"), false);
+}
+
+#[test]
+fn codex_byte_preservation_partial_native_recovery() {
+    codex_unexchanged_recovery(Some("# preserve\r\nmodel = 'original'\n"), true);
+}
+
+fn codex_unexchanged_recovery(initial: Option<&str>, partial: bool) {
+    let f = Fixture::new(Host::Codex, initial);
+    let error = f
+        .store
+        .change(
+            Some(f.registration().value(Host::Codex)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Prepared) {
+                    if partial {
+                        let root = fs::read_dir(&f.store.root)
+                            .unwrap()
+                            .filter_map(|entry| entry.ok())
+                            .find(|entry| entry.file_type().unwrap().is_dir())
+                            .unwrap()
+                            .path();
+                        fs::rename(&f.config, root.join("0-displaced")).unwrap();
+                    }
+                    return Err(ErrorCode::Io.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    let id = error.transaction_id.unwrap();
+    let receipt = f.store.recover(&id).unwrap();
+    assert_eq!(receipt.status, EditStatus::Applied);
+    assert_eq!(receipt.attempts, 2);
+    assert!(!receipt.formatting_changed);
+    assert_eq!(
+        f.document().node(),
+        Some(f.registration().value(Host::Codex))
+    );
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(
+        fs::read(&f.config).unwrap(),
+        initial.unwrap_or_default().as_bytes()
+    );
+}
+
+#[test]
+fn codex_byte_preservation_structural_donor_then_independent_live_edit() {
+    let initial = "model = 'original'\r\n[profiles.old]\nmodel = 'keep'\r\n";
+    let external = format!("{initial}[profiles.new]\n# donor internal\r\nmodel = 'added'\n");
+    let f = Fixture::new(Host::Codex, Some(initial));
+    let mut prepared = 0;
+    let receipt = f
+        .store
+        .change(
+            Some(f.registration().value(Host::Codex)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Prepared) {
+                    prepared += 1;
+                    if prepared == 1 {
+                        fs::write(&f.config, &external).unwrap();
+                    }
+                }
+                if matches!(point, TestPoint::Exchanged) && prepared == 2 {
+                    let live = fs::read_to_string(&f.config).unwrap();
+                    fs::write(
+                        &f.config,
+                        live.replace("model = 'original'", "model = 'later'"),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(receipt.attempts, 2);
+    assert_eq!(f.document().value["model"], "later");
+    assert_eq!(f.document().value["profiles"]["new"]["model"], "added");
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(
+        fs::read(&f.config).unwrap(),
+        external
+            .replace("model = 'original'", "model = 'later'")
+            .as_bytes()
+    );
+}
+
+#[test]
+fn codex_byte_preservation_historical_verified_receipt_stays_historical() {
+    let f = Fixture::new(Host::Codex, Some("# original\r\nmodel = 'synthetic'\n"));
+    let receipt = f.store.install(&f.registration(), None).unwrap();
+    let before = fs::read(&f.config).unwrap();
+    assert_eq!(f.store.recover(&receipt.transaction_id).unwrap(), receipt);
+    assert_eq!(fs::read(&f.config).unwrap(), before);
+}
+
+#[test]
+fn codex_byte_preservation_pending_normalized_intended_is_not_new_success() {
+    let f = Fixture::new(Host::Codex, Some("# mixed\r\nmodel = 'synthetic'\n"));
+    let error = f
+        .store
+        .change(
+            Some(f.registration().value(Host::Codex)),
+            None,
+            &mut |point| {
+                if matches!(point, TestPoint::Exchanged) {
+                    return Err(ErrorCode::Io.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    let id = error.transaction_id.unwrap();
+    let root = f.store.root.join(&id);
+    let old = fs::read(root.join("0-intended")).unwrap();
+    let normalized = String::from_utf8(old)
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .into_bytes();
+    fs::write(root.join("0-intended"), &normalized).unwrap();
+    fs::write(&f.config, &normalized).unwrap();
+    let mut journal = f.store.load(&id).unwrap();
+    journal.attempts[0].intended = hash(&normalized);
+    f.store.save(&mut journal).unwrap();
+    assert_eq!(
+        f.store.recover(&id).unwrap_err().code,
+        ErrorCode::Unsupported
+    );
+    assert_eq!(fs::read(&f.config).unwrap(), normalized);
+    assert!(f.store.load(&id).unwrap().receipt.is_none());
+}
+
+#[test]
+fn codex_byte_preservation_pending_owned_formatting_is_reported() {
+    let original = "# preserve\r\nmodel = 'synthetic'\n";
+    let f = Fixture::new(Host::Codex, Some(original));
+    let mut registration = f.registration();
+    let prior = f.store.install(&registration, None).unwrap();
+    registration.args.push("--updated".into());
+    let error = f
+        .store
+        .change(
+            Some(registration.value(Host::Codex)),
+            Some(&prior),
+            &mut |point| {
+                if matches!(point, TestPoint::Exchanged) {
+                    return Err(ErrorCode::Io.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    let id = error.transaction_id.unwrap();
+    let root = f.store.root.join(&id);
+    let old = fs::read_to_string(root.join("0-intended")).unwrap();
+    let reformatted = old.replacen(
+        "mcp_servers.agent-session-grep = ",
+        "mcp_servers.agent-session-grep  =  ",
+        1,
+    );
+    assert_ne!(old, reformatted);
+    assert!(reformatted.ends_with(original));
+    assert_eq!(
+        Document::parse(Host::Codex, old.as_bytes()).unwrap().value,
+        Document::parse(Host::Codex, reformatted.as_bytes())
+            .unwrap()
+            .value
+    );
+    fs::write(root.join("0-intended"), reformatted.as_bytes()).unwrap();
+    fs::write(&f.config, reformatted.as_bytes()).unwrap();
+    let mut journal = f.store.load(&id).unwrap();
+    journal.attempts[0].intended = hash(reformatted.as_bytes());
+    f.store.save(&mut journal).unwrap();
+    let receipt = f.store.recover(&id).unwrap();
+    assert_eq!(receipt.status, EditStatus::Applied);
+    assert!(receipt.formatting_changed);
+    assert_eq!(fs::read(&f.config).unwrap(), reformatted.as_bytes());
+    assert_eq!(f.document().node(), Some(registration.value(Host::Codex)));
+    assert_eq!(f.store.recover(&id).unwrap(), receipt);
+    f.store.remove(&receipt).unwrap();
+    assert_eq!(fs::read(&f.config).unwrap(), original.as_bytes());
+}
+
+#[test]
 fn codex_comments_order_bom_and_crlf_survive_install_and_remove() {
     let initial = "\u{feff}# personal comment\r\nmodel = 'synthetic' # inline\r\n\r\n[mcp_servers.other]\r\ncommand = 'other'\r\n# trailing comment\r\n";
     let f = Fixture::new(Host::Codex, Some(initial));
