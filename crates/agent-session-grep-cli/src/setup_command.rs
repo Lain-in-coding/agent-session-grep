@@ -1442,10 +1442,18 @@ mod m2_tests {
     fn history_expired_original_end_preserves_control_sequence_and_selections() {
         use agent_session_grep_adapters_sqlite::SqliteControlStore;
         let (_temp, catalog, source, identity) = deadline_selection_fixture();
-        let before = SqliteControlStore::open_current_read_only(catalog.parent().unwrap())
-            .unwrap()
-            .status()
-            .unwrap();
+        let before = {
+            // Snapshot preparation must finish before the expired request starts.
+            let preparation_end = Instant::now() + Duration::from_secs(30);
+            let control = SqliteControlStore::open_current_read_only_with_deadline(
+                catalog.parent().unwrap(),
+                preparation_end,
+            )
+            .expect("expired history fixture control admission");
+            control
+                .with_runtime_deadline(preparation_end, || control.status())
+                .expect("expired history fixture status preparation")
+        };
         let result =
             managed_control::add_selected_history("zcode", &source, &identity, Instant::now());
         assert!(result.is_err());
