@@ -20,6 +20,8 @@ tempfile = "3"
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
+# Reinstall commitments bind the reviewed SHA-256 record format.
+sha2 = "=0.10.9"
 # 与 spikes/data-root-locking 同一原语：OS 独占文件锁作 writer lease 权威。
 # features = ["sync"] 是 fs4 的 default,不必重复声明。
 fs4 = "0.13"

@@ -15,6 +15,18 @@ use std::{
 #[cfg(windows)]
 pub(crate) use windows_private::VerifiedPrivateHandle;
 
+mod reinstall_commitment;
+mod reinstall_records;
+pub use reinstall_commitment::{
+    ReinstallCommitmentPair, ReinstallImageMatch, ReinstallPreparationRead,
+    ReinstallSnapshotBinding,
+};
+pub use reinstall_records::{
+    ReinstallAck, ReinstallCatalogIdentity, ReinstallContext, ReinstallDigest,
+    ReinstallFileBinding, ReinstallFiles, ReinstallImage, ReinstallPrep, ReinstallRoots,
+    ReinstallShmBinding,
+};
+
 const VERSION: i64 = 2;
 /// Current private control schema. Keep VERSION literal for release source parsing.
 pub const CONTROL_SCHEMA_VERSION: i64 = VERSION;
