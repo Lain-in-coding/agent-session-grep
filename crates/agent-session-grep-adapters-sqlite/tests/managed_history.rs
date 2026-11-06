@@ -35,6 +35,38 @@ fn entity(kind: IdKind, suffix: &str) -> StableId {
     StableId::native_checked(kind, suffix).unwrap()
 }
 
+#[derive(Debug)]
+enum PrivateError {
+    InvalidRequest,
+    GenerationMismatch,
+    Backend,
+    SourceIo,
+    SchemaIncompatible,
+    NotFound,
+    SnapshotChanged,
+    ControlRuntimeDeadline,
+    WriterBusy,
+    DeadlineExceeded,
+}
+impl From<&PortError> for PrivateError {
+    fn from(error: &PortError) -> Self {
+        match error {
+            PortError::InvalidRequest(_) => Self::InvalidRequest,
+            PortError::GenerationMismatch(_) => Self::GenerationMismatch,
+            PortError::Backend(_) => Self::Backend,
+            PortError::SourceIo(_) => Self::SourceIo,
+            PortError::SchemaIncompatible(_) => Self::SchemaIncompatible,
+            PortError::NotFound(_) => Self::NotFound,
+            PortError::SnapshotChanged(_) => Self::SnapshotChanged,
+            PortError::WriterBusy(message) if message == "control runtime deadline reached" => {
+                Self::ControlRuntimeDeadline
+            }
+            PortError::WriterBusy(_) => Self::WriterBusy,
+            PortError::DeadlineExceeded(_) => Self::DeadlineExceeded,
+        }
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     catalog: PathBuf,
@@ -54,28 +86,57 @@ impl Fixture {
         let preparation_end = deadline();
         let probe_end = preparation_end + Duration::from_secs(5);
         let mut create_calls = 0;
+        let mut entered = false;
+        let mut first_inner_result = None;
+        let mut inner_end_reached = None;
+        let mut after_scope_assertion = false;
         let mut create = || {
+            entered = true;
             assert_eq!(
                 SqliteControlStore::effective_runtime_deadline(probe_end),
-                preparation_end
+                preparation_end,
+                "history preparation before create: entered={entered} create_calls={create_calls}"
             );
             create_calls += 1;
-            let store = ManagedStore::create(&catalog, &control, id("history-catalog"), 1)?;
+            let result = ManagedStore::create(&catalog, &control, id("history-catalog"), 1);
+            // Only fixed labels and clock observations; never inspect the catalog
+            // after a refusal or substitute a different result for this call.
+            first_inner_result = Some(result.as_ref().map(|_| ()).map_err(PrivateError::from));
+            inner_end_reached = Some(Instant::now() >= preparation_end);
+            let store = result?;
             assert_eq!(
                 SqliteControlStore::effective_runtime_deadline(probe_end),
-                preparation_end
+                preparation_end,
+                "history preparation after create: first_inner={first_inner_result:?} \
+                 inner_end_reached={inner_end_reached:?}"
             );
+            after_scope_assertion = true;
             Ok::<_, PortError>(store)
         };
-        drop(
-            control
-                .with_runtime_deadline(preparation_end, &mut create)
-                .unwrap(),
+        let result = control.with_runtime_deadline(preparation_end, &mut create);
+        let outer_result = result.as_ref().map(|_| ()).map_err(PrivateError::from);
+        drop(result.unwrap_or_else(|_| {
+            panic!(
+                "history preparation failed: entered={entered} called={} \
+                 create_calls={create_calls} first_inner={first_inner_result:?} \
+                 outer={outer_result:?} inner_end_reached={inner_end_reached:?} \
+                 outer_end_reached={} after_scope_assertion={after_scope_assertion} \
+                 scope_restored={}",
+                create_calls != 0,
+                Instant::now() >= preparation_end,
+                SqliteControlStore::effective_runtime_deadline(probe_end) == probe_end,
+            )
+        }));
+        assert_eq!(
+            create_calls, 1,
+            "history preparation calls: entered={entered} \
+             first_inner={first_inner_result:?} outer={outer_result:?}"
         );
-        assert_eq!(create_calls, 1);
         assert_eq!(
             SqliteControlStore::effective_runtime_deadline(probe_end),
-            probe_end
+            probe_end,
+            "history preparation restoration: first_inner={first_inner_result:?} \
+             outer={outer_result:?} after_scope_assertion={after_scope_assertion}"
         );
         drop(control);
         let conn = Connection::open(&catalog).unwrap();
