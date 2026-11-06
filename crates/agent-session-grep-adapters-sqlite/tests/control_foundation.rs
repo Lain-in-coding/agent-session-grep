@@ -3186,49 +3186,51 @@ fn live_runtime_load_is_bounded_but_keeps_exact_old_tokens_and_dependencies() {
     tx.execute("UPDATE control_meta SET next_cycle_seq=2049", [])
         .unwrap();
     tx.commit().unwrap();
-    assert_eq!(
-        store.background_status().unwrap().next_cycle_seq.get(),
-        2049
-    );
-    assert_eq!(
-        store
-            .source_progress(&id("source_f"))
-            .unwrap()
-            .unwrap()
-            .receipt
-            .unwrap()
-            .token,
-        committed.token
-    );
-    assert_eq!(store.cycle(committed.token.cycle_seq).unwrap(), committed);
-    assert_eq!(
-        store.barrier(&first.id).unwrap().completed_cycle_seq,
-        Some(committed.token.cycle_seq)
-    );
-    assert_eq!(
-        store
-            .barrier(&id("old_barrier_0010"))
-            .unwrap()
-            .required_cycle_seq
-            .get(),
-        10
-    );
-    assert_eq!(
-        raw_connection
-            .query_row("SELECT COUNT(*) FROM cycles", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        2048
-    );
-    let reopened = SqliteControlStore::open_read_only(&root, &id("installation")).unwrap();
-    assert_eq!(
-        reopened
-            .cycle(CycleSeq::new(10).unwrap())
-            .unwrap()
-            .token
-            .cycle_seq
-            .get(),
-        10
-    );
+    // These assertions verify retained identities and logical read bounds,
+    // not success within one unscoped 250 ms control-read window under load.
+    let read_end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    store
+        .with_runtime_deadline(read_end, || {
+            assert_eq!(store.background_status()?.next_cycle_seq.get(), 2049);
+            assert_eq!(
+                store
+                    .source_progress(&id("source_f"))?
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .token,
+                committed.token
+            );
+            assert_eq!(store.cycle(committed.token.cycle_seq)?, committed);
+            assert_eq!(
+                store.barrier(&first.id)?.completed_cycle_seq,
+                Some(committed.token.cycle_seq)
+            );
+            assert_eq!(
+                store
+                    .barrier(&id("old_barrier_0010"))?
+                    .required_cycle_seq
+                    .get(),
+                10
+            );
+            assert_eq!(
+                raw_connection
+                    .query_row("SELECT COUNT(*) FROM cycles", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2048
+            );
+            let reopened = SqliteControlStore::open_read_only(&root, &id("installation"))?;
+            assert_eq!(
+                reopened
+                    .cycle(CycleSeq::new(10).unwrap())?
+                    .token
+                    .cycle_seq
+                    .get(),
+                10
+            );
+            Ok(())
+        })
+        .unwrap();
 
     // Current dependencies still use checked decoding rather than being hidden
     // by the historical read bound.
@@ -3238,8 +3240,9 @@ fn live_runtime_load_is_bounded_but_keeps_exact_old_tokens_and_dependencies() {
             [],
         )
         .unwrap();
+    let corrupt_read_end = std::time::Instant::now() + std::time::Duration::from_secs(8);
     assert!(matches!(
-        store.background_status(),
+        store.with_runtime_deadline(corrupt_read_end, || store.background_status()),
         Err(PortError::SchemaIncompatible(_))
     ));
 }
