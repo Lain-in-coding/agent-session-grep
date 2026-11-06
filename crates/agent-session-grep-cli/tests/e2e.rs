@@ -7453,6 +7453,47 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
         CapabilityLevel, ProviderCapabilityMatrix, ProviderMaturity,
     };
 
+    // Accept only one bounded existing path-free diagnostic, never arbitrary
+    // stderr (which debug mode may otherwise include from a private source).
+    let diagnostic = |output: &Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .find(|line| {
+                if line.len() > 512 {
+                    return false;
+                }
+                let Some(detail) = line.strip_prefix("debug [source_io]: source I/O failure: ")
+                else {
+                    return false;
+                };
+                let safe = |value: &str| {
+                    value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b" _=(),-".contains(&byte))
+                };
+                if let Some(snapshot) = detail.strip_prefix("phase=") {
+                    return snapshot
+                        .split_once(" source snapshot unavailable: ")
+                        .is_some_and(|(phase, fields)| {
+                            matches!(phase, "capture" | "open_snapshot" | "verify")
+                                && (fields.starts_with("site=") || fields.starts_with("reason="))
+                                && safe(fields)
+                        });
+                }
+                [
+                    "managed lock storage or request is invalid",
+                    "managed lock storage is unavailable",
+                ]
+                .iter()
+                .any(|prefix| {
+                    detail == *prefix
+                        || detail.strip_prefix(prefix).is_some_and(|fields| {
+                            fields.starts_with(" (site=") && fields.ends_with(')') && safe(fields)
+                        })
+                })
+            })
+            .map(str::to_owned)
+    };
     let matrix = ProviderCapabilityMatrix::current();
     let implemented: Vec<_> = matrix
         .providers
@@ -7484,12 +7525,23 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
         let (dir, db) = temp_db(&format!("incr-{provider_id}"));
         let source = materialize_golden_source(provider_id, relative, dir.path());
         let path = source.to_string_lossy().into_owned();
+        let sync = || {
+            Command::new(BIN)
+                .args(["--db", db.as_str(), "--robot", "sync", path.as_str()])
+                .env("ASG_CLOCK_MS", E2E_CLOCK_MS)
+                .env("ASG_DEBUG_ERRORS", "1")
+                .output()
+                .expect("failed to spawn agent-session-grep binary")
+        };
 
         // 首次 sync：提交 N 条消息，generation 推进到 1。
-        let out = run(&db, &["sync", &path]);
+        let out = sync();
         assert!(
             out.status.success(),
-            "{provider_id}: 首次 sync 必须成功: {}",
+            "{provider_id}: 首次 sync 必须成功: exit={:?} stderr_bytes={} diagnostic={:?} {}",
+            out.status.code(),
+            out.stderr.len(),
+            diagnostic(&out),
             stdout(&out)
         );
         let first = parse_first_line(&out);
@@ -7505,10 +7557,13 @@ fn capability_incremental_claim_matches_real_resync_for_every_provider() {
             .unwrap_or_else(|| panic!("{provider_id}: generation 必须是数字: {first}"));
 
         // 二次 sync 同一字节：指纹命中 → 跳过 parse → 内容级 no-op。
-        let out = run(&db, &["sync", &path]);
+        let out = sync();
         assert!(
             out.status.success(),
-            "{provider_id}: resync 必须成功: {}",
+            "{provider_id}: resync 必须成功: exit={:?} stderr_bytes={} diagnostic={:?} {}",
+            out.status.code(),
+            out.stderr.len(),
+            diagnostic(&out),
             stdout(&out)
         );
         let second = parse_first_line(&out);
