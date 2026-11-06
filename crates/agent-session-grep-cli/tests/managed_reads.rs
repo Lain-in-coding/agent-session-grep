@@ -48,6 +48,7 @@ fn lock(root: &Path, kind: LockKind) -> ExclusiveGuard {
         }
     }
 }
+#[track_caller]
 fn current(control: &SqliteControlStore) -> ControlSeq {
     control.status().unwrap().policy.control_seq
 }
@@ -61,6 +62,7 @@ struct Fixture {
     session: StableId,
     batch: SourceBatch,
     observation: SourceObservation,
+    prepare_end: Instant,
     // Connections and OS guards must close before Windows temp cleanup.
     _temp: tempfile::TempDir,
 }
@@ -249,7 +251,14 @@ impl Fixture {
                 pair_observed: true,
             }],
         };
-        let store = ManagedStore::create(&db, &control, id("private-incarnation"), 1).unwrap();
+        let store = ManagedStore::create_with_deadline(
+            &db,
+            &control,
+            id("private-incarnation"),
+            1,
+            prepare_end,
+        )
+        .unwrap();
         store
             .commit_source(&control, &worker, &batch, &observation)
             .unwrap();
@@ -267,7 +276,17 @@ impl Fixture {
             session,
             batch,
             observation,
+            prepare_end,
         }
+    }
+    #[track_caller]
+    fn prepare_control<T>(
+        &self,
+        operation: impl FnOnce(&SqliteControlStore) -> Result<T, PortError>,
+    ) -> T {
+        self.control
+            .with_runtime_deadline(self.prepare_end, || operation(&self.control))
+            .unwrap()
     }
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
@@ -2090,9 +2109,9 @@ fn f2_human_and_json_direct_evidence_hide_noncontributing_selected_source_failur
             .receipt
             .published
     );
-    f.control
-        .acknowledge_source(
-            current(&f.control),
+    f.prepare_control(|control| {
+        control.acknowledge_source(
+            current(control),
             &worker,
             SourceAcknowledgement {
                 source_id: id("extra-source"),
@@ -2108,26 +2127,26 @@ fn f2_human_and_json_direct_evidence_hide_noncontributing_selected_source_failur
                 confirmation: None,
             },
         )
-        .unwrap();
-    f.control
-        .heartbeat_worker(
-            current(&f.control),
+    });
+    f.prepare_control(|control| {
+        control.heartbeat_worker(
+            current(control),
             &worker,
             UpdateState::Failed,
             Some(BackgroundFailure::Failed),
             22,
         )
-        .unwrap();
+    });
     assert_eq!(
-        f.control
-            .source_progress(&id("extra-source"))
-            .unwrap()
+        f.prepare_control(|control| control.source_progress(&id("extra-source")))
             .unwrap()
             .error,
         Some(BackgroundFailure::Failed)
     );
     assert_eq!(
-        f.control.background_status().unwrap().worker.state,
+        f.prepare_control(|control| control.background_status())
+            .worker
+            .state,
         UpdateState::Failed
     );
     drop(store);
