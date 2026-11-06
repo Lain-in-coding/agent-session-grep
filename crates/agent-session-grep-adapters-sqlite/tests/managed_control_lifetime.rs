@@ -224,6 +224,351 @@ fn inventory_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Ve
     inventory
 }
 
+fn published_fixture() -> (Fixture, Drains, ControlStatus) {
+    let mut f = Fixture::new();
+    f.fence();
+    let end = Instant::now() + Duration::from_secs(30);
+    let control = f.control.as_ref().unwrap();
+    let status = control
+        .with_runtime_deadline(end, || control.status())
+        .unwrap();
+    let intent = RetirementIntent::bind_with_deadline(
+        control,
+        &f.catalog,
+        &f.prefix,
+        &f.installation,
+        &id("synthetic-uninstall"),
+        end,
+    )
+    .unwrap();
+    let drains = Drains::new(&f.root);
+    drop(f.control.take());
+    let retirement = intent
+        .try_acquire_with_deadline(drains.proof(), end)
+        .unwrap();
+    retirement.publish_marker_with_deadline(end).unwrap();
+    drop(retirement);
+    drop(intent);
+    (f, drains, status)
+}
+
+// One actual attempt, without the setup helper's retries or a fresh budget.
+fn acquire_published<'a>(
+    f: &'a Fixture,
+    drains: &'a Drains,
+    end: Instant,
+) -> PortResult<ControlRetirement<'a>> {
+    ControlRetirement::try_acquire_published_with_deadline(
+        &f.root,
+        &f.prefix,
+        &f.installation,
+        expected(
+            &id("synthetic-installation"),
+            &id("synthetic-incarnation"),
+            &id("synthetic-uninstall"),
+        ),
+        drains.proof(),
+        end,
+    )
+}
+
+#[test]
+fn published_acquisition_holds_real_drain_and_releases_without_writing() {
+    let (f, drains, status) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    for remove_database in [false, true] {
+        if remove_database {
+            // Completed default cleanup need not retain any SQLite files.
+            for name in ["control.db", "control.db-wal", "control.db-shm"] {
+                let path = f.root.join(name);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        let before = inventory_bytes(&f.root);
+        let prefix_before = inventory_bytes(&f.prefix);
+        contender.try_lock().unwrap();
+        assert_busy(acquire_published(&f, &drains, end));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        contender.unlock().unwrap();
+
+        let retirement = acquire_published(&f, &drains, end).unwrap();
+        retirement
+            .validate_expected_binding_with_deadline(
+                RootIdentity::read(&f.root).unwrap(),
+                RootIdentity::read(&f.prefix).unwrap(),
+                expected(
+                    &status.policy.installation_id,
+                    status.catalog_incarnation.as_ref().unwrap(),
+                    &id("synthetic-uninstall"),
+                ),
+                (status.policy.control_seq, status.policy.policy_epoch),
+                end,
+            )
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        assert_busy(acquire_published(&f, &drains, end));
+        assert_retired(ControlHandleLease::try_acquire(&f.root));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        drop(retirement);
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    }
+}
+
+#[test]
+fn published_acquisition_refuses_marker_states_without_repair_or_lock_leak() {
+    let (f, drains, _) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let published = f.root.join(RETIREMENT_MARKER);
+    let pending = f.root.join(RETIREMENT_PENDING_MARKER);
+    let marker = fs::read(&published).unwrap();
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    let refuse_unchanged = || {
+        let before = inventory_bytes(&f.root);
+        let prefix_before = inventory_bytes(&f.prefix);
+        assert_retired(acquire_published(&f, &drains, end));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+    };
+
+    fs::write(&published, b"{").unwrap();
+    refuse_unchanged();
+    fs::write(&published, &marker).unwrap();
+    fs::write(&pending, &marker).unwrap();
+    refuse_unchanged();
+    fs::remove_file(&pending).unwrap();
+    fs::rename(&published, &pending).unwrap();
+    refuse_unchanged();
+    assert!(!published.exists());
+    assert_eq!(fs::read(&pending).unwrap(), marker);
+
+    // The strict refusal must not remove the old cleanup recovery capability.
+    let resumed = ControlRetirement::try_resume_with_deadline(
+        &f.root,
+        &f.prefix,
+        &f.installation,
+        expected(
+            &id("synthetic-installation"),
+            &id("synthetic-incarnation"),
+            &id("synthetic-uninstall"),
+        ),
+        drains.proof(),
+        end,
+    )
+    .unwrap();
+    resumed.validate_marker_with_deadline(end).unwrap();
+    assert!(!pending.exists());
+    assert_eq!(fs::read(&published).unwrap(), marker);
+    drop(resumed);
+    drop(acquire_published(&f, &drains, end).unwrap());
+    fs::remove_file(&published).unwrap();
+    refuse_unchanged();
+}
+
+#[test]
+fn published_acquisition_rejects_wrong_expected_and_changed_published_bindings() {
+    let (f, drains, _) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let installation = id("synthetic-installation");
+    let incarnation = id("synthetic-incarnation");
+    let operation = id("synthetic-uninstall");
+    let wrong = id("synthetic-wrong-binding");
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    for binding in [
+        expected(&wrong, &incarnation, &operation),
+        expected(&installation, &wrong, &operation),
+        expected(&installation, &incarnation, &wrong),
+    ] {
+        assert!(matches!(
+            ControlRetirement::try_acquire_published_with_deadline(
+                &f.root,
+                &f.prefix,
+                &f.installation,
+                binding,
+                drains.proof(),
+                end,
+            ),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+    }
+
+    let published = f.root.join(RETIREMENT_MARKER);
+    let original = fs::read(&published).unwrap();
+    for field in [
+        "control_root_id",
+        "prefix_root_id",
+        "installation_id",
+        "catalog_incarnation",
+        "operation_id",
+    ] {
+        let mut marker: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        marker[field] = serde_json::Value::String(wrong.as_str().into());
+        fs::write(&published, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let changed = inventory_bytes(&f.root);
+        assert!(matches!(
+            acquire_published(&f, &drains, end),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert_eq!(inventory_bytes(&f.root), changed);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+    }
+    fs::write(&published, &original).unwrap();
+    let retirement = acquire_published(&f, &drains, end).unwrap();
+    let mut marker: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    marker["operation_id"] = serde_json::Value::String(wrong.as_str().into());
+    fs::write(&published, serde_json::to_vec(&marker).unwrap()).unwrap();
+    let changed = inventory_bytes(&f.root);
+    assert!(matches!(
+        retirement.validate_marker_with_deadline(end),
+        Err(PortError::GenerationMismatch(_))
+    ));
+    assert_eq!(inventory_bytes(&f.root), changed);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    assert!(matches!(
+        contender.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    ));
+    drop(retirement);
+    contender.try_lock().unwrap();
+}
+
+#[test]
+fn published_acquisition_requires_exact_live_drains_and_installation_guard() {
+    let (f, drains, _) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let other = agent_session_grep_testkit::tempdir().unwrap();
+    let other_supervisor = lock(other.path(), LockKind::Supervisor);
+    let other_installation = lock(
+        other.path(),
+        LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap()),
+    );
+    let mut wrong_kind = drains.proof();
+    wrong_kind.supervisor = &drains.background;
+    let mut wrong_root = drains.proof();
+    wrong_root.supervisor = &other_supervisor;
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    for (installation_guard, proof) in [
+        (&f.installation, wrong_kind),
+        (&f.installation, wrong_root),
+        (&drains.policy_owner, drains.proof()),
+        (&other_installation, drains.proof()),
+    ] {
+        assert!(matches!(
+            ControlRetirement::try_acquire_published_with_deadline(
+                &f.root,
+                &f.prefix,
+                installation_guard,
+                expected(
+                    &id("synthetic-installation"),
+                    &id("synthetic-incarnation"),
+                    &id("synthetic-uninstall"),
+                ),
+                proof,
+                end,
+            ),
+            Err(PortError::InvalidRequest(_))
+        ));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+    }
+    drop(acquire_published(&f, &drains, end).unwrap());
+    assert_eq!(inventory_bytes(&f.root), before);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+}
+
+#[test]
+fn published_acquisition_never_recreates_or_truncates_handle_rendezvous() {
+    let (f, drains, _) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let path = f.root.join("control-handles.lock");
+    fs::remove_file(&path).unwrap();
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    assert!(matches!(
+        acquire_published(&f, &drains, end),
+        Err(PortError::GenerationMismatch(_))
+    ));
+    assert_eq!(inventory_bytes(&f.root), before);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    assert!(!path.exists());
+
+    fs::write(&path, b"synthetic-invalid-lock").unwrap();
+    let invalid = inventory_bytes(&f.root);
+    assert!(matches!(
+        acquire_published(&f, &drains, end),
+        Err(PortError::SourceIo(_))
+    ));
+    assert_eq!(inventory_bytes(&f.root), invalid);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+}
+
+#[test]
+fn published_acquisition_expiry_preserves_inventory_and_restores_scope() {
+    let (f, drains, _) = published_fixture();
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    assert!(matches!(
+        acquire_published(&f, &drains, Instant::now()),
+        Err(PortError::WriterBusy(message)) if message == "control retirement deadline reached"
+    ));
+    assert_eq!(inventory_bytes(&f.root), before);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    contender.try_lock().unwrap();
+    contender.unlock().unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    let retirement = acquire_published(&f, &drains, end).unwrap();
+    retirement.validate_marker_with_deadline(end).unwrap();
+    assert_eq!(inventory_bytes(&f.root), before);
+    assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn published_acquisition_refuses_replaced_physical_root_before_lock_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    let (f, drains, _) = published_fixture();
+    let end = Instant::now() + Duration::from_secs(30);
+    let retained = f._temp.path().join("synthetic-retained-root");
+    fs::rename(&f.root, &retained).unwrap();
+    fs::create_dir(&f.root).unwrap();
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o700)).unwrap();
+    // Use the exact published bytes: refusal must come from actual root/drains.
+    let marker = fs::read(retained.join(RETIREMENT_MARKER)).unwrap();
+    fs::write(f.root.join(RETIREMENT_MARKER), &marker).unwrap();
+    let before = inventory_bytes(f._temp.path());
+    assert!(matches!(
+        acquire_published(&f, &drains, end),
+        Err(PortError::InvalidRequest(_))
+    ));
+    assert_eq!(inventory_bytes(f._temp.path()), before);
+    assert!(!f.root.join("control-handles.lock").exists());
+}
+
 #[test]
 fn borrowed_retirement_binding_validates_repeatedly_without_unlocking_or_writing() {
     let mut f = Fixture::new();

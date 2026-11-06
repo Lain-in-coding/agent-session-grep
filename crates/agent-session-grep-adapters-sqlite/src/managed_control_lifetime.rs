@@ -276,6 +276,23 @@ impl Marker {
         PolicyEpoch::new(self.policy_epoch).map_err(|_| corrupt())?;
         retirement_tick()
     }
+
+    fn validate_expected_binding(
+        &self,
+        root_identity: RootIdentity,
+        prefix_identity: RootIdentity,
+        expected: RetirementBinding<'_>,
+    ) -> PortResult<()> {
+        if self.control_root_id != root_identity.control_id().as_str()
+            || self.prefix_root_id != prefix_identity.control_id().as_str()
+            || self.installation_id != expected.installation.as_str()
+            || self.catalog_incarnation != expected.catalog_incarnation.as_str()
+            || self.operation_id != expected.operation.as_str()
+        {
+            return Err(changed());
+        }
+        Ok(())
+    }
 }
 
 /// Owned snapshot of a real durable Uninstalling fence, held under the actual
@@ -525,6 +542,56 @@ pub struct ControlRetirement<'a> {
 }
 
 impl<'a> ControlRetirement<'a> {
+    /// Acquire only an already published retirement under the original deadline.
+    /// Requires every caller drain and the existing ControlHandles rendezvous;
+    /// pending, missing or invalid marker state is never published or repaired.
+    /// No control database is opened. The returned capability retains the real
+    /// exclusive handle drain; terminal counters still require receipt validation.
+    pub fn try_acquire_published_with_deadline(
+        root: &Path,
+        prefix: &Path,
+        installation_guard: &'a ExclusiveGuard,
+        expected: RetirementBinding<'_>,
+        drains: RetirementDrainGuards<'a>,
+        end: Instant,
+    ) -> PortResult<Self> {
+        with_retirement_deadline(end, |_| {
+            let (root_identity, prefix_identity) =
+                Self::validate_acquisition_guards(root, prefix, installation_guard, drains)?;
+            // All cooperating owners are drained and must preserve rendezvous
+            // inodes. Refuse missing state before the ordinary lock acquisition
+            // can create it; noncooperating unlink is outside managed-lock safety.
+            retirement_tick()?;
+            if !drains.policy_owner.child_exists("control-handles.lock")? {
+                return Err(changed());
+            }
+            retirement_tick()?;
+            let handles = ExclusiveGuard::try_acquire(root, LockKind::ControlHandles)?;
+            retirement_tick()?;
+            if !handles.child_exists(RETIREMENT_MARKER)?
+                || handles.child_exists(RETIREMENT_PENDING_MARKER)?
+            {
+                return Err(corrupt());
+            }
+            let marker = read_bound_marker(&handles, root, RETIREMENT_MARKER)?;
+            marker.validate_expected_binding(root_identity, prefix_identity, expected)?;
+            let retirement = Self {
+                intent: RetirementIntent {
+                    root: root.to_path_buf(),
+                    root_identity,
+                    prefix: prefix.to_path_buf(),
+                    prefix_identity,
+                    installation_guard,
+                    marker,
+                },
+                drains,
+                handles,
+            };
+            retirement.validate_marker()?;
+            Ok(retirement)
+        })
+    }
+
     /// Resume an already owned marker under the original cleanup deadline.
     /// Deadline refusal leaves pending/published bytes and caller drains intact.
     pub fn try_resume_with_deadline(
@@ -595,19 +662,8 @@ impl<'a> ControlRetirement<'a> {
         expected: RetirementBinding<'_>,
         drains: RetirementDrainGuards<'a>,
     ) -> PortResult<Self> {
-        retirement_tick()?;
-        validate_private_directory(root)?;
-        validate_prefix(prefix)?;
-        let root_identity = RootIdentity::read(root)?;
-        let prefix_identity = RootIdentity::read(prefix)?;
-        drains.validate(root, root_identity)?;
-        if installation_guard.kind()
-            != &LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY)?)
-            || installation_guard.root_identity() != prefix_identity
-        {
-            return Err(invalid());
-        }
-        installation_guard.validate_current(prefix)?;
+        let (root_identity, prefix_identity) =
+            Self::validate_acquisition_guards(root, prefix, installation_guard, drains)?;
         let handles = ExclusiveGuard::try_acquire(root, LockKind::ControlHandles)?;
         let published = handles.child_exists(RETIREMENT_MARKER)?;
         if published && handles.child_exists(RETIREMENT_PENDING_MARKER)? {
@@ -619,14 +675,7 @@ impl<'a> ControlRetirement<'a> {
             RETIREMENT_PENDING_MARKER
         };
         let marker = read_bound_marker(&handles, root, marker_name)?;
-        if marker.control_root_id != root_identity.control_id().as_str()
-            || marker.prefix_root_id != prefix_identity.control_id().as_str()
-            || marker.installation_id != expected.installation.as_str()
-            || marker.catalog_incarnation != expected.catalog_incarnation.as_str()
-            || marker.operation_id != expected.operation.as_str()
-        {
-            return Err(changed());
-        }
+        marker.validate_expected_binding(root_identity, prefix_identity, expected)?;
         let retirement = Self {
             intent: RetirementIntent {
                 root: root.to_path_buf(),
@@ -653,6 +702,28 @@ impl<'a> ControlRetirement<'a> {
         }
         retirement.validate_marker()?;
         Ok(retirement)
+    }
+
+    fn validate_acquisition_guards(
+        root: &Path,
+        prefix: &Path,
+        installation_guard: &ExclusiveGuard,
+        drains: RetirementDrainGuards<'_>,
+    ) -> PortResult<(RootIdentity, RootIdentity)> {
+        retirement_tick()?;
+        validate_private_directory(root)?;
+        validate_prefix(prefix)?;
+        let root_identity = RootIdentity::read(root)?;
+        let prefix_identity = RootIdentity::read(prefix)?;
+        drains.validate(root, root_identity)?;
+        if installation_guard.kind()
+            != &LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY)?)
+            || installation_guard.root_identity() != prefix_identity
+        {
+            return Err(invalid());
+        }
+        installation_guard.validate_current(prefix)?;
+        Ok((root_identity, prefix_identity))
     }
 
     fn validate_guards(&self) -> PortResult<()> {
