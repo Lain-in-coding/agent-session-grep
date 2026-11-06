@@ -5,18 +5,20 @@ use crate::{
     protocol::{CanonicalCode, ProtocolError},
     setup_hosts::ExpectedAsgIdentity,
 };
-use agent_session_grep_adapters_sqlite::managed_locks::RootIdentity;
+use agent_session_grep_adapters_sqlite::{
+    control::SqliteControlStore, managed_locks::RootIdentity,
+};
 use agent_session_grep_launcher::{
     CurrentPointer, ReleaseMetadata, VerifiedApplication, metadata, verify_installation,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek},
     path::{Component, Path, PathBuf},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 #[cfg(windows)]
@@ -336,7 +338,7 @@ impl ImagePin {
         Ok(())
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
     schema: String,
@@ -516,6 +518,456 @@ pub(crate) fn inspect_installation(prefix: &Path) -> Result<Installation, CliErr
 
 pub(crate) fn verify_staged_package(prefix: &Path) -> Result<(), CliError> {
     installation_for_staged(prefix).map(|_| ())
+}
+
+/// Comparison inputs for a fixed handoff intent. These contain no source path,
+/// lock proof, activation authority or claim that absent archive bytes were read.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IncomingPackageIdentity {
+    pub(crate) version: String,
+    pub(crate) target: String,
+    pub(crate) source_commit: String,
+    pub(crate) release_manifest_sha256: String,
+    pub(crate) checksums_sha256: String,
+    pub(crate) archive_sha256: String,
+    pub(crate) package_inventory_sha256: String,
+    pub(crate) current_pointer_sha256: String,
+}
+
+/// Verified extracted input, kept separate from an installed/staged receipt.
+/// It pins the original image and every admitted input; it cannot launch setup.
+pub(crate) struct VerifiedIncomingPackage {
+    _package: PackageContents,
+    identity: IncomingPackageIdentity,
+    source: PathBuf,
+    directory: File,
+    directory_identity: (u64, u64),
+    image: ImagePin,
+    inputs: Vec<IncomingFilePin>,
+    end: Instant,
+}
+
+impl VerifiedIncomingPackage {
+    pub(crate) fn identity(&self) -> &IncomingPackageIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source
+    }
+
+    pub(crate) fn recheck(&self, end: Instant) -> Result<(), CliError> {
+        let reads = PackageReadEnd::incoming(end.min(self.end));
+        reads.tick()?;
+        let named =
+            crate::native_autostart::platform::directory(&self.source).map_err(invalid_install)?;
+        if crate::native_autostart::platform::identity(&self.directory).map_err(invalid_install)?
+            != self.directory_identity
+            || crate::native_autostart::platform::identity(&named).map_err(invalid_install)?
+                != self.directory_identity
+        {
+            return Err(invalid_install("incoming root changed"));
+        }
+        self.image.recheck()?;
+        for input in &self.inputs {
+            input.recheck(reads)?;
+        }
+        let expected = self
+            .inputs
+            .iter()
+            .filter_map(|input| input.path.strip_prefix(&self.source).ok())
+            .map(relative_member)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        incoming_inventory(&self.source, &expected, reads)?;
+        self.image.recheck()?;
+        if crate::native_autostart::platform::identity(&self.directory).map_err(invalid_install)?
+            != crate::native_autostart::platform::identity(
+                &crate::native_autostart::platform::directory(&self.source)
+                    .map_err(invalid_install)?,
+            )
+            .map_err(invalid_install)?
+        {
+            return Err(invalid_install("incoming root changed"));
+        }
+        reads.tick()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackageReadEnd(Option<Instant>);
+
+impl PackageReadEnd {
+    fn incoming(end: Instant) -> Self {
+        Self(Some(SqliteControlStore::effective_runtime_deadline(end)))
+    }
+
+    fn tick(self) -> Result<(), CliError> {
+        if self.0.is_some_and(|end| Instant::now() >= end) {
+            return Err(ProtocolError::new(
+                CanonicalCode::WriterBusy,
+                "incoming package verification deadline reached",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn pin(self, path: &Path) -> Result<File, CliError> {
+        self.tick()?;
+        let file = pinned(path)?;
+        self.tick()?;
+        Ok(file)
+    }
+
+    fn bytes(self, file: &mut File, limit: u64) -> Result<Vec<u8>, CliError> {
+        if self.0.is_none() {
+            return bytes(file, limit);
+        }
+        self.tick()?;
+        if file.metadata().map_err(invalid_install)?.len() > limit {
+            return Err(invalid_install("incoming metadata size"));
+        }
+        file.rewind().map_err(invalid_install)?;
+        let mut value = Vec::new();
+        let mut buffer = [0; 65536];
+        loop {
+            self.tick()?;
+            let count = file.read(&mut buffer).map_err(invalid_install)?;
+            if count == 0 {
+                break;
+            }
+            if value.len() as u64 + count as u64 > limit {
+                return Err(invalid_install("incoming metadata size"));
+            }
+            value.extend_from_slice(&buffer[..count]);
+        }
+        self.tick()?;
+        Ok(value)
+    }
+
+    fn hash(self, file: &mut File) -> Result<String, CliError> {
+        if self.0.is_none() {
+            return hash(file);
+        }
+        self.tick()?;
+        let before = ImageStamp::read(file)?;
+        if before.len > 1024 * 1024 * 1024 {
+            return Err(invalid_install("incoming member size"));
+        }
+        file.rewind().map_err(invalid_install)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 65536];
+        let mut size = 0u64;
+        loop {
+            self.tick()?;
+            let count = file.read(&mut buffer).map_err(invalid_install)?;
+            if count == 0 {
+                break;
+            }
+            size += count as u64;
+            if size > before.len {
+                return Err(invalid_install("incoming member changed"));
+            }
+            digest.update(&buffer[..count]);
+        }
+        if size != before.len || ImageStamp::read(file)? != before {
+            return Err(invalid_install("incoming member changed"));
+        }
+        self.tick()?;
+        Ok(format!("{:x}", digest.finalize()))
+    }
+}
+
+struct IncomingPackageInputs<'a> {
+    receipt: &'a InstallReceipt,
+    manifest: &'a Path,
+    checksums: &'a Path,
+    reads: PackageReadEnd,
+}
+
+struct StageMetadataAdmission<'borrow, 'paths> {
+    strict_inventory: bool,
+    incoming: Option<&'borrow IncomingPackageInputs<'paths>>,
+}
+
+struct IncomingFilePin {
+    path: PathBuf,
+    file: File,
+    stamp: ImageStamp,
+    sha256: String,
+}
+
+fn incoming_single_link(file: &File) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata().map_err(invalid_install)?.nlink() != 1 {
+            return Err(invalid_install("incoming linked file"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: only query the borrowed live file; no handle ownership passes.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
+            || information.nNumberOfLinks != 1
+        {
+            return Err(invalid_install("incoming linked file"));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        return Err(invalid_install("incoming platform"));
+    }
+    Ok(())
+}
+
+impl IncomingFilePin {
+    fn open(path: PathBuf, sha256: String, reads: PackageReadEnd) -> Result<Self, CliError> {
+        let mut file = reads.pin(&path)?;
+        incoming_single_link(&file)?;
+        let stamp = ImageStamp::read(&file)?;
+        if reads.hash(&mut file)? != sha256 || ImageStamp::read(&file)? != stamp {
+            return Err(invalid_install("incoming input changed"));
+        }
+        Ok(Self {
+            path,
+            file,
+            stamp,
+            sha256,
+        })
+    }
+
+    fn recheck(&self, reads: PackageReadEnd) -> Result<(), CliError> {
+        reads.tick()?;
+        let mut named = reads.pin(&self.path)?;
+        incoming_single_link(&self.file)?;
+        incoming_single_link(&named)?;
+        if ImageStamp::read(&self.file)? != self.stamp
+            || ImageStamp::read(&named)? != self.stamp
+            || reads.hash(&mut named)? != self.sha256
+            || ImageStamp::read(&self.file)? != self.stamp
+        {
+            return Err(invalid_install("incoming input changed"));
+        }
+        reads.tick()
+    }
+}
+
+fn relative_member(path: &Path) -> Result<String, CliError> {
+    let name = path
+        .components()
+        .map(|component| {
+            if !matches!(component, Component::Normal(_)) {
+                return Err(invalid_install("incoming member path"));
+            }
+            component
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| invalid_install("incoming member encoding"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    if !safe_member(&name) {
+        return Err(invalid_install("incoming member path"));
+    }
+    Ok(name)
+}
+
+/// Check exact files AND their planned ancestor directories, including empty
+/// residue, without following links or allowing an unbounded directory walk.
+fn incoming_inventory(
+    source: &Path,
+    expected: &BTreeSet<String>,
+    reads: PackageReadEnd,
+) -> Result<(), CliError> {
+    let mut directories = BTreeSet::from([PathBuf::new()]);
+    for name in expected {
+        let mut parent = Path::new(name).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut folded = BTreeSet::new();
+    let mut pending = vec![PathBuf::new()];
+    let mut count = 0;
+    while let Some(relative) = pending.pop() {
+        reads.tick()?;
+        let absolute = source.join(&relative);
+        ordinary(&absolute)?;
+        let directory =
+            crate::native_autostart::platform::directory(&absolute).map_err(invalid_install)?;
+        let identity =
+            crate::native_autostart::platform::identity(&directory).map_err(invalid_install)?;
+        for entry in fs::read_dir(&absolute).map_err(invalid_install)? {
+            reads.tick()?;
+            count += 1;
+            if count > 64 {
+                return Err(invalid_install("incoming inventory capacity"));
+            }
+            let entry = entry.map_err(invalid_install)?;
+            let path = relative.join(entry.file_name());
+            let name = relative_member(&path)?;
+            if !folded.insert(name.to_ascii_lowercase()) {
+                return Err(invalid_install("incoming member alias"));
+            }
+            ordinary(&entry.path())?;
+            let meta = fs::symlink_metadata(entry.path()).map_err(invalid_install)?;
+            if meta.is_dir() && directories.contains(&path) {
+                pending.push(path);
+            } else if meta.is_file() && expected.contains(&name) {
+                seen.insert(name);
+            } else {
+                return Err(invalid_install("incoming inventory residue"));
+            }
+        }
+        if crate::native_autostart::platform::identity(
+            &crate::native_autostart::platform::directory(&absolute).map_err(invalid_install)?,
+        )
+        .map_err(invalid_install)?
+            != identity
+        {
+            return Err(invalid_install("incoming directory changed"));
+        }
+    }
+    if &seen != expected {
+        return Err(invalid_install("incoming missing member"));
+    }
+    reads.tick()
+}
+
+/// Validate an extracted package and its admitted external release metadata.
+/// The caller supplies current_exe(), never argv[0] or PATH. No install receipt
+/// is written into the input and no payload, host or lifecycle is activated.
+pub(crate) fn verify_incoming_for_handoff(
+    source: &Path,
+    manifest: &Path,
+    checksums: &Path,
+    running: &Path,
+    end: Instant,
+) -> Result<VerifiedIncomingPackage, CliError> {
+    let reads = PackageReadEnd::incoming(end);
+    reads.tick()?;
+    let end = reads.0.ok_or_else(|| invalid_install("incoming end"))?;
+    let source = absolute(source)?;
+    ordinary(&source)?;
+    let source = source.canonicalize().map_err(invalid_install)?;
+    let directory =
+        crate::native_autostart::platform::directory(&source).map_err(invalid_install)?;
+    let directory_identity =
+        crate::native_autostart::platform::identity(&directory).map_err(invalid_install)?;
+    let manifest = absolute(manifest)?;
+    let checksums = absolute(checksums)?;
+    if manifest == checksums {
+        return Err(invalid_install("incoming metadata collision"));
+    }
+    let mut manifest_file = reads.pin(&manifest)?;
+    let manifest_bytes = reads.bytes(&mut manifest_file, STAGE_METADATA_LIMIT)?;
+    let admitted: StageManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(invalid_install)?;
+    let mut checksums_file = reads.pin(&checksums)?;
+    let checksums_bytes = reads.bytes(&mut checksums_file, MAX_CHECKSUM_BYTES)?;
+    let receipt = InstallReceipt {
+        schema: "asg.package-install/v1".into(),
+        product: "agent-session-grep".into(),
+        version: admitted.release.version.clone(),
+        target: admitted.release.target.clone(),
+        source_commit: admitted.release.source_commit.clone(),
+        launcher_protocol: 1,
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+        archive_sha256: admitted.archive.sha256.clone(),
+        package_files_sha256: admitted.install_manifest_sha256.clone(),
+        current_sha256: None,
+        current_generation: None,
+        launcher_sha256: None,
+    };
+    let incoming = IncomingPackageInputs {
+        receipt: &receipt,
+        manifest: &manifest,
+        checksums: &checksums,
+        reads,
+    };
+    let running = absolute(running)?;
+    let image = ImagePin::open(running.clone())?;
+    let package = package_contents_for(
+        Some(&source),
+        Some(&running),
+        false,
+        true,
+        SchemaAdmission::Current,
+        Some(&incoming),
+    )?;
+    let member = source.join(&package.pointer.dir).join(&package.pointer.app);
+    if running.canonicalize().map_err(invalid_install)?
+        != member.canonicalize().map_err(invalid_install)?
+        || package.pointer.version != env!("CARGO_PKG_VERSION")
+    {
+        return Err(invalid_install("incoming current member"));
+    }
+    image.recheck()?;
+    let mut inventory_file = reads.pin(&source.join("PACKAGE-MANIFEST.tsv"))?;
+    let inventory_bytes = reads.bytes(&mut inventory_file, 65536)?;
+    if format!("{:x}", Sha256::digest(&inventory_bytes)) != package.package_files_sha256 {
+        return Err(invalid_install("incoming manifest changed"));
+    }
+    let inventory = Manifest::parse(&inventory_bytes)?;
+    let mut expected: BTreeMap<PathBuf, String> = inventory
+        .members
+        .iter()
+        .map(|(name, member)| (source.join(name), member.sha.clone()))
+        .collect();
+    let current_pointer_sha256 = inventory
+        .members
+        .get("current.json")
+        .ok_or_else(|| invalid_install("incoming pointer"))?
+        .sha
+        .clone();
+    for (path, digest) in [
+        (
+            source.join("PACKAGE-MANIFEST.tsv"),
+            package.package_files_sha256.clone(),
+        ),
+        (manifest, receipt.manifest_sha256.clone()),
+        (checksums, format!("{:x}", Sha256::digest(&checksums_bytes))),
+    ] {
+        if expected.insert(path, digest).is_some() {
+            return Err(invalid_install("incoming metadata overlaps member"));
+        }
+    }
+    let identity = IncomingPackageIdentity {
+        version: package.pointer.version.clone(),
+        target: package.release.target.clone(),
+        source_commit: package.release.source_commit.clone(),
+        release_manifest_sha256: package.manifest_sha256.clone(),
+        checksums_sha256: format!("{:x}", Sha256::digest(&checksums_bytes)),
+        archive_sha256: package.archive_sha256.clone(),
+        package_inventory_sha256: package.package_files_sha256.clone(),
+        current_pointer_sha256,
+    };
+    let inputs = expected
+        .into_iter()
+        .map(|(path, sha)| IncomingFilePin::open(path, sha, reads))
+        .collect::<Result<Vec<_>, _>>()?;
+    let verified = VerifiedIncomingPackage {
+        _package: package,
+        identity,
+        source,
+        directory,
+        directory_identity,
+        image,
+        inputs,
+        end,
+    };
+    verified.recheck(end)?;
+    Ok(verified)
 }
 
 pub(crate) fn verify_supervisor(prefix: &Path, executable: &Path) -> Result<(), CliError> {
@@ -700,6 +1152,59 @@ fn installation_for(
     staged: bool,
     schema_admission: SchemaAdmission,
 ) -> Result<Installation, CliError> {
+    let package = package_contents_for(
+        prefix,
+        running,
+        supervisor_entry,
+        staged,
+        schema_admission,
+        None,
+    )?;
+    let application = verify_installation(&package.prefix).map_err(invalid_install)?;
+    Ok(Installation {
+        prefix: package.prefix,
+        pointer: package.pointer,
+        release: package.release,
+        package_files_sha256: package.package_files_sha256,
+        manifest_sha256: package.manifest_sha256,
+        archive_sha256: package.archive_sha256,
+        helpers: package.helpers,
+        launcher: package.launcher,
+        expected: package.expected,
+        supervisor: package.supervisor,
+        _application: application,
+        _guards: package.guards,
+        _metadata: package.metadata,
+    })
+}
+
+/// Common checked package contents, without a launchable application or a
+/// public unchecked constructor. Installed APIs add their existing launch pin.
+struct PackageContents {
+    prefix: PathBuf,
+    pointer: CurrentPointer,
+    release: ReleaseMetadata,
+    package_files_sha256: String,
+    manifest_sha256: String,
+    archive_sha256: String,
+    helpers: BTreeMap<String, InstalledHelper>,
+    launcher: PathBuf,
+    expected: ExpectedAsgIdentity,
+    supervisor: Option<(PathBuf, String)>,
+    guards: Vec<File>,
+    metadata: Vec<File>,
+}
+
+fn package_contents_for(
+    prefix: Option<&Path>,
+    running: Option<&Path>,
+    supervisor_entry: bool,
+    staged: bool,
+    schema_admission: SchemaAdmission,
+    incoming: Option<&IncomingPackageInputs<'_>>,
+) -> Result<PackageContents, CliError> {
+    let reads = incoming.map_or(PackageReadEnd(None), |input| input.reads);
+    reads.tick()?;
     let prefix = match prefix {
         Some(path) => absolute(path)?,
         None => running_prefix(running.ok_or_else(|| invalid_install("app location"))?)?,
@@ -707,10 +1212,16 @@ fn installation_for(
     ordinary(&prefix)?;
     let mut metadata_files = Vec::new();
     let mut guard_files = Vec::new();
-    let mut receipt_file = pinned(&prefix.join("package-install.json"))?;
-    let receipt: InstallReceipt =
-        serde_json::from_slice(&bytes(&mut receipt_file, 8192)?).map_err(invalid_install)?;
-    metadata_files.push(receipt_file);
+    let receipt = match incoming {
+        Some(input) => input.receipt.clone(),
+        None => {
+            let mut file = reads.pin(&prefix.join("package-install.json"))?;
+            let receipt: InstallReceipt =
+                serde_json::from_slice(&reads.bytes(&mut file, 8192)?).map_err(invalid_install)?;
+            metadata_files.push(file);
+            receipt
+        }
+    };
     if !matches!(
         receipt.schema.as_str(),
         "asg.package-install/v1" | "asg.package-install/v2"
@@ -736,15 +1247,15 @@ fn installation_for(
     {
         return Err(invalid_install("unexpected receipt overrides"));
     }
-    let mut manifest_file = pinned(&prefix.join("PACKAGE-MANIFEST.tsv"))?;
-    let content = bytes(&mut manifest_file, 65536)?;
+    let mut manifest_file = reads.pin(&prefix.join("PACKAGE-MANIFEST.tsv"))?;
+    let content = reads.bytes(&mut manifest_file, 65536)?;
     if format!("{:x}", Sha256::digest(&content)) != receipt.package_files_sha256 {
         return Err(invalid_install("file manifest digest"));
     }
     let manifest = Manifest::parse(&content)?;
     metadata_files.push(manifest_file);
-    let mut pointer_file = pinned(&prefix.join("current.json"))?;
-    let pointer_bytes = bytes(&mut pointer_file, 8192)?;
+    let mut pointer_file = reads.pin(&prefix.join("current.json"))?;
+    let pointer_bytes = reads.bytes(&mut pointer_file, 8192)?;
     let pointer = CurrentPointer::parse(&pointer_bytes).map_err(invalid_install)?;
     if updated
         && (receipt.current_sha256.as_deref()
@@ -756,8 +1267,8 @@ fn installation_for(
     metadata_files.push(pointer_file);
     let release_name = format!("{}/release.json", pointer.dir);
     let app_name = format!("{}/{}", pointer.dir, pointer.app);
-    let mut release_file = pinned(&prefix.join(&release_name))?;
-    let release = ReleaseMetadata::parse(&bytes(&mut release_file, 8192)?, &pointer)
+    let mut release_file = reads.pin(&prefix.join(&release_name))?;
+    let release = ReleaseMetadata::parse(&reads.bytes(&mut release_file, 8192)?, &pointer)
         .map_err(invalid_install)?;
     metadata_files.push(release_file);
     if (running.is_some()
@@ -884,6 +1395,7 @@ fn installation_for(
         })
         .collect();
     for (name, member) in &manifest.members {
+        reads.tick()?;
         let executable = name == metadata::APP_NAME
             || name == alias
             || name == &app_name
@@ -893,8 +1405,8 @@ fn installation_for(
         if member.mode != if executable { "0755" } else { "0644" } {
             return Err(invalid_install("mode"));
         }
-        let mut file = pinned(&prefix.join(name))?;
-        let actual_hash = hash(&mut file)?;
+        let mut file = reads.pin(&prefix.join(name))?;
+        let actual_hash = reads.hash(&mut file)?;
         let override_hash = if updated && name == "current.json" {
             receipt.current_sha256.as_ref()
         } else if updated && (name == metadata::APP_NAME || name == alias) {
@@ -982,7 +1494,7 @@ fn installation_for(
             return Err(invalid_install("supervisor executable"));
         }
     } else if let Some(running) = running
-        && hash(&mut pinned(running)?)? != pointer.app_sha256
+        && reads.hash(&mut reads.pin(running)?)? != pointer.app_sha256
     {
         return Err(invalid_install("program identity"));
     }
@@ -997,10 +1509,10 @@ fn installation_for(
             Err(error) => return Err(invalid_install(error)),
         }
     }
-    if release_metadata_count == 1 {
+    if incoming.is_none() && release_metadata_count == 1 {
         return Err(invalid_install("incomplete release metadata"));
     }
-    if staged || updated || release_metadata_count == 2 {
+    if incoming.is_some() || staged || updated || release_metadata_count == 2 {
         let (stage_manifest, stage_checksums) = verify_stage_metadata(
             &prefix,
             &manifest.members,
@@ -1008,19 +1520,22 @@ fn installation_for(
             &content,
             &receipt,
             &release,
-            staged,
+            StageMetadataAdmission {
+                strict_inventory: staged,
+                incoming,
+            },
         )?;
         metadata_files.push(stage_manifest);
         metadata_files.push(stage_checksums);
     }
-    let application = verify_installation(&prefix).map_err(invalid_install)?;
     let launcher = prefix.join(metadata::APP_NAME);
     let expected_identity = ExpectedAsgIdentity {
         version: pointer.version.clone(),
         launcher_sha256: launcher_hash.clone(),
     };
     let supervisor = supervisor.map(|(name, digest)| (prefix.join(name), digest));
-    Ok(Installation {
+    reads.tick()?;
+    Ok(PackageContents {
         prefix,
         pointer,
         release,
@@ -1031,9 +1546,8 @@ fn installation_for(
         launcher,
         expected: expected_identity,
         supervisor,
-        _application: application,
-        _guards: guard_files,
-        _metadata: metadata_files,
+        guards: guard_files,
+        metadata: metadata_files,
     })
 }
 /// Exact regular-file inventory of a staged root; links and devices fail.
@@ -1080,10 +1594,18 @@ fn verify_stage_metadata(
     package_manifest: &[u8],
     receipt: &InstallReceipt,
     release: &ReleaseMetadata,
-    strict_inventory: bool,
+    admission: StageMetadataAdmission<'_, '_>,
 ) -> Result<(File, File), CliError> {
-    let mut manifest_file = pinned(&prefix.join(STAGE_MANIFEST))?;
-    let manifest_bytes = bytes(&mut manifest_file, STAGE_METADATA_LIMIT)?;
+    let incoming = admission.incoming;
+    let reads = incoming.map_or(PackageReadEnd(None), |input| input.reads);
+    let manifest_path = incoming
+        .map(|input| input.manifest.to_path_buf())
+        .unwrap_or_else(|| prefix.join(STAGE_MANIFEST));
+    let checksums_path = incoming
+        .map(|input| input.checksums.to_path_buf())
+        .unwrap_or_else(|| prefix.join(STAGE_CHECKSUMS));
+    let mut manifest_file = reads.pin(&manifest_path)?;
+    let manifest_bytes = reads.bytes(&mut manifest_file, STAGE_METADATA_LIMIT)?;
     let stage: StageManifest = serde_json::from_slice(&manifest_bytes).map_err(invalid_install)?;
     if format!("{:x}", Sha256::digest(&manifest_bytes)) != receipt.manifest_sha256 {
         return Err(invalid_install("stage manifest digest"));
@@ -1144,6 +1666,7 @@ fn verify_stage_metadata(
     }
     let mut seen = BTreeSet::new();
     for file in &stage.archive.files {
+        reads.tick()?;
         let relative = file
             .name
             .strip_prefix(&root_prefix)
@@ -1161,23 +1684,32 @@ fn verify_stage_metadata(
         }
     }
     let mut expected: BTreeSet<String> = members.keys().cloned().collect();
-    for name in [
-        "PACKAGE-MANIFEST.tsv",
-        "package-install.json",
-        STAGE_MANIFEST,
-        STAGE_CHECKSUMS,
-    ] {
-        expected.insert(name.to_owned());
-    }
-    if strict_inventory && stage_inventory(prefix)? != expected {
-        return Err(invalid_install("stage inventory"));
+    expected.insert("PACKAGE-MANIFEST.tsv".into());
+    if incoming.is_some() {
+        for path in [&manifest_path, &checksums_path] {
+            if let Ok(relative) = path.strip_prefix(prefix)
+                && !expected.insert(relative_member(relative)?)
+            {
+                return Err(invalid_install("incoming metadata member collision"));
+            }
+        }
+        incoming_inventory(prefix, &expected, reads)?;
+    } else {
+        for name in ["package-install.json", STAGE_MANIFEST, STAGE_CHECKSUMS] {
+            expected.insert(name.to_owned());
+        }
+        if admission.strict_inventory && stage_inventory(prefix)? != expected {
+            return Err(invalid_install("stage inventory"));
+        }
     }
     let manifest_digest = format!("{:x}", Sha256::digest(&manifest_bytes));
-    let mut checksums_file = pinned(&prefix.join(STAGE_CHECKSUMS))?;
-    let checksums = parse_release_checksums(&bytes(&mut checksums_file, MAX_CHECKSUM_BYTES)?)?;
+    let mut checksums_file = reads.pin(&checksums_path)?;
+    let checksums =
+        parse_release_checksums(&reads.bytes(&mut checksums_file, MAX_CHECKSUM_BYTES)?)?;
     validate_checksum_assets(&checksums, &stage.release.version)?;
     let (mut manifest_seen, mut archive_seen) = (false, false);
     for (name, sha) in &checksums {
+        reads.tick()?;
         let expected = if *name == format!("{}.manifest.json", stage.archive.root) {
             manifest_seen = true;
             Some(manifest_digest.as_str())
@@ -1561,6 +2093,176 @@ mod tests {
             serde_json::to_vec(&value).unwrap(),
         )
         .unwrap();
+    }
+
+    fn incoming_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, FixtureMembers) {
+        let source = root.join("incoming");
+        fs::create_dir(&source).unwrap();
+        let (members, _) = fixture(&source);
+        // An extracted package has no installation receipt. Release verification
+        // inputs are siblings supplied by the caller, not injected into source.
+        fs::remove_file(source.join("package-install.json")).unwrap();
+        let manifest = root.join("candidate.manifest.json");
+        let checksums = root.join("candidate.SHA256SUMS");
+        fs::rename(source.join(STAGE_MANIFEST), &manifest).unwrap();
+        fs::rename(source.join(STAGE_CHECKSUMS), &checksums).unwrap();
+        let running = source.join(version_dir()).join(metadata::APP_NAME);
+        (source, manifest, checksums, running, members)
+    }
+
+    #[test]
+    fn incoming_handoff_verifies_extracted_source_without_an_install_receipt() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, members) = incoming_fixture(&root);
+        let before: BTreeMap<_, _> = members
+            .keys()
+            .map(|name| (name.clone(), fs::read(source.join(name)).unwrap()))
+            .collect();
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        assert_eq!(verified.source_root(), source);
+        assert_eq!(verified.identity().version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(verified.identity().target, target());
+        assert_eq!(verified.identity().source_commit, "a".repeat(40));
+        assert_eq!(
+            verified.identity().release_manifest_sha256,
+            digest(&fs::read(&manifest).unwrap())
+        );
+        assert_eq!(
+            verified.identity().checksums_sha256,
+            digest(&fs::read(&checksums).unwrap())
+        );
+        assert_eq!(verified.identity().archive_sha256, "d".repeat(64));
+        assert_eq!(
+            verified.identity().current_pointer_sha256,
+            digest(&members["current.json"].0)
+        );
+        assert_eq!(
+            verified.identity().package_inventory_sha256,
+            digest(&fs::read(source.join("PACKAGE-MANIFEST.tsv")).unwrap())
+        );
+        let public_comparison = serde_json::to_string(verified.identity()).unwrap();
+        assert!(!public_comparison.contains(&root.to_string_lossy().into_owned()));
+        verified.recheck(end).unwrap();
+        for (name, bytes) in before {
+            assert_eq!(fs::read(source.join(name)).unwrap(), bytes);
+        }
+        assert!(!source.join("package-install.json").exists());
+        assert!(!source.join(STAGE_MANIFEST).exists());
+        assert!(!source.join(STAGE_CHECKSUMS).exists());
+        // This new admission must not turn ordinary staging into receipt fallback.
+        assert!(installation_for_staged(&source).is_err());
+    }
+
+    #[test]
+    fn incoming_handoff_refuses_same_bytes_outside_the_selected_member() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let other = root.join("other-image");
+        write(&root, "other-image", &fs::read(&running).unwrap(), "0755");
+        assert_eq!(fs::read(&other).unwrap(), fs::read(&running).unwrap());
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        assert!(matches!(
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &other, end),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        assert!(verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).is_ok());
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_handoff_refuses_unknown_empty_directory_and_changed_inputs() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let extra = source.join("unowned-empty");
+        fs::create_dir(&extra).unwrap();
+        assert!(
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).is_err()
+        );
+        fs::remove_dir(&extra).unwrap();
+        let checksum_bytes = fs::read(&checksums).unwrap();
+        let mut changed = checksum_bytes.clone();
+        changed[0] = if changed[0] == b'0' { b'1' } else { b'0' };
+        fs::write(&checksums, changed).unwrap();
+        assert!(
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).is_err()
+        );
+        fs::write(&checksums, checksum_bytes).unwrap();
+        let readme = source.join("README.md");
+        let original = fs::read(&readme).unwrap();
+        fs::write(&readme, b"changed synthetic document").unwrap();
+        assert!(
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).is_err()
+        );
+        fs::write(&readme, original).unwrap();
+        assert!(verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).is_ok());
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_handoff_recheck_refuses_residue_or_same_bytes_on_a_new_inode() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let extra = source.join("unowned-empty");
+        fs::create_dir(&extra).unwrap();
+        assert!(verified.recheck(end).is_err());
+        fs::remove_dir(extra).unwrap();
+        verified.recheck(end).unwrap();
+        let readme = source.join("README.md");
+        let original = fs::read(&readme).unwrap();
+        let displaced = root.join("original-readme");
+        match fs::rename(&readme, &displaced) {
+            Ok(()) => {
+                write(&source, "README.md", &original, "0644");
+                assert_eq!(fs::read(&readme).unwrap(), original);
+                assert!(verified.recheck(end).is_err());
+            }
+            #[cfg(windows)]
+            Err(error) => {
+                // These pins share read access only. Windows may report the
+                // denied rename as access denied or a sharing violation;
+                // ErrorKind alone does not distinguish the latter reliably.
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+                assert_eq!(fs::read(&readme).unwrap(), original);
+                assert!(!displaced.exists());
+                verified.recheck(end).unwrap();
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("{error}"),
+        }
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_handoff_expired_entry_and_recheck_keep_the_original_end() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let missing = root.join("missing");
+        let expired = Instant::now();
+        assert!(matches!(
+            verify_incoming_for_handoff(&missing, &missing, &missing, &missing, expired),
+            Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
+        ));
+        assert!(!missing.exists());
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        assert!(matches!(
+            verified.recheck(expired),
+            Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
+        ));
+        verified.recheck(end).unwrap();
+        assert!(!source.join("package-install.json").exists());
     }
 
     #[test]
