@@ -321,6 +321,7 @@ pub(super) fn prepare(
     end: Instant,
 ) -> Result<(), Reason> {
     journal.validate_roots(end)?;
+    require_completed_path(journal)?;
     if journal.state.after_exit.is_some() {
         return Ok(());
     }
@@ -770,6 +771,20 @@ pub(super) fn schedule(
     let catalog = package_installation::absolute(Path::new(db))?;
     let mut journal = open_journal(&prefix, &catalog, end)?;
     let lock = update_state::acquire_installation_lock(&prefix, end)?;
+    if !journal.state.report.path_cleanup_complete()
+        || journal
+            .state
+            .report
+            .reasons
+            .contains(&Reason::PathConfigurationRetained)
+    {
+        journal
+            .state
+            .report
+            .pending(Reason::PathConfigurationRetained);
+        journal.save_before_deadline(end)?;
+        return Ok(journal.state.report);
+    }
     let result = (|| -> Result<(), Reason> {
         let seal = read_seal(&journal, end)?;
         let mut plan = journal
@@ -1006,6 +1021,8 @@ fn run_child(
     let runner_owner = exit_lock(&journal.root, &plan.runner_exit, &seal.policy, end, false)?;
     let installation = update_state::acquire_installation_lock(prefix, end)
         .map_err(|_| Reason::AfterExitCleanupPending)?;
+    validate_installation_guard(&journal, &installation, end)?;
+    require_completed_path(&journal)?;
     if recover {
         plan.deadline_tick = Some(tick);
         journal.state.after_exit = Some(plan);
@@ -1767,6 +1784,7 @@ fn finalize(
 ) -> Result<(), Reason> {
     let end = SqliteControlStore::effective_runtime_deadline(end);
     validate_installation_guard(journal, installation, end)?;
+    require_completed_path(journal)?;
     let mut guards = drain_owners(journal, end)?;
     let kept_control = if journal.state.owner.keep_data {
         Some(
@@ -1982,6 +2000,19 @@ fn finalize(
         };
         preflight_uninstall_completion(journal, &mut completion_guards, &mode, end)?;
         journal.publish_completion(end)?;
+    }
+    Ok(())
+}
+
+fn require_completed_path(journal: &Journal) -> Result<(), Reason> {
+    if !journal.state.report.path_cleanup_complete()
+        || journal
+            .state
+            .report
+            .reasons
+            .contains(&Reason::PathConfigurationRetained)
+    {
+        return Err(Reason::PathConfigurationRetained);
     }
     Ok(())
 }
@@ -2717,6 +2748,16 @@ pub(super) fn recover_public(
     };
     if state.owner.keep_data != keep_data {
         return Err(error(CanonicalCode::InvalidRequest));
+    }
+    // An older partial plan does not bypass the unfinished native PATH
+    // transaction. Re-enter the package-verified coordinator with its nonce.
+    if !state.report.path_cleanup_complete()
+        || state
+            .report
+            .reasons
+            .contains(&Reason::PathConfigurationRetained)
+    {
+        return Ok(None);
     }
     if state.after_exit.is_none() {
         return Ok(None);

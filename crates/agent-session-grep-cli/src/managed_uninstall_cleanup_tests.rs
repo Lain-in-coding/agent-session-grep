@@ -586,6 +586,20 @@ impl PackageFixture {
         journal.state.purge_prerequisite_complete = true;
         fence(control, &installation, &mut journal, deadline()).unwrap();
         journal.save(deadline()).unwrap();
+        let path = remove_path_current(&UninstallPathAuthority {
+            journal: &journal,
+            control,
+            install: &install,
+            prefix_guard: &install_lock,
+            installation: &installation,
+            root: &self.root,
+            end: deadline(),
+        })
+        .unwrap();
+        assert_eq!(path["reason"], "unowned");
+        assert_eq!(path["installation_bound"], true);
+        journal.state.report.path = Some(path);
+        journal.save(deadline()).unwrap();
         journal.state.private_metadata =
             classify_private(&install, control, &journal, deadline()).unwrap();
         if keep {
@@ -1365,6 +1379,63 @@ fn package_fixture_for_finalize(keep: bool) -> (PackageFixture, Journal) {
         terminal_handoff(&mut journal, &intent, cleanup.retirement(), deadline()).unwrap();
     }
     (fixture, journal)
+}
+
+#[test]
+fn pending_path_blocks_existing_helper_plan_before_prepare_or_finalize_effects() {
+    for keep in [false, true] {
+        let (fixture, mut journal) = package_fixture_for_finalize(keep);
+        let seal = read_seal(&journal, deadline()).unwrap();
+        let parent = exit_lock(
+            &journal.root,
+            &seal.parent_exit,
+            &seal.policy,
+            deadline(),
+            false,
+        )
+        .unwrap();
+        let runner = exit_lock(
+            &journal.root,
+            &seal.runner_exit,
+            &seal.policy,
+            deadline(),
+            false,
+        )
+        .unwrap();
+        let installation =
+            update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+        for path in [
+            json!({"status": "incomplete", "reason": "recovery_required", "installation_bound": true}),
+            json!({"status": "complete", "registration_present": false, "installation_bound": true}),
+        ] {
+            journal.state.report.path = Some(path);
+            journal
+                .state
+                .report
+                .pending(Reason::PathConfigurationRetained);
+            journal.save(deadline()).unwrap();
+            let before = borrowed_keep_data_inventory(&fixture);
+            let (result, drains) = crate::uninstall_command::tests::observe_drain_calls(|| {
+                finalize(
+                    &mut journal,
+                    &seal,
+                    &installation,
+                    &parent,
+                    &runner,
+                    deadline(),
+                )
+            });
+            assert_eq!(result, Err(Reason::PathConfigurationRetained));
+            assert_eq!(drains, 0);
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+            let install = fixture.install();
+            assert_eq!(
+                prepare(&install, &mut journal, deadline()),
+                Err(Reason::PathConfigurationRetained)
+            );
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        }
+    }
 }
 
 /// Produce completed synthetic receipts without executing a helper or service.

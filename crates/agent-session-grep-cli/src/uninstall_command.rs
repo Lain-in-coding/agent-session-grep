@@ -75,6 +75,7 @@ const MAX_FILE: u64 = 16 * 1024 * 1024 * 1024;
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CleanupAdmissionEvent {
+    DrainEntered,
     ExitWouldBlock(PathBuf),
     GuardWouldBlock(PathBuf, LockKind),
     WriterWouldBlock(PathBuf),
@@ -257,6 +258,12 @@ impl Report {
         if !self.reasons.contains(&reason) {
             self.reasons.push(reason);
         }
+    }
+    fn path_cleanup_complete(&self) -> bool {
+        self.path.as_ref().is_some_and(|path| {
+            (path["status"] == "complete" && path["registration_present"] == false)
+                || (path["reason"] == "unowned" && path["installation_bound"] == true)
+        })
     }
     fn outcome(&self) -> Outcome {
         if self.cleanup_pending {
@@ -1035,14 +1042,13 @@ pub(crate) fn run(
             started + BUDGET,
             &mut |prefix| package_installation::installation(prefix),
             &mut local_execute,
-            &mut |catalog, prefix, end| {
-                serde_json::to_value(path_command::remove_owned(catalog, prefix, end))
-                    .map_err(|_| error(CanonicalCode::Internal))
-            },
+            &mut remove_path_current,
         )?
     };
     if report.private_cleanup_receipt_recorded
         && report.after_exit_cleanup_pending
+        && report.path_cleanup_complete()
+        && !report.reasons.contains(&Reason::PathConfigurationRetained)
         && !was_recovered
         && let Ok(updated) = managed_uninstall_cleanup::schedule(
             db,
@@ -1197,7 +1203,132 @@ fn fence(
         }
     }
 }
-type PathRemoval<'a> = dyn FnMut(&Path, &Path, Instant) -> Result<Value, CliError> + 'a;
+/// This capability can only be assembled by the uninstall coordinator while
+/// it retains the original journal, verified package and installation lock.
+/// Recorded IDs are comparison data; none can substitute for these borrows.
+pub(crate) struct UninstallPathAuthority<'a, 'guard> {
+    journal: &'a Journal,
+    control: &'a SqliteControlStore,
+    install: &'a Installation,
+    prefix_guard: &'a ExclusiveGuard,
+    installation: &'a InstallationLockAuthority<'guard>,
+    root: &'a Path,
+    end: Instant,
+}
+
+impl UninstallPathAuthority<'_, '_> {
+    pub(crate) fn end(&self) -> Instant {
+        SqliteControlStore::effective_runtime_deadline(self.end)
+    }
+    pub(crate) fn root(&self) -> &Path {
+        self.root
+    }
+    pub(crate) fn prefix(&self) -> &Path {
+        &self.install.prefix
+    }
+    pub(crate) fn installation_id(&self) -> &str {
+        self.installation.installation_id().as_str()
+    }
+    pub(crate) fn root_identity(&self) -> RootIdentity {
+        self.journal.data_identity
+    }
+    pub(crate) fn prefix_identity(&self) -> RootIdentity {
+        self.journal.prefix_identity
+    }
+    pub(crate) fn validate_roots(&self) -> Result<(), path_command::PathReason> {
+        use path_command::PathReason;
+        self.journal
+            .validate_roots(self.end())
+            .map_err(uninstall_path_reason)?;
+        if !self.journal.state.report.maintenance_fenced
+            || self.journal.receipt_digest.is_none()
+            || self.journal.state.sequence == 0
+            || self.root
+                != self
+                    .journal
+                    .catalog
+                    .parent()
+                    .ok_or(PathReason::IdentityChanged)?
+            || self.install.prefix != self.journal.prefix
+            || self.installation_id() != self.journal.state.owner.installation_id
+            || self.prefix_guard.root_identity() != self.journal.prefix_identity
+        {
+            return Err(PathReason::IdentityChanged);
+        }
+        self.prefix_guard
+            .validate_current(&self.install.prefix)
+            .map_err(|_| PathReason::BindingChanged)?;
+        Ok(())
+    }
+    pub(crate) fn validate(&self, owner: &ExclusiveGuard) -> Result<(), path_command::PathReason> {
+        use path_command::PathReason;
+        self.validate_roots()?;
+        let end = self.end();
+        let policy = self
+            .journal
+            .validate(self.control, end)
+            .map_err(uninstall_path_reason)?;
+        if policy.maintenance.state != MaintenanceState::Uninstalling
+            || policy.maintenance.owner.as_ref().map(ControlId::as_str)
+                != Some(self.journal.state.owner.nonce.as_str())
+            || policy.maintenance.phase != Some(MaintenancePhase::Quiescing)
+        {
+            return Err(PathReason::MaintenanceActive);
+        }
+        let check_file = || {
+            let file = platform::open_file(&self.journal.catalog)
+                .map_err(|_| PathReason::IdentityChanged)?;
+            if platform::identity(&file).map_err(|_| PathReason::IdentityChanged)?
+                != self.journal.state.catalog_file_identity
+            {
+                return Err(PathReason::IdentityChanged);
+            }
+            Ok(())
+        };
+        check_file()?;
+        let operation = ControlId::parse(&self.journal.state.owner.nonce)
+            .map_err(|_| PathReason::IdentityChanged)?;
+        let identity = agent_session_grep_adapters_sqlite::managed_maintenance::inspect_uninstall_catalog_identity(
+            self.control,
+            &self.journal.catalog,
+            self.installation,
+            owner,
+            &operation,
+            end,
+        )
+        .map_err(|value| match value {
+            PortError::WriterBusy(_) | PortError::DeadlineExceeded(_) if Instant::now() >= end => {
+                PathReason::Timeout
+            }
+            PortError::WriterBusy(_) => PathReason::Busy,
+            _ => PathReason::IdentityChanged,
+        })?;
+        if identity.incarnation.as_str() != self.journal.state.catalog_incarnation
+            || identity.installation != *self.installation.installation_id()
+        {
+            return Err(PathReason::IdentityChanged);
+        }
+        check_file()?;
+        self.validate_roots()
+    }
+}
+
+fn uninstall_path_reason(reason: Reason) -> path_command::PathReason {
+    use path_command::PathReason;
+    match reason {
+        Reason::Deadline => PathReason::Timeout,
+        Reason::MaintenanceConflict => PathReason::MaintenanceActive,
+        Reason::ControlCleanupPending => PathReason::Busy,
+        _ => PathReason::IdentityChanged,
+    }
+}
+
+fn remove_path_current(authority: &UninstallPathAuthority<'_, '_>) -> Result<Value, CliError> {
+    serde_json::to_value(path_command::remove_owned_for_uninstall(authority))
+        .map_err(|_| error(CanonicalCode::Internal))
+}
+
+type PathRemoval<'a> = dyn FnMut(&UninstallPathAuthority<'_, '_>) -> Result<Value, CliError> + 'a;
 fn execute(
     db: &str,
     options: Options,
@@ -1255,7 +1386,7 @@ fn execute(
         (incarnation, identity)
     };
     drop(first_lock);
-    let mut path = prior
+    let path = prior
         .as_ref()
         .filter(|state| state.report.maintenance_fenced)
         .and_then(|state| state.report.path.clone());
@@ -1298,24 +1429,38 @@ fn execute(
     // PATH is external state that setup can recreate. Mutate it only after the
     // durable Uninstalling fence is visible, and resume an unfinished PATH
     // transition on the same fenced journal.
-    if path
-        .as_ref()
-        .is_none_or(|path| path["status"] != "complete" && path["reason"] != "unowned")
+    if !journal.state.report.path_cleanup_complete()
+        || journal
+            .state
+            .report
+            .reasons
+            .contains(&Reason::PathConfigurationRetained)
     {
-        path = Some(remove_path(&catalog, &install.prefix, end)?);
-        journal.state.report.path = path.clone();
+        let authority = UninstallPathAuthority {
+            journal: &journal,
+            control: &control,
+            install: &install,
+            prefix_guard: &lock,
+            installation: &installation,
+            root,
+            end,
+        };
+        journal.state.report.path = Some(remove_path(&authority)?);
+        if journal.state.report.path_cleanup_complete() {
+            journal
+                .state
+                .report
+                .reasons
+                .retain(|reason| *reason != Reason::PathConfigurationRetained);
+        }
     }
-    if journal
-        .state
-        .report
-        .path
-        .as_ref()
-        .is_some_and(|path| path["status"] != "complete" && path["reason"] != "unowned")
-    {
+    if !journal.state.report.path_cleanup_complete() {
         journal
             .state
             .report
             .pending(Reason::PathConfigurationRetained);
+        journal.save_before_deadline(end)?;
+        return Ok(journal.state.report);
     }
     journal.save(end)?;
     let retirement = if options.keep_data {
@@ -2136,6 +2281,8 @@ fn cleanup_data(
     Ok(guards)
 }
 fn drain_owners(journal: &mut Journal, end: Instant) -> Result<CleanupGuards, Reason> {
+    #[cfg(test)]
+    observe_cleanup_admission(CleanupAdmissionEvent::DrainEntered, end);
     let root = journal
         .catalog
         .parent()
@@ -2550,6 +2697,20 @@ fn resume_terminal(
     }
     let lock = update_state::acquire_installation_lock(&install.prefix, end)?;
     let mut journal = Journal::resume(install, catalog, state, end)?;
+    if !journal.state.report.path_cleanup_complete()
+        || journal
+            .state
+            .report
+            .reasons
+            .contains(&Reason::PathConfigurationRetained)
+    {
+        journal
+            .state
+            .report
+            .pending(Reason::PathConfigurationRetained);
+        journal.save_before_deadline(end)?;
+        return Ok(journal.state.report);
+    }
     let result = (|| -> Result<(), Reason> {
         let guards = drain_owners(&mut journal, end)?;
         let installation = ControlId::parse(&journal.state.owner.installation_id)

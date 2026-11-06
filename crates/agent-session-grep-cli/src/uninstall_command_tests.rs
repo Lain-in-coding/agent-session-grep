@@ -348,7 +348,7 @@ impl Fixture {
                 self.native_calls.borrow_mut().push(args.to_vec());
                 Err(native_manager::ErrorCode::Unavailable.into())
             },
-            &mut |_, _, _| {
+            &mut |_| {
                 self.path_calls.set(self.path_calls.get() + 1);
                 Ok(json!({"status":"complete","registration_present":false,"owned":true}))
             },
@@ -480,7 +480,7 @@ fn path_removal_runs_only_after_the_uninstalling_fence() {
         deadline(),
         &mut |_| Ok(fixture.installation()),
         &mut |_, _, _| Err(native_manager::ErrorCode::Unavailable.into()),
-        &mut |_, _, _| {
+        &mut |_| {
             assert_eq!(
                 control_status(&fixture.control).policy.maintenance.state,
                 MaintenanceState::Uninstalling
@@ -491,6 +491,337 @@ fn path_removal_runs_only_after_the_uninstalling_fence() {
     .unwrap();
     assert!(report.maintenance_fenced);
     fixture.preserved();
+}
+
+fn prepare_owned_path(fixture: &Fixture) -> path_command::UninstallFixture {
+    let target = path_command::UninstallFixture::new();
+    let report = target.prepare(&fixture.catalog, fixture.installation());
+    assert_eq!(
+        report.status, "complete",
+        "PATH preparation: {:?}",
+        report.reason
+    );
+    assert_eq!(report.owned, Some(true));
+    assert!(report.private_receipt_recorded);
+    target
+}
+
+fn assert_prefix_still_locked(prefix: &Path) {
+    let path = prefix.join("maintenance-job-696e7374616c6c6174696f6e2d757064617465.lock");
+    std::thread::spawn(move || {
+        let file = platform::open_file(&path).unwrap();
+        assert!(matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    })
+    .join()
+    .unwrap();
+}
+
+fn execute_path(fixture: &Fixture, remove_path: &mut PathRemoval<'_>) -> Report {
+    execute(
+        fixture.catalog.to_str().unwrap(),
+        Options {
+            keep_data: true,
+            prefix: Some(fixture.prefix.clone()),
+        },
+        Instant::now() + BUDGET,
+        &mut |_| Ok(fixture.installation()),
+        &mut |_, args, _| {
+            fixture.native_calls.borrow_mut().push(args.to_vec());
+            Err(native_manager::ErrorCode::Unavailable.into())
+        },
+        remove_path,
+    )
+    .unwrap()
+}
+
+pub(super) fn observe_drain_calls<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+    struct Restore(Option<CleanupAdmissionObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLEANUP_ADMISSION_OBSERVER.with_borrow_mut(|slot| *slot = self.0.take());
+        }
+    }
+    let count = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&count);
+    let _restore = Restore(CLEANUP_ADMISSION_OBSERVER.with_borrow_mut(|slot| {
+        slot.replace(Box::new(move |event, _| {
+            if event == CleanupAdmissionEvent::DrainEntered {
+                observed.set(observed.get() + 1);
+            }
+        }))
+    }));
+    (operation(), count.get())
+}
+
+fn path_intents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fs::read_dir(root.join("user-path"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path().join("intent.json");
+            path.is_file()
+                .then(|| (path.clone(), fs::read(path).unwrap()))
+        })
+        .collect()
+}
+
+fn assert_path_stopped_cleanup(fixture: &Fixture, report: &Report) {
+    assert!(report.maintenance_fenced);
+    assert!(report.reasons.contains(&Reason::PathConfigurationRetained));
+    assert!(!report.corpus_removed && !report.continuation_cache_cleared);
+    assert!(!report.emission_drained && !report.catalog_drained && !report.writer_drained);
+    assert!(fixture.native_calls.borrow().is_empty());
+    assert!(!fixture.root.join(RETIREMENT_MARKER).exists());
+    assert!(!fixture.root.join(RETIREMENT_PENDING_MARKER).exists());
+    let state = read_deferred_cleanup(&fixture.prefix, &fixture.catalog, deadline())
+        .unwrap()
+        .unwrap();
+    assert!(state.after_exit.is_none());
+    assert!(!state.retirement_intent_captured);
+    assert!(state.groups.is_empty());
+    fixture.preserved();
+}
+
+#[test]
+fn real_uninstall_path_borrows_the_prefix_and_preserves_independent_settings() {
+    let fixture = Fixture::new();
+    let target = prepare_owned_path(&fixture);
+    target.append_independent_setting();
+    let mut called = false;
+    let report = execute_path(&fixture, &mut |authority| {
+        called = true;
+        assert_prefix_still_locked(&fixture.prefix);
+        let result = remove_path_current(authority)?;
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["registration_present"], false);
+        assert_eq!(result["private_receipt_recorded"], true);
+        assert_prefix_still_locked(&fixture.prefix);
+        Ok(result)
+    });
+    assert!(called && report.path_cleanup_complete());
+    assert!(!report.reasons.contains(&Reason::PathConfigurationRetained));
+    target.assert_preserved_after_removal();
+    fixture.preserved();
+}
+
+#[test]
+fn real_uninstall_unowned_path_validates_authority_without_native_or_owner_effects() {
+    let fixture = Fixture::new();
+    let target = path_command::UninstallFixture::new();
+    let mut called = false;
+    let report = execute_path(&fixture, &mut |authority| {
+        called = true;
+        assert_prefix_still_locked(&fixture.prefix);
+        let result = remove_path_current(authority)?;
+        assert_eq!(result["reason"], "unowned");
+        assert_eq!(result["installation_bound"], true);
+        assert_eq!(result["private_receipt_recorded"], false);
+        assert_eq!(result["changed"], false);
+        assert!(!fixture.root.join("user-path").exists());
+        Ok(result)
+    });
+    assert!(called && report.path_cleanup_complete());
+    target.assert_unowned_target_unchanged();
+    assert!(!fixture.root.join("user-path").exists());
+    fixture.preserved();
+}
+
+#[test]
+fn real_uninstall_path_refuses_changed_maintenance_owner_before_any_cleanup() {
+    let fixture = Fixture::new();
+    let target = prepare_owned_path(&fixture);
+    let before = target.snapshot();
+    let intents = path_intents(&fixture.root);
+    let report = execute_path(&fixture, &mut |authority| {
+        let owner = lock(&fixture.root, LockKind::PolicyOwner);
+        authority
+            .control
+            .with_runtime_deadline(authority.end(), || {
+                let bound = authority.control.bind_control_root(&owner)?;
+                authority.control.recover_maintenance(
+                    authority.control.status()?.policy.control_seq,
+                    &id("other-path-maintenance-owner"),
+                    &bound,
+                    authority.installation,
+                    &id(&authority.journal.state.owner.nonce),
+                    MaintenanceFence {
+                        state: MaintenanceState::Uninstalling,
+                        owner: Some(id("other-path-maintenance-owner")),
+                        phase: Some(MaintenancePhase::Quiescing),
+                    },
+                )
+            })
+            .unwrap();
+        drop(owner);
+        let result = remove_path_current(authority)?;
+        assert_eq!(result["reason"], "maintenance_active");
+        assert_ne!(result["status"], "complete");
+        assert_eq!(result["changed"], false);
+        Ok(result)
+    });
+    assert!(report.reasons.contains(&Reason::PathConfigurationRetained));
+    assert!(!report.continuation_cache_cleared && !report.corpus_removed);
+    assert!(fixture.native_calls.borrow().is_empty());
+    assert!(!fixture.root.join(RETIREMENT_MARKER).exists());
+    // The public reader correctly rejects the now foreign owner; inspect the
+    // already-owned journal directly to verify no downstream plan was created.
+    let owner = read_owner(&fixture.prefix.join("uninstall"))
+        .unwrap()
+        .unwrap();
+    let state = load_state(&fixture.prefix.join("uninstall"), &owner, deadline())
+        .unwrap()
+        .unwrap();
+    assert!(state.after_exit.is_none() && !state.retirement_intent_captured);
+    assert!(state.groups.is_empty());
+    assert_eq!(target.snapshot(), before);
+    assert_eq!(path_intents(&fixture.root), intents);
+    fixture.preserved();
+}
+
+#[test]
+fn real_uninstall_path_recovers_native_applied_and_verified_without_new_intent() {
+    for after_verification in [false, true] {
+        let fixture = Fixture::new();
+        let target = prepare_owned_path(&fixture);
+        target.append_independent_setting();
+        let report = execute_path(&fixture, &mut |authority| {
+            let value = target.interrupt_removal(authority, after_verification);
+            assert_eq!(
+                value.reason,
+                Some(path_command::PathReason::RecoveryRequired)
+            );
+            serde_json::to_value(value).map_err(|_| error(CanonicalCode::Internal))
+        });
+        assert_path_stopped_cleanup(&fixture, &report);
+        target.assert_preserved_after_removal();
+        let intents = path_intents(&fixture.root);
+        assert_eq!(intents.len(), 2, "one install and one interrupted removal");
+        let before = read_deferred_cleanup(&fixture.prefix, &fixture.catalog, deadline())
+            .unwrap()
+            .unwrap();
+        let original_receipt = fixture
+            .prefix
+            .join("uninstall")
+            .join(format!("state-{:06}.json", before.sequence));
+        let original_bytes = fs::read(&original_receipt).unwrap();
+        let resumed = execute_path(&fixture, &mut remove_path_current);
+        assert!(
+            resumed.path_cleanup_complete(),
+            "{}",
+            serde_json::to_string(&resumed).unwrap()
+        );
+        assert!(!resumed.reasons.contains(&Reason::PathConfigurationRetained));
+        assert_eq!(path_intents(&fixture.root), intents);
+        assert_eq!(fs::read(original_receipt).unwrap(), original_bytes);
+        let after = read_deferred_cleanup(&fixture.prefix, &fixture.catalog, deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.owner.nonce, before.owner.nonce);
+        for reason in before.report.reasons {
+            if reason != Reason::PathConfigurationRetained {
+                assert!(after.report.reasons.contains(&reason));
+            }
+        }
+        target.assert_preserved_after_removal();
+        fixture.preserved();
+    }
+}
+
+#[test]
+fn real_uninstall_path_corrupt_binding_is_pending_without_retirement_or_deletion() {
+    let fixture = Fixture::new();
+    let target = prepare_owned_path(&fixture);
+    let before = target.snapshot();
+    write_private(
+        &fixture.root.join("user-path/owner.json"),
+        b"invalid path binding",
+    );
+    let report = execute_path(&fixture, &mut remove_path_current);
+    assert_eq!(report.path.as_ref().unwrap()["reason"], "recovery_required");
+    assert_path_stopped_cleanup(&fixture, &report);
+    assert_eq!(target.snapshot(), before);
+    assert!(
+        managed_uninstall_cleanup::recover_public(
+            &fixture.catalog,
+            &fixture.prefix,
+            true,
+            deadline(),
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn real_uninstall_path_missing_owner_with_retained_intent_is_not_unowned() {
+    let fixture = Fixture::new();
+    let target = prepare_owned_path(&fixture);
+    let before = target.snapshot();
+    let intents = path_intents(&fixture.root);
+    fs::remove_file(fixture.root.join("user-path/owner.json")).unwrap();
+    let report = execute_path(&fixture, &mut remove_path_current);
+    assert_eq!(report.path.as_ref().unwrap()["reason"], "recovery_required");
+    assert_path_stopped_cleanup(&fixture, &report);
+    assert_eq!(target.snapshot(), before);
+    assert_eq!(path_intents(&fixture.root), intents);
+}
+
+#[test]
+fn real_uninstall_empty_path_state_without_owner_is_not_absent() {
+    let fixture = Fixture::new();
+    let target = path_command::UninstallFixture::new();
+    platform::create_private_directory(&fixture.root.join("user-path")).unwrap();
+    let report = execute_path(&fixture, &mut remove_path_current);
+    assert_eq!(report.path.as_ref().unwrap()["reason"], "recovery_required");
+    assert_path_stopped_cleanup(&fixture, &report);
+    assert_eq!(
+        fs::read_dir(fixture.root.join("user-path"))
+            .unwrap()
+            .count(),
+        0
+    );
+    target.assert_unowned_target_unchanged();
+}
+
+#[test]
+fn real_uninstall_path_uses_earlier_end_and_preserves_original_receipt_on_refusal() {
+    let fixture = Fixture::new();
+    let target = prepare_owned_path(&fixture);
+    let before = target.snapshot();
+    let intents = path_intents(&fixture.root);
+    let report = execute_path(&fixture, &mut |authority| {
+        let receipt = fs::read(authority.journal.receipt_path()).unwrap();
+        let outer = Instant::now() + Duration::from_secs(5);
+        let expired = Instant::now() - Duration::from_millis(1);
+        let earlier = UninstallPathAuthority {
+            journal: authority.journal,
+            control: authority.control,
+            install: authority.install,
+            prefix_guard: authority.prefix_guard,
+            installation: authority.installation,
+            root: authority.root,
+            end: expired,
+        };
+        let value = authority
+            .control
+            .with_runtime_deadline(outer, || {
+                assert_eq!(earlier.end(), expired);
+                let value = remove_path_current(&earlier).unwrap();
+                assert_eq!(value["reason"], "timeout");
+                assert_eq!(value["changed"], false);
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(outer + BUDGET),
+                    outer
+                );
+                Ok(value)
+            })
+            .unwrap();
+        assert_eq!(fs::read(authority.journal.receipt_path()).unwrap(), receipt);
+        assert_eq!(SqliteControlStore::effective_runtime_deadline(outer), outer);
+        Ok(value)
+    });
+    assert_path_stopped_cleanup(&fixture, &report);
+    assert_eq!(target.snapshot(), before);
+    assert_eq!(path_intents(&fixture.root), intents);
 }
 
 #[test]
@@ -567,7 +898,7 @@ fn repeated_private_receipt_never_switches_keep_data_to_default() {
             deadline(),
             &mut |_| Ok(fixture.installation()),
             &mut |_, _, _| Err(native_manager::ErrorCode::Unavailable.into()),
-            &mut |_, _, _| panic!("no PATH effect after receipt mode conflict")
+            &mut |_| panic!("no PATH effect after receipt mode conflict")
         )
         .is_err()
     );
@@ -1285,7 +1616,7 @@ fn default_closes_own_control_retires_and_removes_corpus_before_bounded_package_
         Instant::now() + BUDGET,
         &mut |_| Ok(package.take().unwrap()),
         &mut |_, _, _| panic!("no native execution without an owned receipt"),
-        &mut |_, _, _| Ok(json!({"status":"complete","registration_present":false})),
+        &mut |_| Ok(json!({"status":"complete","registration_present":false})),
     )
     .unwrap();
     assert!(
@@ -1325,6 +1656,29 @@ fn retired_cleanup_resumes_without_reopening_control_or_catalog() {
     journal.state.purge_prerequisite_complete = true;
     let installation_lock =
         update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+    let installation = fixture
+        .control
+        .with_runtime_deadline(deadline(), || {
+            fixture
+                .control
+                .bind_installation(&fixture.prefix, &installation_lock)
+        })
+        .unwrap();
+    let path = remove_path_current(&UninstallPathAuthority {
+        journal: &journal,
+        control: &fixture.control,
+        install: &install,
+        prefix_guard: &installation_lock,
+        installation: &installation,
+        root: &fixture.root,
+        end: deadline(),
+    })
+    .unwrap();
+    assert_eq!(path["reason"], "unowned");
+    assert_eq!(path["installation_bound"], true);
+    journal.state.report.path = Some(path);
+    journal.save(deadline()).unwrap();
+    drop(installation);
     let operation = id(&journal.state.owner.nonce);
     let intent = RetirementIntent::bind(
         &fixture.control,
@@ -1360,7 +1714,9 @@ fn retired_cleanup_resumes_without_reopening_control_or_catalog() {
     drop(intent);
     drop(installation_lock);
     drop(journal);
-    let report = resume_terminal(&install, &catalog, false, deadline()).unwrap();
+    let (report, drains) =
+        observe_drain_calls(|| resume_terminal(&install, &catalog, false, deadline()).unwrap());
+    assert_eq!(drains, 1, "positive control must enter the real drain");
     assert!(report.corpus_removed && !report.control_cleanup_pending);
     assert!(report.package_cleanup_pending && report.cleanup_pending);
     let again = resume_terminal(&install, &catalog, false, deadline()).unwrap();
@@ -1379,6 +1735,126 @@ fn retired_cleanup_resumes_without_reopening_control_or_catalog() {
         b"Synthetic original provider bytes remain untouched.\n"
     );
     drop(_temp);
+}
+
+#[test]
+fn retired_pending_path_never_drains_promotes_or_deletes_on_repeat() {
+    for pending_marker in [false, true] {
+        let fixture = Fixture::new();
+        let install = fixture.installation();
+        let mut journal = fixture.fenced_journal(false);
+        journal.state.purge_prerequisite_complete = true;
+        journal
+            .state
+            .report
+            .pending(Reason::PathConfigurationRetained);
+        journal.state.report.path = Some(json!({
+            "status": "incomplete", "reason": "recovery_required", "installation_bound": true
+        }));
+        let installation_lock =
+            update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+        let operation = id(&journal.state.owner.nonce);
+        let intent = RetirementIntent::bind(
+            &fixture.control,
+            &fixture.catalog,
+            &fixture.prefix,
+            &installation_lock,
+            &operation,
+        )
+        .unwrap();
+        journal.state.retirement_intent_captured = true;
+        let guards =
+            cleanup_data(&fixture.control, &mut journal, Some(&intent), deadline()).unwrap();
+        let intent = intent
+            .refresh(&fixture.control, &guards.policy_owner)
+            .unwrap();
+        journal.save(deadline()).unwrap();
+        let Fixture {
+            _temp,
+            root,
+            prefix,
+            catalog,
+            source,
+            control,
+            ..
+        } = fixture;
+        drop(control);
+        let retirement = intent.try_acquire(guards.retirement()).unwrap();
+        retirement.publish_marker().unwrap();
+        drop(retirement);
+        drop(guards);
+        drop(intent);
+        drop(installation_lock);
+        drop(journal);
+        let marker = root.join(if pending_marker {
+            RETIREMENT_PENDING_MARKER
+        } else {
+            RETIREMENT_MARKER
+        });
+        if pending_marker {
+            fs::rename(root.join(RETIREMENT_MARKER), &marker).unwrap();
+        }
+        let paths = [
+            catalog.clone(),
+            SqliteControlStore::path(&root),
+            marker.clone(),
+            source.clone(),
+        ];
+        let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        let prior = read_deferred_cleanup(&prefix, &catalog, deadline())
+            .unwrap()
+            .unwrap();
+        assert!(!prior.control_retired);
+        let mut install = Some(install);
+        for via_execute in [false, true] {
+            assert!(
+                managed_uninstall_cleanup::recover_public(&catalog, &prefix, false, deadline())
+                    .unwrap()
+                    .is_none()
+            );
+            let (report, drains) = observe_drain_calls(|| {
+                if via_execute {
+                    execute(
+                        catalog.to_str().unwrap(),
+                        Options {
+                            keep_data: false,
+                            prefix: Some(prefix.clone()),
+                        },
+                        deadline(),
+                        &mut |_| Ok(install.take().unwrap()),
+                        &mut |_, _, _| panic!("retired PATH pending must not run native cleanup"),
+                        &mut |_| panic!("retired PATH pending cannot reacquire live control"),
+                    )
+                    .unwrap()
+                } else {
+                    resume_terminal(install.as_ref().unwrap(), &catalog, false, deadline()).unwrap()
+                }
+            });
+            assert_eq!(drains, 0, "pending PATH reached a real drain");
+            assert!(report.reasons.contains(&Reason::PathConfigurationRetained));
+            assert!(!report.corpus_removed && report.control_cleanup_pending);
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| fs::read(path).unwrap())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(
+                root.join(RETIREMENT_PENDING_MARKER).exists(),
+                pending_marker
+            );
+            assert_eq!(root.join(RETIREMENT_MARKER).exists(), !pending_marker);
+            let after = read_deferred_cleanup(&prefix, &catalog, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.owner.nonce, prior.owner.nonce);
+            assert_eq!(after.control_retired, prior.control_retired);
+            assert!(after.after_exit.is_none());
+        }
+        drop(install);
+        drop(_temp);
+    }
 }
 #[test]
 fn unexplained_control_rollback_journal_remains_private_and_pending() {

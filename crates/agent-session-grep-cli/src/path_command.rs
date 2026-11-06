@@ -183,8 +183,8 @@ pub(crate) fn run(
     );
     Ok(outcome)
 }
-/// Call before the uninstall maintenance fence, while the managed catalog and
-/// immutable package are still available. No output is emitted by this seam.
+/// Ordinary PATH removal owns its locks and requires idle maintenance.
+/// Fenced uninstall uses `remove_owned_for_uninstall` with borrowed authority.
 pub(crate) fn remove_owned(db: &Path, prefix: &Path, end: Instant) -> PathReport {
     perform(
         db,
@@ -197,6 +197,73 @@ pub(crate) fn remove_owned(db: &Path, prefix: &Path, end: Instant) -> PathReport
         &mut Environment::current,
         &mut |_| Ok(()),
     )
+}
+
+/// The uninstall coordinator retains its installation lock throughout this
+/// call. Only the PATH namespace, policy owner and native target are acquired.
+pub(crate) fn remove_owned_for_uninstall(
+    authority: &crate::uninstall_command::UninstallPathAuthority<'_, '_>,
+) -> PathReport {
+    remove_for_uninstall(authority, &mut |_| Ok(()))
+}
+
+fn remove_for_uninstall(
+    authority: &crate::uninstall_command::UninstallPathAuthority<'_, '_>,
+    hook: &mut dyn FnMut(Point) -> Result<()>,
+) -> PathReport {
+    let mut report = PathReport::new();
+    let end = authority.end();
+    let result = (|| {
+        authority.validate_roots()?;
+        let root = authority.root();
+        let _namespace = acquire(root, "user-path", end)?;
+        let owner = acquire_policy(root, end)?;
+        authority.validate(&owner)?;
+        report.installation_bound = true;
+        let state_root = root.join("user-path");
+        // Absence is inspected only after the live fenced authority. It neither
+        // consults the ambient environment nor creates a PATH owner directory.
+        let recorded = match read_json::<Binding>(&state_root.join("owner.json"))? {
+            Some(binding) => binding,
+            None => {
+                match fs::symlink_metadata(&state_root) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        platform::validate_private(&state_root)
+                            .map_err(|_| PathReason::RecoveryRequired)?;
+                        return Err(PathReason::RecoveryRequired);
+                    }
+                    Err(_) => return Err(PathReason::RecoveryRequired),
+                }
+                return Err(PathReason::Unowned);
+            }
+        };
+        let binding = Binding {
+            schema: "asg.user-path-binding/v1".into(),
+            installation: authority.installation_id().into(),
+            root_identity: authority.root_identity().control_id().as_str().into(),
+            prefix_identity: authority.prefix_identity().control_id().as_str().into(),
+            prefix: authority.prefix().into(),
+            location: recorded.location.clone(),
+        };
+        if recorded != binding {
+            return Err(PathReason::BindingChanged);
+        }
+        let mut preflight = || authority.validate(&owner);
+        transact(
+            state_root,
+            binding,
+            Action::Remove,
+            end,
+            &mut report,
+            &mut preflight,
+            hook,
+        )
+    })();
+    if let Err(reason) = result {
+        report.reason = Some(reason);
+    }
+    report
 }
 
 /// Private accounting DTO: never pass locators/digests to public CLI output.
@@ -761,57 +828,75 @@ fn perform(
             return Err(PathReason::BindingChanged);
         }
         let mut preflight = || check(&identity, &install.prefix, prefix, end);
-        let store = Store::open(state_root, binding, &mut preflight)?;
-        let _target_lock = target::lock(&store.binding.location, end)?;
-        store.validate(&mut preflight)?;
-        let prior = store.latest(end, &mut preflight, hook)?;
-        let before = target::read(&store.binding.location)?;
-        let (after, owned, separator) =
-            edit(&store.binding, options.action, &before, prior.as_ref())?;
-        let changed = before != after;
-        if options.action == Action::Remove && !owned {
-            report.owned = Some(false);
-            report.registration_present = Some(present(&store.binding, &before)?);
-            return Err(PathReason::Unowned);
-        }
-        if let Some(prior) = prior.as_ref()
-            && !changed
-            && prior.owned == owned
-            && prior.present == (options.action == Action::Install)
-        {
-            report.owned = Some(owned);
-            report.registration_present = Some(prior.present);
-            report.private_receipt_recorded = true;
-            report.profile_reference_verified =
-                matches!(store.binding.location, Location::Unix { .. });
-            report.status = "complete";
-            return Ok(());
-        }
-        let receipt = store.apply(
-            Change {
-                action: options.action,
-                before,
-                after,
-                owned,
-                separator,
-                prior,
-            },
+        transact(
+            state_root,
+            binding,
+            options.action,
             end,
+            &mut report,
             &mut preflight,
             hook,
-        )?;
-        report.owned = Some(receipt.owned);
-        report.registration_present = Some(receipt.present);
-        report.changed = changed;
-        report.private_receipt_recorded = true;
-        report.profile_reference_verified = matches!(store.binding.location, Location::Unix { .. });
-        report.status = "complete";
-        Ok(())
+        )
     })();
     if let Err(reason) = result {
         report.reason = Some(reason);
     }
     report
+}
+
+fn transact(
+    state_root: PathBuf,
+    binding: Binding,
+    action: Action,
+    end: Instant,
+    report: &mut PathReport,
+    preflight: &mut dyn FnMut() -> Result<()>,
+    hook: &mut dyn FnMut(Point) -> Result<()>,
+) -> Result<()> {
+    let store = Store::open(state_root, binding, preflight)?;
+    let _target_lock = target::lock(&store.binding.location, end)?;
+    store.validate(preflight)?;
+    let prior = store.latest(end, preflight, hook)?;
+    let before = target::read(&store.binding.location)?;
+    let (after, owned, separator) = edit(&store.binding, action, &before, prior.as_ref())?;
+    let changed = before != after;
+    if action == Action::Remove && !owned {
+        report.owned = Some(false);
+        report.registration_present = Some(present(&store.binding, &before)?);
+        return Err(PathReason::Unowned);
+    }
+    if let Some(prior) = prior.as_ref()
+        && !changed
+        && prior.owned == owned
+        && prior.present == (action == Action::Install)
+    {
+        report.owned = Some(owned);
+        report.registration_present = Some(prior.present);
+        report.private_receipt_recorded = true;
+        report.profile_reference_verified = matches!(store.binding.location, Location::Unix { .. });
+        report.status = "complete";
+        return Ok(());
+    }
+    let receipt = store.apply(
+        Change {
+            action,
+            before,
+            after,
+            owned,
+            separator,
+            prior,
+        },
+        end,
+        preflight,
+        hook,
+    )?;
+    report.owned = Some(receipt.owned);
+    report.registration_present = Some(receipt.present);
+    report.changed = changed;
+    report.private_receipt_recorded = true;
+    report.profile_reference_verified = matches!(store.binding.location, Location::Unix { .. });
+    report.status = "complete";
+    Ok(())
 }
 fn time(end: Instant) -> Result<()> {
     if Instant::now() >= end {
@@ -2278,3 +2363,5 @@ mod target {
 #[cfg(test)]
 #[path = "path_command_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::UninstallFixture;

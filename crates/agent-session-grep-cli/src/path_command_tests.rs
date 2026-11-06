@@ -14,6 +14,141 @@ use serde_json::json;
 
 const FIXTURE_BUDGET: Duration = Duration::from_secs(10);
 
+/// Only this test facade can select a disposable native target. Uninstall
+/// removal itself reads the normal persisted binding, never an injected path.
+pub(crate) struct UninstallFixture {
+    location: Location,
+    original: Option<Image>,
+    #[cfg(windows)]
+    registry: registry::Fixture,
+    _temp: tempfile::TempDir,
+}
+
+impl UninstallFixture {
+    pub(crate) fn new() -> Self {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        #[cfg(windows)]
+        let registry = registry::Fixture::new();
+        #[cfg(windows)]
+        let location = {
+            registry.set("%SYNTHETIC_UNINSTALL%\\bin;independent", 2);
+            registry.location()
+        };
+        #[cfg(unix)]
+        let location = shell::location_at(&temp.path().canonicalize().unwrap());
+        let original = target::read(&location).unwrap();
+        Self {
+            location,
+            original,
+            #[cfg(windows)]
+            registry,
+            _temp: temp,
+        }
+    }
+
+    pub(crate) fn prepare(&self, catalog: &Path, installation: Installation) -> PathReport {
+        let prefix = installation.prefix.clone();
+        let mut install = Some(installation);
+        perform(
+            catalog,
+            Options {
+                action: Action::Install,
+                prefix: Some(prefix),
+            },
+            Instant::now() + FIXTURE_BUDGET,
+            &mut |_| Ok(install.take().unwrap()),
+            &mut || {
+                Ok(Environment {
+                    location: self.location.clone(),
+                    paths: Vec::new(),
+                })
+            },
+            &mut |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn append_independent_setting(&self) {
+        #[cfg(windows)]
+        {
+            let image = target::read(&self.location).unwrap();
+            let (text, terminated, kind) = raw_path(&image).unwrap();
+            self.registry.set_raw(&path_image(
+                &format!("{text};independent-later"),
+                terminated,
+                kind,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let Location::Unix { profile, .. } = &self.location else {
+                unreachable!()
+            };
+            let mut bytes = fs::read(profile).unwrap();
+            bytes.extend_from_slice(b"# independent later setting\n");
+            fs::write(profile, bytes).unwrap();
+        }
+    }
+
+    pub(crate) fn assert_preserved_after_removal(&self) {
+        let current = target::read(&self.location).unwrap();
+        #[cfg(windows)]
+        {
+            let (text, terminated, kind) = raw_path(&self.original).unwrap();
+            let expected = Some(path_image(
+                &format!("{text};independent-later"),
+                terminated,
+                kind,
+            ));
+            assert!(current == expected, "independent registry entries changed");
+        }
+        #[cfg(unix)]
+        {
+            let mut bytes = self.original.as_ref().unwrap().bytes.clone();
+            bytes.extend_from_slice(b"# independent later setting\n");
+            assert!(
+                current == Some(Image { kind: 0, bytes }),
+                "independent profile changed"
+            );
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (Option<u32>, Vec<u8>) {
+        let image = target::read(&self.location).unwrap();
+        (
+            image.as_ref().map(|image| image.kind),
+            image.map_or(Vec::new(), |image| image.bytes),
+        )
+    }
+
+    pub(crate) fn assert_unowned_target_unchanged(&self) {
+        assert!(target::read(&self.location).unwrap() == self.original);
+    }
+
+    pub(crate) fn interrupt_removal(
+        &self,
+        authority: &crate::uninstall_command::UninstallPathAuthority<'_, '_>,
+        after_verification: bool,
+    ) -> PathReport {
+        let mut fired = false;
+        let report = remove_for_uninstall(authority, &mut |point| {
+            if point
+                == if after_verification {
+                    Point::Verified
+                } else {
+                    Point::Applied
+                }
+            {
+                fired = true;
+                Err(PathReason::RecoveryRequired)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(fired, "actual native removal did not reach the fault point");
+        report
+    }
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -356,7 +491,7 @@ mod registry {
         key: HKEY,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let mut random = [0; 8];
             getrandom::fill(&mut random).unwrap();
             let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -381,11 +516,11 @@ mod registry {
             );
             Self { subkey, key }
         }
-        fn set(&self, value: &str, kind: u32) {
+        pub(super) fn set(&self, value: &str, kind: u32) {
             let image = path_image(value, true, kind);
             self.set_raw(&image);
         }
-        fn set_raw(&self, image: &Image) {
+        pub(super) fn set_raw(&self, image: &Image) {
             let name: Vec<_> = "Path".encode_utf16().chain(Some(0)).collect();
             assert_eq!(
                 unsafe {
@@ -401,7 +536,7 @@ mod registry {
                 0
             );
         }
-        fn location(&self) -> Location {
+        pub(super) fn location(&self) -> Location {
             Location::Windows {
                 subkey: self.subkey.clone(),
             }
@@ -759,7 +894,10 @@ mod registry {
 mod shell {
     use super::*;
     fn location(f: &Fixture) -> Location {
-        let home = f.root.parent().unwrap().join("synthetic home");
+        location_at(f.root.parent().unwrap())
+    }
+    pub(super) fn location_at(base: &Path) -> Location {
+        let home = base.join("synthetic home");
         fs::create_dir(&home).unwrap();
         let shell = home.join("bash");
         fs::write(&shell, b"inert shell selection image").unwrap();

@@ -2354,6 +2354,20 @@ mod tests {
                     journal.state.purge_prerequisite_complete = true;
                     fence(&control, &installation, &mut journal, preparation_end).unwrap();
                     journal.save(preparation_end).unwrap();
+                    let path = remove_path_current(&UninstallPathAuthority {
+                        journal: &journal,
+                        control: &control,
+                        install: &install,
+                        prefix_guard: &prefix_guard,
+                        installation: &installation,
+                        root: &data,
+                        end: preparation_end,
+                    })
+                    .unwrap();
+                    assert_eq!(path["reason"], "unowned");
+                    assert_eq!(path["installation_bound"], true);
+                    journal.state.report.path = Some(path);
+                    journal.save(preparation_end).unwrap();
                     journal.state.private_metadata =
                         classify_private(&install, &control, &journal, preparation_end).unwrap();
                     let operation = id(&journal.state.owner.nonce);
