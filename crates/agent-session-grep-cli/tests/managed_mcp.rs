@@ -221,7 +221,7 @@ impl Fixture {
             "filter quiescence exhausted fixture end"
         );
         drop(self.worker.take());
-        bounded_until(end, "pause quiescent filter fixture", || {
+        let paused = bounded_until(end, "pause quiescent filter fixture", || {
             let control = SqliteControlStore::open_current_writable_with_deadline(
                 self.db.parent().unwrap(),
                 end,
@@ -233,7 +233,9 @@ impl Fixture {
                 )
             })
         });
-        assert!(Instant::now() < end, "filter pause exhausted fixture end");
+        // The final mutation is admitted under the original end. Preserve its
+        // acknowledged commit if synchronous commit/close returns after it.
+        assert_eq!(paused.value, DesiredUpdates::Paused);
     }
     fn revoke(&self) {
         self.pause();
