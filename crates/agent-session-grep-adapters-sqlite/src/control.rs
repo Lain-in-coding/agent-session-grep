@@ -881,6 +881,28 @@ impl std::fmt::Debug for SealedControlFile {
     }
 }
 
+/// Purge and backup prerequisites read together from one control snapshot.
+/// This grants no file-identity, freshness or cleanup authority. Callers must
+/// retain their policy-owner guard and validate the bound control connection.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LifecycleCleanupSnapshot {
+    purge_complete: bool,
+    backups_complete: bool,
+}
+
+impl LifecycleCleanupSnapshot {
+    /// Every recorded purge job is Complete; an empty inventory is complete.
+    pub fn purge_complete(&self) -> bool {
+        self.purge_complete
+    }
+
+    /// Every recorded backup is Complete or PurgedByPolicy; an empty inventory
+    /// is complete. This says nothing about unregistered files on disk.
+    pub fn backups_complete(&self) -> bool {
+        self.backups_complete
+    }
+}
+
 /// Private policy store. `create` is explicit setup, never a read fallback.
 pub struct SqliteControlStore {
     conn: RefCell<Connection>,
@@ -983,6 +1005,41 @@ impl SqliteControlStore {
         self.validate_live_root()?;
         runtime_tick()?;
         Ok(status)
+    }
+
+    /// Read purge and backup prerequisites on the held connection under the
+    /// original end. The deferred transaction uses only read-only loaders;
+    /// it never stages runtime state, including in TEMP tables. The caller
+    /// remains responsible for continuous guard and sealed-file validation.
+    pub fn lifecycle_cleanup_snapshot_with_deadline(
+        &self,
+        end: Instant,
+    ) -> PortResult<LifecycleCleanupSnapshot> {
+        self.with_runtime_deadline(end, || {
+            runtime_tick()?;
+            self.validate_live_root()?;
+            let mut conn = self.conn.borrow_mut();
+            configure_runtime_deadline(&conn)?;
+            let tx = conn.transaction().map_err(sql_error)?;
+            validate_policy_admission_capacity(&tx)?;
+            let status = load_status_core(&tx)?;
+            let jobs = load_jobs(&tx)?;
+            let backups = load_backups(&tx, status.policy.policy_epoch)?;
+            let snapshot = LifecycleCleanupSnapshot {
+                purge_complete: jobs.iter().all(|job| job.state == PurgeState::Complete),
+                backups_complete: backups.iter().all(|backup| {
+                    matches!(
+                        backup.state,
+                        BackupState::Complete | BackupState::PurgedByPolicy
+                    )
+                }),
+            };
+            runtime_tick()?;
+            tx.commit().map_err(sql_error)?;
+            self.validate_live_root()?;
+            runtime_tick()?;
+            Ok(snapshot)
+        })
     }
 
     /// Bounded scheduling inventory. AwaitingCatalog is retained here even
@@ -9271,7 +9328,14 @@ mod control_create_tests {
 #[cfg(test)]
 mod bound_read_tests {
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Step {
@@ -9562,6 +9626,428 @@ mod bound_read_tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy, 250);
+    }
+
+    /// Deny mutations on the actual held SQLite connection, including TEMP.
+    /// Removing this hook leaves the busy/progress handlers owned by the store.
+    struct ReadOnlyAuthorizer<'a> {
+        store: &'a SqliteControlStore,
+        calls: Arc<AtomicUsize>,
+        refusals: Arc<AtomicUsize>,
+    }
+
+    impl<'a> ReadOnlyAuthorizer<'a> {
+        fn install(store: &'a SqliteControlStore) -> Self {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let refusals = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let observed_refusals = Arc::clone(&refusals);
+            store
+                .conn
+                .borrow()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    observed_calls.fetch_add(1, Ordering::Relaxed);
+                    match context.action {
+                        AuthAction::Read { .. }
+                        | AuthAction::Select
+                        | AuthAction::Function { .. }
+                        | AuthAction::Transaction { .. }
+                        | AuthAction::Savepoint { .. }
+                        | AuthAction::Recursive
+                        | AuthAction::Pragma {
+                            pragma_value: None, ..
+                        } => Authorization::Allow,
+                        _ => {
+                            observed_refusals.fetch_add(1, Ordering::Relaxed);
+                            Authorization::Deny
+                        }
+                    }
+                }))
+                .unwrap();
+            Self {
+                store,
+                calls,
+                refusals,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn refusals(&self) -> usize {
+            self.refusals.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for ReadOnlyAuthorizer<'_> {
+        fn drop(&mut self) {
+            let _ = self
+                .store
+                .conn
+                .borrow()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        }
+    }
+
+    fn assert_cleanup_snapshot(f: &Bound, purge_complete: bool, backups_complete: bool) {
+        let before = f.owned_state();
+        let authorizer = ReadOnlyAuthorizer::install(&f.store);
+        let commit_seq = runtime_commit_seq();
+        let snapshot = f
+            .store
+            .lifecycle_cleanup_snapshot_with_deadline(Instant::now() + Duration::from_secs(8))
+            .unwrap();
+        assert_eq!(snapshot.purge_complete(), purge_complete);
+        assert_eq!(snapshot.backups_complete(), backups_complete);
+        assert!(authorizer.calls() > 0, "the snapshot must execute real SQL");
+        assert_eq!(
+            authorizer.refusals(),
+            0,
+            "the snapshot attempted a mutation"
+        );
+        assert_eq!(runtime_commit_seq(), commit_seq);
+        drop(authorizer);
+        before.assert_unchanged(f);
+        assert_unscoped(&f.store);
+    }
+
+    #[test]
+    fn cleanup_snapshot_and_bound_read_succeed_with_sql_mutations_denied_including_temp() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        // Only the fixture creates this probe, before the authorizer is active.
+        f.store
+            .conn
+            .borrow()
+            .execute_batch(
+                "CREATE TEMP TABLE cleanup_probe(value);
+                 INSERT INTO temp.cleanup_probe VALUES(1);",
+            )
+            .unwrap();
+        let before = f.owned_state();
+        let authorizer = ReadOnlyAuthorizer::install(&f.store);
+        let end = Instant::now() + Duration::from_secs(8);
+        let bound_status = f
+            .store
+            .read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+            .unwrap();
+        let snapshot = f
+            .store
+            .lifecycle_cleanup_snapshot_with_deadline(end)
+            .unwrap();
+        assert!(snapshot.purge_complete());
+        assert!(snapshot.backups_complete());
+        let after_status = f
+            .store
+            .read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+            .unwrap();
+        assert!(bound_status == after_status, "bound control state changed");
+        assert_eq!(authorizer.refusals(), 0);
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+
+        // Prove the authorizer itself is effective for main and TEMP writes.
+        for sql in [
+            "CREATE TABLE cleanup_forbidden(value)",
+            "CREATE TEMP TABLE cleanup_forbidden(value)",
+            "INSERT INTO main.control_meta SELECT * FROM main.control_meta",
+            "UPDATE main.control_meta SET control_seq=control_seq",
+            "DELETE FROM main.control_meta",
+            "INSERT INTO temp.cleanup_probe VALUES(2)",
+            "UPDATE temp.cleanup_probe SET value=2",
+            "DELETE FROM temp.cleanup_probe",
+        ] {
+            let prior = authorizer.refusals();
+            assert!(matches!(
+                f.store.conn.borrow().execute_batch(sql),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+            ));
+            assert!(authorizer.refusals() > prior);
+        }
+        // Existing public accessors still perform their runtime TEMP staging.
+        let prior = authorizer.refusals();
+        assert!(
+            f.store
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                    f.store.purge_jobs()
+                })
+                .is_err()
+        );
+        assert!(authorizer.refusals() > prior);
+        assert_unscoped(&f.store);
+        let prior = authorizer.refusals();
+        assert!(
+            f.store
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                    f.store.backup_records()
+                })
+                .is_err()
+        );
+        assert!(authorizer.refusals() > prior);
+        assert_unscoped(&f.store);
+
+        let prior = authorizer.refusals();
+        assert_eq!(
+            f.store
+                .lifecycle_cleanup_snapshot_with_deadline(Instant::now() + Duration::from_secs(8))
+                .unwrap(),
+            snapshot
+        );
+        let probe: i64 = f
+            .store
+            .conn
+            .borrow()
+            .query_row("SELECT value FROM temp.cleanup_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(probe, 1);
+        assert_eq!(authorizer.refusals(), prior);
+        drop(authorizer);
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+    }
+
+    #[test]
+    fn cleanup_snapshot_requires_real_purge_jobs_to_be_complete() {
+        let f = bound();
+        let revoked = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let current = f.store.lifecycle_status()?.policy.control_seq;
+                let selected = f.store.add_selection(
+                    current,
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Claude,
+                            locator: CanonicalLocator::from_path(
+                                &f._temp.path().join("synthetic-selection"),
+                            )?,
+                            kind: RootKind::Root,
+                        },
+                        root_identity: Some(cid("cleanup-selection-root")),
+                        now_ms: 1,
+                    },
+                )?;
+                f.store
+                    .revoke_selection(selected.control_seq, &selected.value.id, None, 2)
+            })
+            .unwrap();
+        assert_eq!(revoked.value.purge_job.state, PurgeState::Pending);
+        assert_cleanup_snapshot(&f, false, true);
+
+        let control = f.owner();
+        let purge_guard = retry_busy(|| {
+            ExclusiveGuard::try_acquire(
+                &f.root,
+                LockKind::MaintenanceJob(JobLockKey::parse(PURGE_LOCK_KEY)?),
+            )
+        });
+        let completed = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let owner = f
+                    .store
+                    .bind_purge_owner(&purge_guard, cid("cleanup-purge-owner"))?;
+                let claimed = f.store.claim_purge_job(
+                    revoked.control_seq,
+                    &owner,
+                    &control,
+                    &revoked.value.purge_job.id,
+                    3,
+                )?;
+                f.store.advance_purge_job(
+                    claimed.control_seq,
+                    &owner,
+                    &control,
+                    &revoked.value.purge_job.id,
+                    PurgeTransition {
+                        state: PurgeState::Complete,
+                        checkpoint: PurgeCheckpoint::ArtifactsVerified,
+                        failure: None,
+                        verified_epoch: revoked.value.purge_job.policy_epoch,
+                        now_ms: 4,
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(completed.value.job.state, PurgeState::Complete);
+        assert_cleanup_snapshot(&f, true, true);
+    }
+
+    #[test]
+    fn cleanup_snapshot_requires_terminal_backup_records() {
+        let f = bound();
+        let control = f.owner();
+        let installation = f.installation();
+        let owner = cid("cleanup-backup-owner");
+        let backup_id = cid("cleanup-backup");
+        let registered = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let current = f.store.lifecycle_status()?.policy.control_seq;
+                let fence = f.store.begin_maintenance(
+                    current,
+                    &owner,
+                    &control,
+                    &installation,
+                    MaintenanceFence {
+                        state: MaintenanceState::Updating,
+                        owner: Some(owner.clone()),
+                        phase: Some(MaintenancePhase::Verified),
+                    },
+                )?;
+                f.store.register_backup(
+                    fence.control_seq,
+                    &owner,
+                    &control,
+                    &installation,
+                    &BackupRegistration {
+                        backup_id: backup_id.clone(),
+                        purpose: BackupPurpose::BetaRollback,
+                        relative_locator: backup_locator(&backup_id),
+                        catalog_incarnation: cid("cleanup-catalog"),
+                        catalog_generation: 0,
+                        schema_version: 20,
+                        source_ids: Vec::new(),
+                    },
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(registered.value.state, BackupState::Registered);
+        assert_cleanup_snapshot(&f, true, false);
+
+        let digest = "a".repeat(64);
+        let completed = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                f.store.complete_backup(
+                    registered.control_seq,
+                    &owner,
+                    &control,
+                    &installation,
+                    &backup_id,
+                    &digest,
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(completed.value.state, BackupState::Complete);
+        assert_cleanup_snapshot(&f, true, true);
+
+        let purge_guard = retry_busy(|| {
+            ExclusiveGuard::try_acquire(
+                &f.root,
+                LockKind::MaintenanceJob(JobLockKey::parse(PURGE_LOCK_KEY)?),
+            )
+        });
+        let quarantined = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let purge_owner = f
+                    .store
+                    .bind_purge_owner(&purge_guard, cid("cleanup-backup-purge-owner"))?;
+                f.store.quarantine_unclassified_backup(
+                    completed.control_seq,
+                    &purge_owner,
+                    &control,
+                    &backup_id,
+                    Some((&digest, 1)),
+                )
+            })
+            .unwrap();
+        assert_eq!(quarantined.value.state, BackupState::Quarantined);
+        assert_cleanup_snapshot(&f, true, false);
+
+        let purged = f
+            .store
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                f.store.finalize_backup_purge(
+                    quarantined.control_seq,
+                    &control,
+                    &installation,
+                    &backup_id,
+                    &[],
+                    2,
+                )
+            })
+            .unwrap();
+        assert_eq!(purged.value.state, BackupState::PurgedByPolicy);
+        assert_cleanup_snapshot(&f, true, true);
+    }
+
+    #[test]
+    fn cleanup_snapshot_refuses_expiry_and_restores_the_callers_scope() {
+        let f = bound();
+        let before = f.owned_state();
+        let authorizer = ReadOnlyAuthorizer::install(&f.store);
+        let calls = authorizer.calls();
+        assert!(matches!(
+            f.store
+                .lifecycle_cleanup_snapshot_with_deadline(Instant::now()),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert_eq!(authorizer.calls(), calls, "expired entry executed SQL");
+        assert_unscoped(&f.store);
+
+        let outer_end = Instant::now() + Duration::from_secs(8);
+        let commit_seq = runtime_commit_seq();
+        f.store
+            .with_purge_deadline(outer_end, || {
+                let snapshot = f
+                    .store
+                    .lifecycle_cleanup_snapshot_with_deadline(outer_end + Duration::from_secs(1))?;
+                assert!(snapshot.purge_complete());
+                assert!(snapshot.backups_complete());
+                assert_eq!(runtime_deadline(), Some(outer_end));
+                assert_eq!(
+                    RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                    Duration::from_millis(1)
+                );
+                let busy: i64 = f
+                    .store
+                    .conn
+                    .borrow()
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                    .map_err(sql_error)?;
+                assert_eq!(busy, 0, "the outer scope's handler must remain active");
+
+                let calls = authorizer.calls();
+                assert!(matches!(
+                    f.store
+                        .lifecycle_cleanup_snapshot_with_deadline(Instant::now()),
+                    Err(PortError::WriterBusy(_))
+                ));
+                assert_eq!(authorizer.calls(), calls);
+                assert_eq!(runtime_deadline(), Some(outer_end));
+                assert_eq!(
+                    RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                    Duration::from_millis(1)
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(runtime_commit_seq(), commit_seq);
+        assert_eq!(authorizer.refusals(), 0);
+        drop(authorizer);
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+        assert_cleanup_snapshot(&f, true, true);
     }
 
     #[test]
