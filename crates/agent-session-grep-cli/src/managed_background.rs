@@ -2293,6 +2293,9 @@ struct SourceScheduleState {
     next_debt: SourceLane,
     probe_after: Option<SourceId>,
     hot_probes: VecDeque<SourceId>,
+    exact_probe_after: Option<SourceId>,
+    exact_hot_probes: VecDeque<SourceId>,
+    exact_prefer_aging: bool,
     next_probe: Option<Instant>,
     probes_in_window: usize,
     probe_window: Option<Instant>,
@@ -2317,6 +2320,9 @@ impl SourceScheduleState {
             self.next_debt = SourceLane::Cold;
             self.probe_after = None;
             self.hot_probes.clear();
+            self.exact_probe_after = None;
+            self.exact_hot_probes.clear();
+            self.exact_prefer_aging = false;
             self.next_probe = None;
             self.probes_in_window = 0;
             self.probe_window = None;
@@ -2387,6 +2393,12 @@ impl SourceScheduleState {
             self.hot_probes.push_back(id.clone());
             if self.hot_probes.len() > SOURCE_HINT_BATCH {
                 self.hot_probes.pop_front();
+            }
+        }
+        if !self.exact_hot_probes.contains(id) {
+            self.exact_hot_probes.push_back(id.clone());
+            if self.exact_hot_probes.len() > SOURCE_HINT_BATCH {
+                self.exact_hot_probes.pop_front();
             }
         }
     }
@@ -2609,6 +2621,7 @@ enum EpochSite {
 enum ScheduleTestEvent<'a> {
     Planned,
     BeforeProbe(&'a SourceId, Instant),
+    AfterProbe(&'a SourceId, Instant),
     BeforeAttempt(&'a SourceId, Instant, SourceLane),
     BeforeParse(&'a SourceId, Instant),
     AfterAdmissionFailure(&'a SourceId, Instant, BackgroundFailure),
@@ -2667,12 +2680,51 @@ impl ScheduleTestHooks {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeClass {
+    Epoch,
+    ExactAfterSuccess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactProbeLane {
+    Hot,
+    Aging,
+}
+
+/// Separate totals represent F - P without unsigned underflow. Only actual
+/// first-turn service replenishes credit; cadence rollover never does.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct ExactProbeService {
+    first_turn: Duration,
+    probes: Duration,
+    between_attempts: bool,
+    bootstrap_used: bool,
+}
+
+impl ExactProbeService {
+    fn allows_probe(&self) -> bool {
+        !self.bootstrap_used || (self.between_attempts && self.probes < self.first_turn)
+    }
+
+    fn first_turn_finished(&mut self, elapsed: Duration) {
+        self.first_turn = self.first_turn.saturating_add(elapsed);
+        self.between_attempts = true;
+    }
+
+    fn probe_started(&mut self) {
+        self.bootstrap_used = true;
+        self.between_attempts = false;
+    }
+}
+
 struct SourceTurn {
     original_end: Instant,
     first_pending: bool,
     lane: Option<SourceLane>,
     published_at_start: bool,
     probe: bool,
+    probe_class: Option<ProbeClass>,
     revisitable: bool,
     last_slice: Option<u64>,
     latest_only: bool,
@@ -2695,6 +2747,12 @@ struct CycleSchedule<'a> {
     queues: [BTreeSet<(u64, SourceId)>; 4],
     probes: BTreeSet<SourceId>,
     pending_probes: VecDeque<SourceId>,
+    exact_hot_pending: VecDeque<SourceId>,
+    // Hot service may coalesce a later aging ticket. Only the serviced prefix
+    // advances the committed cursor, never over an earlier unserved identity.
+    exact_aging_pending: VecDeque<(SourceId, bool)>,
+    selected_exact: Option<(SourceId, ExactProbeLane)>,
+    exact_service: ExactProbeService,
     expirations: BTreeSet<(Instant, SourceId)>,
     first_pending: usize,
     slice: u64,
@@ -2712,6 +2770,10 @@ impl<'a> CycleSchedule<'a> {
             queues: Default::default(),
             probes: BTreeSet::new(),
             pending_probes: VecDeque::new(),
+            exact_hot_pending: VecDeque::new(),
+            exact_aging_pending: VecDeque::new(),
+            selected_exact: None,
+            exact_service: ExactProbeService::default(),
             expirations: BTreeSet::new(),
             first_pending: 0,
             slice: 0,
@@ -2756,6 +2818,7 @@ impl<'a> CycleSchedule<'a> {
                 lane: None,
                 published_at_start: published_baseline(prior),
                 probe,
+                probe_class: probe.then_some(ProbeClass::Epoch),
                 revisitable: matches!(obligation, TurnObligation::ProbeOnly),
                 last_slice: None,
                 latest_only: false,
@@ -2882,6 +2945,10 @@ impl<'a> CycleSchedule<'a> {
             };
             if self.probes.contains(&id) {
                 self.state.hot_probes.push_back(id.clone());
+                // Exact identities keep their place but never use epoch slots.
+                if self.turns[&id].probe_class != Some(ProbeClass::Epoch) {
+                    continue;
+                }
                 if keys.len() < SOURCE_HOT_HINT_BATCH.min(budget) {
                     selected.insert(id.clone());
                     keys.push(id);
@@ -2895,6 +2962,7 @@ impl<'a> CycleSchedule<'a> {
             self.probes
                 .range((Excluded(after.clone()), Unbounded))
                 .chain(self.probes.range(..=after.clone()))
+                .filter(|id| self.turns[*id].probe_class == Some(ProbeClass::Epoch))
                 .filter(|id| !selected.contains(*id))
                 .take(budget - keys.len())
                 .cloned()
@@ -2902,6 +2970,7 @@ impl<'a> CycleSchedule<'a> {
         } else {
             self.probes
                 .iter()
+                .filter(|id| self.turns[*id].probe_class == Some(ProbeClass::Epoch))
                 .filter(|id| !selected.contains(*id))
                 .take(budget - keys.len())
                 .cloned()
@@ -2911,7 +2980,63 @@ impl<'a> CycleSchedule<'a> {
             .last()
             .cloned()
             .or_else(|| self.state.probe_after.clone());
+        let epoch_hot = keys.len();
         keys.extend(aging);
+        selected.extend(keys.iter().cloned());
+        // Exact reservations use only capacity left after the epoch selection.
+        // Staging reserves; only an actual start rotates or moves a cursor.
+        self.retire_exact_tickets();
+        self.exact_hot_pending.clear();
+        self.exact_aging_pending.clear();
+        let mut exact_hot = 0;
+        for id in &self.state.exact_hot_probes {
+            if keys.len() >= budget || epoch_hot + exact_hot >= SOURCE_HOT_HINT_BATCH {
+                break;
+            }
+            if self
+                .turns
+                .get(id)
+                .is_some_and(|turn| turn.probe_class == Some(ProbeClass::ExactAfterSuccess))
+                && self.probe_eligible(id, now)
+                && selected.insert(id.clone())
+            {
+                keys.push(id.clone());
+                self.exact_hot_pending.push_back(id.clone());
+                exact_hot += 1;
+            }
+        }
+        // A hot reservation reached in aging order also gets an aging ticket,
+        // so its actual start can retire both without a second I/O.
+        let exact = |id: &&SourceId| {
+            self.turns[*id].probe_class == Some(ProbeClass::ExactAfterSuccess)
+                && self.probe_eligible(id, now)
+        };
+        let exact_order = if let Some(after) = &self.state.exact_probe_after {
+            self.probes
+                .range((Excluded(after.clone()), Unbounded))
+                .chain(self.probes.range(..=after.clone()))
+                .filter(exact)
+                .take(budget)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.probes
+                .iter()
+                .filter(exact)
+                .take(budget)
+                .cloned()
+                .collect()
+        };
+        for id in exact_order {
+            if !selected.contains(&id) {
+                if keys.len() >= budget {
+                    break;
+                }
+                selected.insert(id.clone());
+                keys.push(id.clone());
+            }
+            self.exact_aging_pending.push_back((id, false));
+        }
         self.state.probes_in_window += keys.len();
         keys.into_iter()
             .filter(|id| {
@@ -2931,16 +3056,150 @@ impl<'a> CycleSchedule<'a> {
     }
 
     fn next_probe(&mut self, now: Instant) -> Option<SourceId> {
+        self.selected_exact = None;
         if self.ready_active(now) {
             return None;
         }
-        while let Some(id) = self.pending_probes.pop_front() {
-            let turn = &self.turns[&id];
-            if turn.probe && now < turn.original_end && (turn.first_pending || turn.revisitable) {
-                return Some(id);
+        // Visit the suffix in order, as the original epoch drain did. Retire
+        // only invalid entries before the selected epoch item and leave its
+        // unvisited tail pending: a retained tail still prevents a new batch.
+        // Deferred exact reservations keep their order and never block the
+        // epoch subsequence, which pays no exact service.
+        let mut index = 0;
+        while let Some(id) = self.pending_probes.get(index) {
+            if !self.probe_eligible(id, now) {
+                self.pending_probes.remove(index);
+            } else if self.turns[id].probe_class == Some(ProbeClass::Epoch) {
+                let epoch = self.pending_probes.remove(index);
+                self.retire_exact_tickets();
+                return epoch;
+            } else {
+                index += 1;
             }
         }
-        None
+        // The whole suffix was visited; only live exact reservations remain.
+        self.retire_exact_tickets();
+        if !self.exact_probe_allowed() {
+            return None;
+        }
+        // Every remaining ticket names a live pending reservation. A hot
+        // identity reached in aging order cannot stand in for aging progress.
+        let hot = self.exact_hot_pending.front();
+        let unserved = || {
+            self.exact_aging_pending
+                .iter()
+                .filter(|(_, served)| !served)
+        };
+        let aging = unserved()
+            .find(|(id, _)| !self.state.exact_hot_probes.contains(id))
+            .or_else(|| unserved().next())
+            .map(|(id, _)| id);
+        let choice = if self.state.exact_prefer_aging {
+            aging
+                .map(|id| (id, ExactProbeLane::Aging))
+                .or_else(|| hot.map(|id| (id, ExactProbeLane::Hot)))
+        } else {
+            hot.map(|id| (id, ExactProbeLane::Hot))
+                .or_else(|| aging.map(|id| (id, ExactProbeLane::Aging)))
+        };
+        let (id, lane) = choice?;
+        let id = id.clone();
+        self.selected_exact = Some((id.clone(), lane));
+        Some(id)
+    }
+
+    fn probe_eligible(&self, id: &SourceId, now: Instant) -> bool {
+        let turn = &self.turns[id];
+        self.probes.contains(id)
+            && turn.probe
+            && now < turn.original_end
+            && (turn.first_pending || turn.revisitable)
+    }
+
+    /// The first-debt service limiter for exact probes. It only withholds a
+    /// start; the original membership, end and eligibility checks still apply.
+    fn exact_probe_allowed(&self) -> bool {
+        self.first_pending == 0 || self.exact_service.allows_probe()
+    }
+
+    /// Retire tickets whose reservation left the pending suffix, then advance
+    /// the committed aging cursor over the actually serviced prefix only.
+    fn retire_exact_tickets(&mut self) {
+        let pending = &self.pending_probes;
+        self.exact_hot_pending.retain(|id| pending.contains(id));
+        self.exact_aging_pending
+            .retain(|(id, served)| *served || pending.contains(id));
+        while let Some((id, true)) = self.exact_aging_pending.front() {
+            self.state.exact_probe_after = Some(id.clone());
+            self.exact_aging_pending.pop_front();
+        }
+    }
+
+    /// Called after the post-hook end check, immediately before probe I/O.
+    /// Returns whether restricted first-debt exact service pays the cost.
+    fn probe_started(&mut self, id: &SourceId, now: Instant) -> Option<bool> {
+        if !self.probe_eligible(id, now) {
+            return None;
+        }
+        if self.turns[id].probe_class == Some(ProbeClass::Epoch) {
+            return Some(false);
+        }
+        if self.turns[id].probe_class != Some(ProbeClass::ExactAfterSuccess)
+            || !self.exact_probe_allowed()
+            || !self
+                .selected_exact
+                .as_ref()
+                .is_some_and(|(selected, _)| selected == id)
+        {
+            return None;
+        }
+        let (_, lane) = self.selected_exact.take()?;
+        let charged = self.first_pending > 0;
+        self.exact_service.probe_started();
+        self.pending_probes.retain(|pending| pending != id);
+        self.exact_hot_pending.retain(|pending| pending != id);
+        for (pending, served) in &mut self.exact_aging_pending {
+            if pending == id {
+                *served = true;
+            }
+        }
+        let hot = self.state.exact_hot_probes.iter().position(|key| key == id);
+        self.state.exact_prefer_aging = lane == ExactProbeLane::Hot || hot.is_some();
+        if let Some(index) = hot
+            && let Some(key) = self.state.exact_hot_probes.remove(index)
+        {
+            self.state.exact_hot_probes.push_back(key);
+        }
+        self.retire_exact_tickets();
+        Some(charged)
+    }
+
+    fn probe_finished(&mut self, charged: bool, started: Instant) {
+        if charged {
+            self.exact_service.probes = self
+                .exact_service
+                .probes
+                .saturating_add(self.state.now().saturating_duration_since(started));
+        }
+    }
+
+    /// The closure includes acknowledgement and AfterAttempt. Even an early
+    /// error must account for actual started first work before it propagates.
+    fn run_attempt(
+        &mut self,
+        id: &SourceId,
+        lane: SourceLane,
+        started: Instant,
+        work: impl FnOnce(&mut Self) -> PortResult<()>,
+    ) -> PortResult<()> {
+        let first = self.turns[id].first_pending;
+        self.started(id, lane)?;
+        let result = work(self);
+        if first {
+            self.exact_service
+                .first_turn_finished(self.state.now().saturating_duration_since(started));
+        }
+        result
     }
 
     fn next(&mut self, now: Instant) -> Option<ScheduledTurn> {
@@ -3106,7 +3365,10 @@ impl<'a> CycleSchedule<'a> {
         debt.last_full_verified = Some(now);
         let turn = self.turns.get_mut(id).expect("registered source turn");
         // Keep existing authority; exact work may arm only while other first turns remain.
-        turn.probe |= turn.published_at_start && self.first_pending > 0;
+        if !turn.probe && turn.published_at_start && self.first_pending > 0 {
+            turn.probe = true;
+            turn.probe_class = Some(ProbeClass::ExactAfterSuccess);
+        }
         turn.revisitable = turn.probe && success.revisitable;
         if turn.revisitable {
             self.probes.insert(id.clone());
@@ -4439,6 +4701,10 @@ fn observe_cycle(
         .state
         .hot_probes
         .retain(|id| scheduler.turns.contains_key(id));
+    scheduler
+        .state
+        .exact_hot_probes
+        .retain(|id| scheduler.turns.contains_key(id));
     let mut metadata = BTreeMap::<String, WorkBuddyMetadata>::new();
     let mut absent = BTreeMap::<String, ObservationOutcome>::new();
     let mut baselines = BTreeMap::<SourceId, BackgroundSource>::new();
@@ -4498,6 +4764,9 @@ fn observe_cycle(
         scheduler.stage_probe_batch(now);
         while let Some(id) = scheduler.next_probe(scheduler.state.now()) {
             let group = shared.get(id.as_str()).ok_or_else(invalid)?;
+            // Service time starts before the test boundary; an expired item is
+            // discarded before I/O and consumes no credit or rotation turn.
+            let probe_start = scheduler.state.now();
             #[cfg(test)]
             scheduler
                 .state
@@ -4506,14 +4775,24 @@ fn observe_cycle(
             if scheduler.state.now() >= group.original_end {
                 continue;
             }
+            let Some(charged) = scheduler.probe_started(&id, scheduler.state.now()) else {
+                continue;
+            };
             // A refusal before probe I/O at an expired unowed end records
             // nothing. A real admitted probe failure cannot close on old hints.
-            match probe_source_hint(control, policy, &roots, group, scheduler.state) {
+            let probe = probe_source_hint(control, policy, &roots, group, scheduler.state);
+            scheduler.probe_finished(charged, probe_start);
+            match probe {
                 Ok(hint) => {
                     let prior = baselines
                         .get(&id)
                         .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
                     scheduler.hint(&id, hint, prior.and_then(|prior| prior.indexed_len));
+                    #[cfg(test)]
+                    scheduler
+                        .state
+                        .hooks
+                        .event(ScheduleTestEvent::AfterProbe(&id, group.original_end))?;
                 }
                 Err(error) => {
                     if matches!(
@@ -4581,6 +4860,9 @@ fn observe_cycle(
             }
             ScheduledTurn::Attempt(id, lane) => (id, lane),
         };
+        // Service time starts before the test boundary. It enters the
+        // first-turn ledger only if this item actually starts as first work.
+        let attempt_start = scheduler.state.now();
         #[cfg(test)]
         scheduler
             .state
@@ -4595,113 +4877,116 @@ fn observe_cycle(
         if scheduler.state.now() >= scheduler.turns[&id].original_end {
             continue;
         }
-        scheduler.started(&id, lane)?;
-        if let Some(source) = missing.get(&id) {
-            let outcome = observe_missing_source(
-                db,
-                control,
-                authority,
-                policy,
-                &roots,
-                cycle,
-                &incarnation,
-                source,
-                boot,
-                &metadata,
-                scheduler.state,
-            )?;
-            if let ObservationOutcome::Attempted {
-                committed, claimed, ..
-            } = &outcome
-            {
-                for &index in claimed {
-                    attempted_sources
-                        .entry(index)
-                        .or_default()
-                        .insert(id.clone());
-                    if *committed {
-                        published_sources
-                            .entry(index)
-                            .or_default()
-                            .insert(id.clone());
-                    }
-                }
-            }
-            absent.insert(id.as_str().into(), outcome);
-        } else {
-            let group = shared.get(id.as_str()).ok_or_else(invalid)?;
-            let prior = baselines
-                .get(&id)
-                .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
-            let revisit = matches!(
-                outcomes.get(id.as_str()),
-                Some(ObservationOutcome::Attempted { .. })
-            );
-            let (outcome, success) = observe_shared_source(
-                db,
-                control,
-                authority,
-                policy,
-                &roots,
-                &inconsistent,
-                cycle,
-                &incarnation,
-                group,
-                prior,
-                revisit,
-                boot,
-                &mut metadata,
-                scheduler.state,
-            )?;
-            if let Some(success) = success {
-                successful_hints.insert(id.clone(), success.hint);
-                scheduler.succeeded(&id, &success);
-                baselines.insert(id.clone(), success.baseline);
-            } else {
-                scheduler.failed(&id);
+        // Every early return after `started` passes through the ledger first.
+        scheduler.run_attempt(&id, lane, attempt_start, |scheduler| {
+            if let Some(source) = missing.get(&id) {
+                let outcome = observe_missing_source(
+                    db,
+                    control,
+                    authority,
+                    policy,
+                    &roots,
+                    cycle,
+                    &incarnation,
+                    source,
+                    boot,
+                    &metadata,
+                    scheduler.state,
+                )?;
                 if let ObservationOutcome::Attempted {
-                    published: true, ..
+                    committed, claimed, ..
                 } = &outcome
-                    && let Some(observed) =
-                        metadata.values().find(|metadata| metadata.source.id == id)
                 {
-                    successful_hints
-                        .insert(id.clone(), SourceHint::from_snapshot(&observed.snapshot));
-                    baselines.insert(
-                        id.clone(),
-                        BackgroundSource {
-                            binding: observed.binding.clone(),
-                            latest_receipt: Some(observed.receipt.clone()),
-                            indexed_len: Some(observed.snapshot.len),
-                            superseded: false,
-                        },
-                    );
-                }
-            }
-            if let ObservationOutcome::Attempted {
-                committed, claimed, ..
-            } = &outcome
-            {
-                for &index in claimed {
-                    attempted_sources
-                        .entry(index)
-                        .or_default()
-                        .insert(id.clone());
-                    if *committed {
-                        published_sources
+                    for &index in claimed {
+                        attempted_sources
                             .entry(index)
                             .or_default()
                             .insert(id.clone());
+                        if *committed {
+                            published_sources
+                                .entry(index)
+                                .or_default()
+                                .insert(id.clone());
+                        }
                     }
                 }
+                absent.insert(id.as_str().into(), outcome);
+            } else {
+                let group = shared.get(id.as_str()).ok_or_else(invalid)?;
+                let prior = baselines
+                    .get(&id)
+                    .or_else(|| group.path.to_str().and_then(|path| known.get(path)));
+                let revisit = matches!(
+                    outcomes.get(id.as_str()),
+                    Some(ObservationOutcome::Attempted { .. })
+                );
+                let (outcome, success) = observe_shared_source(
+                    db,
+                    control,
+                    authority,
+                    policy,
+                    &roots,
+                    &inconsistent,
+                    cycle,
+                    &incarnation,
+                    group,
+                    prior,
+                    revisit,
+                    boot,
+                    &mut metadata,
+                    scheduler.state,
+                )?;
+                if let Some(success) = success {
+                    successful_hints.insert(id.clone(), success.hint);
+                    scheduler.succeeded(&id, &success);
+                    baselines.insert(id.clone(), success.baseline);
+                } else {
+                    scheduler.failed(&id);
+                    if let ObservationOutcome::Attempted {
+                        published: true, ..
+                    } = &outcome
+                        && let Some(observed) =
+                            metadata.values().find(|metadata| metadata.source.id == id)
+                    {
+                        successful_hints
+                            .insert(id.clone(), SourceHint::from_snapshot(&observed.snapshot));
+                        baselines.insert(
+                            id.clone(),
+                            BackgroundSource {
+                                binding: observed.binding.clone(),
+                                latest_receipt: Some(observed.receipt.clone()),
+                                indexed_len: Some(observed.snapshot.len),
+                                superseded: false,
+                            },
+                        );
+                    }
+                }
+                if let ObservationOutcome::Attempted {
+                    committed, claimed, ..
+                } = &outcome
+                {
+                    for &index in claimed {
+                        attempted_sources
+                            .entry(index)
+                            .or_default()
+                            .insert(id.clone());
+                        if *committed {
+                            published_sources
+                                .entry(index)
+                                .or_default()
+                                .insert(id.clone());
+                        }
+                    }
+                }
+                outcomes.insert(id.as_str().into(), outcome);
             }
-            outcomes.insert(id.as_str().into(), outcome);
-        }
-        #[cfg(test)]
-        scheduler
-            .state
-            .hooks
-            .event(ScheduleTestEvent::AfterAttempt(&id, lane))?;
+            #[cfg(test)]
+            scheduler
+                .state
+                .hooks
+                .event(ScheduleTestEvent::AfterAttempt(&id, lane))?;
+            Ok(())
+        })?;
     }
     #[cfg(test)]
     scheduler.state.hooks.event(ScheduleTestEvent::Finalizing)?;
@@ -10070,6 +10355,270 @@ mod control_deadline_tests {
     }
 
     #[test]
+    fn scheduler_exact_revisit_probes_cannot_starve_owed_first_turns() {
+        const SOURCES: usize = 20;
+        const STEP_COST: Duration = Duration::from_millis(250);
+
+        #[derive(Default)]
+        struct Progress {
+            planned: bool,
+            ends: BTreeMap<SourceId, Instant>,
+            published: BTreeSet<SourceId>,
+            succeeded: BTreeSet<SourceId>,
+            not_scheduled: BTreeSet<SourceId>,
+            probes: usize,
+            successful_probes: usize,
+            probes_with_debt: usize,
+            discoveries: usize,
+        }
+
+        let fixture = CycleFixture::new();
+        for index in 0..SOURCES {
+            fixture.write_source(
+                &format!("warm-{index:02}.jsonl"),
+                SearchProvider::Claude,
+                &format!("exactprobecapacity{index}"),
+            );
+        }
+        let boot = ObservationClock::with_epoch_gate(Instant::now(), EpochGate::Unverified);
+        let mut schedule = SourceScheduleState::default();
+        let discovery_members = |cycle: &ObservationCycle| {
+            let conn = rusqlite::Connection::open_with_flags(
+                &fixture.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            conn.prepare(
+                "SELECT s.source_id,s.revision_id,COALESCE(
+                   r.source_id=s.source_id AND r.published=1 AND r.completeness='complete'
+                   AND r.cycle_seq=d.cycle_seq AND r.started_control_seq=d.started_control_seq
+                   AND r.worker_boot_id=d.worker_boot_id
+                   AND r.catalog_incarnation=d.catalog_incarnation
+                   AND r.policy_epoch=d.policy_epoch AND h.latest_receipt_id=s.revision_id
+                   AND c.selection_revision=d.selection_revision
+                   AND c.root_identity=d.root_identity,0)
+                 FROM discovery_receipts d
+                 JOIN discovery_sources s ON s.cycle_seq=d.cycle_seq AND s.selection_id=d.selection_id
+                 LEFT JOIN source_revision_receipts r ON r.revision_id=s.revision_id
+                 LEFT JOIN source_heads h ON h.source_id=s.source_id
+                 LEFT JOIN receipt_selection_claims c
+                   ON c.revision_id=s.revision_id AND c.selection_id=s.selection_id
+                 WHERE d.cycle_seq=?1 AND d.selection_id=?2 AND d.complete=1
+                   AND d.started_control_seq=?3
+                 ORDER BY s.source_id",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params![
+                    cycle.token.cycle_seq.get(),
+                    fixture.selection.id.as_str(),
+                    cycle.started_control_seq.unwrap().get()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        let (first, first_cycle) = fixture.production_cycle(&mut schedule, &boot);
+        let first = first.unwrap();
+        assert!(first.idle() && first.all_sources_attempted);
+        assert_eq!(first_cycle.state, CycleState::Committed);
+        assert_eq!(first_cycle.selections.len(), 1);
+        let first_root = &first_cycle.selections[0];
+        assert_eq!(first_root.selection.selection_id, fixture.selection.id);
+        assert!(first_root.discovery_complete && first_root.error.is_none());
+        assert_eq!(
+            (
+                first_root.discovered_count,
+                first_root.observed_count,
+                first_root.committed_count
+            ),
+            (SOURCES as u64, SOURCES as u64, SOURCES as u64),
+            "cycle one must acknowledge every published warm baseline"
+        );
+        let before = fixture
+            .sources()
+            .into_iter()
+            .map(|source| (source.binding.source_id.clone(), source))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(before.len(), SOURCES);
+        let expected = before
+            .iter()
+            .map(|(id, source)| {
+                assert!(published_baseline(Some(source)));
+                let receipt = source.latest_receipt.as_ref().unwrap();
+                assert_eq!(receipt.cycle_seq, first_cycle.token.cycle_seq.get());
+                (
+                    id.as_str().to_owned(),
+                    receipt.revision_id.as_str().to_owned(),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            discovery_members(&first_cycle),
+            expected,
+            "all twenty warm baselines must have real exact discovery proof"
+        );
+
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let progress = Rc::new(RefCell::new(Progress::default()));
+        schedule.hooks = scheduler_hooks(elapsed.clone(), {
+            let elapsed = elapsed.clone();
+            let progress = progress.clone();
+            let expected_ids = before.keys().cloned().collect::<BTreeSet<_>>();
+            move |event| {
+                let mut progress = progress.borrow_mut();
+                match event {
+                    ScheduleTestEvent::Planned => {
+                        assert!(!progress.planned);
+                        assert!(progress.ends.is_empty() && progress.succeeded.is_empty());
+                        progress.planned = true;
+                    }
+                    ScheduleTestEvent::BeforeAttempt(id, end, lane) => {
+                        assert!(progress.planned && expected_ids.contains(id));
+                        assert_eq!(lane, SourceLane::Verification);
+                        assert!(progress.ends.insert(id.clone(), end).is_none());
+                    }
+                    ScheduleTestEvent::Published(id, end) => {
+                        assert_eq!(progress.ends.get(id), Some(&end));
+                        assert!(progress.published.insert(id.clone()));
+                    }
+                    ScheduleTestEvent::AfterAttempt(id, _) => {
+                        assert!(progress.published.contains(id));
+                        assert!(progress.succeeded.insert(id.clone()));
+                        elapsed.set(elapsed.get() + STEP_COST);
+                    }
+                    ScheduleTestEvent::BeforeProbe(id, end) => {
+                        assert!(
+                            progress.succeeded.contains(id),
+                            "exact probes require this cycle's successful first turn"
+                        );
+                        assert_eq!(progress.ends.get(id), Some(&end));
+                        assert!(Instant::now() + elapsed.get() < end);
+                        progress.probes += 1;
+                        // Model admitted probe cost without changing the root end
+                        // or forcing cadence. A large quiet batch consumes time
+                        // that the remaining exact first turns still need.
+                        elapsed.set(elapsed.get() + STEP_COST);
+                    }
+                    ScheduleTestEvent::AfterProbe(id, end) => {
+                        assert!(progress.published.contains(id) && progress.succeeded.contains(id));
+                        assert_eq!(progress.ends.get(id), Some(&end));
+                        progress.successful_probes += 1;
+                        if progress.succeeded.len() < SOURCES {
+                            progress.probes_with_debt += 1;
+                        }
+                    }
+                    ScheduleTestEvent::AfterNotScheduled(id) => {
+                        assert!(progress.not_scheduled.insert(id.clone()));
+                    }
+                    ScheduleTestEvent::SourceFailed { error, .. } => {
+                        panic!(
+                            "synthetic exact attempt failed: {}",
+                            ScheduleTestHooks::error_label(error)
+                        );
+                    }
+                    ScheduleTestEvent::BeforeDiscoveryPublication { epoch } => {
+                        assert!(!epoch, "unverified cycles require exact discovery");
+                    }
+                    ScheduleTestEvent::AfterDiscoveryPublication { epoch } => {
+                        assert!(!epoch);
+                        progress.discoveries += 1;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        });
+        schedule.next_probe = None;
+
+        let (second, cycle) = fixture.production_cycle(&mut schedule, &boot);
+        let second = second.unwrap();
+        let progress = progress.borrow();
+        let members = discovery_members(&cycle);
+        assert_eq!(
+            *schedule.hooks.epoch_refusals.borrow(),
+            [(EpochSite::Plan, EpochRefusal::Unverified)]
+        );
+        assert!(
+            progress.probes_with_debt > 0,
+            "a successful probe I/O must follow this source's acknowledged publication \
+             while another source still owes its first turn"
+        );
+        assert!(
+            second.catalog_complete,
+            "exact discovery must close despite competing probes: attempts={}, \
+             published={}, succeeded={}, not_scheduled={}, probes={}, \
+             successful_probes={}, probes_with_debt={}, members={}, charged_ms={}, state={:?}",
+            progress.ends.len(),
+            progress.published.len(),
+            progress.succeeded.len(),
+            progress.not_scheduled.len(),
+            progress.probes,
+            progress.successful_probes,
+            progress.probes_with_debt,
+            members.len(),
+            elapsed.get().as_millis(),
+            cycle.state
+        );
+        assert!(second.idle() && second.all_sources_attempted);
+        assert_eq!(cycle.state, CycleState::Committed);
+        assert_eq!(progress.ends.len(), SOURCES);
+        assert_eq!(progress.published.len(), SOURCES);
+        assert_eq!(progress.succeeded.len(), SOURCES);
+        assert_eq!(progress.successful_probes, progress.probes);
+        assert!(progress.not_scheduled.is_empty());
+        assert_eq!(progress.discoveries, 1);
+        assert_eq!(cycle.selections.len(), 1);
+        let selection = &cycle.selections[0];
+        assert_eq!(selection.selection.selection_id, fixture.selection.id);
+        assert!(selection.discovery_complete && selection.error.is_none());
+        assert_eq!(
+            (
+                selection.discovered_count,
+                selection.observed_count,
+                selection.committed_count
+            ),
+            (SOURCES as u64, SOURCES as u64, SOURCES as u64)
+        );
+        let sources = fixture.sources();
+        assert_eq!(sources.len(), SOURCES);
+        let mut expected = sources
+            .iter()
+            .map(|source| {
+                let id = &source.binding.source_id;
+                let prior = &before[id];
+                assert_eq!(source.binding, prior.binding);
+                let receipt = source.latest_receipt.as_ref().unwrap();
+                let old = prior.latest_receipt.as_ref().unwrap();
+                assert!(receipt.published);
+                assert_eq!(receipt.cycle_seq, cycle.token.cycle_seq.get());
+                assert_ne!(receipt.revision_id, old.revision_id);
+                assert_eq!(receipt.digest, old.digest);
+                (
+                    id.as_str().to_owned(),
+                    receipt.revision_id.as_str().to_owned(),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            members, expected,
+            "exact discovery must bind all current heads"
+        );
+    }
+
+    #[test]
     fn scheduler_commit_refusal_keeps_baselines_incomplete_and_owed_without_new_attempts() {
         use crate::update_state::acquire_installation_lock;
 
@@ -11740,6 +12289,100 @@ mod control_deadline_tests {
     }
 
     #[test]
+    fn scheduler_pending_epoch_tail_survives_active_interruption_across_cadence() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let advance = {
+            let elapsed = elapsed.clone();
+            move |cost: Duration| elapsed.set(elapsed.get() + cost)
+        };
+        let mut state = SourceScheduleState {
+            hooks: ScheduleTestHooks {
+                now: Some(elapsed.clone()),
+                ..ScheduleTestHooks::default()
+            },
+            ..SourceScheduleState::default()
+        };
+        let start = Instant::now();
+        let ids = ["epoch-0", "epoch-1"].map(|id| SourceId::parse(id).unwrap());
+        let appended = SourceHint {
+            len: 2,
+            mtime_ms: 2,
+        };
+        let (_, mut success) = exact_published(&ids[0]);
+        success.hint = appended;
+        let mut cycle = CycleSchedule::new(&mut state);
+        // Both ProbeOnly epoch sources are live at reservation; E1 has the
+        // shorter original end, so its expiry needs no NotScheduled event.
+        for (id, end) in [
+            (&ids[0], start + SOURCE_OBSERVATION_BUDGET),
+            (&ids[1], start + CADENCE / 2),
+        ] {
+            cycle
+                .add_obligation(
+                    id,
+                    None,
+                    SourceLane::Verification,
+                    end,
+                    true,
+                    TurnObligation::ProbeOnly,
+                )
+                .unwrap();
+        }
+        let window = cycle.state.now();
+        cycle.stage_probe_batch(window);
+        assert_eq!(cycle.pending_probes, VecDeque::from(ids.clone()));
+        let mut batches = 1;
+        let mut events = Vec::new();
+        advance(CADENCE / 2);
+        // Mirror the observe_cycle loop: stage once per iteration, drain
+        // probes until Active work is ready, then take the next turn.
+        loop {
+            let fresh = cycle.pending_probes.is_empty();
+            cycle.stage_probe_batch(cycle.state.now());
+            if fresh && !cycle.pending_probes.is_empty() {
+                batches += 1;
+            }
+            while let Some(id) = cycle.next_probe(cycle.state.now()) {
+                assert_eq!(cycle.probe_started(&id, cycle.state.now()), Some(false));
+                events.push(("probe", id.clone()));
+                cycle.hint(&id, appended, Some(1));
+            }
+            let Some(turn) = cycle.next(cycle.state.now()) else {
+                if !cycle.pending_probes.is_empty() {
+                    continue;
+                }
+                break;
+            };
+            let ScheduledTurn::Attempt(id, lane) = turn else {
+                panic!("no owed turn can expire in this trace");
+            };
+            events.push(("attempt", id.clone()));
+            // The successful Active attempt finishes after the next cadence,
+            // while E0 remains within its original end.
+            cycle
+                .run_attempt(&id, lane, cycle.state.now(), |cycle| {
+                    advance(CADENCE);
+                    cycle.succeeded(&id, &success);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // The original lazy drain keeps E1 pending through the Active turn and
+        // retires it without reserving another batch. Eager pruning would
+        // reserve a final batch, probe E0 again and reset the window.
+        assert_eq!(batches, 1);
+        let expected = vec![("probe", ids[0].clone()), ("attempt", ids[0].clone())];
+        assert_eq!(events, expected);
+        assert!(cycle.pending_probes.is_empty());
+        assert!(!cycle.final_probe_done);
+        assert_eq!(cycle.state.probe_window, Some(window));
+        assert_eq!(cycle.state.probes_in_window, ids.len());
+        assert_eq!(cycle.state.next_probe, Some(window + CADENCE));
+        assert_eq!(cycle.state.probe_after, Some(ids[1].clone()));
+        assert!(cycle.probes.contains(&ids[0]) && !cycle.probes.contains(&ids[1]));
+    }
+
+    #[test]
     fn scheduler_probe_rotation_keeps_aging_work_under_a_hot_backfill() {
         let mut state = SourceScheduleState::default();
         let start = Instant::now();
@@ -11784,6 +12427,678 @@ mod control_deadline_tests {
             "aging probes must not starve behind the hot set"
         );
         assert_eq!(cycle.first_pending, 1);
+    }
+
+    /// A synthetic published prior and its same-cycle success for pure
+    /// scheduler tests. No catalog proof is implied by these values.
+    fn exact_published(id: &SourceId) -> (BackgroundSource, SuccessfulSourceAttempt) {
+        let prior = BackgroundSource {
+            binding: SourceBinding {
+                source_id: id.clone(),
+                source_path: format!("synthetic-{}", id.as_str()),
+                provider: SearchProvider::Claude,
+                namespace_id: None,
+                root_identity: "synthetic-root".into(),
+            },
+            latest_receipt: Some(agent_session_grep_ports::managed::RevisionRef {
+                revision_id: RevisionId::parse(&format!("{}-receipt", id.as_str())).unwrap(),
+                digest: "a".repeat(64),
+                observed_at_ms: 1,
+                cycle_seq: 1,
+                worker_boot_id: "synthetic-boot".into(),
+                catalog_incarnation: "pending-catalog".into(),
+                policy_epoch: 1,
+                started_control_seq: 1,
+                committed_generation: Some(1),
+                published: true,
+            }),
+            indexed_len: Some(1),
+            superseded: false,
+        };
+        let success = SuccessfulSourceAttempt {
+            baseline: prior.clone(),
+            hint: SourceHint {
+                len: 1,
+                mtime_ms: 1,
+            },
+            revisitable: true,
+            claims: Vec::new(),
+        };
+        (prior, success)
+    }
+
+    #[test]
+    fn scheduler_exact_probe_service_counts_only_started_first_turn_work() {
+        let exact = ["exact-0", "exact-1", "exact-2"].map(|id| SourceId::parse(id).unwrap());
+        let debts =
+            ["first-0", "first-1", "first-2", "first-3"].map(|id| SourceId::parse(id).unwrap());
+        let expiring = SourceId::parse("first-expiring").unwrap();
+        let late = SourceId::parse("late-first").unwrap();
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let advance = {
+            let elapsed = elapsed.clone();
+            move |cost: Duration| elapsed.set(elapsed.get() + cost)
+        };
+        let mut state = SourceScheduleState {
+            hooks: ScheduleTestHooks {
+                now: Some(elapsed.clone()),
+                ..ScheduleTestHooks::default()
+            },
+            ..SourceScheduleState::default()
+        };
+        let start = Instant::now();
+        let end = start + SOURCE_OBSERVATION_BUDGET;
+        let successes = exact
+            .iter()
+            .map(|id| (id.clone(), exact_published(id)))
+            .collect::<BTreeMap<_, _>>();
+        let mut cycle = CycleSchedule::new(&mut state);
+        for id in &exact {
+            cycle
+                .add(
+                    id,
+                    Some(&successes[id].0),
+                    SourceLane::Verification,
+                    end,
+                    false,
+                )
+                .unwrap();
+        }
+        for id in &debts {
+            cycle.add(id, None, SourceLane::Cold, end, false).unwrap();
+        }
+        cycle
+            .add(
+                &expiring,
+                None,
+                SourceLane::Cold,
+                start + CADENCE / 2,
+                false,
+            )
+            .unwrap();
+
+        // Each exact first turn actually starts, succeeds while other first
+        // turns remain owed and adds its measured service time to F.
+        for id in &exact {
+            cycle
+                .run_attempt(id, SourceLane::Verification, cycle.state.now(), |cycle| {
+                    advance(Duration::from_millis(100));
+                    cycle.succeeded(id, &successes[id].1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                cycle.turns[id].probe_class,
+                Some(ProbeClass::ExactAfterSuccess)
+            );
+        }
+        assert_eq!(cycle.first_pending, 5);
+        let service = cycle.exact_service;
+        assert!(service.between_attempts && !service.bootstrap_used);
+        assert!(service.first_turn >= Duration::from_millis(300));
+        assert_eq!(service.probes, Duration::ZERO);
+
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact.clone()));
+        assert_eq!(cycle.state.probes_in_window, exact.len());
+
+        // The first actual exact start consumes the single bootstrap even
+        // though first-turn service is ahead.
+        let probe_start = cycle.state.now();
+        assert_eq!(cycle.next_probe(cycle.state.now()), Some(exact[0].clone()));
+        assert_eq!(
+            cycle.probe_started(&exact[0], cycle.state.now()),
+            Some(true)
+        );
+        advance(CADENCE);
+        cycle.probe_finished(true, probe_start);
+        let service = cycle.exact_service;
+        assert!(service.bootstrap_used && !service.between_attempts);
+        assert!(service.probes >= CADENCE && service.probes > service.first_turn);
+        assert_eq!(cycle.state.exact_probe_after, Some(exact[0].clone()));
+
+        // An already filled suffix keeps its reservations but cannot start.
+        assert!(cycle.next_probe(cycle.state.now()).is_none());
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact[1..].to_vec()));
+        assert_eq!(cycle.exact_service, service);
+
+        // Unstarted expiry retires its owed turn and mints nothing.
+        let Some(ScheduledTurn::NotScheduled(retired)) = cycle.next(cycle.state.now()) else {
+            panic!("expired first turn kept its NotScheduled ownership");
+        };
+        assert_eq!(retired, expiring);
+        assert_eq!(cycle.first_pending, 4);
+        assert_eq!(cycle.exact_service, service);
+
+        // Crossing cadence with a pending suffix reserves nothing and grants
+        // no credit.
+        advance(2 * CADENCE);
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        assert!(cycle.next_probe(now).is_none());
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact[1..].to_vec()));
+        assert_eq!(cycle.state.probes_in_window, exact.len());
+        assert_eq!(cycle.exact_service, service);
+
+        // A dirty exact revisit uses its Active turn and mints no credit.
+        cycle.hint(
+            &exact[0],
+            SourceHint {
+                len: 2,
+                mtime_ms: 2,
+            },
+            Some(1),
+        );
+        assert_eq!(cycle.first_pending, 4);
+        let Some(ScheduledTurn::Attempt(id, SourceLane::Active)) = cycle.next(cycle.state.now())
+        else {
+            panic!("dirty exact revisit did not use its Active turn");
+        };
+        assert_eq!(id, exact[0]);
+        cycle
+            .run_attempt(&id, SourceLane::Active, cycle.state.now(), |cycle| {
+                advance(2 * CADENCE);
+                cycle.succeeded(&id, &successes[&id].1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(cycle.exact_service, service);
+        assert_eq!(
+            cycle.turns[&id].probe_class,
+            Some(ProbeClass::ExactAfterSuccess)
+        );
+
+        // Real first work restores the inter-attempt credit, but the negative
+        // balance survives cadence and still withholds a start.
+        let Some(ScheduledTurn::Attempt(id, SourceLane::Cold)) = cycle.next(cycle.state.now())
+        else {
+            panic!("owed first work did not run while exact credit was negative");
+        };
+        assert_eq!(id, debts[0]);
+        cycle
+            .run_attempt(&id, SourceLane::Cold, cycle.state.now(), |_| {
+                advance(Duration::from_millis(100));
+                Ok(())
+            })
+            .unwrap();
+        assert!(cycle.exact_service.between_attempts);
+        assert!(cycle.exact_service.probes > cycle.exact_service.first_turn);
+        assert!(cycle.next_probe(cycle.state.now()).is_none());
+
+        // A started first attempt that returns early still pays its service
+        // time before the original error propagates.
+        let Some(ScheduledTurn::Attempt(id, SourceLane::Cold)) = cycle.next(cycle.state.now())
+        else {
+            panic!("second owed first turn did not run");
+        };
+        assert_eq!(id, debts[1]);
+        let failed = cycle.run_attempt(&id, SourceLane::Cold, cycle.state.now(), |_| {
+            advance(Duration::from_millis(1500));
+            Err(changed())
+        });
+        assert!(matches!(failed, Err(PortError::SnapshotChanged(_))));
+        assert!(cycle.exact_service.first_turn > cycle.exact_service.probes);
+
+        // Restored balance plus one completion permits exactly one charged start.
+        let probe_start = cycle.state.now();
+        assert_eq!(cycle.next_probe(cycle.state.now()), Some(exact[1].clone()));
+        assert_eq!(
+            cycle.probe_started(&exact[1], cycle.state.now()),
+            Some(true)
+        );
+        advance(Duration::from_millis(100));
+        cycle.probe_finished(true, probe_start);
+        assert!(cycle.next_probe(cycle.state.now()).is_none());
+        assert_eq!(cycle.pending_probes, VecDeque::from([exact[2].clone()]));
+
+        // With the last first debt retired, the armed suffix drains under the
+        // existing final rules without charge or a new batch.
+        for id in &debts[2..] {
+            let Some(ScheduledTurn::Attempt(served, SourceLane::Cold)) =
+                cycle.next(cycle.state.now())
+            else {
+                panic!("remaining first debt did not run");
+            };
+            assert_eq!(&served, id);
+            cycle
+                .run_attempt(&served, SourceLane::Cold, cycle.state.now(), |_| {
+                    advance(Duration::from_millis(100));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(cycle.first_pending, 0);
+        let service = cycle.exact_service;
+        assert_eq!(cycle.next_probe(cycle.state.now()), Some(exact[2].clone()));
+        assert_eq!(
+            cycle.probe_started(&exact[2], cycle.state.now()),
+            Some(false)
+        );
+        cycle.probe_finished(false, cycle.state.now());
+        assert_eq!(
+            (cycle.exact_service.first_turn, cycle.exact_service.probes),
+            (service.first_turn, service.probes)
+        );
+        assert!(cycle.pending_probes.is_empty());
+
+        // The original due final pass may probe already armed sources once.
+        // It mints neither authority nor service time.
+        advance(CADENCE);
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        assert!(cycle.final_probe_done);
+        let final_pass = std::iter::from_fn(|| {
+            let id = cycle.next_probe(now)?;
+            assert_eq!(cycle.probe_started(&id, now), Some(false));
+            Some(id)
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(final_pass, exact.to_vec());
+        cycle.stage_probe_batch(now);
+        assert!(cycle.pending_probes.is_empty());
+        assert_eq!(
+            (cycle.exact_service.first_turn, cycle.exact_service.probes),
+            (service.first_turn, service.probes)
+        );
+
+        // Debt reappearing in this cycle resumes the same ledger. A source
+        // succeeding at zero remaining debt is never armed.
+        let (late_prior, late_success) = exact_published(&late);
+        cycle
+            .add(
+                &late,
+                Some(&late_prior),
+                SourceLane::Verification,
+                end,
+                false,
+            )
+            .unwrap();
+        assert_eq!(cycle.first_pending, 1);
+        assert!(!cycle.exact_probe_allowed());
+        assert_eq!(
+            (cycle.exact_service.first_turn, cycle.exact_service.probes),
+            (service.first_turn, service.probes)
+        );
+        cycle
+            .run_attempt(
+                &late,
+                SourceLane::Verification,
+                cycle.state.now(),
+                |cycle| {
+                    advance(Duration::from_millis(100));
+                    cycle.succeeded(&late, &late_success);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(cycle.turns[&late].probe_class, None);
+        assert!(!cycle.probes.contains(&late));
+    }
+
+    #[test]
+    fn scheduler_exact_deferral_keeps_epoch_subsequence_and_one_reservation() {
+        let epochs = ["epoch-0", "epoch-1", "epoch-2"].map(|id| SourceId::parse(id).unwrap());
+        let exact = ["exact-0", "exact-1"].map(|id| SourceId::parse(id).unwrap());
+        let debts = ["first-0", "first-1"].map(|id| SourceId::parse(id).unwrap());
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let advance = {
+            let elapsed = elapsed.clone();
+            move |cost: Duration| elapsed.set(elapsed.get() + cost)
+        };
+        let mut state = SourceScheduleState {
+            hooks: ScheduleTestHooks {
+                now: Some(elapsed.clone()),
+                ..ScheduleTestHooks::default()
+            },
+            ..SourceScheduleState::default()
+        };
+        let end = Instant::now() + SOURCE_OBSERVATION_BUDGET;
+        let mut cycle = CycleSchedule::new(&mut state);
+        for id in &epochs {
+            cycle
+                .add_obligation(
+                    id,
+                    None,
+                    SourceLane::Verification,
+                    end,
+                    true,
+                    TurnObligation::ProbeOnly,
+                )
+                .unwrap();
+        }
+        for id in &debts {
+            cycle.add(id, None, SourceLane::Cold, end, false).unwrap();
+        }
+        for id in &exact {
+            let (prior, success) = exact_published(id);
+            cycle
+                .add(id, Some(&prior), SourceLane::Verification, end, false)
+                .unwrap();
+            cycle.started(id, SourceLane::Verification).unwrap();
+            cycle.succeeded(id, &success);
+            assert_eq!(
+                cycle.turns[id].probe_class,
+                Some(ProbeClass::ExactAfterSuccess)
+            );
+        }
+
+        // A fresh mixed batch reserves the epoch selection first.
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        let fresh = epochs
+            .iter()
+            .chain(&exact)
+            .cloned()
+            .collect::<VecDeque<_>>();
+        assert_eq!(cycle.pending_probes, fresh);
+        assert_eq!(cycle.state.probes_in_window, fresh.len());
+
+        // An older carried suffix may hold epoch work behind deferred exact
+        // work. The epoch subsequence drains in order and pays nothing.
+        cycle.pending_probes = [&exact[0], &epochs[0], &exact[1], &epochs[1], &epochs[2]]
+            .into_iter()
+            .cloned()
+            .collect();
+        cycle.exact_service.bootstrap_used = true;
+        assert!(!cycle.exact_probe_allowed());
+        let service = cycle.exact_service;
+        let drained = std::iter::from_fn(|| {
+            let id = cycle.next_probe(now)?;
+            assert_eq!(cycle.probe_started(&id, now), Some(false));
+            Some(id)
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(drained, epochs.to_vec());
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact.clone()));
+        assert_eq!(cycle.exact_service, service);
+        assert!(cycle.state.exact_probe_after.is_none());
+
+        // Crossing cadence never reserves the same suffix again.
+        advance(CADENCE);
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact.clone()));
+        assert_eq!(cycle.state.probes_in_window, fresh.len());
+
+        // Real first work reopens exactly one exact start.
+        let Some(ScheduledTurn::Attempt(id, SourceLane::Cold)) = cycle.next(now) else {
+            panic!("owed first work did not run before deferred exact work");
+        };
+        assert_eq!(id, debts[0]);
+        cycle
+            .run_attempt(&id, SourceLane::Cold, cycle.state.now(), |_| {
+                advance(Duration::from_millis(100));
+                Ok(())
+            })
+            .unwrap();
+        let probe_start = cycle.state.now();
+        assert_eq!(cycle.next_probe(cycle.state.now()), Some(exact[0].clone()));
+        assert_eq!(
+            cycle.probe_started(&exact[0], cycle.state.now()),
+            Some(true)
+        );
+        advance(Duration::from_millis(50));
+        cycle.probe_finished(true, probe_start);
+        assert!(cycle.next_probe(cycle.state.now()).is_none());
+        assert_eq!(cycle.pending_probes, VecDeque::from([exact[1].clone()]));
+        assert_eq!(cycle.state.exact_probe_after, Some(exact[0].clone()));
+        assert_eq!(
+            cycle
+                .exact_aging_pending
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [(exact[1].clone(), false)]
+        );
+
+        // An expired deferred ticket retires without claiming service.
+        let service = cycle.exact_service;
+        assert!(cycle.next_probe(end).is_none());
+        assert!(cycle.pending_probes.is_empty());
+        assert!(cycle.exact_aging_pending.is_empty());
+        assert_eq!(cycle.state.exact_probe_after, Some(exact[0].clone()));
+        assert_eq!(cycle.exact_service, service);
+        assert_eq!(cycle.state.probes_in_window, fresh.len());
+    }
+
+    #[test]
+    fn scheduler_fresh_mixed_reservations_keep_epoch_slots_and_combined_limits() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let mut state = SourceScheduleState {
+            hooks: ScheduleTestHooks {
+                now: Some(elapsed.clone()),
+                ..ScheduleTestHooks::default()
+            },
+            ..SourceScheduleState::default()
+        };
+        let end = Instant::now() + SOURCE_OBSERVATION_BUDGET;
+        let debt = SourceId::parse("first-debt").unwrap();
+        let exact = ["exact-a", "exact-b", "exact-hot-0", "exact-hot-1"]
+            .map(|id| SourceId::parse(id).unwrap());
+        let epochs = (0..61)
+            .map(|n| SourceId::parse(&format!("epoch-{n:02}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut cycle = CycleSchedule::new(&mut state);
+        for id in &epochs {
+            cycle
+                .add_obligation(
+                    id,
+                    None,
+                    SourceLane::Verification,
+                    end,
+                    true,
+                    TurnObligation::ProbeOnly,
+                )
+                .unwrap();
+        }
+        cycle
+            .add(&debt, None, SourceLane::Cold, end, false)
+            .unwrap();
+        for id in &exact {
+            let (prior, success) = exact_published(id);
+            cycle
+                .add(id, Some(&prior), SourceLane::Verification, end, false)
+                .unwrap();
+            cycle.started(id, SourceLane::Verification).unwrap();
+            cycle.succeeded(id, &success);
+        }
+        for id in epochs.iter().take(15).chain(&exact[2..]) {
+            cycle.state.remember_hot(id);
+        }
+        let now = cycle.state.now();
+        cycle.stage_probe_batch(now);
+        // Epoch selection is unchanged. Exact work gets the one remaining
+        // hot-priority slot, then aging order up to 64 combined slots; the
+        // second hot identity is refused by the 16-slot hot limit.
+        assert_eq!(
+            cycle.pending_probes,
+            epochs
+                .iter()
+                .chain([&exact[2], &exact[0], &exact[1]])
+                .cloned()
+                .collect::<VecDeque<_>>()
+        );
+        assert_eq!(cycle.state.probes_in_window, SOURCE_HINT_BATCH);
+        assert_eq!(cycle.exact_hot_pending, VecDeque::from([exact[2].clone()]));
+        // The hot reservation reached in aging order is coalesced, not reserved twice.
+        assert_eq!(
+            cycle
+                .exact_aging_pending
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                (exact[0].clone(), false),
+                (exact[1].clone(), false),
+                (exact[2].clone(), false)
+            ]
+        );
+
+        cycle
+            .run_attempt(&debt, SourceLane::Cold, cycle.state.now(), |_| {
+                elapsed.set(elapsed.get() + Duration::from_millis(100));
+                Ok(())
+            })
+            .unwrap();
+        // Debt that reappears keeps the exact gate restricted.
+        let owed = SourceId::parse("first-owed").unwrap();
+        cycle
+            .add(&owed, None, SourceLane::Cold, end, false)
+            .unwrap();
+        let now = cycle.state.now();
+        let mut drained = Vec::new();
+        while let Some(id) = cycle.next_probe(now) {
+            if cycle.turns[&id].probe_class != Some(ProbeClass::Epoch) {
+                break;
+            }
+            assert_eq!(cycle.probe_started(&id, now), Some(false));
+            drained.push(id);
+        }
+        assert_eq!(drained, epochs);
+        // A hot service retires its later aging ticket but cannot move the
+        // committed cursor over earlier unserved aging identities.
+        assert_eq!(cycle.next_probe(now), Some(exact[2].clone()));
+        assert_eq!(cycle.probe_started(&exact[2], now), Some(true));
+        assert!(cycle.state.exact_probe_after.is_none());
+        assert!(cycle.state.exact_prefer_aging);
+        assert!(cycle.next_probe(now).is_none());
+        assert_eq!(cycle.pending_probes, VecDeque::from(exact[..2].to_vec()));
+
+        // Without first debt, the remaining aging work drains. The cursor
+        // advances over the contiguous serviced prefix only.
+        cycle.started(&owed, SourceLane::Cold).unwrap();
+        assert_eq!(cycle.next_probe(now), Some(exact[0].clone()));
+        assert_eq!(cycle.probe_started(&exact[0], now), Some(false));
+        assert_eq!(cycle.state.exact_probe_after, Some(exact[0].clone()));
+        assert_eq!(cycle.next_probe(now), Some(exact[1].clone()));
+        assert_eq!(cycle.probe_started(&exact[1], now), Some(false));
+        assert_eq!(cycle.state.exact_probe_after, Some(exact[2].clone()));
+        assert!(cycle.pending_probes.is_empty() && cycle.exact_aging_pending.is_empty());
+    }
+
+    #[test]
+    fn scheduler_exact_hot_and_aging_alternate_at_actual_starts_across_cycles() {
+        type Published = BTreeMap<SourceId, (BackgroundSource, SuccessfulSourceAttempt)>;
+        fn arm(
+            cycle: &mut CycleSchedule<'_>,
+            debt: &SourceId,
+            ids: &[SourceId],
+            published: &Published,
+            end: Instant,
+        ) {
+            cycle.add(debt, None, SourceLane::Cold, end, false).unwrap();
+            for id in ids {
+                let (prior, success) = &published[id];
+                cycle
+                    .add(id, Some(prior), SourceLane::Verification, end, false)
+                    .unwrap();
+                cycle.started(id, SourceLane::Verification).unwrap();
+                cycle.succeeded(id, success);
+            }
+            // No first debt remains, so only rotation decides the order.
+            cycle.started(debt, SourceLane::Cold).unwrap();
+            cycle.state.next_probe = None;
+            let now = cycle.state.now();
+            cycle.stage_probe_batch(now);
+        }
+        fn serve(cycle: &mut CycleSchedule<'_>) -> SourceId {
+            let now = cycle.state.now();
+            let id = cycle.next_probe(now).expect("eligible exact reservation");
+            assert_eq!(cycle.probe_started(&id, now), Some(false));
+            id
+        }
+
+        let fixture = CycleFixture::new();
+        let policy =
+            fixture.read_control(|control| control.read_policy(RequestIntersection::Selected));
+        let incarnation = ControlId::parse("pending-catalog").unwrap();
+        let boot = ControlId::parse("exact-rotation-boot").unwrap();
+        let mut state = SourceScheduleState::default();
+        state.prepare(&policy, &incarnation, &boot).unwrap();
+        let end = Instant::now() + SOURCE_OBSERVATION_BUDGET;
+        let ids =
+            ["exact-a-hot", "exact-b-hot", "exact-c-aging"].map(|id| SourceId::parse(id).unwrap());
+        let debt = SourceId::parse("first-debt").unwrap();
+        let published = ids
+            .iter()
+            .map(|id| (id.clone(), exact_published(id)))
+            .collect::<Published>();
+
+        {
+            let mut cycle = CycleSchedule::new(&mut state);
+            cycle.state.remember_hot(&ids[1]);
+            cycle.state.remember_hot(&ids[0]);
+            arm(&mut cycle, &debt, &ids, &published, end);
+            assert_eq!(
+                cycle.pending_probes,
+                [&ids[1], &ids[0], &ids[2]]
+                    .into_iter()
+                    .cloned()
+                    .collect::<VecDeque<_>>()
+            );
+            // Hot first; a later aging ticket cannot move the cursor.
+            assert_eq!(serve(&mut cycle), ids[1]);
+            assert!(cycle.state.exact_probe_after.is_none());
+            // The second opportunity serves non-hot aging work. A hot
+            // identity at the aging front cannot stand in for it.
+            assert_eq!(serve(&mut cycle), ids[2]);
+            assert!(cycle.state.exact_probe_after.is_none());
+            assert_eq!(
+                cycle
+                    .exact_aging_pending
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                [
+                    (ids[0].clone(), false),
+                    (ids[1].clone(), true),
+                    (ids[2].clone(), true)
+                ]
+            );
+            assert_eq!(serve(&mut cycle), ids[0]);
+            assert_eq!(cycle.state.exact_probe_after, Some(ids[2].clone()));
+            assert!(cycle.next_probe(cycle.state.now()).is_none());
+            // The unmet aging preference survives the cycle.
+            assert!(cycle.state.exact_prefer_aging);
+        }
+        state.prepare(&policy, &incarnation, &boot).unwrap();
+        assert!(state.exact_prefer_aging);
+        {
+            let mut cycle = CycleSchedule::new(&mut state);
+            assert_eq!(cycle.exact_service, ExactProbeService::default());
+            assert!(cycle.exact_hot_pending.is_empty() && cycle.exact_aging_pending.is_empty());
+            arm(&mut cycle, &debt, &ids, &published, end);
+            // The carried preference serves aging first, not hot again.
+            assert_eq!(serve(&mut cycle), ids[2]);
+            assert_eq!(
+                cycle
+                    .exact_aging_pending
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                [
+                    (ids[0].clone(), false),
+                    (ids[1].clone(), false),
+                    (ids[2].clone(), true)
+                ]
+            );
+            assert_eq!(serve(&mut cycle), ids[1]);
+            assert_eq!(serve(&mut cycle), ids[0]);
+            assert_eq!(cycle.state.exact_probe_after, Some(ids[2].clone()));
+            assert!(cycle.exact_aging_pending.is_empty());
+        }
+        assert!(state.exact_prefer_aging);
+        assert_eq!(
+            state.exact_hot_probes,
+            VecDeque::from([ids[1].clone(), ids[0].clone()])
+        );
+        // Any identity change discards the persistent exact rotation.
+        let other = ControlId::parse("exact-rotation-other-boot").unwrap();
+        state.prepare(&policy, &incarnation, &other).unwrap();
+        assert!(state.exact_probe_after.is_none());
+        assert!(state.exact_hot_probes.is_empty());
+        assert!(!state.exact_prefer_aging);
     }
 
     #[test]
@@ -15080,6 +16395,10 @@ mod control_deadline_tests {
                     ScheduleTestEvent::Planned => "planned".into(),
                     ScheduleTestEvent::BeforeProbe(_, end) => format!(
                         "before_probe remaining={:?}",
+                        end.saturating_duration_since(Instant::now())
+                    ),
+                    ScheduleTestEvent::AfterProbe(_, end) => format!(
+                        "after_probe remaining={:?}",
                         end.saturating_duration_since(Instant::now())
                     ),
                     ScheduleTestEvent::BeforeAttempt(_, end, lane) => format!(
