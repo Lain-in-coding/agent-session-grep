@@ -301,26 +301,29 @@ struct TerminalRegion {
     locator: String,
     recursive: bool,
 }
+fn terminal_regions(policy: &ReadPolicy) -> Vec<TerminalRegion> {
+    policy
+        .selections
+        .iter()
+        .map(|selection| &selection.region)
+        .chain(
+            policy
+                .exclusions
+                .iter()
+                .filter_map(|exclusion| match &exclusion.region {
+                    ExcludedRegion::Locator(region) => Some(region),
+                    ExcludedRegion::SourceIdentity { .. } => None,
+                }),
+        )
+        .map(|region| TerminalRegion {
+            locator: region.locator.as_str().into(),
+            recursive: region.kind == RootKind::Root,
+        })
+        .collect()
+}
 impl TerminalPolicy {
     fn capture(policy: &ReadPolicy, root: &Path) -> Result<Self, Reason> {
-        let regions = policy
-            .selections
-            .iter()
-            .map(|selection| &selection.region)
-            .chain(
-                policy
-                    .exclusions
-                    .iter()
-                    .filter_map(|exclusion| match &exclusion.region {
-                        ExcludedRegion::Locator(region) => Some(region),
-                        ExcludedRegion::SourceIdentity { .. } => None,
-                    }),
-            )
-            .map(|region| TerminalRegion {
-                locator: region.locator.as_str().into(),
-                recursive: region.kind == RootKind::Root,
-            })
-            .collect();
+        let regions = terminal_regions(policy);
         let file = platform::open_file(&SqliteControlStore::path(root))
             .map_err(|_| Reason::ControlCleanupPending)?;
         Ok(Self {

@@ -2,6 +2,8 @@
 //! The native parent retains one noninheritable OS lock until process exit; the
 //! child must acquire that SAME inode before changing any planned payload file.
 use super::*;
+#[cfg(test)]
+use agent_session_grep_adapters_sqlite::control::SealedControlFile;
 use agent_session_grep_adapters_sqlite::{
     control::INSTALLATION_LOCK_KEY, managed_locks::JobLockKey, managed_purge::PrivateArtifactClass,
 };
@@ -1907,6 +1909,83 @@ pub(super) fn recover_public(
             Ok(Some(journal.state.report))
         }
     }
+}
+
+/// Read through the caller's sealed connection and real held guards. The
+/// snapshot grants no continuing cleanup authority. The completion inspector
+/// in the following slice will own the production call and remove this gate.
+#[cfg(test)]
+fn validate_borrowed_keep_data(
+    journal: &Journal,
+    seal: &Seal,
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    guards: &CleanupGuards,
+    end: Instant,
+) -> Result<(), Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    time(end)?;
+    let control_error = |value| journal_control_error(value, end, Instant::now());
+    // Carry CLI refusals separately from adapter errors. The existing scope
+    // owns the final tick, busy allowance and SQL-handler reset, also on unwind.
+    let inspect = || {
+        #[cfg(test)]
+        tests::before_borrowed_keep_data_check(tests::BorrowedKeepDataCheck::Roots)
+            .map_err(control_error)?;
+        journal.validate_roots(end)?;
+        time(end)?;
+        #[cfg(test)]
+        tests::before_borrowed_keep_data_check(tests::BorrowedKeepDataCheck::Control)
+            .map_err(control_error)?;
+        let owner = control
+            .bind_control_root(&guards.policy_owner)
+            .map_err(control_error)?;
+        let status = control
+            .read_bound_to_sealed_with_deadline(
+                journal.data_identity,
+                &owner,
+                installation,
+                SealedControlFile::from_recorded(seal.policy.control_file_identity),
+                end,
+            )
+            .map_err(control_error)?;
+        time(end)?;
+        let policy = &status.policy;
+        if !journal.state.owner.keep_data
+            || seal.owner != journal.state.owner
+            || policy.installation_id.as_str() != journal.state.owner.installation_id
+            || &policy.installation_id != installation.installation_id()
+            || seal.catalog_incarnation != journal.state.catalog_incarnation
+            || status.catalog_incarnation.as_ref().map(ControlId::as_str)
+                != Some(seal.catalog_incarnation.as_str())
+            || policy.maintenance.state != MaintenanceState::Uninstalling
+            || policy.maintenance.owner.as_ref().map(ControlId::as_str)
+                != Some(journal.state.owner.nonce.as_str())
+            || policy.control_seq.get() != seal.policy.control_seq
+            || policy.policy_epoch.get() != seal.policy.policy_epoch
+            || serde_json::to_vec(&terminal_regions(policy))
+                .map_err(|_| Reason::MaintenanceConflict)?
+                != serde_json::to_vec(&seal.policy.regions)
+                    .map_err(|_| Reason::MaintenanceConflict)?
+        {
+            return Err(Reason::MaintenanceConflict);
+        }
+        time(end)?;
+        #[cfg(test)]
+        tests::before_borrowed_keep_data_check(tests::BorrowedKeepDataCheck::Catalog)
+            .map_err(control_error)?;
+        let file =
+            platform::open_file(&journal.catalog).map_err(|_| Reason::CorpusCleanupPending)?;
+        if platform::identity(&file).map_err(|_| Reason::IdentityChanged)?
+            != journal.state.catalog_file_identity
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        time(end)
+    };
+    control
+        .with_runtime_deadline(end, || Ok(inspect()))
+        .map_err(control_error)?
 }
 
 fn validate_keep_fence(

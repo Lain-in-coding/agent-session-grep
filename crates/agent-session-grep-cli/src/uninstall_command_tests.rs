@@ -27,7 +27,7 @@ pub(super) fn before_control_validation(step: ControlValidationRead) -> Result<(
         None => Ok(()),
     })
 }
-fn with_control_validation_hook<T>(
+pub(super) fn with_control_validation_hook<T>(
     hook: impl FnMut(ControlValidationRead) -> Result<(), PortError> + 'static,
     operation: impl FnOnce() -> T,
 ) -> T {

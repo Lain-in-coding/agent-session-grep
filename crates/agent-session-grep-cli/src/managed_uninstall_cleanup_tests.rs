@@ -2,6 +2,40 @@
 use super::*;
 use agent_session_grep_ports::control::{BackgroundControl, DesiredUpdates};
 use serde_json::json;
+use std::{cell::RefCell, rc::Rc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BorrowedKeepDataCheck {
+    Roots,
+    Control,
+    Catalog,
+}
+type BorrowedKeepDataHook = Box<dyn FnMut(BorrowedKeepDataCheck) -> Result<(), PortError>>;
+thread_local! {
+    static BORROWED_KEEP_DATA_HOOK: RefCell<Option<BorrowedKeepDataHook>> = const { RefCell::new(None) };
+}
+pub(super) fn before_borrowed_keep_data_check(
+    step: BorrowedKeepDataCheck,
+) -> Result<(), PortError> {
+    BORROWED_KEEP_DATA_HOOK.with_borrow_mut(|hook| match hook {
+        Some(hook) => hook(step),
+        None => Ok(()),
+    })
+}
+fn with_borrowed_keep_data_hook<T>(
+    hook: impl FnMut(BorrowedKeepDataCheck) -> Result<(), PortError> + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<BorrowedKeepDataHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BORROWED_KEEP_DATA_HOOK.with_borrow_mut(|hook| *hook = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(BORROWED_KEEP_DATA_HOOK.with_borrow_mut(|slot| slot.replace(Box::new(hook))));
+    operation()
+}
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
@@ -553,6 +587,726 @@ impl PackageFixture {
         (install, journal)
     }
 }
+
+// Retain the full synthetic inventory and durable bytes. Locked rendezvous
+// bytes are read only through their held handles; SQLite owns transient SHM
+// bookkeeping, so neither is compared through a second pathname read.
+fn borrowed_keep_data_inventory(fixture: &PackageFixture) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if meta.is_dir() {
+                out.insert(relative, None);
+                collect(root, &path, out);
+            } else {
+                assert!(meta.is_file());
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let bytes = if name.ends_with(".lock") || name.ends_with("-shm") {
+                    None
+                } else {
+                    Some(fs::read(&path).unwrap())
+                };
+                out.insert(relative, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    let root = fixture.prefix.parent().unwrap();
+    collect(root, &fixture.prefix, &mut out);
+    collect(root, &fixture.root, &mut out);
+    out
+}
+
+#[test]
+fn terminal_regions_preserves_disabled_selections_and_locator_denials_in_order() {
+    use agent_session_grep_ports::{
+        SearchProvider,
+        control::{Exclusion, ScopeRegion, Selection},
+    };
+
+    let fixture = PackageFixture::new(false);
+    let control = fixture.control.as_ref().unwrap();
+    let mut policy = control
+        .with_runtime_deadline(deadline(), || control.lifecycle_status())
+        .unwrap()
+        .policy;
+    let selected = CanonicalLocator::from_path(&fixture.root.join("selected")).unwrap();
+    let disabled = CanonicalLocator::from_path(&fixture.root.join("disabled.jsonl")).unwrap();
+    let denied = CanonicalLocator::from_path(&fixture.root.join("denied")).unwrap();
+    for (name, locator, kind, enabled) in [
+        ("selected", selected.clone(), RootKind::Root, true),
+        ("disabled", disabled.clone(), RootKind::Exact, false),
+    ] {
+        policy.selections.push(Selection {
+            id: id(name),
+            region: ScopeRegion {
+                provider: SearchProvider::Codex,
+                locator,
+                kind,
+            },
+            root_identity: None,
+            enabled,
+            revision: policy.control_seq,
+            created_at_ms: 1,
+            revoked_at_ms: (!enabled).then_some(2),
+        });
+    }
+    for (name, region) in [
+        (
+            "denied-locator",
+            ExcludedRegion::Locator(ScopeRegion {
+                provider: SearchProvider::Codex,
+                locator: denied.clone(),
+                kind: RootKind::Root,
+            }),
+        ),
+        (
+            "denied-identity",
+            ExcludedRegion::SourceIdentity {
+                provider: SearchProvider::Codex,
+                source_id: id("synthetic-denied-source"),
+            },
+        ),
+    ] {
+        policy.exclusions.push(Exclusion {
+            id: id(name),
+            region,
+            revision: policy.control_seq,
+            created_policy_epoch: policy.policy_epoch,
+            created_at_ms: 1,
+        });
+    }
+    let before = policy.clone();
+    let expected = json!([
+        {"locator": selected.as_str(), "recursive": true},
+        {"locator": disabled.as_str(), "recursive": false},
+        {"locator": denied.as_str(), "recursive": true},
+    ]);
+    assert_eq!(
+        serde_json::to_value(terminal_regions(&policy)).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(
+            TerminalPolicy::capture(&policy, &fixture.root)
+                .unwrap()
+                .regions
+        )
+        .unwrap(),
+        expected
+    );
+    assert_eq!(policy, before);
+}
+
+#[test]
+fn borrowed_keep_data_matches_the_seal_without_reopening_or_changing_inventory() {
+    use crate::uninstall_command::tests::{ControlValidationRead, with_control_validation_hook};
+    use std::cell::Cell;
+
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let mut guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let writer_before = guards._writer.read_record().unwrap();
+    let before = borrowed_keep_data_inventory(&fixture);
+    let state_before = serde_json::to_vec(&journal.state).unwrap();
+    let status_before = control
+        .with_runtime_deadline(deadline(), || control.lifecycle_status())
+        .unwrap();
+    let opens = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&opens);
+    with_control_validation_hook(
+        move |step| {
+            if step == ControlValidationRead::Open {
+                observed.set(observed.get() + 1);
+                Err(PortError::Backend(
+                    "synthetic control reopen refused".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || {
+            // Positive control: the existing reopening path really is blocked.
+            assert!(matches!(
+                journal.validate(control, deadline()),
+                Err(Reason::IdentityChanged)
+            ));
+            assert_eq!(opens.get(), 1);
+            for _ in 0..3 {
+                validate_borrowed_keep_data(
+                    &journal,
+                    &seal,
+                    control,
+                    &installation,
+                    &guards,
+                    deadline(),
+                )
+                .unwrap();
+            }
+            assert_eq!(opens.get(), 1);
+        },
+    );
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(&fixture.root, LockKind::PolicyOwner),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(
+            &fixture.prefix,
+            LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap())
+        ),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(matches!(
+        WriterLease::try_acquire(&fixture.root),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert_eq!(guards._writer.read_record().unwrap(), writer_before);
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state_before);
+    assert_eq!(
+        control
+            .with_runtime_deadline(deadline(), || control.lifecycle_status())
+            .unwrap(),
+        status_before
+    );
+    drop(guards);
+    let contender = ExclusiveGuard::try_acquire(&fixture.root, LockKind::PolicyOwner).unwrap();
+    drop(contender);
+}
+
+#[test]
+fn borrowed_keep_data_refuses_each_fence_and_seal_mismatch_without_effects() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let original_state = journal.state.clone();
+    let original_seal = serde_json::to_vec(&seal).unwrap();
+    let owner_path = journal.root.join("owner.json");
+    let original_owner = fs::read(&owner_path).unwrap();
+    let status_before = control
+        .with_runtime_deadline(deadline(), || control.lifecycle_status())
+        .unwrap();
+    for case in [
+        "nonce",
+        "installation",
+        "incarnation",
+        "sequence",
+        "epoch",
+        "regions",
+        "mode",
+    ] {
+        journal.state = original_state.clone();
+        let mut candidate: Seal = serde_json::from_slice(&original_seal).unwrap();
+        match case {
+            "nonce" => journal.state.owner.nonce = "synthetic-other-uninstall".into(),
+            "installation" => {
+                journal.state.owner.installation_id = "synthetic-other-installation".into();
+            }
+            "incarnation" => {
+                journal.state.catalog_incarnation = "synthetic-other-catalog".into();
+                candidate.catalog_incarnation = journal.state.catalog_incarnation.clone();
+            }
+            "sequence" => candidate.policy.control_seq += 1,
+            "epoch" => candidate.policy.policy_epoch += 1,
+            "regions" => candidate.policy.regions.push(TerminalRegion {
+                locator: CanonicalLocator::from_path(&fixture.root.join("synthetic-region"))
+                    .unwrap()
+                    .as_str()
+                    .into(),
+                recursive: true,
+            }),
+            "mode" => journal.state.owner.keep_data = false,
+            _ => unreachable!(),
+        }
+        // Keep the forged journal/owner/seal coherent, so nonce/installation
+        // refusal must compare with the actual connection's lifecycle snapshot.
+        candidate.owner = journal.state.owner.clone();
+        fs::write(
+            &owner_path,
+            serde_json::to_vec(&journal.state.owner).unwrap(),
+        )
+        .unwrap();
+        let before = borrowed_keep_data_inventory(&fixture);
+        let state_before = serde_json::to_vec(&journal.state).unwrap();
+        assert!(
+            matches!(
+                validate_borrowed_keep_data(
+                    &journal,
+                    &candidate,
+                    control,
+                    &installation,
+                    &guards,
+                    deadline()
+                ),
+                Err(Reason::MaintenanceConflict)
+            ),
+            "{case}"
+        );
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before, "{case}");
+        assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state_before);
+        assert_eq!(
+            control
+                .with_runtime_deadline(deadline(), || control.lifecycle_status())
+                .unwrap(),
+            status_before
+        );
+    }
+    fs::write(owner_path, original_owner).unwrap();
+    journal.state = original_state;
+    validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline())
+        .unwrap();
+
+    // Keep the owner and counters coherent with a real non-uninstall fence.
+    // Only the required maintenance state may explain this refusal.
+    let bound = control.bind_control_root(&guards.policy_owner).unwrap();
+    let owner = id(&journal.state.owner.nonce);
+    let status = control
+        .with_runtime_deadline(deadline(), || {
+            let status = control.lifecycle_status()?;
+            control.begin_maintenance(
+                status.policy.control_seq,
+                &owner,
+                &bound,
+                &installation,
+                MaintenanceFence {
+                    state: MaintenanceState::Updating,
+                    owner: Some(owner.clone()),
+                    phase: Some(MaintenancePhase::Quiescing),
+                },
+            )?;
+            control.lifecycle_status()
+        })
+        .unwrap();
+    let mut candidate: Seal = serde_json::from_slice(&original_seal).unwrap();
+    candidate.policy.control_seq = status.policy.control_seq.get();
+    candidate.policy.policy_epoch = status.policy.policy_epoch.get();
+    let before = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(
+            &journal,
+            &candidate,
+            control,
+            &installation,
+            &guards,
+            deadline()
+        ),
+        Err(Reason::MaintenanceConflict)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    assert_eq!(
+        control
+            .with_runtime_deadline(deadline(), || control.lifecycle_status())
+            .unwrap(),
+        status
+    );
+}
+
+#[test]
+fn borrowed_keep_data_refuses_foreign_guards_and_changed_prefix_receipt() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let mut guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let other = PackageFixture::new(false);
+    let other_control = other.control.as_ref().unwrap();
+    let other_end = deadline();
+    let other_prefix_lock =
+        update_state::acquire_installation_lock(&other.prefix, other_end).unwrap();
+    let other_installation = other_control
+        .with_runtime_deadline(other_end, || {
+            other_control.bind_installation(&other.prefix, &other_prefix_lock)
+        })
+        .unwrap();
+    let before = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(
+            &journal,
+            &seal,
+            control,
+            &other_installation,
+            &guards,
+            deadline()
+        ),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    for wrong_owner in [
+        ExclusiveGuard::try_acquire(&other.root, LockKind::PolicyOwner).unwrap(),
+        ExclusiveGuard::try_acquire(&fixture.root, LockKind::HistoryReaders).unwrap(),
+    ] {
+        let original = std::mem::replace(&mut guards.policy_owner, wrong_owner);
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(matches!(
+            validate_borrowed_keep_data(
+                &journal,
+                &seal,
+                control,
+                &installation,
+                &guards,
+                deadline()
+            ),
+            Err(Reason::IdentityChanged)
+        ));
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        drop(std::mem::replace(&mut guards.policy_owner, original));
+    }
+    let binding = fixture.root.join("installation-prefix.json");
+    let original_binding = fs::read(&binding).unwrap();
+    fs::write(&binding, b"{}").unwrap();
+    let before = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    fs::write(binding, original_binding).unwrap();
+    validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline())
+        .unwrap();
+}
+
+#[test]
+fn borrowed_keep_data_refuses_same_byte_catalog_replacement() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let bytes = fs::read(&fixture.catalog).unwrap();
+    let original = fixture.root.join("original-catalog");
+    fs::rename(&fixture.catalog, &original).unwrap();
+    let before_missing = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline()),
+        Err(Reason::CorpusCleanupPending)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before_missing);
+    private_file(&fixture.catalog, &bytes);
+    assert_ne!(
+        platform::identity(&platform::open_file(&fixture.catalog).unwrap()).unwrap(),
+        journal.state.catalog_file_identity
+    );
+    let before_replaced = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline()),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before_replaced);
+    fs::remove_file(&fixture.catalog).unwrap();
+    fs::rename(original, &fixture.catalog).unwrap();
+    validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline())
+        .unwrap();
+}
+
+#[test]
+fn borrowed_keep_data_refuses_reopened_control_with_the_old_seal() {
+    let mut fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let mut seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let control = fixture.control.as_ref().unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let status_before = control
+        .with_runtime_deadline(deadline(), || control.lifecycle_status())
+        .unwrap();
+    drop(fixture.control.take());
+    let path = SqliteControlStore::path(&fixture.root);
+    let bytes = fs::read(&path).unwrap();
+    fs::rename(&path, fixture.root.join("original-control")).unwrap();
+    private_file(&path, &bytes);
+    let replaced = platform::identity(&platform::open_file(&path).unwrap()).unwrap();
+    assert_ne!(replaced, seal.policy.control_file_identity);
+    let reopened =
+        SqliteControlStore::open_current_read_only_with_deadline(&fixture.root, deadline())
+            .unwrap();
+    assert_eq!(
+        reopened
+            .with_runtime_deadline(deadline(), || reopened.lifecycle_status())
+            .unwrap(),
+        status_before
+    );
+    let before = borrowed_keep_data_inventory(&fixture);
+    assert!(matches!(
+        validate_borrowed_keep_data(
+            &journal,
+            &seal,
+            &reopened,
+            &installation,
+            &guards,
+            deadline()
+        ),
+        Err(Reason::IdentityChanged)
+    ));
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    seal.policy.control_file_identity = replaced;
+    validate_borrowed_keep_data(
+        &journal,
+        &seal,
+        &reopened,
+        &installation,
+        &guards,
+        deadline(),
+    )
+    .unwrap();
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+}
+
+#[test]
+fn borrowed_keep_data_restores_the_outer_scope_after_success_error_and_unwind() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let before = borrowed_keep_data_inventory(&fixture);
+    let end = deadline();
+    let outer = end + Duration::from_secs(10);
+    let probe = outer + Duration::from_secs(10);
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let calls = Rc::clone(&observed);
+    control
+        .with_runtime_deadline(outer, || {
+            with_borrowed_keep_data_hook(
+                move |step| {
+                    calls
+                        .borrow_mut()
+                        .push((step, SqliteControlStore::effective_runtime_deadline(probe)));
+                    Ok(())
+                },
+                || {
+                    validate_borrowed_keep_data(
+                        &journal,
+                        &seal,
+                        control,
+                        &installation,
+                        &guards,
+                        end,
+                    )
+                    .unwrap();
+                },
+            );
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            with_borrowed_keep_data_hook(
+                move |step| {
+                    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), end);
+                    if step == BorrowedKeepDataCheck::Control {
+                        Err(PortError::WriterBusy("synthetic bounded contention".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    assert!(matches!(
+                        validate_borrowed_keep_data(
+                            &journal,
+                            &seal,
+                            control,
+                            &installation,
+                            &guards,
+                            end
+                        ),
+                        Err(Reason::ControlCleanupPending)
+                    ));
+                },
+            );
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_borrowed_keep_data_hook(
+                    |step| {
+                        if step == BorrowedKeepDataCheck::Catalog {
+                            panic!("synthetic borrowed inspection unwind");
+                        }
+                        Ok(())
+                    },
+                    || {
+                        let _ = validate_borrowed_keep_data(
+                            &journal,
+                            &seal,
+                            control,
+                            &installation,
+                            &guards,
+                            end,
+                        );
+                    },
+                );
+            }));
+            assert!(unwound.is_err());
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            control.lifecycle_status()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        *observed.borrow(),
+        [
+            (BorrowedKeepDataCheck::Roots, end),
+            (BorrowedKeepDataCheck::Control, end),
+            (BorrowedKeepDataCheck::Catalog, end),
+        ]
+    );
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline())
+        .unwrap();
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+}
+
+#[test]
+fn borrowed_keep_data_expiry_uses_the_earliest_end_and_skips_later_checks() {
+    let fixture = PackageFixture::new(false);
+    let (_install, mut journal) = fixture.journal(true);
+    let control = fixture.control.as_ref().unwrap();
+    let seal = read_seal(&journal, deadline()).unwrap();
+    let preparation_end = deadline();
+    let prefix_lock =
+        update_state::acquire_installation_lock(&fixture.prefix, preparation_end).unwrap();
+    let installation = control
+        .with_runtime_deadline(preparation_end, || {
+            control.bind_installation(&fixture.prefix, &prefix_lock)
+        })
+        .unwrap();
+    let guards = drain_owners(&mut journal, preparation_end).unwrap();
+    let before = borrowed_keep_data_inventory(&fixture);
+    with_borrowed_keep_data_hook(
+        |_| panic!("expired entry must not inspect roots, control or catalog"),
+        || {
+            assert!(matches!(
+                validate_borrowed_keep_data(
+                    &journal,
+                    &seal,
+                    control,
+                    &installation,
+                    &guards,
+                    Instant::now()
+                ),
+                Err(Reason::Deadline)
+            ));
+        },
+    );
+    let outer = Instant::now() + Duration::from_secs(2);
+    let requested = outer + Duration::from_secs(10);
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let calls = Rc::clone(&observed);
+    let result = control.with_runtime_deadline(outer, || {
+        with_borrowed_keep_data_hook(
+            move |step| {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(requested),
+                    outer
+                );
+                calls.borrow_mut().push(step);
+                if step == BorrowedKeepDataCheck::Control {
+                    std::thread::sleep(
+                        outer.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                    );
+                }
+                Ok(())
+            },
+            || {
+                // Binding/the adapter now returns real deadline contention.
+                // Mapping against the later request would report pending.
+                assert!(matches!(
+                    validate_borrowed_keep_data(
+                        &journal,
+                        &seal,
+                        control,
+                        &installation,
+                        &guards,
+                        requested
+                    ),
+                    Err(Reason::Deadline)
+                ));
+            },
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested),
+            outer
+        );
+        with_borrowed_keep_data_hook(
+            |_| panic!("expired outer scope must refuse before any inspection"),
+            || {
+                assert!(matches!(
+                    validate_borrowed_keep_data(
+                        &journal,
+                        &seal,
+                        control,
+                        &installation,
+                        &guards,
+                        requested
+                    ),
+                    Err(Reason::Deadline)
+                ));
+            },
+        );
+        Ok(())
+    });
+    assert!(matches!(result, Err(PortError::WriterBusy(_))));
+    assert_eq!(
+        *observed.borrow(),
+        [BorrowedKeepDataCheck::Roots, BorrowedKeepDataCheck::Control]
+    );
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(requested),
+        requested
+    );
+    validate_borrowed_keep_data(&journal, &seal, control, &installation, &guards, deadline())
+        .unwrap();
+    assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+}
+
 #[test]
 fn held_installation_guard_validation_requires_kind_and_pinned_prefix() {
     let fixture = PackageFixture::new(false);
