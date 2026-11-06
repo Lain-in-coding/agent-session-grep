@@ -881,6 +881,18 @@ impl std::fmt::Debug for SealedControlFile {
     }
 }
 
+/// Comparison inputs for the private reinstall coordinator's connection seam.
+/// The caller retains every drain and validates the fixed transfer records;
+/// this input alone does not prove completed cleanup or authorize adoption.
+pub struct ReinstallControlOpen<'a> {
+    pub root: &'a Path,
+    pub prefix: &'a Path,
+    pub policy_owner: &'a ExclusiveGuard,
+    pub prefix_guard: &'a ExclusiveGuard,
+    pub sealed: SealedControlFile,
+    pub expected: &'a ControlStatus,
+}
+
 /// Purge and backup prerequisites read together from one control snapshot.
 /// This grants no file-identity, freshness or cleanup authority. Callers must
 /// retain their policy-owner guard and validate the bound control connection.
@@ -1134,6 +1146,178 @@ impl SqliteControlStore {
     ) -> PortResult<Self> {
         Self::open_existing_with_deadline(root, None, false, deadline)
     }
+
+    /// Current-schema, sealed read admission for the private reinstall path.
+    /// Requires existing rendezvous and actual held prefix/PolicyOwner guards.
+    /// No runtime TEMP staging, schema upgrade or checkpoint-on-close is used.
+    /// This checks the supplied status, not the coordinator's full commitment.
+    pub fn open_reinstall_read_only_with_deadline(
+        input: ReinstallControlOpen<'_>,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        Self::open_reinstall_with_deadline(input, false, deadline)
+    }
+
+    /// Writable counterpart for an already validated, published transfer prep.
+    /// The coordinator must independently validate that record and its complete
+    /// pre/post commitment before any mutation. Opening never adopts a fence.
+    pub fn open_reinstall_writable_with_deadline(
+        input: ReinstallControlOpen<'_>,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        Self::open_reinstall_with_deadline(input, true, deadline)
+    }
+
+    fn open_reinstall_with_deadline(
+        input: ReinstallControlOpen<'_>,
+        writable: bool,
+        deadline: Instant,
+    ) -> PortResult<Self> {
+        let deadline = Self::effective_runtime_deadline(deadline);
+        let scope = RuntimeDeadlineScope::enter(deadline)?;
+        let result = Self::open_reinstall(input, writable).and_then(|store| {
+            runtime_tick()?;
+            Ok(store)
+        });
+        drop(scope);
+        if let Ok(store) = &result {
+            configure_runtime_deadline(&store.conn.borrow())?;
+        }
+        result
+    }
+
+    fn open_reinstall(input: ReinstallControlOpen<'_>, writable: bool) -> PortResult<Self> {
+        runtime_tick()?;
+        if !input.root.is_absolute()
+            || !input.prefix.is_absolute()
+            || input.policy_owner.kind() != &LockKind::PolicyOwner
+            || input.prefix_guard.kind()
+                != &LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY)?)
+            || input.expected.catalog_incarnation.is_none()
+            || input.expected.policy.maintenance.owner.is_none()
+            || !matches!(
+                (
+                    input.expected.policy.maintenance.state,
+                    input.expected.policy.maintenance.phase,
+                ),
+                (
+                    MaintenanceState::Uninstalling,
+                    Some(MaintenancePhase::Quiescing)
+                ) | (
+                    MaintenanceState::Recovering,
+                    Some(MaintenancePhase::Reconciling)
+                )
+            )
+        {
+            return Err(invalid());
+        }
+        input.expected.policy.maintenance.validate()?;
+        private_directory(input.root, false)?;
+        reject_links(input.prefix)?;
+        let root = fs::canonicalize(input.root).map_err(io_error)?;
+        let prefix = fs::canonicalize(input.prefix).map_err(io_error)?;
+        let root_identity = RootIdentity::read(&root)?;
+        let prefix_identity = RootIdentity::read(&prefix)?;
+        if input.policy_owner.root_identity() != root_identity
+            || input.prefix_guard.root_identity() != prefix_identity
+        {
+            return Err(invalid());
+        }
+        input.policy_owner.validate_current(&root)?;
+        input.prefix_guard.validate_current(&prefix)?;
+        // A normal shared ControlHandleLease can create its rendezvous. Pin
+        // the existing file before calling it and recheck the same file after.
+        let handles_pin = ReinstallHandlesPin::open(&root)?;
+        let path = Self::path(&root);
+        private_file(&path)?;
+        if fs::metadata(&path).map_err(io_error)?.len() == 0
+            || input.policy_owner.child_exists("control.db-journal")?
+        {
+            return Err(corrupt());
+        }
+        verify_sidecars(&path)?;
+        runtime_tick()?;
+        let handle_lease = admit_control_handle(&root, false)?;
+        handles_pin.validate()?;
+        runtime_tick()?;
+        let conn = connect_raw(&path, writable)?;
+        install_reinstall_close_policy(&conn)?;
+        let store = Self {
+            conn: RefCell::new(conn),
+            handle_lease,
+            writable,
+            root_identity,
+            private_root: root,
+        };
+        // File-control/metadata binding precedes the first SQL on this connection.
+        store.verify_connection_file(input.sealed)?;
+        handles_pin.validate()?;
+        {
+            let conn = store.conn.borrow();
+            configure_runtime_deadline(&conn)?;
+            #[cfg(test)]
+            reinstall_open_tests::observe(reinstall_open_tests::Step::BeforeSql, &conn)?;
+            runtime_tick()?;
+            conn.execute_batch(
+                "PRAGMA query_only=ON; PRAGMA foreign_keys=ON;
+                 PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;
+                 PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=-1;",
+            )
+            .map_err(sql_error)?;
+        }
+        let status = {
+            let mut conn = store.conn.borrow_mut();
+            let tx = conn.transaction().map_err(sql_error)?;
+            let version: i64 = tx
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .map_err(sql_error)?;
+            let mode: String = tx
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(sql_error)?;
+            if version != VERSION || mode != "wal" {
+                return Err(corrupt());
+            }
+            validate_policy_admission_capacity(&tx)?;
+            let status = load_status_core(&tx)?;
+            if &status != input.expected {
+                return Err(conflict());
+            }
+            runtime_tick()?;
+            tx.commit().map_err(sql_error)?;
+            status
+        };
+        let owner = store.bind_control_root(input.policy_owner)?;
+        let installation = InstallationLockAuthority {
+            guard: input.prefix_guard,
+            prefix,
+            identity: prefix_identity,
+            installation: status.policy.installation_id.clone(),
+            control_root: root_identity,
+        };
+        owner.validate(&store)?;
+        installation.validate_with_status(&store, &status)?;
+        input.policy_owner.validate_current(&store.private_root)?;
+        input.prefix_guard.validate_current(&installation.prefix)?;
+        store.verify_connection_file(input.sealed)?;
+        handles_pin.validate()?;
+        verify_sidecars(&path)?;
+        if input.policy_owner.child_exists("control.db-journal")? {
+            return Err(corrupt());
+        }
+        {
+            let conn = store.conn.borrow();
+            #[cfg(test)]
+            reinstall_open_tests::observe(reinstall_open_tests::Step::Bound, &conn)?;
+            runtime_tick()?;
+            if writable {
+                conn.execute_batch("PRAGMA query_only=OFF;")
+                    .map_err(sql_error)?;
+            }
+        }
+        runtime_tick()?;
+        Ok(store)
+    }
+
     pub fn open_existing_writable_with_deadline(
         root: &Path,
         installation: &ControlId,
@@ -2960,7 +3144,9 @@ const CONTROL_VFS: &std::ffi::CStr = c"unix-posix";
 #[cfg(all(unix, not(target_vendor = "apple")))]
 const CONTROL_VFS: &std::ffi::CStr = c"unix";
 
-fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
+/// Raw open used by both ordinary and purpose-specific connection setup.
+/// No SQL or connection policy is installed here.
+fn connect_raw(path: &Path, writable: bool) -> PortResult<Connection> {
     let access = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -2975,6 +3161,11 @@ fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     let conn = Connection::open_with_flags(path, flags).map_err(sql_error)?;
     #[cfg(unix)]
     verify_connection_vfs(&conn)?;
+    Ok(conn)
+}
+
+fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
+    let conn = connect_raw(path, writable)?;
     configure_runtime_deadline(&conn)?;
     runtime_tick()?;
     conn.execute_batch(
@@ -2982,6 +3173,94 @@ fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     )
     .map_err(|e| sql_query_error(&conn, e))?;
     Ok(conn)
+}
+
+fn install_reinstall_close_policy(conn: &Connection) -> PortResult<()> {
+    use rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
+    // Install before the first SQL, including schema reads. Keep it installed
+    // through error/unwind/Drop; restoring false would checkpoint on close.
+    if !conn
+        .set_db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(sql_error)?
+        || !conn
+            .db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+            .map_err(sql_error)?
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+struct ReinstallHandlesPin {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl ReinstallHandlesPin {
+    fn open(root: &Path) -> PortResult<Self> {
+        let path = root.join("control-handles.lock");
+        private_file(&path)?;
+        #[cfg(unix)]
+        let file = {
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos"
+            ))]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        crate::managed_locks::platform::NOFOLLOW
+                            | crate::managed_locks::platform::NONBLOCK
+                            | crate::managed_locks::platform::CLOEXEC,
+                    )
+                    .open(&path)
+                    .map_err(io_error)?
+            }
+            #[cfg(not(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos"
+            )))]
+            {
+                return Err(invalid());
+            }
+        };
+        #[cfg(windows)]
+        let file = windows_private::open_reinstall_rendezvous(&path)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(invalid());
+        let pin = Self { file, path };
+        pin.validate()?;
+        Ok(pin)
+    }
+
+    fn validate(&self) -> PortResult<()> {
+        runtime_tick()?;
+        private_file(&self.path)?;
+        let held = self.file.metadata().map_err(io_error)?;
+        if !held.is_file() || held.len() != 0 {
+            return Err(invalid());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            verify_private(&self.path, &held)?;
+            let named = fs::symlink_metadata(&self.path).map_err(io_error)?;
+            if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Err(conflict());
+            }
+        }
+        #[cfg(windows)]
+        windows_private::validate_private_read(&self.path, &self.file)?;
+        runtime_tick()
+    }
 }
 
 /// Refuse a connection whose main database does not use the exact VFS object
@@ -6671,6 +6950,14 @@ mod windows_private {
         open_private_read_with_sidecar(path, false)
     }
 
+    pub(super) fn open_reinstall_rendezvous(path: &Path) -> PortResult<File> {
+        // Metadata-only compatible sharing: the subsequent shared lock opens
+        // this same rendezvous read/write. A deny-write pin would self-conflict.
+        let file = open_for_verification(path, false)?;
+        verify_handle(&file, true, false)?;
+        Ok(file)
+    }
+
     fn open_private_read_with_sidecar(path: &Path, sidecar: bool) -> PortResult<File> {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, READ_CONTROL,
@@ -7655,6 +7942,597 @@ mod windows_private {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reinstall_open_tests {
+    use super::*;
+    use crate::managed_locks::SharedGuard;
+    use rusqlite::{
+        config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        hooks::{AuthAction, AuthContext, Authorization},
+    };
+    use std::{
+        collections::BTreeMap,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        BeforeSql,
+        Bound,
+    }
+
+    type Hook = Box<dyn FnMut(Step, &Connection) -> PortResult<()>>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe(step: Step, conn: &Connection) -> PortResult<()> {
+        HOOK.with_borrow_mut(|slot| match slot.as_mut() {
+            Some(hook) => hook(step, conn),
+            None => Ok(()),
+        })
+    }
+
+    fn with_hook<T>(
+        hook: impl FnMut(Step, &Connection) -> PortResult<()> + 'static,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Hook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HOOK.with_borrow_mut(|slot| *slot = self.0.take());
+            }
+        }
+        let reset = Reset(HOOK.with_borrow_mut(|slot| slot.replace(Box::new(hook))));
+        let result = operation();
+        drop(reset);
+        result
+    }
+
+    fn end() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn cid(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    fn seal(path: &Path) -> SealedControlFile {
+        let file = fs::File::open(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata().unwrap();
+            SealedControlFile::from_recorded((metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: this owned File stays alive for the exact output buffer.
+            assert_ne!(
+                unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) },
+                0
+            );
+            SealedControlFile::from_recorded((
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            drop(file);
+            panic!("reinstall requires a supported local filesystem");
+        }
+    }
+
+    struct Fixture {
+        owner: ExclusiveGuard,
+        prefix_guard: ExclusiveGuard,
+        root: PathBuf,
+        prefix: PathBuf,
+        sealed: SealedControlFile,
+        expected: ControlStatus,
+        _temp: tempfile::TempDir,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SnapshotFile {
+        Bytes(Vec<u8>),
+        SharedMemory,
+        EmptyLock(SealedControlFile),
+    }
+
+    impl Fixture {
+        fn new(recovering: bool) -> Self {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let root = temp.path().join("data");
+            let prefix = temp.path().join("prefix");
+            private_directory(&prefix, true).unwrap();
+            let until = end();
+            let store = SqliteControlStore::create_with_deadline(
+                &root,
+                &cid("reinstall-foundation-installation"),
+                DesiredUpdates::Paused,
+                until,
+            )
+            .unwrap();
+            let owner = ExclusiveGuard::try_acquire(&root, LockKind::PolicyOwner).unwrap();
+            let prefix_guard = ExclusiveGuard::try_acquire(
+                &prefix,
+                LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap()),
+            )
+            .unwrap();
+            store
+                .with_runtime_deadline(until, || {
+                    let bound = store.bind_control_root(&owner)?;
+                    store.record_verified_installation_prefix(
+                        &prefix,
+                        &prefix_guard,
+                        &bound,
+                        until,
+                    )?;
+                    let background = ExclusiveGuard::try_acquire(&root, LockKind::Background)?;
+                    let worker = store.bind_worker(&background, cid("reinstall-worker"))?;
+                    let registered =
+                        store.register_worker(store.status()?.policy.control_seq, &worker, 1, 1)?;
+                    store.reconcile_catalog_summary(
+                        registered.control_seq,
+                        &worker,
+                        &cid("reinstall-foundation-catalog"),
+                        1,
+                    )?;
+                    let installation = store.bind_installation(&prefix, &prefix_guard)?;
+                    store.begin_maintenance(
+                        store.status()?.policy.control_seq,
+                        &cid("reinstall-old-owner"),
+                        &bound,
+                        &installation,
+                        MaintenanceFence {
+                            state: MaintenanceState::Uninstalling,
+                            owner: Some(cid("reinstall-old-owner")),
+                            phase: Some(MaintenancePhase::Quiescing),
+                        },
+                    )?;
+                    if recovering {
+                        store.recover_maintenance(
+                            store.status()?.policy.control_seq,
+                            &cid("reinstall-fixed-owner"),
+                            &bound,
+                            &installation,
+                            &cid("reinstall-old-owner"),
+                            MaintenanceFence {
+                                state: MaintenanceState::Recovering,
+                                owner: Some(cid("reinstall-fixed-owner")),
+                                phase: Some(MaintenancePhase::Reconciling),
+                            },
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let expected = store
+                .with_runtime_deadline(until, || store.lifecycle_status())
+                .unwrap();
+            let sealed = seal(&SqliteControlStore::path(&root));
+            // Deliberately leave real nonempty WAL as the last connection closes.
+            {
+                let conn = store.conn.borrow();
+                install_reinstall_close_policy(&conn).unwrap();
+                conn.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=-1;")
+                    .unwrap();
+            }
+            assert!(fs::metadata(root.join("control.db-wal")).unwrap().len() > 32);
+            drop(store);
+            assert!(fs::metadata(root.join("control.db-wal")).unwrap().len() > 32);
+            Self {
+                owner,
+                prefix_guard,
+                root,
+                prefix,
+                sealed,
+                expected,
+                _temp: temp,
+            }
+        }
+
+        fn input(&self) -> ReinstallControlOpen<'_> {
+            ReinstallControlOpen {
+                root: &self.root,
+                prefix: &self.prefix,
+                policy_owner: &self.owner,
+                prefix_guard: &self.prefix_guard,
+                sealed: self.sealed,
+                expected: &self.expected,
+            }
+        }
+
+        fn open(&self, writable: bool, until: Instant) -> PortResult<SqliteControlStore> {
+            if writable {
+                SqliteControlStore::open_reinstall_writable_with_deadline(self.input(), until)
+            } else {
+                SqliteControlStore::open_reinstall_read_only_with_deadline(self.input(), until)
+            }
+        }
+
+        fn snapshot(&self) -> BTreeMap<PathBuf, SnapshotFile> {
+            self.owner.validate_current(&self.root).unwrap();
+            self.prefix_guard.validate_current(&self.prefix).unwrap();
+            let snapshot = fs::read_dir(&self.root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    assert!(metadata.is_file());
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    let observed = if name.ends_with(".lock") {
+                        // Windows byte-range locks also refuse reads through
+                        // this process's independently opened handles. Prove the
+                        // same private, single-link empty inode without reading
+                        // its locked bytes or releasing the real guard.
+                        private_file_observed(&path, &metadata, false).unwrap();
+                        assert_eq!(metadata.len(), 0);
+                        SnapshotFile::EmptyLock(seal(&path))
+                    } else if name == "control.db-shm" {
+                        SnapshotFile::SharedMemory
+                    } else {
+                        SnapshotFile::Bytes(fs::read(&path).unwrap())
+                    };
+                    (name.into(), observed)
+                })
+                .collect();
+            self.owner.validate_current(&self.root).unwrap();
+            self.prefix_guard.validate_current(&self.prefix).unwrap();
+            snapshot
+        }
+
+        fn assert_released(&self) {
+            drop(ExclusiveGuard::try_acquire(&self.root, LockKind::ControlHandles).unwrap());
+            self.owner.validate_current(&self.root).unwrap();
+            self.prefix_guard.validate_current(&self.prefix).unwrap();
+        }
+    }
+
+    fn assert_unscoped() {
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        assert!(RUNTIME_BUSY_END.with(Cell::get).is_none());
+    }
+
+    fn close_store(store: SqliteControlStore) {
+        let SqliteControlStore {
+            conn, handle_lease, ..
+        } = store;
+        match conn.into_inner().close() {
+            Ok(()) => {}
+            Err((conn, error)) => {
+                // Still owned; cleanup precedes release. Never reopen/retry.
+                drop(conn);
+                drop(handle_lease);
+                panic!("unexpected connection close refusal: {error}");
+            }
+        }
+        drop(handle_lease);
+    }
+
+    #[test]
+    fn reinstall_open_preserves_live_wal_and_original_lease_on_final_close() {
+        for recovering in [false, true] {
+            for writable in [false, true] {
+                let f = Fixture::new(recovering);
+                let before = f.snapshot();
+                let before_identity = seal(&SqliteControlStore::path(&f.root));
+                let store = f.open(writable, end()).unwrap();
+                assert_eq!(store.writable, writable);
+                assert_eq!(store.root_identity, f.owner.root_identity());
+                assert_eq!(
+                    store
+                        .with_runtime_deadline(end(), || store.lifecycle_status())
+                        .unwrap(),
+                    f.expected
+                );
+                {
+                    let conn = store.conn.borrow();
+                    assert!(conn.db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE).unwrap());
+                    for (pragma, expected) in [
+                        ("PRAGMA wal_autocheckpoint", 0),
+                        ("PRAGMA journal_size_limit", -1),
+                        ("PRAGMA query_only", i64::from(!writable)),
+                        ("PRAGMA busy_timeout", 250),
+                    ] {
+                        assert_eq!(
+                            conn.query_row(pragma, [], |row| row.get::<_, i64>(0))
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM sqlite_temp_schema", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                }
+                assert!(matches!(
+                    ExclusiveGuard::try_acquire(&f.root, LockKind::ControlHandles),
+                    Err(PortError::WriterBusy(_))
+                ));
+                drop(SharedGuard::try_acquire(&f.root, LockKind::ControlHandles).unwrap());
+                assert_unscoped();
+                close_store(store);
+                f.assert_released();
+                assert_eq!(seal(&SqliteControlStore::path(&f.root)), before_identity);
+                assert!(before == f.snapshot(), "admission changed durable files");
+                let reopened = f.open(writable, end()).unwrap();
+                close_store(reopened);
+                assert!(before == f.snapshot(), "re-entry changed durable files");
+            }
+        }
+    }
+
+    #[test]
+    fn reinstall_open_binds_before_any_main_or_temp_mutation() {
+        let f = Fixture::new(false);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let denied = Arc::new(AtomicUsize::new(0));
+        let captured_reads = Arc::clone(&reads);
+        let captured_denied = Arc::clone(&denied);
+        let until = end();
+        let before = f.snapshot();
+        let store = with_hook(
+            move |step, conn| {
+                assert_eq!(runtime_deadline(), Some(until));
+                assert!(conn.db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE).unwrap());
+                if step == Step::BeforeSql {
+                    let reads = Arc::clone(&captured_reads);
+                    let denied = Arc::clone(&captured_denied);
+                    conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                        let allowed = match ctx.action {
+                            AuthAction::Read { .. } | AuthAction::Select => {
+                                reads.fetch_add(1, Ordering::Relaxed);
+                                true
+                            }
+                            AuthAction::Transaction { .. } | AuthAction::Function { .. } => true,
+                            AuthAction::Pragma {
+                                pragma_name,
+                                pragma_value,
+                            } => matches!(
+                                (pragma_name, pragma_value),
+                                ("query_only", Some("ON" | "OFF"))
+                                    | ("foreign_keys", Some("ON"))
+                                    | ("synchronous", Some("FULL"))
+                                    | ("trusted_schema", Some("OFF"))
+                                    | ("wal_autocheckpoint", Some("0"))
+                                    | ("journal_size_limit", Some("-1"))
+                                    | ("user_version" | "application_id" | "journal_mode", None)
+                            ),
+                            _ => false,
+                        };
+                        if allowed {
+                            Authorization::Allow
+                        } else {
+                            denied.fetch_add(1, Ordering::Relaxed);
+                            Authorization::Deny
+                        }
+                    }))
+                    .unwrap();
+                }
+                Ok(())
+            },
+            || f.open(true, until),
+        )
+        .unwrap();
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert_eq!(denied.load(Ordering::Relaxed), 0);
+        for sql in [
+            "CREATE TABLE reinstall_forbidden(value)",
+            "CREATE TEMP TABLE reinstall_forbidden(value)",
+            "UPDATE main.control_meta SET control_seq=control_seq",
+            "DELETE FROM main.worker_state",
+        ] {
+            let count = denied.load(Ordering::Relaxed);
+            assert!(matches!(
+                store.conn.borrow().execute_batch(sql),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+            ));
+            assert!(denied.load(Ordering::Relaxed) > count);
+        }
+        store
+            .conn
+            .borrow()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        close_store(store);
+        assert!(before == f.snapshot());
+        assert_unscoped();
+    }
+
+    #[test]
+    fn reinstall_open_refuses_wrong_binding_and_absent_rendezvous_without_repair() {
+        let f = Fixture::new(false);
+        let before = f.snapshot();
+        for case in [
+            "seal",
+            "owner",
+            "phase",
+            "prefix",
+            "policy-kind",
+            "prefix-kind",
+        ] {
+            let other = agent_session_grep_testkit::tempdir().unwrap();
+            let policy_kind = ExclusiveGuard::try_acquire(&f.root, LockKind::Background).unwrap();
+            let prefix_kind = ExclusiveGuard::try_acquire(&f.prefix, LockKind::Background).unwrap();
+            let mut expected = f.expected.clone();
+            let mut input = f.input();
+            match case {
+                "seal" => input.sealed = SealedControlFile::from_recorded((0, 0)),
+                "owner" => {
+                    expected.policy.maintenance.owner = Some(cid("wrong-owner"));
+                    input.expected = &expected;
+                }
+                "phase" => {
+                    expected.policy.maintenance.phase = Some(MaintenancePhase::Failed);
+                    input.expected = &expected;
+                }
+                "prefix" => input.prefix = other.path(),
+                "policy-kind" => input.policy_owner = &policy_kind,
+                "prefix-kind" => input.prefix_guard = &prefix_kind,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    SqliteControlStore::open_reinstall_writable_with_deadline(input, end()),
+                    Err(PortError::InvalidRequest(_) | PortError::GenerationMismatch(_))
+                ),
+                "{case}"
+            );
+            f.assert_released();
+            assert_unscoped();
+        }
+        // Extra test rendezvous are separate from the pre-existing byte proof.
+        for (name, bytes) in before {
+            assert_eq!(f.snapshot().get(&name), Some(&bytes));
+        }
+        let path = f.root.join("control-handles.lock");
+        fs::remove_file(&path).unwrap();
+        let before_missing = f.snapshot();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        assert!(
+            with_hook(
+                move |_, _| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+                || f.open(false, end())
+            )
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(!path.exists());
+        assert!(before_missing == f.snapshot());
+        assert_unscoped();
+    }
+
+    #[test]
+    fn reinstall_open_never_upgrades_a_legacy_control_schema() {
+        let f = Fixture::new(false);
+        let conn = connect_raw(&SqliteControlStore::path(&f.root), true).unwrap();
+        install_reinstall_close_policy(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=-1;
+             DROP INDEX cycles_runtime_state;
+             DROP INDEX barriers_runtime_state;
+             DROP INDEX barriers_runtime_admission;
+             PRAGMA user_version=1; UPDATE control_meta SET schema_version=1;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = f.snapshot();
+        assert!(matches!(
+            f.open(true, end()),
+            Err(PortError::SchemaIncompatible(_))
+        ));
+        assert!(before == f.snapshot(), "legacy schema was rewritten");
+        f.assert_released();
+        assert_unscoped();
+    }
+
+    #[test]
+    fn reinstall_open_error_and_unwind_close_before_lease_release() {
+        for panic in [false, true] {
+            let f = Fixture::new(false);
+            let before = f.snapshot();
+            let root = f.root.clone();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                with_hook(
+                    move |step, conn| {
+                        assert!(conn.db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE).unwrap());
+                        if step == Step::Bound {
+                            assert!(matches!(
+                                ExclusiveGuard::try_acquire(&root, LockKind::ControlHandles),
+                                Err(PortError::WriterBusy(_))
+                            ));
+                            if panic {
+                                panic!("injected reinstall admission unwind");
+                            }
+                            return Err(conflict());
+                        }
+                        Ok(())
+                    },
+                    || f.open(true, end()),
+                )
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    Err(PortError::GenerationMismatch(_))
+                ));
+            }
+            f.assert_released();
+            assert!(before == f.snapshot(), "failed admission checkpointed WAL");
+            assert_unscoped();
+            close_store(f.open(true, end()).unwrap());
+        }
+    }
+
+    #[test]
+    fn reinstall_open_uses_earliest_end_and_restores_scope_on_expired_entry() {
+        let f = Fixture::new(false);
+        let before = f.snapshot();
+        let expired = with_hook(
+            |_, _| panic!("expired entry reached the connection"),
+            || f.open(true, Instant::now()),
+        );
+        assert!(matches!(
+            expired,
+            Err(PortError::WriterBusy(ref message)) if message == "control runtime deadline reached"
+        ));
+        assert!(before == f.snapshot());
+        assert_unscoped();
+        let outer = end();
+        let requested = outer + Duration::from_secs(5);
+        let scope =
+            RuntimeDeadlineScope::enter_with_busy(outer, Duration::from_millis(17)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let store = with_hook(
+            move |_, _| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(runtime_deadline(), Some(outer));
+                assert_eq!(
+                    RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                    Duration::from_millis(17)
+                );
+                Ok(())
+            },
+            || f.open(false, requested),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime_deadline(), Some(outer));
+        assert_eq!(
+            RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+            Duration::from_millis(17)
+        );
+        close_store(store);
+        drop(scope);
+        assert_unscoped();
+        f.assert_released();
     }
 }
 
