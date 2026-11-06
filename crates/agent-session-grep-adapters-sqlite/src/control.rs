@@ -689,13 +689,30 @@ impl InstallationLockAuthority<'_> {
         &self.installation
     }
     pub(crate) fn validate(&self, store: &SqliteControlStore) -> PortResult<()> {
+        self.validate_bound(store, || Ok(store.status()?.policy.installation_id))
+    }
+    /// Same root/kind/prefix/receipt checks as `validate`, comparing the
+    /// installation recorded in one snapshot the caller already read through
+    /// this connection instead of issuing a second default-budget status read.
+    fn validate_with_status(
+        &self,
+        store: &SqliteControlStore,
+        status: &ControlStatus,
+    ) -> PortResult<()> {
+        self.validate_bound(store, || Ok(status.policy.installation_id.clone()))
+    }
+    fn validate_bound(
+        &self,
+        store: &SqliteControlStore,
+        installation: impl FnOnce() -> PortResult<ControlId>,
+    ) -> PortResult<()> {
         store.validate_live_root()?;
         if self.control_root != store.root_identity
             || self.guard.kind()
                 != &LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY)?)
             || self.guard.root_identity() != self.identity
             || RootIdentity::read(&self.prefix)? != self.identity
-            || store.status()?.policy.installation_id != self.installation
+            || installation()? != self.installation
         {
             return Err(invalid());
         }
@@ -836,6 +853,31 @@ impl ControlRootGuard<'_> {
             return Err(invalid());
         }
         Ok(())
+    }
+}
+
+/// Seal-recorded identity of `control.db` in the uninstall seal's historical
+/// format: `(volume serial, file index)` on Windows and `(st_dev, st_ino)` on
+/// Unix. It is a comparison input only and grants no authority. It is not the
+/// 128-bit `FILE_ID_INFO` lock/root identity and is never compared with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SealedControlFile {
+    volume: u64,
+    file: u64,
+}
+
+impl SealedControlFile {
+    pub fn from_recorded(identity: (u64, u64)) -> Self {
+        Self {
+            volume: identity.0,
+            file: identity.1,
+        }
+    }
+}
+
+impl std::fmt::Debug for SealedControlFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealedControlFile([private])")
     }
 }
 
@@ -1261,6 +1303,101 @@ impl SqliteControlStore {
             guard,
             identity: self.root_identity,
         })
+    }
+
+    /// One lifecycle snapshot read through this store's existing connection,
+    /// bound to the sealed `control.db` file, the pinned control root, the
+    /// held PolicyOwner lock and the held installation-prefix lock.
+    ///
+    /// The earliest of `end` and any active caller scope bounds every step,
+    /// and an expired end refuses before any check. `lifecycle_status` may
+    /// still wait on SQLite contention under the existing bounded busy
+    /// handler; filesystem and file-control calls are checked between steps
+    /// but are not preemptible. This never reopens, retries, writes, upgrades
+    /// indexes or exposes the connection, handle, descriptor or path. The
+    /// returned snapshot is a point-in-time value, not continuing authority.
+    pub fn read_bound_to_sealed_with_deadline(
+        &self,
+        control_root: RootIdentity,
+        owner: &ControlRootGuard<'_>,
+        installation: &InstallationLockAuthority<'_>,
+        sealed: SealedControlFile,
+        end: Instant,
+    ) -> PortResult<ControlStatus> {
+        self.with_runtime_deadline(end, || {
+            #[cfg(test)]
+            bound_read_tests::observe(bound_read_tests::Step::Entered);
+            runtime_tick()?;
+            if control_root != self.root_identity || owner.identity != control_root {
+                return Err(invalid());
+            }
+            owner.validate(self)?;
+            owner.guard.validate_current(&self.private_root)?;
+            self.validate_live_root()?;
+            self.verify_connection_file(sealed)?;
+            runtime_tick()?;
+            verify_sidecars(&Self::path(&self.private_root))?;
+            runtime_tick()?;
+            let status = self.lifecycle_status()?;
+            installation.validate_with_status(self, &status)?;
+            installation.guard.validate_current(&installation.prefix)?;
+            #[cfg(test)]
+            bound_read_tests::observe(bound_read_tests::Step::BetweenPlatformSteps);
+            self.verify_connection_file(sealed)?;
+            runtime_tick()?;
+            Ok(status)
+        })
+    }
+
+    /// Bind this connection's main database file to the sealed identity.
+    /// Every FFI borrow ends before this returns; nothing is retained.
+    #[cfg(windows)]
+    fn verify_connection_file(&self, sealed: SealedControlFile) -> PortResult<()> {
+        runtime_tick()?;
+        let conn = self.conn.borrow();
+        // The connection borrow stays alive through verification of its handle.
+        let (volume, file) = windows_private::connection_file_identity(
+            connection_win32_handle(&conn)?,
+            &Self::path(&self.private_root),
+        )?;
+        drop(conn);
+        if (volume, file) != (sealed.volume, sealed.file) {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+
+    /// SQLite exposes no Unix descriptor identity. A supported POSIX VFS
+    /// records the inode it opened, and `HAS_MOVED` compares it with the
+    /// stored name; two such checks bracket the sealed name's lstat identity.
+    #[cfg(unix)]
+    fn verify_connection_file(&self, sealed: SealedControlFile) -> PortResult<()> {
+        use std::os::unix::fs::MetadataExt;
+        runtime_tick()?;
+        let path = Self::path(&self.private_root);
+        {
+            let conn = self.conn.borrow();
+            verify_connection_vfs(&conn)?;
+            if connection_main_filename(&conn)? != path {
+                return Err(invalid());
+            }
+            connection_unmoved(&conn)?;
+        }
+        runtime_tick()?;
+        reject_links(path.parent().ok_or_else(invalid)?)?;
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|error| private_validation_io(error, "file_metadata"))?;
+        private_file_observed(&path, &meta, false)?;
+        if (meta.dev(), meta.ino()) != (sealed.volume, sealed.file) {
+            return Err(conflict());
+        }
+        connection_unmoved(&self.conn.borrow())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn verify_connection_file(&self, sealed: SealedControlFile) -> PortResult<()> {
+        let _ = sealed;
+        Err(io_error(()))
     }
 
     /// Run a purge with the original SQL budget. RefCell makes this scope
@@ -2755,14 +2892,32 @@ mod control_create {
         PathBuf::from(value)
     }
 }
+/// Unix VFS for every control connection. Apple's default `unix` VFS picks a
+/// locking style per file system and can choose nolock or dotlock, which
+/// record no inode, so `HAS_MOVED` would report a replaced file as unmoved.
+/// `unix-posix` always uses POSIX advisory locks and records the inode, or
+/// fails the open. Elsewhere the bundled SQLite registers `unix` with the same
+/// POSIX finder and registers `unix-posix` only with locking styles enabled.
+#[cfg(all(unix, target_vendor = "apple"))]
+const CONTROL_VFS: &std::ffi::CStr = c"unix-posix";
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const CONTROL_VFS: &std::ffi::CStr = c"unix";
+
 fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
-    let flags = if writable {
+    let access = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(sql_error)?;
+    let flags = access | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    // An unregistered VFS name fails the open; there is no automatic or
+    // lockless fallback. The plain path is never interpreted as a URI.
+    #[cfg(unix)]
+    let conn = Connection::open_with_flags_and_vfs(path, flags, CONTROL_VFS).map_err(sql_error)?;
+    #[cfg(not(unix))]
+    let conn = Connection::open_with_flags(path, flags).map_err(sql_error)?;
+    #[cfg(unix)]
+    verify_connection_vfs(&conn)?;
     configure_runtime_deadline(&conn)?;
     runtime_tick()?;
     conn.execute_batch(
@@ -2770,6 +2925,103 @@ fn connect(path: &Path, writable: bool) -> PortResult<Connection> {
     )
     .map_err(|e| sql_query_error(&conn, e))?;
     Ok(conn)
+}
+
+/// Refuse a connection whose main database does not use the exact VFS object
+/// that `connect` selects, such as an automatic, lockless or dotfile
+/// connection opened elsewhere. An existing connection cannot change VFS, so
+/// this only refuses; it never reopens.
+#[cfg(unix)]
+fn verify_connection_vfs(conn: &Connection) -> PortResult<()> {
+    let mut actual: *mut rusqlite::ffi::sqlite3_vfs = std::ptr::null_mut();
+    // SAFETY: conn is a live connection used only on this thread for this
+    // call. SQLite writes one sqlite3_vfs pointer into the local out-pointer;
+    // the pointer is compared and never dereferenced or retained.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_VFS_POINTER,
+            (&raw mut actual).cast(),
+        )
+    };
+    // SAFETY: CONTROL_VFS is a NUL-terminated static name; SQLite returns a
+    // registered VFS pointer or null and transfers no ownership.
+    let expected = unsafe { rusqlite::ffi::sqlite3_vfs_find(CONTROL_VFS.as_ptr()) };
+    if rc != rusqlite::ffi::SQLITE_OK
+        || actual.is_null()
+        || expected.is_null()
+        || actual != expected
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// The full path SQLite opened for the main database. Not exposed or logged.
+#[cfg(unix)]
+fn connection_main_filename(conn: &Connection) -> PortResult<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: conn is live on this thread; SQLite returns a NUL-terminated
+    // string owned by the connection, copied here before the borrow ends.
+    let name = unsafe { rusqlite::ffi::sqlite3_db_filename(conn.handle(), c"main".as_ptr()) };
+    if name.is_null() {
+        return Err(invalid());
+    }
+    // SAFETY: non-null result points to a NUL-terminated string that stays
+    // valid while the connection is open and unchanged during this call.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    if bytes.is_empty() {
+        return Err(invalid());
+    }
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// `SQLITE_OK` with moved 0 is the only unmoved answer. `SQLITE_NOTFOUND`
+/// (a VFS without the check) refuses instead of counting as unmoved.
+#[cfg(unix)]
+fn connection_unmoved(conn: &Connection) -> PortResult<()> {
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: conn is live on this thread; SQLite writes one int into the
+    // local out-pointer before returning and retains no pointer.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&raw mut moved).cast(),
+        )
+    };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        return Err(invalid());
+    }
+    if moved != 0 {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+/// SQLite's own handle for the main database. SQLite keeps ownership.
+#[cfg(windows)]
+fn connection_win32_handle(
+    conn: &Connection,
+) -> PortResult<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // SAFETY: conn is live on this thread; the win32 VFS writes its file
+    // handle into the local out-pointer. Another VFS returns SQLITE_NOTFOUND.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            (&raw mut handle).cast(),
+        )
+    };
+    if rc != rusqlite::ffi::SQLITE_OK || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(invalid());
+    }
+    Ok(handle)
 }
 
 fn fresh_id(conn: &Connection, prefix: &str) -> PortResult<ControlId> {
@@ -6379,14 +6631,31 @@ mod windows_private {
     }
 
     pub(super) fn validate_private_read(path: &Path, file: &File) -> PortResult<()> {
-        validate_private_read_with_sidecar(path, file, false)
+        validate_private_read_with_sidecar(path, file, false).map(drop)
+    }
+
+    /// Validate SQLite's own handle for the main control database with the same
+    /// handle checks and no-follow name comparison as a private read, then
+    /// return its seal-format `(volume serial, file index)`. SQLite keeps
+    /// ownership: the handle is never closed, cloned, duplicated or retained.
+    pub(super) fn connection_file_identity(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        path: &Path,
+    ) -> PortResult<(u64, u64)> {
+        use std::{mem::ManuallyDrop, os::windows::io::FromRawHandle};
+        // SAFETY: the caller holds the live connection that owns this open,
+        // non-null, valid handle for the whole call. ManuallyDrop guarantees
+        // this borrowed File never closes it, including on error or unwind.
+        let borrowed = ManuallyDrop::new(unsafe { File::from_raw_handle(handle) });
+        let (volume, high, low) = validate_private_read_with_sidecar(path, &borrowed, false)?;
+        Ok((u64::from(volume), (u64::from(high) << 32) | u64::from(low)))
     }
 
     fn validate_private_read_with_sidecar(
         path: &Path,
         file: &File,
         sidecar: bool,
-    ) -> PortResult<()> {
+    ) -> PortResult<(u32, u32, u32)> {
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
@@ -6413,7 +6682,11 @@ mod windows_private {
         ) {
             return Err(io_error(()));
         }
-        Ok(())
+        Ok((
+            opened_info.dwVolumeSerialNumber,
+            opened_info.nFileIndexHigh,
+            opened_info.nFileIndexLow,
+        ))
     }
 
     fn open_for_verification(path: &Path, sidecar: bool) -> PortResult<File> {
@@ -8992,6 +9265,640 @@ mod control_create_tests {
         drop(outer);
         assert!(runtime_deadline().is_none());
         assert!(store.status().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod bound_read_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        Entered,
+        BetweenPlatformSteps,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Action {
+        Record,
+        ExpireBetween,
+        PanicBetween,
+    }
+
+    thread_local! {
+        static OBSERVER: RefCell<Option<(Action, Vec<Step>)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe(step: Step) {
+        let action = OBSERVER.with(|slot| {
+            slot.borrow_mut().as_mut().map(|(action, steps)| {
+                steps.push(step);
+                *action
+            })
+        });
+        match (action, step) {
+            (Some(Action::ExpireBetween), Step::BetweenPlatformSteps) => {
+                // Simulate the original end passing between the two platform
+                // steps; the enclosing scope restores the previous value.
+                RUNTIME_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+            }
+            (Some(Action::PanicBetween), Step::BetweenPlatformSteps) => {
+                panic!("injected bound read unwind");
+            }
+            _ => {}
+        }
+    }
+
+    fn observed<T>(action: Action, operation: impl FnOnce() -> T) -> (T, Vec<Step>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                OBSERVER.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some((action, Vec::new()));
+        });
+        let reset = Reset;
+        let value = operation();
+        let steps = OBSERVER.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .map(|(_, steps)| std::mem::take(steps))
+                .unwrap_or_default()
+        });
+        drop(reset);
+        (value, steps)
+    }
+
+    fn cid(value: &str) -> ControlId {
+        ControlId::parse(value).unwrap()
+    }
+
+    // Field order is drop order: the store closes before its guards and root.
+    struct Bound {
+        store: SqliteControlStore,
+        policy_owner: ExclusiveGuard,
+        installation_lock: ExclusiveGuard,
+        root: PathBuf,
+        prefix: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum OwnedArtifact {
+        Directory,
+        Symlink(PathBuf),
+        File(Option<Vec<u8>>),
+    }
+
+    struct OwnedState {
+        rows: Vec<(String, Vec<String>)>,
+        artifacts: Vec<(PathBuf, OwnedArtifact)>,
+    }
+
+    impl OwnedState {
+        fn assert_unchanged(&self, fixture: &Bound) {
+            self.assert_matches(fixture.owned_state());
+        }
+
+        fn assert_matches(&self, after: Self) {
+            // Do not print durable rows or file contents on failure.
+            assert!(self.rows == after.rows, "bound read changed durable rows");
+            assert!(
+                self.artifacts == after.artifacts,
+                "bound read changed owned files or inventory"
+            );
+        }
+    }
+
+    fn owned_artifacts(root: &Path) -> Vec<(PathBuf, OwnedArtifact)> {
+        fn visit(root: &Path, directory: &Path, entries: &mut Vec<(PathBuf, OwnedArtifact)>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = fs::symlink_metadata(&path).unwrap().file_type();
+                let artifact = if kind.is_dir() {
+                    visit(root, &path, entries);
+                    OwnedArtifact::Directory
+                } else if kind.is_symlink() {
+                    OwnedArtifact::Symlink(fs::read_link(&path).unwrap())
+                } else {
+                    assert!(kind.is_file(), "unexpected owned artifact type");
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    // Track all names, but compare bytes only for databases,
+                    // WALs and the prefix receipt. SQLite SHM bookkeeping and
+                    // the contents of held OS lock files are not owned writes.
+                    let bytes = if name.ends_with(".db")
+                        || name.ends_with(".db-wal")
+                        || name == "installation-prefix.json"
+                    {
+                        Some(fs::read(&path).unwrap())
+                    } else {
+                        None
+                    };
+                    OwnedArtifact::File(bytes)
+                };
+                entries.push((path.strip_prefix(root).unwrap().to_path_buf(), artifact));
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// These tests own independent roots. Parallel tests can briefly starve
+    /// the default 250ms status budget, so retry typed contention only for
+    /// expected-success preparation; every assertion stays unretried.
+    fn retry_busy<T>(mut operation: impl FnMut() -> PortResult<T>) -> T {
+        let end = Instant::now() + Duration::from_secs(8);
+        loop {
+            match operation() {
+                Err(PortError::WriterBusy(_)) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(value) => return value,
+                Err(error) => panic!("expected uncontended preparation: {error:?}"),
+            }
+        }
+    }
+
+    fn bound() -> Bound {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let prefix = temp.path().join("install");
+        fs::create_dir(&prefix).unwrap();
+        let store = retry_busy(|| {
+            SqliteControlStore::create(
+                &root,
+                &cid("synthetic-bound-installation"),
+                DesiredUpdates::Running,
+            )
+        });
+        let installation_lock = retry_busy(|| {
+            ExclusiveGuard::try_acquire(
+                &prefix,
+                LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY)?),
+            )
+        });
+        let policy_owner = retry_busy(|| ExclusiveGuard::try_acquire(&root, LockKind::PolicyOwner));
+        retry_busy(|| {
+            let owner = store.bind_control_root(&policy_owner)?;
+            store.record_verified_installation_prefix(
+                &prefix,
+                &installation_lock,
+                &owner,
+                Instant::now() + Duration::from_secs(8),
+            )
+        });
+        Bound {
+            store,
+            policy_owner,
+            installation_lock,
+            root,
+            prefix,
+            _temp: temp,
+        }
+    }
+
+    impl Bound {
+        fn owned_state(&self) -> OwnedState {
+            self.owned_state_on(&self.store.conn.borrow())
+        }
+
+        fn owned_state_on(&self, conn: &Connection) -> OwnedState {
+            // Never open by name here: after rename/replacement only this
+            // retained connection still identifies the original database.
+            let names = conn
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows = names
+                .into_iter()
+                .map(|name| {
+                    let mut statement = conn
+                        .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    let mut rows = statement
+                        .query_map([], |row| {
+                            let values = (0..columns)
+                                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            Ok(format!("{values:?}"))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    rows.sort();
+                    (name, rows)
+                })
+                .collect();
+            OwnedState {
+                rows,
+                artifacts: owned_artifacts(self._temp.path()),
+            }
+        }
+
+        fn installation(&self) -> InstallationLockAuthority<'_> {
+            retry_busy(|| {
+                self.store
+                    .bind_installation(&self.prefix, &self.installation_lock)
+            })
+        }
+
+        fn owner(&self) -> ControlRootGuard<'_> {
+            self.store.bind_control_root(&self.policy_owner).unwrap()
+        }
+
+        fn sealed(&self) -> SealedControlFile {
+            let file = fs::File::open(SqliteControlStore::path(&self.root)).unwrap();
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                let meta = file.metadata().unwrap();
+                (meta.dev(), meta.ino())
+            };
+            #[cfg(windows)]
+            let identity = {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+                };
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                // SAFETY: file owns a live handle; info is the matching buffer.
+                assert_ne!(
+                    unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) },
+                    0
+                );
+                (
+                    u64::from(info.dwVolumeSerialNumber),
+                    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+                )
+            };
+            #[cfg(not(any(unix, windows)))]
+            let identity = {
+                drop(file);
+                (0, 0)
+            };
+            SealedControlFile::from_recorded(identity)
+        }
+    }
+
+    /// No scope remains active, the ordinary busy allowance is back, and the
+    /// connection's handlers are the unscoped ones (`busy_timeout` 250ms; a
+    /// scoped busy handler reads as 0). The borrow also proves no leaked borrow.
+    fn assert_unscoped(store: &SqliteControlStore) {
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        let busy: i64 = store
+            .conn
+            .borrow()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 250);
+    }
+
+    #[test]
+    fn bound_read_returns_the_lifecycle_snapshot_and_restores_the_scope() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        let before = f.owned_state();
+        let end = Instant::now() + Duration::from_secs(8);
+        let (status, steps) = observed(Action::Record, || {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+        });
+        assert_eq!(steps, [Step::Entered, Step::BetweenPlatformSteps]);
+        before.assert_unchanged(&f);
+        assert_eq!(status.unwrap(), retry_busy(|| f.store.lifecycle_status()));
+        assert_unscoped(&f.store);
+    }
+
+    #[test]
+    fn bound_read_restores_deadline_allowance_and_handlers_after_refusal_and_unwind() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        let read = |seal: SealedControlFile, end: Instant| {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                seal,
+                end,
+            )
+        };
+        let before = f.owned_state();
+        let end = Instant::now() + Duration::from_secs(8);
+
+        // A typed refusal from the identity comparison.
+        let foreign = SealedControlFile::from_recorded((0, 0));
+        assert!(matches!(
+            read(foreign, end),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+
+        // An injected unwind between the platform steps.
+        let (unwound, steps) = observed(Action::PanicBetween, || {
+            catch_unwind(AssertUnwindSafe(|| read(sealed, end))).is_err()
+        });
+        assert!(unwound);
+        assert_eq!(steps, [Step::Entered, Step::BetweenPlatformSteps]);
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+
+        // A nested read keeps and then restores the caller's own scope.
+        let outer_end = end + Duration::from_secs(2);
+        f.store
+            .with_runtime_deadline(outer_end, || {
+                let status = read(sealed, end)?;
+                assert_eq!(runtime_deadline(), Some(outer_end));
+                assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+                let busy: i64 = f
+                    .store
+                    .conn
+                    .borrow()
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                    .map_err(sql_error)?;
+                assert_eq!(busy, 0, "the outer scope's busy handler is retained");
+                Ok(status)
+            })
+            .unwrap();
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+        assert!(read(sealed, end).is_ok(), "the store remains usable");
+        before.assert_unchanged(&f);
+    }
+
+    #[test]
+    fn bound_read_mid_call_expiry_returns_no_snapshot_and_keeps_the_store_usable() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        let before = f.owned_state();
+        let end = Instant::now() + Duration::from_secs(8);
+        let read = || {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+        };
+        let (expired, steps) = observed(Action::ExpireBetween, read);
+        assert_eq!(steps, [Step::Entered, Step::BetweenPlatformSteps]);
+        assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+        assert_eq!(read().unwrap(), retry_busy(|| f.store.lifecycle_status()));
+        before.assert_unchanged(&f);
+    }
+
+    #[test]
+    fn bound_read_refuses_an_expired_or_earlier_outer_end_before_any_step() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        let read = |end: Instant| {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+        };
+        let before = f.owned_state();
+        let (expired, steps) = observed(Action::Record, || read(Instant::now()));
+        assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+        assert!(steps.is_empty(), "no check may run after the end");
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+
+        // An earlier active caller end wins over the later requested end.
+        let mut entered = false;
+        let (outer, steps) = observed(Action::Record, || {
+            f.store
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                    entered = true;
+                    RUNTIME_DEADLINE.with(|slot| slot.set(Some(Instant::now())));
+                    read(Instant::now() + Duration::from_secs(30))
+                })
+        });
+        assert!(entered);
+        assert!(matches!(outer, Err(PortError::WriterBusy(_))));
+        assert!(steps.is_empty(), "the earlier outer end refuses at entry");
+        before.assert_unchanged(&f);
+        assert_unscoped(&f.store);
+        assert!(read(Instant::now() + Duration::from_secs(8)).is_ok());
+        before.assert_unchanged(&f);
+    }
+
+    /// POSIX rename-away refuses through `HAS_MOVED`; a symlink to the same
+    /// inode refuses through lstat although `HAS_MOVED` follows it. Keep the
+    /// original connection for both row snapshots and recovery.
+    #[cfg(unix)]
+    #[test]
+    fn bound_control_read_refuses_rename_away_and_symlink_then_reads_after_restore() {
+        let f = bound();
+        let control = SqliteControlStore::path(&f.root);
+        let sealed = f.sealed();
+        let owner = f.owner();
+        let installation = f.installation();
+        let read = || {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                Instant::now() + Duration::from_secs(8),
+            )
+        };
+        let status = retry_busy(read);
+        let original = f.owned_state();
+        let aside = f.root.join("control-aside.db");
+        fs::rename(&control, &aside).unwrap();
+        let renamed = f.owned_state();
+        assert!(matches!(read(), Err(PortError::GenerationMismatch(_))));
+        renamed.assert_unchanged(&f);
+
+        std::os::unix::fs::symlink(&aside, &control).unwrap();
+        let linked = f.owned_state();
+        assert!(matches!(read(), Err(PortError::Backend(_))));
+        linked.assert_unchanged(&f);
+
+        fs::remove_file(&control).unwrap();
+        fs::rename(&aside, &control).unwrap();
+        assert_eq!(retry_busy(read), status);
+        original.assert_unchanged(&f);
+    }
+
+    /// Both seals refuse a byte-identical replacement while the stale
+    /// connection still reads its original rows. Snapshot the named original
+    /// and replacement before restoring anything; equal bytes are not identity.
+    #[cfg(unix)]
+    #[test]
+    fn bound_control_read_refuses_same_byte_replacement_against_both_seals() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = bound();
+        let control = SqliteControlStore::path(&f.root);
+        let original = f.sealed();
+        let owner = f.owner();
+        let installation = f.installation();
+        let read = |sealed| {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                Instant::now() + Duration::from_secs(8),
+            )
+        };
+        let status = retry_busy(|| read(original));
+        let before = f.owned_state();
+        let staged = f.root.join("control-staged.db");
+        let aside = f.root.join("control-aside.db");
+        let bytes = fs::read(&control).unwrap();
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staged)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        fs::rename(&control, &aside).unwrap();
+        fs::rename(&staged, &control).unwrap();
+        let replacement = f.sealed();
+        assert_ne!(replacement, original);
+        let replaced = f.owned_state();
+        for sealed in [original, replacement] {
+            assert!(matches!(
+                read(sealed),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            replaced.assert_unchanged(&f);
+        }
+        assert!(retry_busy(|| f.store.status()) == status);
+        replaced.assert_unchanged(&f);
+
+        fs::remove_file(&control).unwrap();
+        fs::rename(&aside, &control).unwrap();
+        assert_eq!(retry_busy(|| read(original)), status);
+        before.assert_unchanged(&f);
+    }
+
+    #[cfg(unix)]
+    fn synthetic_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE synthetic(value); INSERT INTO synthetic VALUES(1);")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn open_with_vfs(path: &Path, vfs: &std::ffi::CStr) -> Connection {
+        Connection::open_with_flags_and_vfs(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            vfs,
+        )
+        .unwrap()
+    }
+
+    /// Public lockless VFSes record no inode, so `HAS_MOVED` reports a
+    /// replaced file as unmoved. The supported-VFS check is what refuses them.
+    #[cfg(unix)]
+    #[test]
+    fn lockless_vfs_hides_replacement_from_has_moved_and_is_refused() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let path = temp.path().join("synthetic.db");
+        let copy = temp.path().join("synthetic-copy.db");
+        synthetic_database(&path);
+        for vfs in [c"unix-none", c"unix-dotfile"] {
+            let stale = open_with_vfs(&path, vfs);
+            let control = open_with_vfs(&path, CONTROL_VFS);
+            assert!(connection_unmoved(&stale).is_ok());
+            assert!(connection_unmoved(&control).is_ok());
+            fs::copy(&path, &copy).unwrap();
+            fs::rename(&copy, &path).unwrap();
+            assert!(
+                connection_unmoved(&stale).is_ok(),
+                "the lockless VFS cannot see the replacement"
+            );
+            assert!(matches!(
+                connection_unmoved(&control),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            assert!(matches!(
+                verify_connection_vfs(&stale),
+                Err(PortError::InvalidRequest(_))
+            ));
+            assert!(verify_connection_vfs(&control).is_ok());
+        }
+    }
+
+    /// An existing connection cannot change its VFS. A connection that `connect`
+    /// did not select refuses without a reopen; restoring the original
+    /// connection reads again, so nothing was latched, dropped or reacquired.
+    /// On Apple targets the automatic `unix` VFS is the ambiguous case.
+    #[cfg(unix)]
+    #[test]
+    fn bound_read_refuses_an_already_open_connection_on_another_vfs_without_reopening() {
+        let f = bound();
+        let owner = f.owner();
+        let installation = f.installation();
+        let sealed = f.sealed();
+        let read = || {
+            f.store.read_bound_to_sealed_with_deadline(
+                f.store.root_identity,
+                &owner,
+                &installation,
+                sealed,
+                Instant::now() + Duration::from_secs(8),
+            )
+        };
+        let expected = read().unwrap();
+        let path = SqliteControlStore::path(&f.root);
+        for (vfs, supported) in [
+            (c"unix", !cfg!(target_vendor = "apple")),
+            (c"unix-excl", false),
+        ] {
+            let other = open_with_vfs(&path, vfs);
+            let original = std::mem::replace(&mut *f.store.conn.borrow_mut(), other);
+            let before = f.owned_state_on(&original);
+            let result = read();
+            before.assert_matches(f.owned_state_on(&original));
+            let other = std::mem::replace(&mut *f.store.conn.borrow_mut(), original);
+            if supported {
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert!(matches!(result, Err(PortError::InvalidRequest(_))));
+            }
+            drop(other);
+            assert_eq!(read().unwrap(), expected);
+        }
     }
 }
 

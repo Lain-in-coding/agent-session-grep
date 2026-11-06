@@ -2746,6 +2746,10 @@ fn worker_authority_binds_real_lock_to_physical_control_root() {
 // catches accidental writes even if a rejected mutation failed to bump the CAS.
 fn control_rows(root: &Path) -> Vec<(String, Vec<String>)> {
     let conn = raw(root);
+    control_rows_from(&conn)
+}
+
+fn control_rows_from(conn: &Connection) -> Vec<(String, Vec<String>)> {
     let names = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .unwrap()
@@ -3238,4 +3242,468 @@ fn live_runtime_load_is_bounded_but_keeps_exact_old_tokens_and_dependencies() {
         store.background_status(),
         Err(PortError::SchemaIncompatible(_))
     ));
+}
+
+/// Reads bound to the uninstall seal's control.db identity. Seals are computed
+/// the CLI way: the `(volume, file index)` or `(st_dev, st_ino)` of the name
+/// observed without following a final link.
+mod bound_control_read {
+    use super::*;
+    use agent_session_grep_adapters_sqlite::control::{INSTALLATION_LOCK_KEY, SealedControlFile};
+    use agent_session_grep_adapters_sqlite::managed_locks::JobLockKey;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    // Field order is drop order: the store closes before its guards and root.
+    struct Bound {
+        store: SqliteControlStore,
+        policy_owner: ExclusiveGuard,
+        installation_lock: ExclusiveGuard,
+        root: PathBuf,
+        prefix: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum OwnedArtifact {
+        Directory,
+        Symlink(PathBuf),
+        File(Option<Vec<u8>>),
+    }
+
+    struct OwnedState {
+        rows: Vec<(String, Vec<String>)>,
+        artifacts: Vec<(PathBuf, OwnedArtifact)>,
+    }
+
+    impl OwnedState {
+        fn assert_unchanged(&self, fixture: &Bound) {
+            let after = fixture.owned_state();
+            // Do not print durable rows or file contents on failure.
+            assert!(self.rows == after.rows, "bound read changed durable rows");
+            assert!(
+                self.artifacts == after.artifacts,
+                "bound read changed owned files or inventory"
+            );
+        }
+    }
+
+    fn owned_artifacts(root: &Path) -> Vec<(PathBuf, OwnedArtifact)> {
+        fn visit(root: &Path, directory: &Path, entries: &mut Vec<(PathBuf, OwnedArtifact)>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                let artifact = if kind.is_dir() {
+                    visit(root, &path, entries);
+                    OwnedArtifact::Directory
+                } else if kind.is_symlink() {
+                    OwnedArtifact::Symlink(std::fs::read_link(&path).unwrap())
+                } else {
+                    assert!(kind.is_file(), "unexpected owned artifact type");
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    // Keep every artifact name, including SHM and held locks,
+                    // without requiring their bookkeeping bytes to be stable.
+                    let bytes = if name.ends_with(".db")
+                        || name.ends_with(".db-wal")
+                        || name == "installation-prefix.json"
+                    {
+                        Some(std::fs::read(&path).unwrap())
+                    } else {
+                        None
+                    };
+                    OwnedArtifact::File(bytes)
+                };
+                entries.push((path.strip_prefix(root).unwrap().to_path_buf(), artifact));
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    fn installation_kind() -> LockKind {
+        LockKind::MaintenanceJob(JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap())
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(8)
+    }
+
+    fn bound() -> Bound {
+        let (temp, root, store) = setup();
+        let prefix = temp.path().join("install");
+        std::fs::create_dir(&prefix).unwrap();
+        let installation_lock = exclusive_guard(&prefix, installation_kind());
+        let policy_owner = exclusive_guard(&root, LockKind::PolicyOwner);
+        retry_expected_success(|| {
+            let owner = store.bind_control_root(&policy_owner)?;
+            store.record_verified_installation_prefix(&prefix, &installation_lock, &owner, later())
+        })
+        .unwrap();
+        Bound {
+            store,
+            policy_owner,
+            installation_lock,
+            root,
+            prefix,
+            _temp: temp,
+        }
+    }
+
+    impl Bound {
+        fn owned_state(&self) -> OwnedState {
+            // Only fixtures with an intact control.db name use this helper.
+            // Stale-name cases live in the private connection unit seam.
+            let conn = Connection::open_with_flags(
+                self.control(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .unwrap();
+            let rows = control_rows_from(&conn);
+            drop(conn);
+            OwnedState {
+                rows,
+                artifacts: owned_artifacts(self._temp.path()),
+            }
+        }
+
+        fn control(&self) -> PathBuf {
+            SqliteControlStore::path(&self.root)
+        }
+
+        /// One bound read with freshly borrowed views of the real held guards.
+        fn read(
+            &self,
+            sealed: SealedControlFile,
+            end: Instant,
+        ) -> Result<ControlStatus, PortError> {
+            let installation = retry_expected_success(|| {
+                self.store
+                    .bind_installation(&self.prefix, &self.installation_lock)
+            })?;
+            let owner = self.store.bind_control_root(&self.policy_owner)?;
+            self.store.read_bound_to_sealed_with_deadline(
+                RootIdentity::read(&self.root)?,
+                &owner,
+                &installation,
+                sealed,
+                end,
+            )
+        }
+
+        fn expect_read(&self, sealed: SealedControlFile) -> ControlStatus {
+            retry_expected_success(|| self.read(sealed, later())).unwrap()
+        }
+    }
+
+    /// Close the store, change the files, then reopen the same root read-only
+    /// while the guards, prefix and root stay held.
+    fn reopen_after(f: Bound, change: impl FnOnce(&Path)) -> Bound {
+        let Bound {
+            store,
+            policy_owner,
+            installation_lock,
+            root,
+            prefix,
+            _temp,
+        } = f;
+        drop(store);
+        change(&root);
+        let store =
+            retry_expected_success(|| SqliteControlStore::open_current_read_only(&root)).unwrap();
+        Bound {
+            store,
+            policy_owner,
+            installation_lock,
+            root,
+            prefix,
+            _temp,
+        }
+    }
+
+    fn seal(path: &Path) -> SealedControlFile {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            assert!(meta.file_type().is_file());
+            SealedControlFile::from_recorded((meta.dev(), meta.ino()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
+                GetFileInformationByHandle,
+            };
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: file owns a live handle; info is the matching buffer.
+            assert_ne!(
+                unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) },
+                0
+            );
+            SealedControlFile::from_recorded((
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            SealedControlFile::from_recorded((0, 0))
+        }
+    }
+
+    #[test]
+    fn bound_control_read_repeats_the_lifecycle_snapshot_and_excludes_policy_writers() {
+        let f = bound();
+        let sealed = seal(&f.control());
+        let before = f.owned_state();
+        for _ in 0..3 {
+            let status = f.expect_read(sealed);
+            before.assert_unchanged(&f);
+            assert_eq!(
+                status,
+                retry_expected_success(|| f.store.lifecycle_status()).unwrap()
+            );
+        }
+        assert!(matches!(
+            ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner),
+            Err(PortError::WriterBusy(_))
+        ));
+        before.assert_unchanged(&f);
+        let Bound {
+            policy_owner, root, ..
+        } = f;
+        drop(policy_owner);
+        drop(exclusive_guard(&root, LockKind::PolicyOwner));
+    }
+
+    #[test]
+    fn bound_control_read_refuses_foreign_root_kind_installation_and_prefix_receipt() {
+        let a = bound();
+        let b = bound();
+        let a_root = RootIdentity::read(&a.root).unwrap();
+        let b_root = RootIdentity::read(&b.root).unwrap();
+        let sealed = seal(&a.control());
+        let before = control_rows(&a.root);
+        let status = a.expect_read(sealed);
+        let a_installation =
+            retry_expected_success(|| a.store.bind_installation(&a.prefix, &a.installation_lock))
+                .unwrap();
+        let b_installation =
+            retry_expected_success(|| b.store.bind_installation(&b.prefix, &b.installation_lock))
+                .unwrap();
+        let a_owner = a.store.bind_control_root(&a.policy_owner).unwrap();
+        let b_owner = b.store.bind_control_root(&b.policy_owner).unwrap();
+
+        // Only the same root's PolicyOwner guard can be borrowed.
+        let emission = exclusive_guard(&a.root, LockKind::PolicyEmission);
+        let a_before = a.owned_state();
+        let b_before = b.owned_state();
+        assert!(matches!(
+            a.store.bind_control_root(&emission),
+            Err(PortError::InvalidRequest(_))
+        ));
+        a_before.assert_unchanged(&a);
+        b_before.assert_unchanged(&b);
+        assert!(matches!(
+            a.store.bind_control_root(&b.policy_owner),
+            Err(PortError::InvalidRequest(_))
+        ));
+        a_before.assert_unchanged(&a);
+        b_before.assert_unchanged(&b);
+        let invalid = |result: Result<ControlStatus, PortError>| {
+            assert!(matches!(result, Err(PortError::InvalidRequest(_))));
+            a_before.assert_unchanged(&a);
+            b_before.assert_unchanged(&b);
+        };
+        invalid(a.store.read_bound_to_sealed_with_deadline(
+            b_root,
+            &a_owner,
+            &a_installation,
+            sealed,
+            later(),
+        ));
+        invalid(a.store.read_bound_to_sealed_with_deadline(
+            a_root,
+            &b_owner,
+            &a_installation,
+            sealed,
+            later(),
+        ));
+        invalid(a.store.read_bound_to_sealed_with_deadline(
+            a_root,
+            &a_owner,
+            &b_installation,
+            sealed,
+            later(),
+        ));
+        invalid(b.store.read_bound_to_sealed_with_deadline(
+            b_root,
+            &a_owner,
+            &b_installation,
+            sealed,
+            later(),
+        ));
+
+        // An unrelated private file's identity is not the sealed control.db.
+        assert!(matches!(
+            a.read(seal(&a.root.join("installation-prefix.json")), later()),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        a_before.assert_unchanged(&a);
+        b_before.assert_unchanged(&b);
+
+        // A receipt naming another control root binds no installation here.
+        let receipt = a.root.join("installation-prefix.json");
+        let original = std::fs::read(&receipt).unwrap();
+        let foreign = String::from_utf8(original.clone())
+            .unwrap()
+            .replace(a_root.control_id().as_str(), b_root.control_id().as_str());
+        assert_ne!(foreign.as_bytes(), original.as_slice());
+        let overwrite = |bytes: &[u8]| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&receipt)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        };
+        overwrite(foreign.as_bytes());
+        let changed_receipt = a.owned_state();
+        assert!(matches!(
+            a.store.read_bound_to_sealed_with_deadline(
+                a_root,
+                &a_owner,
+                &a_installation,
+                sealed,
+                later(),
+            ),
+            Err(PortError::InvalidRequest(_))
+        ));
+        changed_receipt.assert_unchanged(&a);
+        b_before.assert_unchanged(&b);
+        overwrite(&original);
+        assert_eq!(a.expect_read(sealed), status);
+        a_before.assert_unchanged(&a);
+        assert!(control_rows(&a.root) == before);
+    }
+
+    /// All targets: an extra hard link refuses through the link count. If
+    /// Windows denies linking a file SQLite holds open, the raw OS error must
+    /// be 5 or 32 and the read must still succeed.
+    #[test]
+    fn bound_control_read_refuses_an_extra_hard_link_until_it_is_removed() {
+        let f = bound();
+        let sealed = seal(&f.control());
+        let status = f.expect_read(sealed);
+        let link = f.root.join("control-link.db");
+        let unlinked = f.owned_state();
+        match std::fs::hard_link(f.control(), &link) {
+            Ok(()) => {
+                let linked = f.owned_state();
+                assert!(matches!(
+                    f.read(sealed, later()),
+                    Err(PortError::Backend(_))
+                ));
+                linked.assert_unchanged(&f);
+                #[cfg(not(windows))]
+                {
+                    std::fs::remove_file(&link).unwrap();
+                    // Retain the original store, seal and both held guards.
+                    assert_eq!(f.expect_read(sealed), status);
+                    unlinked.assert_unchanged(&f);
+                }
+                #[cfg(windows)]
+                match std::fs::remove_file(&link) {
+                    Ok(()) => {
+                        assert_eq!(f.expect_read(sealed), status);
+                        unlinked.assert_unchanged(&f);
+                    }
+                    Err(error) => {
+                        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                        linked.assert_unchanged(&f);
+                        // SQLite's handle may deny deleting this link. This
+                        // Windows-only reopen is not same-connection recovery.
+                        let f = reopen_after(f, |_| std::fs::remove_file(&link).unwrap());
+                        assert_eq!(f.expect_read(sealed), status);
+                    }
+                }
+            }
+            #[cfg(windows)]
+            Err(error) => {
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                unlinked.assert_unchanged(&f);
+                assert_eq!(f.expect_read(sealed), status);
+                unlinked.assert_unchanged(&f);
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// All targets: a new connection over a byte-identical private copy reads
+    /// the same policy, but only the copy's own seal binds to it.
+    #[test]
+    fn bound_control_read_binds_file_identity_not_connection_age() {
+        let f = bound();
+        let original = seal(&f.control());
+        let status = f.expect_read(original);
+        let f = reopen_after(f, |root| {
+            let control = SqliteControlStore::path(root);
+            let copy = root.join("control-copy.db");
+            std::fs::copy(&control, &copy).unwrap();
+            std::fs::rename(&copy, &control).unwrap();
+        });
+        let replacement = seal(&f.control());
+        assert_ne!(replacement, original);
+        let before = f.owned_state();
+        assert!(matches!(
+            f.read(original, later()),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        before.assert_unchanged(&f);
+        assert!(retry_expected_success(|| f.store.status()).is_ok());
+        assert!(
+            retry_expected_success(|| f.store.read_policy(RequestIntersection::Selected)).is_ok()
+        );
+        assert_eq!(f.expect_read(replacement), status);
+        before.assert_unchanged(&f);
+    }
+
+    /// Windows refuses to rename or replace the name while SQLite holds it
+    /// open. Any other outcome fails; this is never reported as a replacement.
+    #[cfg(windows)]
+    #[test]
+    fn bound_control_read_name_cannot_be_renamed_or_replaced_while_connected() {
+        let f = bound();
+        let control = f.control();
+        let sealed = seal(&control);
+        let status = f.expect_read(sealed);
+        let aside = f.root.join("control-aside.db");
+        let replacement = f.root.join("control-replacement.db");
+        std::fs::write(&replacement, b"synthetic replacement").unwrap();
+        let before = f.owned_state();
+        for (from, to) in [(&control, &aside), (&replacement, &control)] {
+            let result = std::fs::rename(from, to);
+            let error = result.expect_err("an open control.db must not be renamed or replaced");
+            assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+            before.assert_unchanged(&f);
+        }
+        assert_eq!(f.expect_read(sealed), status);
+        before.assert_unchanged(&f);
+        std::fs::remove_file(&replacement).unwrap();
+        assert_eq!(seal(&control), sealed);
+        assert_eq!(f.expect_read(sealed), status);
+    }
 }
