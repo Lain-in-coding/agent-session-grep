@@ -2,11 +2,12 @@
 //! The native parent retains one noninheritable OS lock until process exit; the
 //! child must acquire that SAME inode before changing any planned payload file.
 use super::*;
-#[cfg(test)]
-use agent_session_grep_adapters_sqlite::control::SealedControlFile;
 use agent_session_grep_adapters_sqlite::{
-    control::INSTALLATION_LOCK_KEY, managed_locks::JobLockKey, managed_purge::PrivateArtifactClass,
+    control::{INSTALLATION_LOCK_KEY, SealedControlFile},
+    managed_locks::JobLockKey,
+    managed_purge::PrivateArtifactClass,
 };
+use agent_session_grep_ports::control::{ControlSeq, PolicyEpoch};
 use std::io::Write;
 
 const CHILD: &str = "__managed-uninstall-cleanup";
@@ -968,7 +969,7 @@ fn run_child(
         return Err(Reason::IdentityChanged);
     }
     verify(&journal.root, &plan.runner, &seal.policy, end, false)?;
-    let _parent_exited = exit_lock(&journal.root, &plan.parent_exit, &seal.policy, end, true)?;
+    let parent_exited = exit_lock(&journal.root, &plan.parent_exit, &seal.policy, end, true)?;
     let runner_owner = exit_lock(&journal.root, &plan.runner_exit, &seal.policy, end, false)?;
     let installation = update_state::acquire_installation_lock(prefix, end)
         .map_err(|_| Reason::AfterExitCleanupPending)?;
@@ -979,19 +980,34 @@ fn run_child(
     let result = if consume_tail_result(&mut journal, &seal, end)? {
         Ok(())
     } else {
-        finalize(&mut journal, &seal, &installation, end)
+        finalize(
+            &mut journal,
+            &seal,
+            &installation,
+            &parent_exited,
+            &runner_owner,
+            end,
+        )
     };
-    if let Err(reason) = &result {
-        journal.state.report.pending(*reason);
-    }
-    if result.is_ok() && cfg!(windows) {
-        // launch_tail already flushed its exact handoff receipt. Writing another
-        // would sever the tail's sequence/digest binding to that durable intent.
-        std::mem::forget(runner_owner);
-    } else {
-        journal
-            .save_before_deadline(end)
-            .map_err(|_| Reason::AfterExitCleanupPending)?;
+    match &result {
+        Err(reason)
+            if journal.state.report.cleanup_pending
+                || journal.state.report.after_exit_cleanup_pending =>
+        {
+            journal.state.report.pending(*reason);
+            journal
+                .save_before_deadline(end)
+                .map_err(|_| Reason::AfterExitCleanupPending)?;
+        }
+        Ok(()) if cfg!(windows) => {
+            // launch_tail already flushed its exact handoff receipt. Writing another
+            // would sever the tail's sequence/digest binding to that durable intent.
+            std::mem::forget(runner_owner);
+        }
+        // Unix completion is the last acknowledged write in finalize. No
+        // fallible receipt save or validation may turn that commit into failure.
+        // Rechecking an older completed receipt also never rewrites that receipt.
+        Err(_) | Ok(()) => {}
     }
     result
 }
@@ -1013,16 +1029,701 @@ fn validate_installation_guard(
     time(end)
 }
 
+/// Views of the actual held guards, split at the writer field so an existing
+/// retirement can keep borrowing the other drains while diagnostics are read.
+struct CompletionGuards<'a> {
+    parent_exit: &'a ExitGuard,
+    runner_exit: &'a ExitGuard,
+    prefix: &'a ExclusiveGuard,
+    drains: RetirementDrainGuards<'a>,
+    writer: &'a mut WriterLease,
+    history: &'a ExclusiveGuard,
+}
+
+enum CompletionMode<'a, 'held> {
+    KeepData {
+        control: &'a SqliteControlStore,
+        installation: &'a InstallationLockAuthority<'held>,
+    },
+    Default {
+        retirement: &'a ControlRetirement<'held>,
+    },
+}
+
+#[derive(PartialEq, Eq)]
+struct CompletionFile {
+    identity: (u64, u64),
+    size: u64,
+    // SQLite owns transient WAL-index bookkeeping. Its ordinary/private name
+    // is checked, but its bytes are not a durable completion preimage.
+    sha256: Option<String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct CompletionEvidence {
+    roots: RootPins,
+    sequence: u64,
+    tail_sequence: Option<u64>,
+    files: BTreeMap<String, Option<CompletionFile>>,
+}
+
+#[derive(Clone, Copy)]
+enum CompletionReceiptCheck {
+    Published,
+    BeforePublication,
+}
+
+/// Private point-in-time completion proof. It keeps the real guards, mode and
+/// journal borrowed; subsequent effects still have to revalidate its evidence.
+#[must_use = "completion evidence is valid only while the actual guards remain borrowed"]
+struct CompletedUninstall<'a, 'guards, 'mode, 'held> {
+    journal: &'a Journal,
+    guards: &'a mut CompletionGuards<'guards>,
+    mode: &'a CompletionMode<'mode, 'held>,
+    end: Instant,
+    evidence: CompletionEvidence,
+}
+
+impl CompletedUninstall<'_, '_, '_, '_> {
+    fn validate_current(&mut self) -> Result<(), Reason> {
+        let end = SqliteControlStore::effective_runtime_deadline(self.end);
+        let current = completion_with_deadline(self.mode, end, || {
+            completion_pass(
+                self.journal,
+                self.guards,
+                self.mode,
+                CompletionReceiptCheck::Published,
+                end,
+            )
+        })?;
+        if current != self.evidence {
+            return Err(Reason::IdentityChanged);
+        }
+        time(end)
+    }
+}
+
+fn inspect_completed_uninstall<'a, 'guards, 'mode, 'held>(
+    journal: &'a Journal,
+    guards: &'a mut CompletionGuards<'guards>,
+    mode: &'a CompletionMode<'mode, 'held>,
+    end: Instant,
+) -> Result<CompletedUninstall<'a, 'guards, 'mode, 'held>, Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    time(end)?;
+    let evidence = completion_with_deadline(mode, end, || {
+        let evidence = completion_pass(
+            journal,
+            guards,
+            mode,
+            CompletionReceiptCheck::Published,
+            end,
+        )?;
+        #[cfg(test)]
+        tests::between_completion_passes();
+        if completion_pass(
+            journal,
+            guards,
+            mode,
+            CompletionReceiptCheck::Published,
+            end,
+        )? != evidence
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        Ok(evidence)
+    })?;
+    time(end)?;
+    Ok(CompletedUninstall {
+        journal,
+        guards,
+        mode,
+        end,
+        evidence,
+    })
+}
+
+/// Read the still-pending receipt and all physical evidence before publication.
+/// This grants no completed-receipt proof and changes no journal/report bytes.
+fn preflight_uninstall_completion(
+    journal: &Journal,
+    guards: &mut CompletionGuards<'_>,
+    mode: &CompletionMode<'_, '_>,
+    end: Instant,
+) -> Result<(), Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    completion_with_deadline(mode, end, || {
+        let evidence = completion_pass(
+            journal,
+            guards,
+            mode,
+            CompletionReceiptCheck::BeforePublication,
+            end,
+        )?;
+        #[cfg(test)]
+        tests::between_completion_passes();
+        if completion_pass(
+            journal,
+            guards,
+            mode,
+            CompletionReceiptCheck::BeforePublication,
+            end,
+        )? != evidence
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        time(end)
+    })
+}
+
+fn completion_with_deadline<T>(
+    mode: &CompletionMode<'_, '_>,
+    end: Instant,
+    inspect: impl FnOnce() -> Result<T, Reason>,
+) -> Result<T, Reason> {
+    time(end)?;
+    let result = match mode {
+        CompletionMode::KeepData { control, .. } => control
+            .with_runtime_deadline(end, || Ok(inspect()))
+            .map_err(|value| journal_control_error(value, end, Instant::now()))?,
+        CompletionMode::Default { .. } => inspect(),
+    };
+    time(end)?;
+    result
+}
+
+fn completion_guard_proof(
+    journal: &Journal,
+    seal: &Seal,
+    guards: &mut CompletionGuards<'_>,
+    end: Instant,
+) -> Result<OwnedFile, Reason> {
+    time(end)?;
+    journal.validate_roots(end)?;
+    guards
+        .parent_exit
+        .validate_current(&journal.root, &seal.parent_exit, &seal.policy, end)?;
+    guards
+        .runner_exit
+        .validate_current(&journal.root, &seal.runner_exit, &seal.policy, end)?;
+    validate_installation_guard(journal, guards.prefix, end)?;
+    let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    for (guard, kind) in [
+        (guards.drains.emission, LockKind::PolicyEmission),
+        (guards.drains.supervisor, LockKind::Supervisor),
+        (guards.drains.background, LockKind::Background),
+        (
+            guards.drains.purge,
+            managed_purge::purge_lock_kind().map_err(|_| Reason::IdentityChanged)?,
+        ),
+        (guards.drains.catalog_handles, LockKind::CatalogHandles),
+        (guards.drains.policy_owner, LockKind::PolicyOwner),
+        (guards.history, LockKind::HistoryReaders),
+    ] {
+        time(end)?;
+        if guard.kind() != &kind || guard.root_identity() != journal.data_identity {
+            return Err(Reason::IdentityChanged);
+        }
+        guard
+            .validate_current(root)
+            .map_err(|_| Reason::IdentityChanged)?;
+        time(end)?;
+    }
+    writer_proof(journal, guards.writer, &seal.policy, end)
+}
+
+fn validate_completion_mode(
+    journal: &Journal,
+    seal: &Seal,
+    guards: &CompletionGuards<'_>,
+    mode: &CompletionMode<'_, '_>,
+    end: Instant,
+) -> Result<(), Reason> {
+    time(end)?;
+    match mode {
+        CompletionMode::KeepData {
+            control,
+            installation,
+        } => {
+            if !journal.state.owner.keep_data {
+                return Err(Reason::IdentityChanged);
+            }
+            validate_borrowed_keep_data_with_owner(
+                journal,
+                seal,
+                control,
+                installation,
+                guards.drains.policy_owner,
+                end,
+            )?;
+            let cleanup = control
+                .lifecycle_cleanup_snapshot_with_deadline(end)
+                .map_err(|value| journal_control_error(value, end, Instant::now()))?;
+            if !cleanup.purge_complete() {
+                return Err(Reason::PurgePrerequisitePending);
+            }
+            if !cleanup.backups_complete() {
+                return Err(Reason::BackupCleanupPending);
+            }
+        }
+        CompletionMode::Default { retirement } => {
+            if journal.state.owner.keep_data {
+                return Err(Reason::IdentityChanged);
+            }
+            let installation = ControlId::parse(&seal.owner.installation_id)
+                .map_err(|_| Reason::IdentityChanged)?;
+            let incarnation =
+                ControlId::parse(&seal.catalog_incarnation).map_err(|_| Reason::IdentityChanged)?;
+            let operation =
+                ControlId::parse(&seal.owner.nonce).map_err(|_| Reason::IdentityChanged)?;
+            retirement
+                .validate_expected_binding_with_deadline(
+                    journal.data_identity,
+                    journal.prefix_identity,
+                    RetirementBinding {
+                        installation: &installation,
+                        catalog_incarnation: &incarnation,
+                        operation: &operation,
+                    },
+                    (
+                        ControlSeq::new(seal.policy.control_seq)
+                            .map_err(|_| Reason::IdentityChanged)?,
+                        PolicyEpoch::new(seal.policy.policy_epoch)
+                            .map_err(|_| Reason::IdentityChanged)?,
+                    ),
+                    end,
+                )
+                .map_err(|value| journal_control_error(value, end, Instant::now()))?;
+        }
+    }
+    time(end)
+}
+
+fn completion_history(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
+    time(end)?;
+    let latest = load_state(&journal.root, &seal.owner, end)
+        .map_err(|_| {
+            if Instant::now() >= end {
+                Reason::Deadline
+            } else {
+                Reason::IdentityChanged
+            }
+        })?
+        .ok_or(Reason::IdentityChanged)?;
+    if serde_json::to_vec(&latest).map_err(|_| Reason::IdentityChanged)?
+        != serde_json::to_vec(&journal.state).map_err(|_| Reason::IdentityChanged)?
+        || journal.receipt_digest.is_none()
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    let mut previous: Option<DeferredCleanup> = None;
+    for sequence in 1..=journal.state.sequence {
+        time(end)?;
+        let relative = format!("state-{sequence:06}.json");
+        let proof = private_proof(&journal.root, &relative, &seal.policy, end)?;
+        let bytes = update_state::read(&journal.root.join(relative), INVENTORY_LIMIT)
+            .map_err(|_| Reason::IdentityChanged)?
+            .ok_or(Reason::IdentityChanged)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != proof.digest {
+            return Err(Reason::IdentityChanged);
+        }
+        let state: DeferredCleanup =
+            serde_json::from_slice(&bytes).map_err(|_| Reason::IdentityChanged)?;
+        if state.schema != STATE_SCHEMA
+            || state.owner != seal.owner
+            || state.sequence != sequence
+            || state.catalog_incarnation != seal.catalog_incarnation
+            || state.catalog_file_identity != journal.state.catalog_file_identity
+            || state.package_manifest_sha256 != seal.package_manifest_sha256
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        if let Some(plan) = &state.after_exit {
+            plan.validate(&state)?;
+            for (recorded, sealed) in [
+                (&plan.runner, &seal.runner),
+                (&plan.parent_exit, &seal.parent_exit),
+                (&plan.runner_exit, &seal.runner_exit),
+                (&plan.manifest, &seal.manifest),
+                (
+                    &plan.seal,
+                    &journal
+                        .state
+                        .after_exit
+                        .as_ref()
+                        .ok_or(Reason::IdentityChanged)?
+                        .seal,
+                ),
+            ] {
+                if serde_json::to_vec(recorded).map_err(|_| Reason::IdentityChanged)?
+                    != serde_json::to_vec(sealed).map_err(|_| Reason::IdentityChanged)?
+                {
+                    return Err(Reason::IdentityChanged);
+                }
+            }
+            if serde_json::to_vec(&state.terminal_policy).map_err(|_| Reason::IdentityChanged)?
+                != serde_json::to_vec(&Some(&seal.policy)).map_err(|_| Reason::IdentityChanged)?
+                || serde_json::to_vec(&state.package_files).map_err(|_| Reason::IdentityChanged)?
+                    != serde_json::to_vec(&seal.package_files)
+                        .map_err(|_| Reason::IdentityChanged)?
+                || serde_json::to_vec(&state.private_metadata)
+                    .map_err(|_| Reason::IdentityChanged)?
+                    != serde_json::to_vec(&seal.metadata).map_err(|_| Reason::IdentityChanged)?
+            {
+                return Err(Reason::IdentityChanged);
+            }
+        }
+        if let Some(prior) = &previous {
+            if prior.after_exit.is_some() && state.after_exit.is_none()
+                || prior.purge_prerequisite_complete && !state.purge_prerequisite_complete
+                || prior.control_retired && !state.control_retired
+                || prior.groups.len() > state.groups.len()
+            {
+                return Err(Reason::IdentityChanged);
+            }
+            for (old, new) in prior.groups.iter().zip(&state.groups) {
+                if old.kind != new.kind
+                    || old.removed && !new.removed
+                    || serde_json::to_vec(&old.files).map_err(|_| Reason::IdentityChanged)?
+                        != serde_json::to_vec(&new.files).map_err(|_| Reason::IdentityChanged)?
+                {
+                    return Err(Reason::IdentityChanged);
+                }
+            }
+        }
+        verify(&journal.root, &proof, &seal.policy, end, false)?;
+        previous = Some(state);
+    }
+    time(end)
+}
+
+fn completion_prerequisites(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
+    let state = &journal.state;
+    let report = &state.report;
+    let plan = state
+        .after_exit
+        .as_ref()
+        .ok_or(Reason::AfterExitCleanupPending)?;
+    if !state.purge_prerequisite_complete {
+        return Err(Reason::PurgePrerequisitePending);
+    }
+    if !seal.metadata.classified || report.private_metadata_cleanup_pending {
+        return Err(Reason::PrivateMetadataCleanupPending);
+    }
+    if !report.continuation_cache_cleared {
+        return Err(Reason::CacheCleanupPending);
+    }
+    if !plan.payload_complete || report.package_cleanup_pending {
+        return Err(Reason::AfterExitCleanupPending);
+    }
+    if !report.installation_bound
+        || !report.maintenance_fenced
+        || !report.private_cleanup_receipt_recorded
+        || report.keep_data != state.owner.keep_data
+        || !report.emission_drained
+        || !report.supervisor_drained
+        || !report.background_drained
+        || !report.purge_owner_drained
+        || !report.catalog_drained
+        || !report.writer_drained
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    if report.control_cleanup_pending
+        || if state.owner.keep_data {
+            state.control_retired || report.corpus_removed || !report.catalog_and_policy_retained
+        } else {
+            !state.retirement_intent_captured || !state.control_retired || !report.corpus_removed
+        }
+    {
+        return Err(Reason::ControlCleanupPending);
+    }
+    time(end)
+}
+
+fn precompletion_receipt(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
+    completion_prerequisites(journal, seal, end)?;
+    let report = &journal.state.report;
+    let plan = journal
+        .state
+        .after_exit
+        .as_ref()
+        .ok_or(Reason::IdentityChanged)?;
+    if !report.after_exit_cleanup_pending
+        || !report.cleanup_pending
+        || report.status != "pending_cleanup"
+        || plan.tail.is_some()
+        || plan.tail_pending
+        || plan.tail_handoff_sequence.is_some()
+        || report.reasons.iter().any(|reason| {
+            !matches!(
+                reason,
+                Reason::AfterExitCleanupPending | Reason::OwnedAfterExitHelperRequired
+            )
+        })
+    {
+        return Err(Reason::AfterExitCleanupPending);
+    }
+    time(end)
+}
+
+fn completed_receipt(journal: &Journal, seal: &Seal, end: Instant) -> Result<Option<u64>, Reason> {
+    completion_prerequisites(journal, seal, end)?;
+    let report = &journal.state.report;
+    let plan = journal
+        .state
+        .after_exit
+        .as_ref()
+        .ok_or(Reason::IdentityChanged)?;
+    let tail_sequence = if let Some(sequence) = plan.tail_handoff_sequence {
+        if !cfg!(windows)
+            || plan.tail.is_none()
+            || validated_tail_result(journal, seal, sequence, end)?
+                != Some(TailReceiptCompletion::Complete)
+        {
+            return Err(Reason::AfterExitCleanupPending);
+        }
+        Some(sequence)
+    } else {
+        if plan.tail_pending || report.after_exit_cleanup_pending || report.cleanup_pending {
+            return Err(Reason::AfterExitCleanupPending);
+        }
+        None
+    };
+    // The complete Windows acknowledgement can discharge only the old tail
+    // reasons. Other pending work never becomes complete by report projection.
+    if report.reasons.iter().any(|reason| {
+        tail_sequence.is_none()
+            || !matches!(
+                reason,
+                Reason::AfterExitCleanupPending | Reason::OwnedAfterExitHelperRequired
+            )
+    }) {
+        return Err(Reason::AfterExitCleanupPending);
+    }
+    time(end)?;
+    Ok(tail_sequence)
+}
+
+fn require_absent(
+    base: &Path,
+    proof: &OwnedFile,
+    policy: &TerminalPolicy,
+    reason: Reason,
+    end: Instant,
+) -> Result<(), Reason> {
+    if verify(base, proof, policy, end, true)? {
+        return Err(reason);
+    }
+    time(end)
+}
+
+fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
+    let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    for proof in &seal.package_files {
+        require_absent(
+            &journal.prefix,
+            proof,
+            &seal.policy,
+            Reason::AfterExitCleanupPending,
+            end,
+        )?;
+    }
+    for proof in &seal.metadata.removable {
+        require_absent(
+            root,
+            proof,
+            &seal.policy,
+            Reason::PrivateMetadataCleanupPending,
+            end,
+        )?;
+    }
+    for proof in seal
+        .metadata
+        .preserved
+        .iter()
+        .chain(&seal.metadata.retained)
+    {
+        verify(root, proof, &seal.policy, end, false)?;
+    }
+    for group in &journal.state.groups {
+        if !group.removed {
+            return Err(match group.kind {
+                GroupKind::Corpus => Reason::CorpusCleanupPending,
+                GroupKind::Cache => Reason::CacheCleanupPending,
+                GroupKind::Backup => Reason::BackupCleanupPending,
+                GroupKind::Control => Reason::ControlCleanupPending,
+            });
+        }
+        for proof in &group.files {
+            require_absent(
+                root,
+                proof,
+                &seal.policy,
+                Reason::AfterExitCleanupPending,
+                end,
+            )?;
+        }
+    }
+    if !journal.state.owner.keep_data {
+        // A forged group list cannot hide a surviving main database or sibling.
+        for main in [&journal.catalog, &SqliteControlStore::path(root)] {
+            for suffix in ["", "-wal", "-shm"] {
+                let name = format!(
+                    "{}{suffix}",
+                    main.file_name()
+                        .and_then(OsStr::to_str)
+                        .ok_or(Reason::IdentityChanged)?
+                );
+                time(end)?;
+                match fs::symlink_metadata(root.join(name)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(Reason::FileLocked),
+                    Ok(_) => return Err(Reason::CorpusCleanupPending),
+                }
+            }
+        }
+    }
+    require_absent(
+        &journal.root,
+        &seal.runner,
+        &seal.policy,
+        Reason::AfterExitCleanupPending,
+        end,
+    )?;
+    if let Some(tail) = &seal.tail {
+        require_absent(
+            &journal.root,
+            tail,
+            &seal.policy,
+            Reason::AfterExitCleanupPending,
+            end,
+        )?;
+    }
+    Ok(())
+}
+
+fn completion_inventory_evidence(
+    files: &mut BTreeMap<String, Option<CompletionFile>>,
+    scope: &str,
+    root: &Path,
+    proofs: &[OwnedFile],
+    end: Instant,
+) -> Result<(), Reason> {
+    for proof in proofs {
+        time(end)?;
+        let value = match fs::symlink_metadata(root.join(&proof.relative)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(Reason::FileLocked),
+            Ok(_) => Some(CompletionFile {
+                identity: proof.identity,
+                size: proof.size,
+                sha256: (!proof.relative.ends_with("-shm")).then(|| proof.digest.clone()),
+            }),
+        };
+        if files
+            .insert(format!("{scope}/{}", proof.relative), value)
+            .is_some()
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    time(end)
+}
+
+fn completion_pass(
+    journal: &Journal,
+    guards: &mut CompletionGuards<'_>,
+    mode: &CompletionMode<'_, '_>,
+    receipt: CompletionReceiptCheck,
+    end: Instant,
+) -> Result<CompletionEvidence, Reason> {
+    time(end)?;
+    let seal = read_seal(journal, end)?;
+    let writer = completion_guard_proof(journal, &seal, guards, end)?;
+    validate_completion_mode(journal, &seal, guards, mode, end)?;
+    completion_history(journal, &seal, end)?;
+    let tail_sequence = match receipt {
+        CompletionReceiptCheck::Published => completed_receipt(journal, &seal, end)?,
+        CompletionReceiptCheck::BeforePublication => {
+            precompletion_receipt(journal, &seal, end)?;
+            None
+        }
+    };
+    completed_payload_absent(journal, &seal, end)?;
+    let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    let private = private_inventory(
+        journal,
+        &seal,
+        matches!(mode, CompletionMode::Default { .. }),
+        &writer,
+        end,
+    )?;
+    let package = package_inventory(journal, &seal, end)?;
+    if !account_tree_with_writer(root, &private, &seal.policy, Some(&writer), end)?
+        || !account_tree(&journal.prefix, &package, &seal.policy, end)?
+    {
+        return Err(Reason::UnclassifiedOwnedArtifact);
+    }
+    let mut files = BTreeMap::new();
+    completion_inventory_evidence(&mut files, "data", root, &private, end)?;
+    completion_inventory_evidence(&mut files, "prefix", &journal.prefix, &package, end)?;
+    let after_writer = completion_guard_proof(journal, &seal, guards, end)?;
+    if writer.identity != after_writer.identity
+        || writer.digest != after_writer.digest
+        || writer.size != after_writer.size
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    validate_completion_mode(journal, &seal, guards, mode, end)?;
+    read_seal(journal, end)?;
+    time(end)?;
+    Ok(CompletionEvidence {
+        roots: seal.roots,
+        sequence: journal.state.sequence,
+        tail_sequence,
+        files,
+    })
+}
+
 fn finalize(
     journal: &mut Journal,
     seal: &Seal,
     installation: &ExclusiveGuard,
+    parent_exit: &ExitGuard,
+    runner_exit: &ExitGuard,
     end: Instant,
 ) -> Result<(), Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
     validate_installation_guard(journal, installation, end)?;
     let mut guards = drain_owners(journal, end)?;
-    let writer_proof = writer_proof(journal, &mut guards._writer, &seal.policy, end)?;
-    let _history = acquire(
+    let kept_control = if journal.state.owner.keep_data {
+        Some(
+            SqliteControlStore::open_current_read_only_with_deadline(
+                journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
+                end,
+            )
+            .map_err(|value| journal_control_error(value, end, Instant::now()))?,
+        )
+    } else {
+        None
+    };
+    let kept_installation = kept_control
+        .as_ref()
+        .map(|control| {
+            control
+                .with_runtime_deadline(end, || {
+                    control.bind_installation(&journal.prefix, installation)
+                })
+                .map_err(|value| journal_control_error(value, end, Instant::now()))
+        })
+        .transpose()?;
+    if let (Some(control), Some(authority)) = (&kept_control, &kept_installation) {
+        validate_borrowed_keep_data(journal, seal, control, authority, &guards, end)?;
+    }
+    let (drains, writer) = guards.split_for_completion();
+    let writer_proof = writer_proof(journal, writer, &seal.policy, end)?;
+    let history = acquire(
         journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
         LockKind::HistoryReaders,
         end,
@@ -1032,12 +1733,6 @@ fn finalize(
         return Err(Reason::PurgePrerequisitePending);
     }
     let control_retirement = if journal.state.owner.keep_data {
-        let control = SqliteControlStore::open_current_read_only_with_deadline(
-            journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
-            end,
-        )
-        .map_err(|_| Reason::IdentityChanged)?;
-        journal.validate(&control, end)?;
         if !journal.state.report.continuation_cache_cleared {
             return Err(Reason::CacheCleanupPending);
         }
@@ -1050,17 +1745,43 @@ fn finalize(
                 .map_err(|_| Reason::IdentityChanged)?,
             operation: &ControlId::parse(&seal.owner.nonce).map_err(|_| Reason::IdentityChanged)?,
         };
-        let retirement = ControlRetirement::try_resume(
+        let retirement = ControlRetirement::try_resume_with_deadline(
             journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
             &journal.prefix,
             installation,
             binding,
-            guards.retirement(),
+            drains,
+            end,
         )
         .map_err(|_| Reason::ControlHandleDrainRequired)?;
-        terminal_cleanup(journal, &retirement, end)?;
         Some(retirement)
     };
+    // An already completed input receives the strict read-only proof. It is
+    // never republished merely to validate its current evidence.
+    if !journal.state.report.cleanup_pending && !journal.state.report.after_exit_cleanup_pending {
+        let mode = match (&kept_control, &kept_installation, &control_retirement) {
+            (Some(control), Some(installation), None) => CompletionMode::KeepData {
+                control,
+                installation,
+            },
+            (None, None, Some(retirement)) => CompletionMode::Default { retirement },
+            _ => return Err(Reason::IdentityChanged),
+        };
+        let mut completion_guards = CompletionGuards {
+            parent_exit,
+            runner_exit,
+            prefix: installation,
+            drains,
+            writer,
+            history: &history,
+        };
+        let mut completed =
+            inspect_completed_uninstall(journal, &mut completion_guards, &mode, end)?;
+        return completed.validate_current();
+    }
+    if let Some(retirement) = &control_retirement {
+        terminal_cleanup(journal, retirement, end)?;
+    }
     if !seal.metadata.classified {
         return Err(Reason::PrivateMetadataCleanupPending);
     }
@@ -1145,42 +1866,53 @@ fn finalize(
     journal
         .save(end)
         .map_err(|_| Reason::AfterExitCleanupPending)?;
-    #[cfg(windows)]
-    {
-        launch_tail(journal, seal, control_retirement.as_ref(), end)
-    }
-    #[cfg(unix)]
-    {
-        let runner = journal
-            .state
-            .after_exit
-            .as_ref()
-            .ok_or(Reason::IdentityChanged)?
-            .runner
-            .clone();
-        remove_planned(
-            &journal.root,
-            &runner,
-            journal,
-            seal,
-            control_retirement.as_ref(),
-            end,
-        )?;
-        journal.state.report.after_exit_cleanup_pending = false;
-        journal.state.report.reasons.retain(|reason| {
-            !matches!(
-                reason,
-                Reason::OwnedAfterExitHelperRequired | Reason::AfterExitCleanupPending
-            )
-        });
-        journal.state.report.cleanup_pending = !journal.state.report.reasons.is_empty();
-        if !journal.state.report.cleanup_pending {
-            journal.state.report.status = "complete_with_retained_private_markers".into();
+    if cfg!(windows) {
+        // Preserve the existing close-before-capture ordering: the tail records
+        // retained database bytes only after this coordinator's reader closes.
+        drop(kept_control);
+        #[cfg(windows)]
+        launch_tail(journal, seal, control_retirement.as_ref(), end)?;
+    } else {
+        #[cfg(unix)]
+        {
+            let runner = journal
+                .state
+                .after_exit
+                .as_ref()
+                .ok_or(Reason::IdentityChanged)?
+                .runner
+                .clone();
+            remove_planned(
+                &journal.root,
+                &runner,
+                journal,
+                seal,
+                control_retirement.as_ref(),
+                end,
+            )?;
         }
-        journal
-            .save(end)
-            .map_err(|_| Reason::AfterExitCleanupPending)
+        // The asynchronous Windows tail still owns pending work. This production
+        // caller preflights the pending receipt while all original drains live.
+        let mode = match (&kept_control, &kept_installation, &control_retirement) {
+            (Some(control), Some(installation), None) => CompletionMode::KeepData {
+                control,
+                installation,
+            },
+            (None, None, Some(retirement)) => CompletionMode::Default { retirement },
+            _ => return Err(Reason::IdentityChanged),
+        };
+        let mut completion_guards = CompletionGuards {
+            parent_exit,
+            runner_exit,
+            prefix: installation,
+            drains,
+            writer,
+            history: &history,
+        };
+        preflight_uninstall_completion(journal, &mut completion_guards, &mode, end)?;
+        journal.publish_completion(end)?;
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1500,6 +2232,32 @@ fn account_private(
     writer: &OwnedFile,
     end: Instant,
 ) -> Result<bool, Reason> {
+    if let Some(retirement) = retirement {
+        retirement
+            .validate_marker()
+            .map_err(|_| Reason::IdentityChanged)?;
+    } else if journal.state.owner.keep_data {
+        validate_keep_fence(journal, &seal.policy, end)?;
+    }
+    let proofs = private_inventory(journal, seal, retirement.is_some(), writer, end)?;
+    account_tree_with_writer(
+        journal.catalog.parent().ok_or(Reason::IdentityChanged)?,
+        &proofs,
+        &seal.policy,
+        Some(writer),
+        end,
+    )
+}
+
+/// Construct only the finite inventory. Callers retain their own mode/connection
+/// validation; this helper never opens a control connection or resumes retirement.
+fn private_inventory(
+    journal: &Journal,
+    seal: &Seal,
+    retired: bool,
+    writer: &OwnedFile,
+    end: Instant,
+) -> Result<Vec<OwnedFile>, Reason> {
     let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
     let mut proofs = Vec::new();
     for proof in seal
@@ -1533,13 +2291,9 @@ fn account_private(
             proofs.push(proof);
         }
     }
-    if let Some(retirement) = retirement {
-        retirement
-            .validate_marker()
-            .map_err(|_| Reason::IdentityChanged)?;
+    if retired {
         proofs.push(private_proof(root, RETIREMENT_MARKER, &seal.policy, end)?);
     } else if journal.state.owner.keep_data {
-        validate_keep_fence(journal, &seal.policy, end)?;
         let control_path = SqliteControlStore::path(root);
         let catalog_proof =
             private_proof(root, &journal.state.owner.catalog_name, &seal.policy, end)?;
@@ -1592,9 +2346,17 @@ fn account_private(
             }
         }
     }
-    account_tree_with_writer(root, &proofs, &seal.policy, Some(writer), end)
+    Ok(proofs)
 }
 fn account_package(journal: &Journal, seal: &Seal, end: Instant) -> Result<bool, Reason> {
+    let proofs = package_inventory(journal, seal, end)?;
+    account_tree(&journal.prefix, &proofs, &seal.policy, end)
+}
+fn package_inventory(
+    journal: &Journal,
+    seal: &Seal,
+    end: Instant,
+) -> Result<Vec<OwnedFile>, Reason> {
     let mut proofs = seal.package_files.clone();
     proofs.push(private_proof(
         &journal.prefix,
@@ -1660,7 +2422,7 @@ fn account_package(journal: &Journal, seal: &Seal, end: Instant) -> Result<bool,
         proof.relative = format!("uninstall/{}", proof.relative);
         proofs.push(proof);
     }
-    account_tree(&journal.prefix, &proofs, &seal.policy, end)
+    Ok(proofs)
 }
 
 fn clear_completed_reasons(report: &mut Report) {
@@ -1912,15 +2674,31 @@ pub(super) fn recover_public(
 }
 
 /// Read through the caller's sealed connection and real held guards. The
-/// snapshot grants no continuing cleanup authority. The completion inspector
-/// in the following slice will own the production call and remove this gate.
-#[cfg(test)]
+/// snapshot grants no continuing cleanup authority.
 fn validate_borrowed_keep_data(
     journal: &Journal,
     seal: &Seal,
     control: &SqliteControlStore,
     installation: &InstallationLockAuthority<'_>,
     guards: &CleanupGuards,
+    end: Instant,
+) -> Result<(), Reason> {
+    validate_borrowed_keep_data_with_owner(
+        journal,
+        seal,
+        control,
+        installation,
+        &guards.policy_owner,
+        end,
+    )
+}
+
+fn validate_borrowed_keep_data_with_owner(
+    journal: &Journal,
+    seal: &Seal,
+    control: &SqliteControlStore,
+    installation: &InstallationLockAuthority<'_>,
+    policy_owner: &ExclusiveGuard,
     end: Instant,
 ) -> Result<(), Reason> {
     let end = SqliteControlStore::effective_runtime_deadline(end);
@@ -1938,7 +2716,7 @@ fn validate_borrowed_keep_data(
         tests::before_borrowed_keep_data_check(tests::BorrowedKeepDataCheck::Control)
             .map_err(control_error)?;
         let owner = control
-            .bind_control_root(&guards.policy_owner)
+            .bind_control_root(policy_owner)
             .map_err(control_error)?;
         let status = control
             .read_bound_to_sealed_with_deadline(

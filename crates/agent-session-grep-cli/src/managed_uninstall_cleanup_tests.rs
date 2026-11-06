@@ -11,8 +11,28 @@ pub(super) enum BorrowedKeepDataCheck {
     Catalog,
 }
 type BorrowedKeepDataHook = Box<dyn FnMut(BorrowedKeepDataCheck) -> Result<(), PortError>>;
+type CompletionPassHook = Box<dyn FnMut()>;
 thread_local! {
     static BORROWED_KEEP_DATA_HOOK: RefCell<Option<BorrowedKeepDataHook>> = const { RefCell::new(None) };
+    static COMPLETION_PASS_HOOK: RefCell<Option<CompletionPassHook>> = const { RefCell::new(None) };
+}
+pub(super) fn between_completion_passes() {
+    COMPLETION_PASS_HOOK.with_borrow_mut(|slot| {
+        if let Some(hook) = slot {
+            hook();
+        }
+    });
+}
+fn with_completion_pass_hook<T>(hook: impl FnMut() + 'static, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<CompletionPassHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPLETION_PASS_HOOK.with_borrow_mut(|slot| *slot = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(COMPLETION_PASS_HOOK.with_borrow_mut(|slot| slot.replace(Box::new(hook))));
+    operation()
 }
 pub(super) fn before_borrowed_keep_data_check(
     step: BorrowedKeepDataCheck,
@@ -599,6 +619,10 @@ impl PackageFixture {
 // bytes are read only through their held handles; SQLite owns transient SHM
 // bookkeeping, so neither is compared through a second pathname read.
 fn borrowed_keep_data_inventory(fixture: &PackageFixture) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    cleanup_inventory(&fixture.prefix, &fixture.root)
+}
+
+fn cleanup_inventory(prefix: &Path, data: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
@@ -620,9 +644,9 @@ fn borrowed_keep_data_inventory(fixture: &PackageFixture) -> BTreeMap<PathBuf, O
         }
     }
     let mut out = BTreeMap::new();
-    let root = fixture.prefix.parent().unwrap();
-    collect(root, &fixture.prefix, &mut out);
-    collect(root, &fixture.root, &mut out);
+    let root = prefix.parent().unwrap();
+    collect(root, prefix, &mut out);
+    collect(root, data, &mut out);
     out
 }
 
@@ -1314,6 +1338,1419 @@ fn borrowed_keep_data_expiry_uses_the_earliest_end_and_skips_later_checks() {
     assert_eq!(borrowed_keep_data_inventory(&fixture), before);
 }
 
+/// Prepare real cleanup ownership while leaving package/runner completion pending.
+/// Default cleanup uses the real terminal capability during preparation only.
+fn package_fixture_for_finalize(keep: bool) -> (PackageFixture, Journal) {
+    let mut fixture = PackageFixture::new(cfg!(windows));
+    let (install, mut journal) = fixture.journal(keep);
+    drop(install);
+    if !keep {
+        let control = fixture.control.take().unwrap();
+        let prefix = update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
+        let operation = id(&journal.state.owner.nonce);
+        let intent = RetirementIntent::bind_with_deadline(
+            &control,
+            &fixture.catalog,
+            &fixture.prefix,
+            &prefix,
+            &operation,
+            deadline(),
+        )
+        .unwrap();
+        let cleanup = cleanup_data(&control, &mut journal, Some(&intent), deadline()).unwrap();
+        let intent = intent
+            .refresh_with_deadline(&control, &cleanup.policy_owner, deadline())
+            .unwrap();
+        drop(control);
+        terminal_handoff(&mut journal, &intent, cleanup.retirement(), deadline()).unwrap();
+    }
+    (fixture, journal)
+}
+
+/// Produce completed synthetic receipts without executing a helper or service.
+fn completed_package_fixture(keep: bool) -> (PackageFixture, Journal) {
+    let (fixture, journal) = package_fixture_for_finalize(keep);
+    complete_prepared_package_fixture(fixture, journal)
+}
+
+fn complete_prepared_package_fixture(
+    fixture: PackageFixture,
+    mut journal: Journal,
+) -> (PackageFixture, Journal) {
+    let seal = read_seal(&journal, deadline()).unwrap();
+    for proof in &seal.metadata.removable {
+        if verify(&fixture.root, proof, &seal.policy, deadline(), true).unwrap() {
+            remove_exact(&fixture.root, proof, &seal.policy, deadline()).unwrap();
+        }
+    }
+    for proof in &seal.package_files {
+        remove_exact(&fixture.prefix, proof, &seal.policy, deadline()).unwrap();
+    }
+    remove_exact(&journal.root, &seal.runner, &seal.policy, deadline()).unwrap();
+    if let Some(tail) = &seal.tail {
+        remove_exact(&journal.root, tail, &seal.policy, deadline()).unwrap();
+    }
+    journal.state.report.package_cleanup_pending = false;
+    journal.state.report.private_metadata_cleanup_pending = false;
+    journal.state.report.after_exit_cleanup_pending = cfg!(windows);
+    journal.state.report.reasons.clear();
+    let next_sequence = journal.state.sequence + 1;
+    let plan = journal.state.after_exit.as_mut().unwrap();
+    plan.payload_complete = true;
+    plan.tail_pending = cfg!(windows);
+    if cfg!(windows) {
+        // Historical acknowledgement may be older than the current call. Its
+        // tick is compared byte-for-byte and never converted into new time.
+        plan.deadline_tick = Some(1);
+        plan.tail_handoff_sequence = Some(next_sequence);
+        journal
+            .state
+            .report
+            .reasons
+            .push(Reason::AfterExitCleanupPending);
+    } else {
+        journal.state.report.cleanup_pending = false;
+        journal.state.report.status = "complete_with_retained_private_markers".into();
+    }
+    journal.save(deadline()).unwrap();
+    if cfg!(windows) {
+        let plan = journal.state.after_exit.as_ref().unwrap();
+        let receipt = fs::read(journal.receipt_path()).unwrap();
+        let result = json!({
+            "schema": "asg.uninstall-tail-result/v1",
+            "nonce": journal.state.owner.nonce,
+            "seal_sha256": plan.seal.digest,
+            "receipt_sequence": journal.state.sequence,
+            "receipt_sha256": format!("{:x}", Sha256::digest(&receipt)),
+            "deadline_tick": 1,
+            "tail_removed": true,
+            "runner_removed": true,
+            "complete": true,
+            "reason": "complete",
+        });
+        private_file(
+            &journal.root.join(format!(
+                "helper/tail-result-{:06}.json",
+                journal.state.sequence
+            )),
+            &serde_json::to_vec(&result).unwrap(),
+        );
+    }
+    (fixture, journal)
+}
+
+fn with_completion_inputs<T>(
+    fixture: &PackageFixture,
+    journal: &mut Journal,
+    operation: impl FnOnce(&mut Journal, &mut CompletionGuards<'_>, &CompletionMode<'_, '_>) -> T,
+) -> T {
+    let end = deadline();
+    let seal = read_seal(journal, end).unwrap();
+    let parent_exit =
+        exit_lock(&journal.root, &seal.parent_exit, &seal.policy, end, false).unwrap();
+    let runner_exit =
+        exit_lock(&journal.root, &seal.runner_exit, &seal.policy, end, false).unwrap();
+    let prefix = update_state::acquire_installation_lock(&fixture.prefix, end).unwrap();
+    let authority = fixture.control.as_ref().map(|control| {
+        control
+            .with_runtime_deadline(end, || control.bind_installation(&fixture.prefix, &prefix))
+            .unwrap()
+    });
+    let mut cleanup = drain_owners(journal, end).unwrap();
+    let history = acquire(
+        &fixture.root,
+        LockKind::HistoryReaders,
+        end,
+        Reason::PrivateMetadataCleanupPending,
+    )
+    .unwrap();
+    let (drains, writer) = cleanup.split_for_completion();
+    let installation = id(&seal.owner.installation_id);
+    let incarnation = id(&seal.catalog_incarnation);
+    let owner = id(&seal.owner.nonce);
+    let retired = if journal.state.owner.keep_data {
+        None
+    } else {
+        Some(
+            ControlRetirement::try_resume_with_deadline(
+                &fixture.root,
+                &fixture.prefix,
+                &prefix,
+                RetirementBinding {
+                    installation: &installation,
+                    catalog_incarnation: &incarnation,
+                    operation: &owner,
+                },
+                drains,
+                end,
+            )
+            .unwrap(),
+        )
+    };
+    let mode = match (&fixture.control, &authority, &retired) {
+        (Some(control), Some(installation), None) => CompletionMode::KeepData {
+            control,
+            installation,
+        },
+        (None, None, Some(retirement)) => CompletionMode::Default { retirement },
+        _ => panic!("incoherent synthetic completion mode"),
+    };
+    let mut guards = CompletionGuards {
+        parent_exit: &parent_exit,
+        runner_exit: &runner_exit,
+        prefix: &prefix,
+        drains,
+        writer,
+        history: &history,
+    };
+    operation(journal, &mut guards, &mode)
+}
+
+/// Instrument only this test's thread and original control connection. SQLite's
+/// extension registry is process-wide, but neither callback borrows this state.
+mod inspector_sql_denial {
+    use super::{Instant, SqliteControlStore, time};
+    use rusqlite::ffi;
+    use std::{
+        cell::Cell,
+        ffi::{CStr, c_char, c_int, c_void},
+        marker::PhantomData,
+        ptr::{self, NonNull},
+        rc::Rc,
+        sync::{Mutex, MutexGuard},
+    };
+
+    static REGISTRATION: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Counts {
+        connections: u64,
+        callbacks: u64,
+        refusals: u64,
+        foreign_callbacks: u64,
+        reads: [u64; 3],
+    }
+
+    #[derive(Clone, Copy)]
+    struct Watch {
+        enabled: bool,
+        capture: bool,
+        active: bool,
+        target: *mut ffi::sqlite3,
+        ambiguous: bool,
+        failed: bool,
+        counts: Counts,
+    }
+
+    thread_local! {
+        static WATCH: Cell<Watch> = const { Cell::new(Watch {
+            enabled: false,
+            capture: false,
+            active: false,
+            target: ptr::null_mut(),
+            ambiguous: false,
+            failed: false,
+            counts: Counts {
+                connections: 0,
+                callbacks: 0,
+                refusals: 0,
+                foreign_callbacks: 0,
+                reads: [0; 3],
+            },
+        }) };
+    }
+
+    unsafe fn argument_is(argument: *const c_char, expected: &[u8]) -> bool {
+        // SAFETY: SQLite supplies either NULL or a callback-lived C string.
+        !argument.is_null()
+            && unsafe { CStr::from_ptr(argument) }
+                .to_bytes()
+                .eq_ignore_ascii_case(expected)
+    }
+
+    unsafe extern "C" fn authorize(
+        userdata: *mut c_void,
+        action: c_int,
+        first: *const c_char,
+        second: *const c_char,
+        database: *const c_char,
+        _trigger: *const c_char,
+    ) -> c_int {
+        WATCH
+            .try_with(|slot| {
+                let mut watch = slot.get();
+                if !watch.enabled {
+                    return ffi::SQLITE_OK;
+                }
+                let db = userdata.cast::<ffi::sqlite3>();
+                watch.counts.callbacks = watch.counts.callbacks.saturating_add(1);
+                if watch.capture {
+                    if watch.target.is_null() {
+                        watch.target = db;
+                    } else if watch.target != db {
+                        watch.ambiguous = true;
+                    }
+                }
+                if !watch.active {
+                    watch.failed |= db.is_null();
+                    slot.set(watch);
+                    return ffi::SQLITE_OK;
+                }
+                if db.is_null() || db != watch.target {
+                    watch.counts.foreign_callbacks =
+                        watch.counts.foreign_callbacks.saturating_add(1);
+                    watch.counts.refusals = watch.counts.refusals.saturating_add(1);
+                    slot.set(watch);
+                    return ffi::SQLITE_DENY;
+                }
+                // SAFETY: these arguments live for this SQLite callback only.
+                let allowed = unsafe {
+                    match action {
+                        ffi::SQLITE_READ | ffi::SQLITE_SELECT | ffi::SQLITE_RECURSIVE => true,
+                        ffi::SQLITE_TRANSACTION => {
+                            argument_is(first, b"BEGIN")
+                                || argument_is(first, b"COMMIT")
+                                || argument_is(first, b"ROLLBACK")
+                        }
+                        ffi::SQLITE_SAVEPOINT => {
+                            argument_is(first, b"BEGIN")
+                                || argument_is(first, b"RELEASE")
+                                || argument_is(first, b"ROLLBACK")
+                        }
+                        ffi::SQLITE_FUNCTION => {
+                            argument_is(second, b"count") || argument_is(second, b"like")
+                        }
+                        ffi::SQLITE_PRAGMA => {
+                            second.is_null()
+                                && (argument_is(first, b"user_version")
+                                    || argument_is(first, b"application_id"))
+                        }
+                        _ => false,
+                    }
+                };
+                if allowed && action == ffi::SQLITE_READ {
+                    // SAFETY: use the names only while SQLite lends them.
+                    if unsafe { argument_is(database, b"main") } {
+                        for (index, table) in [
+                            b"control_meta".as_slice(),
+                            b"purge_jobs".as_slice(),
+                            b"backup_manifests".as_slice(),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if unsafe { argument_is(first, table) } {
+                                watch.counts.reads[index] =
+                                    watch.counts.reads[index].saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                if !allowed {
+                    watch.counts.refusals = watch.counts.refusals.saturating_add(1);
+                }
+                slot.set(watch);
+                if allowed {
+                    ffi::SQLITE_OK
+                } else {
+                    ffi::SQLITE_DENY
+                }
+            })
+            .unwrap_or(ffi::SQLITE_DENY)
+    }
+
+    unsafe extern "C" fn connection_created(
+        db: *mut ffi::sqlite3,
+        _error: *mut *mut c_char,
+        _api: *const ffi::sqlite3_api_routines,
+    ) -> c_int {
+        let install = WATCH
+            .try_with(|slot| {
+                let mut watch = slot.get();
+                if !watch.enabled {
+                    return None;
+                }
+                // Count at entry, even if open/installation is subsequently refused.
+                watch.counts.connections = watch.counts.connections.saturating_add(1);
+                let refuse = watch.capture || watch.active || db.is_null();
+                watch.failed |= refuse;
+                slot.set(watch);
+                Some(!refuse)
+            })
+            .unwrap_or(None);
+        match install {
+            None => ffi::SQLITE_OK,
+            Some(false) => ffi::SQLITE_AUTH,
+            Some(true) => {
+                // SAFETY: SQLite lends a live new connection. The userdata is
+                // that connection, not registration memory; no ownership passes.
+                let rc = unsafe {
+                    ffi::sqlite3_set_authorizer(db, Some(authorize), db.cast::<c_void>())
+                };
+                if rc != ffi::SQLITE_OK {
+                    let _ = WATCH.try_with(|slot| {
+                        let mut watch = slot.get();
+                        watch.failed = true;
+                        slot.set(watch);
+                    });
+                }
+                rc
+            }
+        }
+    }
+
+    pub(super) struct InspectorExtension {
+        _registration: MutexGuard<'static, ()>,
+        _thread: PhantomData<Rc<()>>,
+        registered: bool,
+    }
+
+    impl InspectorExtension {
+        pub(super) fn register() -> Self {
+            assert!(!WATCH.with(|slot| slot.get().enabled));
+            let mut extension = Self {
+                _registration: REGISTRATION
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+                _thread: PhantomData,
+                registered: false,
+            };
+            // SAFETY: both callbacks are static, nonpanicking and never open or
+            // close a database or alter the extension registry from a callback.
+            let rc = unsafe { ffi::sqlite3_auto_extension(Some(connection_created)) };
+            assert_eq!(rc, ffi::SQLITE_OK);
+            extension.registered = true;
+            WATCH.with(|slot| {
+                let mut watch = slot.get();
+                watch.enabled = true;
+                watch.failed = false;
+                watch.ambiguous = false;
+                watch.counts = Counts::default();
+                slot.set(watch);
+            });
+            extension
+        }
+
+        pub(super) fn arm<'registration, 'control>(
+            &'registration self,
+            control: &'control SqliteControlStore,
+            end: Instant,
+        ) -> InspectorSqlDenial<'registration, 'control> {
+            time(end).unwrap();
+            let before_capture = WATCH.with(|slot| {
+                let mut watch = slot.get();
+                assert!(watch.enabled && !watch.capture && !watch.active && !watch.failed);
+                watch.capture = true;
+                watch.target = ptr::null_mut();
+                watch.ambiguous = false;
+                slot.set(watch);
+                watch.counts
+            });
+            let snapshot = control.lifecycle_cleanup_snapshot_with_deadline(end);
+            let captured = WATCH.with(|slot| {
+                let mut watch = slot.get();
+                watch.capture = false;
+                slot.set(watch);
+                watch
+            });
+            // No saved-pointer FFI is permitted before ALL of these checks.
+            let snapshot = snapshot.expect("the actual control snapshot must succeed");
+            assert!(snapshot.purge_complete() && snapshot.backups_complete());
+            assert!(!captured.failed && !captured.ambiguous);
+            assert!(captured.counts.callbacks > before_capture.callbacks);
+            assert_eq!(captured.counts.connections, before_capture.connections);
+            let db = NonNull::new(captured.target).expect("capture must identify one connection");
+            let denial = InspectorSqlDenial {
+                _extension: self,
+                control,
+                db,
+                end,
+                installed: true,
+            };
+            // The completed snapshot has dropped every transaction/cursor. Do
+            // not rely on set_authorizer's advisory statement expiration alone.
+            denial.assert_no_statements();
+            control
+                .with_runtime_deadline(end, || {
+                    for sql in [
+                        c"CREATE TEMP TABLE inspector_sql_probe(value INTEGER NOT NULL)",
+                        c"INSERT INTO temp.inspector_sql_probe VALUES(1)",
+                    ] {
+                        let (rc, statement) = denial.prepare(sql);
+                        assert_eq!(rc, ffi::SQLITE_OK);
+                        assert_eq!(statement.step(), ffi::SQLITE_DONE);
+                        assert_eq!(statement.finish(), ffi::SQLITE_OK);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            denial.assert_no_statements();
+            WATCH.with(|slot| {
+                let mut watch = slot.get();
+                assert!(!watch.failed);
+                assert_eq!(watch.counts.connections, captured.counts.connections);
+                watch.active = true;
+                slot.set(watch);
+            });
+            // SAFETY: the successful capture identified this store's original
+            // connection; the guard borrows the store and registration on this
+            // thread. No statement, transaction or RefCell borrow remains.
+            let rc = unsafe {
+                ffi::sqlite3_set_authorizer(db.as_ptr(), Some(authorize), db.as_ptr().cast())
+            };
+            assert_eq!(rc, ffi::SQLITE_OK);
+            denial
+        }
+
+        fn cancel(&mut self) -> bool {
+            let _ = WATCH.try_with(|slot| {
+                let mut watch = slot.get();
+                watch.enabled = false;
+                watch.capture = false;
+                watch.active = false;
+                watch.target = ptr::null_mut();
+                slot.set(watch);
+            });
+            if !self.registered {
+                return true;
+            }
+            // SAFETY: remove only our static entry. SQLite returns 1 for
+            // removal, not SQLITE_OK; this neither drains callbacks nor removes
+            // authorizers on existing connections. They use no borrowed state.
+            let removed = unsafe { ffi::sqlite3_cancel_auto_extension(Some(connection_created)) };
+            self.registered = false;
+            removed == 1
+        }
+
+        pub(super) fn finish(mut self) {
+            assert!(
+                self.cancel(),
+                "the private extension must still be registered"
+            );
+        }
+    }
+
+    impl Drop for InspectorExtension {
+        fn drop(&mut self) {
+            let _ = self.cancel();
+        }
+    }
+
+    pub(super) struct InspectorSqlDenial<'registration, 'control> {
+        _extension: &'registration InspectorExtension,
+        control: &'control SqliteControlStore,
+        db: NonNull<ffi::sqlite3>,
+        end: Instant,
+        installed: bool,
+    }
+
+    struct Statement<'connection> {
+        raw: *mut ffi::sqlite3_stmt,
+        _connection: PhantomData<&'connection SqliteControlStore>,
+    }
+
+    impl Statement<'_> {
+        fn step(&self) -> c_int {
+            // SAFETY: only successful fixture preparation calls step, while
+            // the connection is borrowed on this thread and the statement lives.
+            unsafe { ffi::sqlite3_step(self.raw) }
+        }
+
+        fn finish(mut self) -> c_int {
+            let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+            // SAFETY: we own only this statement, never its database connection.
+            unsafe { ffi::sqlite3_finalize(raw) }
+        }
+    }
+
+    impl Drop for Statement<'_> {
+        fn drop(&mut self) {
+            // SAFETY: even unexpected prepare success/panic finalizes the
+            // statement. SQLite explicitly permits finalize(NULL).
+            unsafe { ffi::sqlite3_finalize(self.raw) };
+        }
+    }
+
+    impl InspectorSqlDenial<'_, '_> {
+        fn prepare(&self, sql: &CStr) -> (c_int, Statement<'_>) {
+            time(self.end).unwrap();
+            // Own the out-pointer BEFORE prepare or any assertion, including
+            // when a supposedly forbidden statement unexpectedly succeeds.
+            let mut statement = Statement {
+                raw: ptr::null_mut(),
+                _connection: PhantomData,
+            };
+            // SAFETY: capture proved this live borrowed connection; SQL is a
+            // test-owned C string and the out-pointer belongs to the RAII guard.
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(
+                    self.db.as_ptr(),
+                    sql.as_ptr(),
+                    -1,
+                    &mut statement.raw,
+                    ptr::null_mut(),
+                )
+            };
+            (rc, statement)
+        }
+
+        fn assert_no_statements(&self) {
+            // SAFETY: capture succeeded and the store is still borrowed. This
+            // observes the list only; it never finalizes another owner's cursor.
+            assert!(unsafe { ffi::sqlite3_next_stmt(self.db.as_ptr(), ptr::null_mut()) }.is_null());
+            assert_eq!(unsafe { ffi::sqlite3_get_autocommit(self.db.as_ptr()) }, 1);
+        }
+
+        pub(super) fn counts(&self) -> Counts {
+            WATCH.with(|slot| {
+                let watch = slot.get();
+                assert!(watch.active && !watch.failed && !watch.ambiguous);
+                assert!(watch.target == self.db.as_ptr());
+                watch.counts
+            })
+        }
+
+        pub(super) fn assert_reads_since(&self, before: Counts, phase: &str) {
+            let after = self.counts();
+            assert!(after.callbacks > before.callbacks, "{phase}: no actual SQL");
+            assert_eq!(after.connections, before.connections, "{phase}: reopened");
+            assert_eq!(after.foreign_callbacks, before.foreign_callbacks, "{phase}");
+            assert_eq!(
+                after.refusals, before.refusals,
+                "{phase}: attempted mutation"
+            );
+            for (after, before) in after.reads.into_iter().zip(before.reads) {
+                assert!(after > before, "{phase}: missing control/job/backup read");
+            }
+        }
+
+        pub(super) fn assert_denied(&self, sql: &CStr) {
+            let before = self.counts();
+            self.control
+                .with_runtime_deadline(self.end, || {
+                    let (rc, statement) = self.prepare(sql);
+                    assert_eq!(rc, ffi::SQLITE_AUTH, "mutation control must be denied");
+                    // Never step a mutation control, even if prepare succeeds.
+                    assert_eq!(statement.finish(), ffi::SQLITE_OK);
+                    Ok(())
+                })
+                .unwrap();
+            let after = self.counts();
+            assert!(after.refusals > before.refusals);
+            assert_eq!(after.connections, before.connections);
+            assert_eq!(after.foreign_callbacks, before.foreign_callbacks);
+        }
+
+        fn uninstall(&mut self) -> c_int {
+            if !self.installed {
+                return ffi::SQLITE_OK;
+            }
+            // SAFETY: remove the authorizer before the store/registration
+            // borrows end. Do not alter the store's busy/progress handlers.
+            let rc =
+                unsafe { ffi::sqlite3_set_authorizer(self.db.as_ptr(), None, ptr::null_mut()) };
+            if rc == ffi::SQLITE_OK {
+                self.installed = false;
+            }
+            let _ = WATCH.try_with(|slot| {
+                let mut watch = slot.get();
+                watch.active = false;
+                watch.target = ptr::null_mut();
+                slot.set(watch);
+            });
+            rc
+        }
+
+        pub(super) fn finish(mut self) {
+            assert_eq!(self.uninstall(), ffi::SQLITE_OK);
+        }
+    }
+
+    impl Drop for InspectorSqlDenial<'_, '_> {
+        fn drop(&mut self) {
+            let _ = self.uninstall();
+        }
+    }
+}
+
+#[test]
+fn completed_inspection_uses_the_original_connection_with_sql_mutations_denied() {
+    let extension = inspector_sql_denial::InspectorExtension::register();
+    // Register before any fixture connection exists; preparation remains writable.
+    let (fixture, mut journal) = completed_package_fixture(true);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let CompletionMode::KeepData { control, .. } = mode else {
+            panic!("this test needs the actual retained control connection");
+        };
+        let before = borrowed_keep_data_inventory(&fixture);
+        let state = serde_json::to_vec(&journal.state).unwrap();
+        let end = deadline();
+        let denial = extension.arm(control, end);
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+
+        // This other thread encounters the registered extension while denial is
+        // active here, but receives no authorizer and can mutate its own database.
+        std::thread::spawn(|| {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE unrelated(value);
+                     CREATE TEMP TABLE unrelated_temp(value);
+                     INSERT INTO unrelated VALUES(1);
+                     INSERT INTO unrelated_temp VALUES(1);
+                     UPDATE unrelated SET value=2;
+                     UPDATE unrelated_temp SET value=2;
+                     DELETE FROM unrelated;
+                     DELETE FROM unrelated_temp;",
+                )
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+
+        // Capture/preparation observations cannot satisfy any of these deltas.
+        let inspection = denial.counts();
+        let mut completed = inspect_completed_uninstall(journal, guards, mode, end).unwrap();
+        denial.assert_reads_since(inspection, "inspection");
+        let revalidation = denial.counts();
+        completed.validate_current().unwrap();
+        denial.assert_reads_since(revalidation, "revalidation");
+        for sql in [
+            c"CREATE TABLE inspector_forbidden(value)",
+            c"CREATE TEMP TABLE inspector_forbidden(value)",
+            c"INSERT INTO main.control_meta SELECT * FROM main.control_meta",
+            c"UPDATE main.control_meta SET control_seq=control_seq",
+            c"DELETE FROM main.control_meta",
+            c"INSERT INTO temp.inspector_sql_probe VALUES(2)",
+            c"UPDATE temp.inspector_sql_probe SET value=2",
+            c"DELETE FROM temp.inspector_sql_probe",
+            c"PRAGMA user_version=1",
+            c"PRAGMA wal_checkpoint",
+        ] {
+            denial.assert_denied(sql);
+        }
+        let after_controls = denial.counts();
+        completed.validate_current().unwrap();
+        denial.assert_reads_since(after_controls, "revalidation after denial controls");
+        drop(completed);
+        assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state);
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        denial.finish();
+    });
+    drop(fixture);
+    extension.finish();
+}
+
+#[test]
+fn completed_inspection_preserves_both_modes_and_excludes_live_contenders() {
+    use crate::uninstall_command::tests::{ControlValidationRead, with_control_validation_hook};
+    use std::cell::Cell;
+
+    for keep in [true, false] {
+        let (fixture, mut journal) = completed_package_fixture(keep);
+        let source = fixture._temp.path().join("untouched-source.jsonl");
+        private_file(&source, b"synthetic source retained");
+        with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+            let before = borrowed_keep_data_inventory(&fixture);
+            let state = serde_json::to_vec(&journal.state).unwrap();
+            let writer = guards.writer.read_record().unwrap();
+            let opens = Rc::new(Cell::new(0));
+            let observed = Rc::clone(&opens);
+            with_control_validation_hook(
+                move |step| {
+                    if step == ControlValidationRead::Open {
+                        observed.set(observed.get() + 1);
+                        Err(PortError::Backend("synthetic reopen refused".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    if let CompletionMode::KeepData { control, .. } = mode {
+                        assert!(matches!(
+                            journal.validate(control, deadline()),
+                            Err(Reason::IdentityChanged)
+                        ));
+                        assert_eq!(opens.get(), 1);
+                    }
+                    for _ in 0..2 {
+                        let mut completed =
+                            inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+                        completed.validate_current().unwrap();
+                        for kind in [
+                            LockKind::PolicyEmission,
+                            LockKind::Supervisor,
+                            LockKind::Background,
+                            managed_purge::purge_lock_kind().unwrap(),
+                            LockKind::CatalogHandles,
+                            LockKind::PolicyOwner,
+                            LockKind::HistoryReaders,
+                        ] {
+                            assert!(matches!(
+                                ExclusiveGuard::try_acquire(&fixture.root, kind),
+                                Err(PortError::WriterBusy(_))
+                            ));
+                        }
+                        assert!(matches!(
+                            ExclusiveGuard::try_acquire(
+                                &fixture.prefix,
+                                LockKind::MaintenanceJob(
+                                    JobLockKey::parse(INSTALLATION_LOCK_KEY).unwrap()
+                                )
+                            ),
+                            Err(PortError::WriterBusy(_))
+                        ));
+                        let seal = read_seal(journal, deadline()).unwrap();
+                        for proof in [&seal.parent_exit, &seal.runner_exit] {
+                            assert!(matches!(
+                                exit_lock(&journal.root, proof, &seal.policy, deadline(), false),
+                                Err(Reason::AfterExitCleanupPending)
+                            ));
+                        }
+                        assert!(matches!(
+                            WriterLease::try_acquire(&fixture.root),
+                            Err(PortError::WriterBusy(_))
+                        ));
+                        if !keep {
+                            assert!(matches!(
+                                ExclusiveGuard::try_acquire(
+                                    &fixture.root,
+                                    LockKind::ControlHandles
+                                ),
+                                Err(PortError::WriterBusy(_))
+                            ));
+                        }
+                    }
+                    assert_eq!(opens.get(), u32::from(keep));
+                },
+            );
+            assert_eq!(guards.writer.read_record().unwrap(), writer);
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+            assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state);
+        });
+        let contender = ExclusiveGuard::try_acquire(&fixture.root, LockKind::PolicyOwner).unwrap();
+        drop(contender);
+        assert_eq!(fs::read(source).unwrap(), b"synthetic source retained");
+    }
+}
+
+#[test]
+fn completed_inspection_refuses_real_pending_purge_with_coherent_receipt() {
+    use agent_session_grep_ports::{
+        SearchProvider,
+        control::{ScopeRegion, SelectionRequest},
+    };
+
+    let fixture = PackageFixture::new(cfg!(windows));
+    let control = fixture.control.as_ref().unwrap();
+    let revoked = control
+        .with_runtime_deadline(deadline(), || {
+            let status = control.lifecycle_status()?;
+            let selected = control.add_selection(
+                status.policy.control_seq,
+                SelectionRequest {
+                    region: ScopeRegion {
+                        provider: SearchProvider::Claude,
+                        locator: CanonicalLocator::from_path(
+                            &fixture._temp.path().join("synthetic-purge-selection"),
+                        )?,
+                        kind: RootKind::Root,
+                    },
+                    root_identity: Some(id("synthetic-purge-selection-root")),
+                    now_ms: 2,
+                },
+            )?;
+            control.revoke_selection(selected.control_seq, &selected.value.id, None, 3)
+        })
+        .unwrap();
+    assert_eq!(revoked.value.purge_job.state, PurgeState::Pending);
+    let (install, journal) = fixture.journal(true);
+    drop(install);
+    let (fixture, mut journal) = complete_prepared_package_fixture(fixture, journal);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let CompletionMode::KeepData {
+            control,
+            installation,
+        } = mode
+        else {
+            panic!("keep-data fixture must lend the original connection");
+        };
+        let seal = read_seal(journal, deadline()).unwrap();
+        completion_history(journal, &seal, deadline()).unwrap();
+        assert_eq!(
+            completed_receipt(journal, &seal, deadline()).unwrap(),
+            journal
+                .state
+                .after_exit
+                .as_ref()
+                .unwrap()
+                .tail_handoff_sequence
+        );
+        validate_borrowed_keep_data_with_owner(
+            journal,
+            &seal,
+            control,
+            installation,
+            guards.drains.policy_owner,
+            deadline(),
+        )
+        .unwrap();
+        let snapshot = control
+            .lifecycle_cleanup_snapshot_with_deadline(deadline())
+            .unwrap();
+        assert!(!snapshot.purge_complete());
+        assert!(snapshot.backups_complete());
+        let policy = control
+            .with_runtime_deadline(deadline(), || control.lifecycle_status())
+            .unwrap();
+        let before = borrowed_keep_data_inventory(&fixture);
+        let state = serde_json::to_vec(&journal.state).unwrap();
+        assert!(matches!(
+            inspect_completed_uninstall(journal, guards, mode, deadline()),
+            Err(Reason::PurgePrerequisitePending)
+        ));
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state);
+        assert_eq!(
+            control
+                .with_runtime_deadline(deadline(), || control.lifecycle_status())
+                .unwrap(),
+            policy
+        );
+
+        // Fixture-only transition of the real typed job, leaving seal/counters
+        // unchanged. Only completing this row may remove the refusal.
+        let conn = rusqlite::Connection::open_with_flags(
+            SqliteControlStore::path(&fixture.root),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE purge_jobs SET state='complete',attempts=1,
+                 progress_key='asg.purge/v1:artifacts_verified',owner_nonce=NULL
+                 WHERE job_id=?1 AND state='pending'",
+                [revoked.value.purge_job.id.as_str()],
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        let mut completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+        completed.validate_current().unwrap();
+    });
+}
+
+#[test]
+fn completed_inspection_refuses_real_nonterminal_backup_with_coherent_receipt() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let CompletionMode::KeepData {
+            control,
+            installation,
+        } = mode
+        else {
+            panic!("keep-data fixture must lend the original connection");
+        };
+        let policy = control
+            .with_runtime_deadline(deadline(), || control.lifecycle_status())
+            .unwrap();
+        let seal = read_seal(journal, deadline()).unwrap();
+        // Fixture-only insertion keeps every policy/receipt field unchanged and
+        // uses the adapter's coherent Registered artifact/backup row pair.
+        let mut conn = rusqlite::Connection::open_with_flags(
+            SqliteControlStore::path(&fixture.root),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO private_artifacts
+             (artifact_id,kind,relative_locator,policy_epoch,owner_nonce,state,digest)
+             VALUES('synthetic-pending-backup','catalog_backup',
+             'backups/synthetic-pending-backup/catalog.db',?1,?2,'registered',NULL)",
+            rusqlite::params![seal.policy.policy_epoch, journal.state.owner.nonce],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO backup_manifests
+             (backup_id,purpose,relative_locator,catalog_incarnation,catalog_generation,
+              schema_version,digest,size_bytes,state,created_at_ms)
+             VALUES('synthetic-pending-backup','beta_rollback',
+             'backups/synthetic-pending-backup/catalog.db',?1,0,?2,'',0,'registered',1)",
+            rusqlite::params![journal.state.catalog_incarnation, SCHEMA_VERSION],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            control
+                .with_runtime_deadline(deadline(), || control.lifecycle_status())
+                .unwrap(),
+            policy
+        );
+        completion_history(journal, &seal, deadline()).unwrap();
+        assert_eq!(
+            completed_receipt(journal, &seal, deadline()).unwrap(),
+            journal
+                .state
+                .after_exit
+                .as_ref()
+                .unwrap()
+                .tail_handoff_sequence
+        );
+        validate_borrowed_keep_data_with_owner(
+            journal,
+            &seal,
+            control,
+            installation,
+            guards.drains.policy_owner,
+            deadline(),
+        )
+        .unwrap();
+        let snapshot = control
+            .lifecycle_cleanup_snapshot_with_deadline(deadline())
+            .unwrap();
+        assert!(snapshot.purge_complete());
+        assert!(!snapshot.backups_complete());
+        let before = borrowed_keep_data_inventory(&fixture);
+        let state = serde_json::to_vec(&journal.state).unwrap();
+        assert!(matches!(
+            inspect_completed_uninstall(journal, guards, mode, deadline()),
+            Err(Reason::BackupCleanupPending)
+        ));
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        assert_eq!(serde_json::to_vec(&journal.state).unwrap(), state);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM backup_manifests WHERE backup_id='synthetic-pending-backup'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "registered"
+        );
+        // A typed policy-purged tombstone is permitted; it grants no backup
+        // content or restoration authority and preserves the same sealed policy.
+        conn.execute_batch(
+            "BEGIN;
+             UPDATE private_artifacts SET state='purged_by_policy',owner_nonce=NULL
+             WHERE artifact_id='synthetic-pending-backup';
+             UPDATE backup_manifests SET state='purged_by_policy'
+             WHERE backup_id='synthetic-pending-backup';
+             COMMIT;",
+        )
+        .unwrap();
+        drop(conn);
+        let mut completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+        completed.validate_current().unwrap();
+    });
+}
+
+#[test]
+fn completed_inspection_refuses_wrong_modes_foreign_retirement_and_live_fence_changes() {
+    let (kept, mut kept_journal) = completed_package_fixture(true);
+    let (removed, mut removed_journal) = completed_package_fixture(false);
+    let (foreign, mut foreign_journal) = completed_package_fixture(false);
+    with_completion_inputs(
+        &kept,
+        &mut kept_journal,
+        |kept_journal, kept_guards, kept_mode| {
+            with_completion_inputs(
+                &removed,
+                &mut removed_journal,
+                |removed_journal, removed_guards, removed_mode| {
+                    let before_kept = borrowed_keep_data_inventory(&kept);
+                    let before_removed = borrowed_keep_data_inventory(&removed);
+                    assert!(matches!(
+                        inspect_completed_uninstall(
+                            kept_journal,
+                            kept_guards,
+                            removed_mode,
+                            deadline()
+                        ),
+                        Err(Reason::IdentityChanged)
+                    ));
+                    assert!(matches!(
+                        inspect_completed_uninstall(
+                            removed_journal,
+                            removed_guards,
+                            kept_mode,
+                            deadline()
+                        ),
+                        Err(Reason::IdentityChanged)
+                    ));
+                    with_completion_inputs(&foreign, &mut foreign_journal, |_, _, foreign_mode| {
+                        let before_foreign = borrowed_keep_data_inventory(&foreign);
+                        assert!(matches!(
+                            inspect_completed_uninstall(
+                                removed_journal,
+                                removed_guards,
+                                foreign_mode,
+                                deadline()
+                            ),
+                            Err(Reason::IdentityChanged)
+                        ));
+                        assert_eq!(borrowed_keep_data_inventory(&foreign), before_foreign);
+                    });
+                    assert_eq!(borrowed_keep_data_inventory(&kept), before_kept);
+                    assert_eq!(borrowed_keep_data_inventory(&removed), before_removed);
+                },
+            );
+            let CompletionMode::KeepData {
+                control,
+                installation,
+            } = kept_mode
+            else {
+                panic!("keep-data fixture must lend the original connection");
+            };
+            let bound = control
+                .bind_control_root(kept_guards.drains.policy_owner)
+                .unwrap();
+            let owner = id(&kept_journal.state.owner.nonce);
+            let status = control
+                .with_runtime_deadline(deadline(), || {
+                    let status = control.lifecycle_status()?;
+                    control.begin_maintenance(
+                        status.policy.control_seq,
+                        &owner,
+                        &bound,
+                        installation,
+                        MaintenanceFence {
+                            state: MaintenanceState::Updating,
+                            owner: Some(owner.clone()),
+                            phase: Some(MaintenancePhase::Quiescing),
+                        },
+                    )?;
+                    control.lifecycle_status()
+                })
+                .unwrap();
+            let before = borrowed_keep_data_inventory(&kept);
+            assert!(matches!(
+                inspect_completed_uninstall(kept_journal, kept_guards, kept_mode, deadline()),
+                Err(Reason::MaintenanceConflict)
+            ));
+            assert_eq!(borrowed_keep_data_inventory(&kept), before);
+            assert_eq!(
+                control
+                    .with_runtime_deadline(deadline(), || control.lifecycle_status())
+                    .unwrap(),
+                status
+            );
+        },
+    );
+}
+
+#[test]
+fn completed_inspection_refuses_missing_linked_and_same_byte_replaced_catalog() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let original = fixture._temp.path().join("saved-catalog");
+        fs::rename(&fixture.catalog, &original).unwrap();
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(matches!(
+            inspect_completed_uninstall(journal, guards, mode, deadline()),
+            Err(Reason::CorpusCleanupPending)
+        ));
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        private_file(&fixture.catalog, &fs::read(&original).unwrap());
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(matches!(
+            inspect_completed_uninstall(journal, guards, mode, deadline()),
+            Err(Reason::IdentityChanged)
+        ));
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        fs::remove_file(&fixture.catalog).unwrap();
+        fs::rename(&original, &fixture.catalog).unwrap();
+        fs::hard_link(&fixture.catalog, &original).unwrap();
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(inspect_completed_uninstall(journal, guards, mode, deadline()).is_err());
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        fs::remove_file(&original).unwrap();
+        {
+            let mut completed =
+                inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+            completed.validate_current().unwrap();
+        }
+        fs::rename(&fixture.catalog, &original).unwrap();
+        private_root(&fixture.catalog);
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(inspect_completed_uninstall(journal, guards, mode, deadline()).is_err());
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        fs::remove_dir(&fixture.catalog).unwrap();
+        fs::rename(&original, &fixture.catalog).unwrap();
+        let _completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+    });
+}
+
+#[test]
+fn completed_inspection_rejects_swapped_exit_roles_and_wrong_drain_bindings() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    let other = fixture
+        ._temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("other-data");
+    private_root(&other);
+    let other_guard = ExclusiveGuard::try_acquire(&other, LockKind::PolicyOwner).unwrap();
+    let mut other_writer = WriterLease::try_acquire(&other).unwrap();
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let before = borrowed_keep_data_inventory(&fixture);
+        for case in 0..11 {
+            let mut drains = guards.drains;
+            match case {
+                2 => drains.emission = guards.drains.background,
+                3 => drains.supervisor = guards.drains.background,
+                4 => drains.background = guards.drains.supervisor,
+                5 => drains.purge = guards.drains.background,
+                6 => drains.catalog_handles = guards.drains.background,
+                7 => drains.policy_owner = &other_guard,
+                _ => {}
+            }
+            let mut wrong = CompletionGuards {
+                parent_exit: if case == 0 {
+                    guards.runner_exit
+                } else {
+                    guards.parent_exit
+                },
+                runner_exit: if case == 1 {
+                    guards.parent_exit
+                } else {
+                    guards.runner_exit
+                },
+                prefix: if case == 8 {
+                    &other_guard
+                } else {
+                    guards.prefix
+                },
+                drains,
+                writer: if case == 9 {
+                    &mut other_writer
+                } else {
+                    &mut *guards.writer
+                },
+                history: if case == 10 {
+                    guards.drains.background
+                } else {
+                    guards.history
+                },
+            };
+            assert!(
+                inspect_completed_uninstall(journal, &mut wrong, mode, deadline()).is_err(),
+                "{case}"
+            );
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        }
+        let _completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+    });
+}
+
+#[test]
+fn completed_inspection_refuses_unfinished_receipts_and_surviving_payload() {
+    for case in [
+        "purge", "cache", "private", "package", "group", "runner", "unknown",
+    ] {
+        let (fixture, mut journal) = completed_package_fixture(true);
+        with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+            let seal = read_seal(journal, deadline()).unwrap();
+            match case {
+                "purge" => journal.state.purge_prerequisite_complete = false,
+                "cache" => journal.state.report.continuation_cache_cleared = false,
+                "private" => journal.state.report.private_metadata_cleanup_pending = true,
+                "package" => journal.state.after_exit.as_mut().unwrap().payload_complete = false,
+                "group" => journal.state.groups.push(RemovalGroup {
+                    kind: GroupKind::Backup,
+                    files: Vec::new(),
+                    removed: false,
+                }),
+                "runner" => private_file(
+                    &journal.root.join(&seal.runner.relative),
+                    b"replacement runner",
+                ),
+                "unknown" => private_file(&fixture.root.join("unknown-residue"), b"unclassified"),
+                _ => unreachable!(),
+            }
+            if !matches!(case, "runner" | "unknown") {
+                journal.save(deadline()).unwrap();
+            }
+            let before = borrowed_keep_data_inventory(&fixture);
+            assert!(
+                inspect_completed_uninstall(journal, guards, mode, deadline()).is_err(),
+                "{case}"
+            );
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        });
+    }
+}
+
+#[test]
+fn completed_inspection_requires_contiguous_exact_history_and_two_equal_passes() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let first = journal.root.join("state-000001.json");
+        let missing = fixture._temp.path().join("saved-first-state");
+        fs::rename(&first, &missing).unwrap();
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(inspect_completed_uninstall(journal, guards, mode, deadline()).is_err());
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        fs::rename(missing, &first).unwrap();
+        let bytes = fs::read(&first).unwrap();
+        let path = first.clone();
+        let changed = [bytes.as_slice(), b"\n"].concat();
+        let expected = changed.clone();
+        with_completion_pass_hook(
+            move || fs::write(&path, &changed).unwrap(),
+            || {
+                assert!(matches!(
+                    inspect_completed_uninstall(journal, guards, mode, deadline()),
+                    Err(Reason::IdentityChanged)
+                ));
+            },
+        );
+        assert_eq!(fs::read(&first).unwrap(), expected);
+        fs::write(&first, bytes).unwrap();
+        let _completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+    });
+}
+
+#[test]
+fn completed_inspection_checks_live_proof_again_and_keeps_the_original_end() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let before = borrowed_keep_data_inventory(&fixture);
+        assert!(matches!(
+            inspect_completed_uninstall(journal, guards, mode, Instant::now()),
+            Err(Reason::Deadline)
+        ));
+        {
+            let mut proof = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+            let extra = fixture.root.join("new-residue");
+            private_file(&extra, b"cannot be ignored");
+            assert!(matches!(
+                proof.validate_current(),
+                Err(Reason::UnclassifiedOwnedArtifact)
+            ));
+            fs::remove_file(extra).unwrap();
+            proof.validate_current().unwrap();
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        let requested = end + Duration::from_secs(10);
+        let control = fixture.control.as_ref().unwrap();
+        let result = control.with_runtime_deadline(end, || {
+            with_completion_pass_hook(
+                move || {
+                    std::thread::sleep(
+                        end.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                    )
+                },
+                || {
+                    assert!(matches!(
+                        inspect_completed_uninstall(journal, guards, mode, requested),
+                        Err(Reason::Deadline)
+                    ));
+                },
+            );
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(requested),
+                end
+            );
+            Ok(())
+        });
+        assert!(matches!(result, Err(PortError::WriterBusy(_))));
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested),
+            requested
+        );
+        assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+    });
+}
+
+#[test]
+fn completed_inspection_never_promotes_pending_or_repairs_retirement_markers() {
+    let (fixture, mut journal) = completed_package_fixture(false);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let published = fixture.root.join(RETIREMENT_MARKER);
+        let pending = fixture.root.join(RETIREMENT_PENDING_MARKER);
+        let original = fs::read(&published).unwrap();
+        for case in ["pending", "both", "corrupt", "absent"] {
+            match case {
+                "pending" => fs::rename(&published, &pending).unwrap(),
+                "both" => private_file(&pending, &original),
+                "corrupt" => fs::write(&published, b"{}").unwrap(),
+                "absent" => {
+                    fs::rename(&published, fixture._temp.path().join("saved-marker")).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let before = borrowed_keep_data_inventory(&fixture);
+            assert!(
+                inspect_completed_uninstall(journal, guards, mode, deadline()).is_err(),
+                "{case}"
+            );
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+            match case {
+                "pending" => fs::rename(&pending, &published).unwrap(),
+                "both" => fs::remove_file(&pending).unwrap(),
+                "corrupt" => fs::write(&published, &original).unwrap(),
+                "absent" => {
+                    fs::rename(fixture._temp.path().join("saved-marker"), &published).unwrap()
+                }
+                _ => unreachable!(),
+            }
+        }
+        let _completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn completed_inspection_binds_unconsumed_tail_to_original_receipt_and_tick() {
+    let (fixture, mut journal) = completed_package_fixture(true);
+    assert!(journal.state.report.after_exit_cleanup_pending);
+    with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+        let sequence = journal
+            .state
+            .after_exit
+            .as_ref()
+            .unwrap()
+            .tail_handoff_sequence
+            .unwrap();
+        let result = journal
+            .root
+            .join(format!("helper/tail-result-{sequence:06}.json"));
+        let original = fs::read(&result).unwrap();
+        for field in [
+            "nonce",
+            "receipt_sha256",
+            "seal_sha256",
+            "receipt_sequence",
+            "deadline_tick",
+            "complete",
+        ] {
+            let mut value: Value = serde_json::from_slice(&original).unwrap();
+            value[field] = match field {
+                "receipt_sequence" | "deadline_tick" => json!(123),
+                "complete" => json!(false),
+                _ => json!("synthetic-mismatch"),
+            };
+            fs::write(&result, serde_json::to_vec(&value).unwrap()).unwrap();
+            let before = borrowed_keep_data_inventory(&fixture);
+            assert!(
+                inspect_completed_uninstall(journal, guards, mode, deadline()).is_err(),
+                "{field}"
+            );
+            assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        }
+        fs::write(result, original).unwrap();
+        let _completed = inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+        assert!(journal.state.report.after_exit_cleanup_pending);
+        assert_eq!(
+            journal.state.after_exit.as_ref().unwrap().deadline_tick,
+            Some(1)
+        );
+    });
+}
+
 #[test]
 fn held_installation_guard_validation_requires_kind_and_pinned_prefix() {
     let fixture = PackageFixture::new(false);
@@ -1473,9 +2910,32 @@ fn historical_package_without_tail_remains_explicitly_pending_with_recovery_imag
     let fixture = PackageFixture::new(false);
     let (_install, mut journal) = fixture.journal(true);
     let seal = read_seal(&journal, deadline()).unwrap();
+    let parent = exit_lock(
+        &journal.root,
+        &seal.parent_exit,
+        &seal.policy,
+        deadline(),
+        false,
+    )
+    .unwrap();
+    let runner = exit_lock(
+        &journal.root,
+        &seal.runner_exit,
+        &seal.policy,
+        deadline(),
+        false,
+    )
+    .unwrap();
     let installation =
         update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
-    let result = finalize(&mut journal, &seal, &installation, deadline());
+    let result = finalize(
+        &mut journal,
+        &seal,
+        &installation,
+        &parent,
+        &runner,
+        deadline(),
+    );
     assert!(
         matches!(result, Err(Reason::OwnedAfterExitHelperRequired)),
         "actual result {result:?}; report {}",
@@ -1493,31 +2953,167 @@ fn historical_package_without_tail_remains_explicitly_pending_with_recovery_imag
 #[cfg(unix)]
 #[test]
 fn unix_package_cleanup_completes_in_process_without_a_tail_helper() {
-    let fixture = PackageFixture::new(false);
-    let (_install, mut journal) = fixture.journal(true);
-    let seal = read_seal(&journal, deadline()).unwrap();
-    let installation =
-        update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
-    let result = finalize(&mut journal, &seal, &installation, deadline());
-    assert!(
-        result.is_ok(),
-        "actual result {result:?}; report {}",
-        serde_json::to_string(&journal.state.report).unwrap()
-    );
+    use std::cell::Cell;
+
+    for keep in [true, false] {
+        let (fixture, mut journal) = package_fixture_for_finalize(keep);
+        let receipt_root = journal.root.clone();
+        let owner = journal.state.owner.clone();
+        let calls = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&calls);
+        let result = with_completion_pass_hook(
+            move || {
+                observed.set(observed.get() + 1);
+                let state = load_state(&receipt_root, &owner, deadline())
+                    .unwrap()
+                    .unwrap();
+                assert!(state.report.cleanup_pending);
+                assert!(state.report.after_exit_cleanup_pending);
+                assert_eq!(state.report.status, "pending_cleanup");
+                assert!(matches!(state.report.outcome(), Outcome::Partial));
+            },
+            || run_unix_fixture_finalize(&fixture, &mut journal, deadline()),
+        );
+        assert!(
+            result.is_ok(),
+            "mode {keep}, actual result {result:?}; report {}",
+            serde_json::to_string(&journal.state.report).unwrap()
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            journal.state.report.status,
+            "complete_with_retained_private_markers"
+        );
+        assert!(!journal.state.report.cleanup_pending);
+        assert!(!journal.state.report.after_exit_cleanup_pending);
+        assert!(journal.state.report.reasons.is_empty());
+        assert!(matches!(journal.state.report.outcome(), Outcome::Success));
+        let persisted = load_state(&journal.root, &journal.state.owner, deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&persisted).unwrap(),
+            serde_json::to_vec(&journal.state).unwrap()
+        );
+        assert!(
+            !fixture
+                .prefix
+                .join(agent_session_grep_launcher::metadata::APP_NAME)
+                .exists()
+        );
+        assert!(!journal.root.join("helper/runner").exists());
+        assert_eq!(fixture.catalog.exists(), keep);
+        assert_eq!(SqliteControlStore::path(&fixture.root).exists(), keep);
+        with_completion_inputs(&fixture, &mut journal, |journal, guards, mode| {
+            let mut completed =
+                inspect_completed_uninstall(journal, guards, mode, deadline()).unwrap();
+            completed.validate_current().unwrap();
+        });
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_fixture_finalize(
+    fixture: &PackageFixture,
+    journal: &mut Journal,
+    end: Instant,
+) -> Result<(), Reason> {
+    let seal = read_seal(journal, end)?;
+    let parent = exit_lock(&journal.root, &seal.parent_exit, &seal.policy, end, false)?;
+    let runner = exit_lock(&journal.root, &seal.runner_exit, &seal.policy, end, false)?;
+    let installation = update_state::acquire_installation_lock(&fixture.prefix, end)
+        .map_err(|_| Reason::AfterExitCleanupPending)?;
+    finalize(journal, &seal, &installation, &parent, &runner, end)
+}
+
+#[cfg(unix)]
+fn assert_unix_finalize_stays_pending(journal: &Journal) {
+    let persisted = load_state(&journal.root, &journal.state.owner, deadline())
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        journal.state.report.status,
-        "complete_with_retained_private_markers"
+        serde_json::to_vec(&persisted).unwrap(),
+        serde_json::to_vec(&journal.state).unwrap()
     );
-    assert!(!journal.state.report.cleanup_pending);
-    assert!(
-        !fixture
-            .prefix
-            .join(agent_session_grep_launcher::metadata::APP_NAME)
-            .exists()
-    );
+    for sequence in 1..=persisted.sequence {
+        let bytes = fs::read(journal.root.join(format!("state-{sequence:06}.json"))).unwrap();
+        let state: DeferredCleanup = serde_json::from_slice(&bytes).unwrap();
+        assert!(state.report.cleanup_pending, "sequence {sequence}");
+        assert!(
+            state.report.after_exit_cleanup_pending,
+            "sequence {sequence}"
+        );
+        assert_eq!(state.report.status, "pending_cleanup");
+        assert!(matches!(state.report.outcome(), Outcome::Partial));
+    }
+    // The actual Unix caller removed the runner before reaching preflight.
     assert!(!journal.root.join("helper/runner").exists());
-    // Keep-data cleanup removes package bytes only.
-    assert!(fixture.catalog.exists() && SqliteControlStore::path(&fixture.root).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_finalize_precompletion_refusal_preserves_durable_pending_in_both_modes() {
+    for keep in [true, false] {
+        let (fixture, mut journal) = package_fixture_for_finalize(keep);
+        let first = journal.root.join("state-000001.json");
+        let prefix = fixture.prefix.clone();
+        let data = fixture.root.clone();
+        let observed = Rc::new(RefCell::new(None));
+        let snapshot = Rc::clone(&observed);
+        let result = with_completion_pass_hook(
+            move || {
+                // Preserve valid JSON and logical history, but change the exact
+                // evidence between the two real preflight passes.
+                let mut bytes = fs::read(&first).unwrap();
+                bytes.push(b'\n');
+                fs::write(&first, bytes).unwrap();
+                *snapshot.borrow_mut() = Some(cleanup_inventory(&prefix, &data));
+            },
+            || run_unix_fixture_finalize(&fixture, &mut journal, deadline()),
+        );
+        assert!(matches!(result, Err(Reason::IdentityChanged)), "{result:?}");
+        assert_unix_finalize_stays_pending(&journal);
+        assert_eq!(
+            borrowed_keep_data_inventory(&fixture),
+            *observed.borrow().as_ref().expect("real preflight reached")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_finalize_precompletion_expiry_preserves_durable_pending_in_both_modes() {
+    for keep in [true, false] {
+        let (fixture, mut journal) = package_fixture_for_finalize(keep);
+        let prefix = fixture.prefix.clone();
+        let data = fixture.root.clone();
+        let observed = Rc::new(RefCell::new(None));
+        let snapshot = Rc::clone(&observed);
+        let end = Instant::now() + Duration::from_secs(2);
+        let result = with_completion_pass_hook(
+            move || {
+                *snapshot.borrow_mut() = Some(cleanup_inventory(&prefix, &data));
+                std::thread::sleep(
+                    end.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            },
+            || run_unix_fixture_finalize(&fixture, &mut journal, end),
+        );
+        assert!(matches!(result, Err(Reason::Deadline)), "{result:?}");
+        assert!(Instant::now() >= end);
+        assert_unix_finalize_stays_pending(&journal);
+        assert_eq!(
+            borrowed_keep_data_inventory(&fixture),
+            *observed.borrow().as_ref().expect("real preflight reached")
+        );
+        // The production failure path cannot save beyond the old end; its
+        // diagnostic only changes memory, while the pending receipt survives.
+        let receipt = fs::read(journal.receipt_path()).unwrap();
+        journal.state.report.pending(Reason::Deadline);
+        journal.save_before_deadline(end).unwrap();
+        assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt);
+        assert!(matches!(journal.state.report.outcome(), Outcome::Partial));
+    }
 }
 
 #[cfg(windows)]

@@ -386,6 +386,19 @@ impl CleanupGuards {
             purge: &self.purge,
         }
     }
+    fn split_for_completion(&mut self) -> (RetirementDrainGuards<'_>, &mut WriterLease) {
+        (
+            RetirementDrainGuards {
+                policy_owner: &self.policy_owner,
+                emission: &self.emission,
+                catalog_handles: &self.catalog_handles,
+                background: &self.background,
+                supervisor: &self.supervisor,
+                purge: &self.purge,
+            },
+            &mut self._writer,
+        )
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -872,6 +885,52 @@ impl Journal {
         }
         update_state::write_new(&self.receipt_path(), &bytes)?;
         self.capture_receipt()
+    }
+    /// Publish the preflighted Unix completion as the last acknowledged effect.
+    /// Until the write is acknowledged, memory and the prior acknowledged
+    /// receipt stay pending. Do not read the new receipt or check time after
+    /// commit: an admitted nonpreemptible write may finish after the original end.
+    fn publish_completion(&mut self, end: Instant) -> Result<(), Reason> {
+        let end = SqliteControlStore::effective_runtime_deadline(end);
+        self.validate_roots(end)?;
+        if self.state.sequence >= MAX_STATES
+            || !self.state.report.cleanup_pending
+            || !self.state.report.after_exit_cleanup_pending
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        let mut completed = self.state.clone();
+        completed.sequence += 1;
+        completed.report.private_cleanup_receipt_recorded = true;
+        completed.report.after_exit_cleanup_pending = false;
+        completed.report.reasons.retain(|reason| {
+            !matches!(
+                reason,
+                Reason::OwnedAfterExitHelperRequired | Reason::AfterExitCleanupPending
+            )
+        });
+        if !completed.report.reasons.is_empty() {
+            return Err(Reason::AfterExitCleanupPending);
+        }
+        completed.report.cleanup_pending = false;
+        completed.report.status = "complete_with_retained_private_markers".into();
+        let bytes = serde_json::to_vec(&completed).map_err(|_| Reason::IdentityChanged)?;
+        if bytes.len() as u64 > INVENTORY_LIMIT {
+            return Err(Reason::IdentityChanged);
+        }
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let path = self
+            .root
+            .join(format!("state-{:06}.json", completed.sequence));
+        time(end)?;
+        // write_new owns create-new, write, file flush and directory sync.
+        // A storage error leaves memory pending but can leave an absent, partial
+        // or complete unacknowledged next image. Never overwrite or downgrade it:
+        // recovery validates the exact image; partial/corrupt bytes refuse.
+        update_state::write_new(&path, &bytes).map_err(|_| Reason::AfterExitCleanupPending)?;
+        self.state = completed;
+        self.receipt_digest = Some(digest);
+        Ok(())
     }
     fn save_before_deadline(&mut self, end: Instant) -> Result<(), CliError> {
         // No replacement budget. The previously flushed intent/fence remains.
