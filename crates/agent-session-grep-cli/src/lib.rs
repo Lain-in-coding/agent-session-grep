@@ -6990,29 +6990,6 @@ mod tests {
 
     // ---- help/version 提前拦截（ADR-0006，R3）----
 
-    const KNOWN_COMMANDS: [&str; 20] = [
-        "ingest",
-        "sync",
-        "index",
-        "search",
-        "handoff",
-        "get-message",
-        "get-session-resume",
-        "resume",
-        "hook",
-        "get",
-        "show",
-        "list",
-        "context",
-        "status",
-        "mcp",
-        "tui",
-        "doctor",
-        "providers",
-        "config",
-        "model",
-    ];
-
     #[test]
     fn intercept_top_level_help_and_version() {
         assert_eq!(intercept_help_or_version(&[]), None);
@@ -7050,7 +7027,7 @@ mod tests {
 
     #[test]
     fn intercept_subcommand_help_for_every_known_command() {
-        for cmd in KNOWN_COMMANDS {
+        for &cmd in KNOWN_SUBCOMMANDS {
             assert_eq!(
                 intercept_help_or_version(&[cmd.into(), "--help".into()]),
                 Some(HelpRequest::SubcommandHelp(cmd.into())),
@@ -7112,7 +7089,7 @@ mod tests {
 
     #[test]
     fn every_known_subcommand_has_help_text() {
-        for cmd in KNOWN_COMMANDS {
+        for &cmd in KNOWN_SUBCOMMANDS {
             let text = subcommand_help_text(cmd);
             assert!(text.contains(cmd), "{cmd}: {text}");
             assert!(!text.is_empty(), "{cmd}");
@@ -7132,10 +7109,10 @@ mod tests {
         //
         // 做法：从 README 的 fenced 代码块里抽出所有 `asg`/`agent-session-grep`
         // 调用行，取其子命令 token（跳过 `--flag` 与其值占位符），要求每个都在
-        // KNOWN_COMMANDS 里。KNOWN_COMMANDS 已由
+        // 真实 KNOWN_SUBCOMMANDS 清单里。该清单还由
         // `intercept_subcommand_help_for_every_known_command` 与
         // `every_known_subcommand_has_help_text` 钉在真实 dispatch 上，故这里
-        // 传递地锚定到真实行为，而不是另一份手抄表。
+        // 同时检查真实帮助行为，不再维护另一份手抄命令表。
         let mut in_fence = false;
         let mut documented: std::collections::BTreeSet<String> = Default::default();
         for line in README_SOURCE.lines() {
@@ -7175,8 +7152,8 @@ mod tests {
         );
         for cmd in &documented {
             assert!(
-                KNOWN_COMMANDS.contains(&cmd.as_str()),
-                "README 记录的命令 `{cmd}` 不在 KNOWN_COMMANDS 里——命令已改名/下线，\
+                known_subcommand(cmd),
+                "README 记录的命令 `{cmd}` 不在 KNOWN_SUBCOMMANDS 里——命令已改名/下线，\
                  而 README 是新用户照抄的第一组命令"
             );
         }
