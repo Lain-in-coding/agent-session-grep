@@ -16257,16 +16257,22 @@ mod control_deadline_tests {
         let started = Instant::now();
         let effective_end = SqliteControlStore::effective_runtime_deadline(fixture.scope_end);
         schedule.hooks.completion_end.set(Some(Instant::now()));
-        let result = run_cycle(
-            &fixture.db,
-            &fixture.control,
-            &fixture.worker(),
-            boot,
-            0,
-            fixture.scope_end,
-            &mut pending,
-            schedule,
-        );
+        // Only preparation reads use the fixture scope. Explicit source/ack ends
+        // and the injected expired completion end still shorten it.
+        let result = fixture
+            .control
+            .with_runtime_deadline(fixture.scope_end, || {
+                run_cycle(
+                    &fixture.db,
+                    &fixture.control,
+                    &fixture.worker(),
+                    boot,
+                    0,
+                    fixture.scope_end,
+                    &mut pending,
+                    schedule,
+                )
+            });
         let elapsed = started.elapsed();
         schedule
             .hooks
@@ -16317,6 +16323,76 @@ mod control_deadline_tests {
         assert!(!intent.completion_confirmed, "{}", context());
         assert!(schedule.closed_idle_at.is_none(), "{}", context());
         pending
+    }
+
+    #[test]
+    fn expired_completion_preparation_uses_earliest_scope_and_restores_it() {
+        for earlier_outer in [false, true] {
+            let fixture = CycleFixture::new();
+            fixture.write_source("scope.jsonl", SearchProvider::Claude, "completion scope");
+            let boot = ObservationClock::new(Instant::now());
+            let probe = fixture.scope_end + CONTROL_BUDGET;
+            let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+            let outer_end = fixture.scope_end - CADENCE;
+            let expected_end = previous_end.min(if earlier_outer {
+                outer_end
+            } else {
+                fixture.scope_end
+            });
+            let finalizing_end = Rc::new(Cell::new(None));
+            let mut schedule = SourceScheduleState {
+                hooks: scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                    let finalizing_end = finalizing_end.clone();
+                    move |event| {
+                        if matches!(event, ScheduleTestEvent::Finalizing) {
+                            assert!(
+                                finalizing_end
+                                    .replace(Some(SqliteControlStore::effective_runtime_deadline(
+                                        probe,
+                                    )))
+                                    .is_none(),
+                                "completion preparation must finalize once"
+                            );
+                        }
+                        Ok(())
+                    }
+                }),
+                ..Default::default()
+            };
+            let pending = if earlier_outer {
+                fixture
+                    .control
+                    .with_runtime_deadline(outer_end, || {
+                        let pending = expired_completion(&fixture, &mut schedule, &boot);
+                        assert_eq!(
+                            SqliteControlStore::effective_runtime_deadline(probe),
+                            expected_end,
+                            "completion refusal must restore the enclosing scope"
+                        );
+                        Ok(pending)
+                    })
+                    .unwrap()
+            } else {
+                expired_completion(&fixture, &mut schedule, &boot)
+            };
+            assert_eq!(finalizing_end.get(), Some(expected_end));
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous_end,
+                "completion preparation must restore the previous scope"
+            );
+            assert_eq!(schedule.hooks.observation_result.get(), Some("ok"));
+            assert!(schedule.hooks.observation_error.get().is_none());
+            assert!(schedule.hooks.completion_end.get().is_none());
+            let token = &pending.as_ref().unwrap().token;
+            assert_eq!(
+                fixture
+                    .read_control(|control| control.cycle(token.cycle_seq))
+                    .state,
+                CycleState::Observing,
+                "the injected expired completion must remain uncommitted"
+            );
+        }
     }
 
     fn resume_pending(
