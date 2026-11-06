@@ -1,8 +1,8 @@
 //! Real SQLite/WAL and OS-lock tests under synthetic private roots.
 use agent_session_grep_adapters_sqlite::{
-    SqliteControlStore,
+    SqliteControlStore, WriterLease,
     control::{BackupPurpose, BackupRegistration, BackupState},
-    managed_locks::{ExclusiveGuard, JobLockKey, LockKind},
+    managed_locks::{ExclusiveGuard, JobLockKey, LockKind, SharedGuard},
     managed_maintenance::{
         BackupAttention, BackupOutcome, MaintenanceCatalog, PurgeOutcome, RestoreOutcome,
         apply_restore, inspect_catalog_identity, inspect_restore_inventory, prepare_restore,
@@ -518,6 +518,193 @@ fn exclusive_gate_proves_drain_before_any_catalog_maintenance() {
         .is_ok()
     );
 }
+#[test]
+fn authorized_open_restores_scope_and_releases_guards_on_success_and_error() {
+    let f = Fixture::new();
+    f.fence("owner");
+    let (installation, before) = prepare(&f.control, success_end(), |_| {
+        Ok((
+            f.control
+                .bind_installation(&f.prefix, &f.installation_lock)?,
+            f.control.status()?,
+        ))
+    })
+    .unwrap();
+    let requested_end = end();
+    let probe = requested_end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let catalog = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        requested_end,
+    )
+    .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    assert_eq!(catalog.identity().installation, id("installation"));
+    assert_eq!(catalog.identity().incarnation, id("original_incarnation"));
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(&f.root, LockKind::CatalogHandles),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(matches!(
+        WriterLease::try_acquire(&f.root),
+        Err(PortError::WriterBusy(_))
+    ));
+    drop(catalog);
+    let assert_released = || {
+        drop(ExclusiveGuard::try_acquire(&f.root, LockKind::CatalogHandles).unwrap());
+        drop(WriterLease::try_acquire(&f.root).unwrap());
+    };
+    assert_released();
+
+    // This real SQL refusal occurs after both guards, the pin and connection
+    // have been acquired. The receiver must release them without schema repair.
+    {
+        let raw = rusqlite::Connection::open(&f.catalog).unwrap();
+        raw.pragma_update(None, "user_version", 999).unwrap();
+    }
+    let requested_end = end();
+    let probe = requested_end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        requested_end,
+    );
+    assert!(matches!(
+        result,
+        Err(PortError::SchemaIncompatible(reason))
+            if reason == "managed catalog identity is unavailable"
+    ));
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    assert_released();
+    assert_eq!(
+        recovery_rows(&f.catalog, "PRAGMA user_version"),
+        vec![vec![rusqlite::types::Value::Integer(999)]]
+    );
+    assert_eq!(
+        prepare(&f.control, end(), |_| f.control.status()).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn authorized_open_catalog_handle_contention_honors_earlier_outer_end() {
+    let f = Fixture::new();
+    f.fence("owner");
+    let installation = prepare(&f.control, success_end(), |_| {
+        f.control.bind_installation(&f.prefix, &f.installation_lock)
+    })
+    .unwrap();
+    let reader = SharedGuard::try_acquire(&f.root, LockKind::CatalogHandles).unwrap();
+    let outer_end = Instant::now() + Duration::from_secs(1);
+    let requested_end = outer_end + Duration::from_secs(5);
+    let probe = requested_end + Duration::from_secs(1);
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = f.control.with_runtime_deadline(outer_end, || {
+        let result = MaintenanceCatalog::open_authorized(
+            &f.control,
+            &installation,
+            &id("owner"),
+            &f.catalog,
+            requested_end,
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            outer_end
+        );
+        result
+    });
+    let returned = Instant::now();
+    // The exact reason distinguishes reaching the held catalog gate from
+    // an earlier control-read timeout that would not exercise the drain.
+    assert!(matches!(
+        result,
+        Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+    ));
+    assert!(returned >= outer_end);
+    assert!(
+        returned < requested_end,
+        "drain ignored the earlier outer end"
+    );
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(&f.root, LockKind::CatalogHandles),
+        Err(PortError::WriterBusy(_))
+    ));
+    drop(reader);
+    drop(
+        MaintenanceCatalog::open_authorized(
+            &f.control,
+            &installation,
+            &id("owner"),
+            &f.catalog,
+            end(),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn authorized_open_expired_entry_preserves_files_and_scope() {
+    let f = Fixture::new();
+    f.fence("owner");
+    let installation = prepare(&f.control, success_end(), |_| {
+        f.control.bind_installation(&f.prefix, &f.installation_lock)
+    })
+    .unwrap();
+    // This fresh fixture has only files at its data root. Compare every name
+    // and byte, including SQLite siblings and the existing writer diagnostic.
+    let snapshot = || {
+        std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                let bytes = if entry.metadata().unwrap().len() == 0 {
+                    Vec::new()
+                } else {
+                    std::fs::read(entry.path()).unwrap()
+                };
+                (entry.file_name(), bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = snapshot();
+    let probe = end();
+    let previous = SqliteControlStore::effective_runtime_deadline(probe);
+    let result = MaintenanceCatalog::open_authorized(
+        &f.control,
+        &installation,
+        &id("owner"),
+        &f.catalog,
+        Instant::now(),
+    );
+    assert!(matches!(
+        result,
+        Err(PortError::WriterBusy(reason)) if reason == "control runtime deadline reached"
+    ));
+    assert_eq!(snapshot(), before);
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(probe),
+        previous
+    );
+    drop(ExclusiveGuard::try_acquire(&f.root, LockKind::CatalogHandles).unwrap());
+}
+
 #[test]
 fn real_same_root_guard_and_journal_owner_are_required_for_nonce_adoption() {
     let f = Fixture::new();

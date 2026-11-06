@@ -213,6 +213,7 @@ impl MaintenanceCatalog {
     /// proves it by taking `catalog-handles` exclusively and only then the
     /// writer lease. It never takes a shared handle and then waits for the
     /// exclusive one, and it never opens SQLite with automatic migration.
+    /// All admission reads and waits share the earliest caller deadline.
     pub fn open_authorized(
         control: &SqliteControlStore,
         installation: &InstallationLockAuthority<'_>,
@@ -220,43 +221,46 @@ impl MaintenanceCatalog {
         catalog: &Path,
         deadline: Instant,
     ) -> PortResult<Self> {
-        installation.validate(control)?;
-        require_fence(control, owner)?;
-        validate_catalog_path(catalog)?;
-        let root_path = catalog
-            .parent()
-            .ok_or_else(|| invalid("catalog root is invalid"))?;
-        let root = RootIdentity::read(root_path)?;
-        if !control.matches_root(root) {
-            return Err(invalid("catalog is not under this control root"));
-        }
-        control.validate_catalog_file(catalog)?;
-        let installation_id = installation.installation_id().clone();
+        let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
+        control.with_runtime_deadline(deadline, || {
+            installation.validate(control)?;
+            require_fence(control, owner)?;
+            validate_catalog_path(catalog)?;
+            let root_path = catalog
+                .parent()
+                .ok_or_else(|| invalid("catalog root is invalid"))?;
+            let root = RootIdentity::read(root_path)?;
+            if !control.matches_root(root) {
+                return Err(invalid("catalog is not under this control root"));
+            }
+            control.validate_catalog_file(catalog)?;
+            let installation_id = installation.installation_id().clone();
 
-        let handles = acquire_exclusive(root_path, LockKind::CatalogHandles, deadline)?;
-        if handles.root_identity() != root {
-            return Err(invalid("catalog root changed during admission"));
-        }
-        let lease = acquire_lease(root_path, deadline)?;
-        let pin = open_catalog_pin(control, catalog)?;
-        let conn = open_read_write(catalog, deadline)?;
-        let identity = validate_compatible_identity(&conn, &installation_id)?;
-        control.validate_private_read(catalog, &pin)?;
-        require_fence(control, owner)?;
-        if RootIdentity::read(root_path)? != root {
-            return Err(invalid("catalog root changed during drain"));
-        }
-        Ok(Self {
-            conn: Some(conn),
-            pin: Some(pin),
-            path: catalog.to_path_buf(),
-            _lease: lease,
-            _handles: handles,
-            root,
-            installation: installation_id,
-            identity,
-            #[cfg(test)]
-            recovery_after_commit: None,
+            let handles = acquire_exclusive(root_path, LockKind::CatalogHandles, deadline)?;
+            if handles.root_identity() != root {
+                return Err(invalid("catalog root changed during admission"));
+            }
+            let lease = acquire_lease(root_path, deadline)?;
+            let pin = open_catalog_pin(control, catalog)?;
+            let conn = open_read_write(catalog, deadline)?;
+            let identity = validate_compatible_identity(&conn, &installation_id)?;
+            control.validate_private_read(catalog, &pin)?;
+            require_fence(control, owner)?;
+            if RootIdentity::read(root_path)? != root {
+                return Err(invalid("catalog root changed during drain"));
+            }
+            Ok(Self {
+                conn: Some(conn),
+                pin: Some(pin),
+                path: catalog.to_path_buf(),
+                _lease: lease,
+                _handles: handles,
+                root,
+                installation: installation_id,
+                identity,
+                #[cfg(test)]
+                recovery_after_commit: None,
+            })
         })
     }
 
