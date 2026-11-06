@@ -69,6 +69,49 @@ const INVENTORY_LIMIT: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 1024;
 const MAX_STATES: u64 = 256;
 const MAX_FILE: u64 = 16 * 1024 * 1024 * 1024;
+
+// Observation only: no callback can substitute authority, a read result or an
+// error. Tests install this thread-local slot with a restoring RAII guard.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CleanupAdmissionEvent {
+    ExitWouldBlock(PathBuf),
+    GuardWouldBlock(PathBuf, LockKind),
+    WriterWouldBlock(PathBuf),
+    PrefixRefused(PathBuf),
+    SupervisorRefused(PathBuf),
+    ControlHandlesRefused { keep_data: bool, busy: bool },
+    OwnerRead(OwnerReadResult),
+    BeforeImage,
+    BeforeDelete,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerReadResult {
+    Present,
+    Missing,
+    Refused,
+}
+
+#[cfg(test)]
+type CleanupAdmissionObserver = Box<dyn FnMut(CleanupAdmissionEvent, Instant)>;
+
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_ADMISSION_OBSERVER: std::cell::RefCell<Option<CleanupAdmissionObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_cleanup_admission(event: CleanupAdmissionEvent, end: Instant) {
+    CLEANUP_ADMISSION_OBSERVER.with_borrow_mut(|slot| {
+        if let Some(observer) = slot.as_mut() {
+            observer(event, end);
+        }
+    });
+}
+
 struct Options {
     keep_data: bool,
     prefix: Option<PathBuf>,
@@ -528,9 +571,17 @@ fn load_state(
     }
     let bytes = update_state::read(path, INVENTORY_LIMIT)?
         .ok_or_else(|| error(CanonicalCode::SchemaIncompatible))?;
+    decode_cleanup_state(&bytes, owner, *sequence).map(Some)
+}
+
+fn decode_cleanup_state(
+    bytes: &[u8],
+    owner: &Owner,
+    sequence: u64,
+) -> Result<DeferredCleanup, CliError> {
     let state: DeferredCleanup =
-        serde_json::from_slice(&bytes).map_err(|_| error(CanonicalCode::SchemaIncompatible))?;
-    if state.schema != STATE_SCHEMA || state.owner != *owner || state.sequence != *sequence {
+        serde_json::from_slice(bytes).map_err(|_| error(CanonicalCode::SchemaIncompatible))?;
+    if state.schema != STATE_SCHEMA || state.owner != *owner || state.sequence != sequence {
         return Err(error(CanonicalCode::SchemaIncompatible));
     }
     for file in state
@@ -549,7 +600,7 @@ fn load_state(
         plan.validate(&state)
             .map_err(|_| error(CanonicalCode::SchemaIncompatible))?;
     }
-    Ok(Some(state))
+    Ok(state)
 }
 /// Read-only handoff. Callers must independently obtain all live drain proofs.
 pub(crate) fn read_deferred_cleanup(
@@ -565,7 +616,17 @@ pub(crate) fn read_deferred_cleanup(
         Ok(_) => {}
     }
     checked_root(&root)?;
-    let owner = read_owner(&root)?.ok_or_else(|| error(CanonicalCode::SchemaIncompatible))?;
+    let owner = read_owner(&root);
+    #[cfg(test)]
+    observe_cleanup_admission(
+        CleanupAdmissionEvent::OwnerRead(match &owner {
+            Ok(Some(_)) => OwnerReadResult::Present,
+            Ok(None) => OwnerReadResult::Missing,
+            Err(_) => OwnerReadResult::Refused,
+        }),
+        end,
+    );
+    let owner = owner?.ok_or_else(|| error(CanonicalCode::SchemaIncompatible))?;
     let data = catalog
         .parent()
         .ok_or_else(|| error(CanonicalCode::InvalidRequest))?;
@@ -1035,9 +1096,16 @@ fn acquire(
         time(end)?;
         match ExclusiveGuard::try_acquire(root, kind.clone()) {
             Ok(guard) => return Ok(guard),
-            Err(PortError::WriterBusy(_)) => std::thread::sleep(
-                Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
-            ),
+            Err(PortError::WriterBusy(_)) => {
+                #[cfg(test)]
+                observe_cleanup_admission(
+                    CleanupAdmissionEvent::GuardWouldBlock(root.to_path_buf(), kind.clone()),
+                    end,
+                );
+                std::thread::sleep(
+                    Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+                );
+            }
             Err(_) => return Err(reason),
         }
     }
@@ -1047,9 +1115,16 @@ fn writer(root: &Path, end: Instant) -> Result<WriterLease, Reason> {
         time(end)?;
         match WriterLease::try_acquire(root) {
             Ok(lease) => return Ok(lease),
-            Err(PortError::WriterBusy(_)) => std::thread::sleep(
-                Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
-            ),
+            Err(PortError::WriterBusy(_)) => {
+                #[cfg(test)]
+                observe_cleanup_admission(
+                    CleanupAdmissionEvent::WriterWouldBlock(root.to_path_buf()),
+                    end,
+                );
+                std::thread::sleep(
+                    Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+                );
+            }
             Err(_) => return Err(Reason::WriterDrainPending),
         }
     }
@@ -2061,48 +2136,98 @@ fn cleanup_data(
     Ok(guards)
 }
 fn drain_owners(journal: &mut Journal, end: Instant) -> Result<CleanupGuards, Reason> {
-    let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    let root = journal
+        .catalog
+        .parent()
+        .ok_or(Reason::IdentityChanged)?
+        .to_path_buf();
     journal.validate_roots(end)?;
+    acquire_completion_drains(&root, journal.data_identity, end, |step| {
+        match step {
+            DrainStep::Emission => journal.state.report.emission_drained = true,
+            DrainStep::Supervisor => journal.state.report.supervisor_drained = true,
+            DrainStep::Background => journal.state.report.background_drained = true,
+            DrainStep::Purge => journal.state.report.purge_owner_drained = true,
+            DrainStep::Catalog => journal.state.report.catalog_drained = true,
+            DrainStep::Writer => journal.state.report.writer_drained = true,
+            DrainStep::Complete => journal.validate_roots(end)?,
+        }
+        Ok(())
+    })
+}
+
+enum DrainStep {
+    Emission,
+    Supervisor,
+    Background,
+    Purge,
+    Catalog,
+    Writer,
+    Complete,
+}
+
+/// Preserve the original acquisition order; handoff observers never change old
+/// report flags. The existing cleanup observer keeps its partial-progress flags.
+fn acquire_completion_drains(
+    root: &Path,
+    identity: RootIdentity,
+    end: Instant,
+    mut observed: impl FnMut(DrainStep) -> Result<(), Reason>,
+) -> Result<CleanupGuards, Reason> {
+    time(end)?;
+    if checked_root(root).map_err(|_| Reason::IdentityChanged)? != identity {
+        return Err(Reason::IdentityChanged);
+    }
     let emission = acquire(
         root,
         LockKind::PolicyEmission,
         end,
         Reason::EmissionDrainPending,
     )?;
-    journal.state.report.emission_drained = true;
-    let supervisor = native_manager::wait_supervisor_drained(root, journal.data_identity, end)
-        .map_err(|_| Reason::SupervisorDrainPending)?;
-    journal.state.report.supervisor_drained = true;
+    observed(DrainStep::Emission)?;
+    let supervisor =
+        native_manager::wait_supervisor_drained(root, identity, end).map_err(|_| {
+            #[cfg(test)]
+            observe_cleanup_admission(
+                CleanupAdmissionEvent::SupervisorRefused(root.to_path_buf()),
+                end,
+            );
+            Reason::SupervisorDrainPending
+        })?;
+    observed(DrainStep::Supervisor)?;
     let background = acquire(
         root,
         LockKind::Background,
         end,
         Reason::BackgroundDrainPending,
     )?;
-    journal.state.report.background_drained = true;
+    observed(DrainStep::Background)?;
     let purge = acquire(
         root,
         managed_purge::purge_lock_kind().map_err(|_| Reason::PurgeOwnerDrainPending)?,
         end,
         Reason::PurgeOwnerDrainPending,
     )?;
-    journal.state.report.purge_owner_drained = true;
+    observed(DrainStep::Purge)?;
     let catalog_handles = acquire(
         root,
         LockKind::CatalogHandles,
         end,
         Reason::CatalogDrainPending,
     )?;
-    journal.state.report.catalog_drained = true;
+    observed(DrainStep::Catalog)?;
     let writer = writer(root, end)?;
-    journal.state.report.writer_drained = true;
+    observed(DrainStep::Writer)?;
     let policy_owner = acquire(
         root,
         LockKind::PolicyOwner,
         end,
         Reason::ControlHandleDrainRequired,
     )?;
-    journal.validate_roots(end)?;
+    if checked_root(root).map_err(|_| Reason::IdentityChanged)? != identity {
+        return Err(Reason::IdentityChanged);
+    }
+    observed(DrainStep::Complete)?;
     Ok(CleanupGuards {
         emission,
         supervisor,

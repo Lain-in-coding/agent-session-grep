@@ -10,6 +10,9 @@ use agent_session_grep_adapters_sqlite::{
 use agent_session_grep_ports::control::{ControlSeq, PolicyEpoch};
 use std::io::Write;
 
+#[path = "managed_reinstall_handoff.rs"]
+mod managed_reinstall_handoff;
+
 const CHILD: &str = "__managed-uninstall-cleanup";
 pub(super) const WINDOWS_TAIL_HELPER: &str = "package-uninstall.ps1";
 const PLAN_SCHEMA: &str = "asg.uninstall-helper/v1";
@@ -633,14 +636,42 @@ fn read_seal(journal: &Journal, end: Instant) -> Result<Seal, Reason> {
     let bytes = update_state::read(&journal.root.join(&plan.seal.relative), MAX_PLAN)
         .map_err(|_| Reason::IdentityChanged)?
         .ok_or(Reason::IdentityChanged)?;
-    let seal: Seal = serde_json::from_slice(&bytes).map_err(|_| Reason::IdentityChanged)?;
+    let manifest_bytes =
+        update_state::read(&journal.root.join(&plan.manifest.relative), INVENTORY_LIMIT)
+            .map_err(|_| Reason::IdentityChanged)?
+            .ok_or(Reason::IdentityChanged)?;
+    let seal = decode_seal(
+        &journal.state,
+        RootPins::capture(journal)?,
+        &bytes,
+        &manifest_bytes,
+    )?;
+    verify(&journal.root, &seal.owner_file, policy, end, false)?;
+    Ok(seal)
+}
+
+/// Common semantics for active and intent-bound record readers. Physical
+/// identity, exact bytes and live guards remain the reader's responsibility.
+fn decode_seal(
+    state: &DeferredCleanup,
+    roots: RootPins,
+    bytes: &[u8],
+    manifest_bytes: &[u8],
+) -> Result<Seal, Reason> {
+    let plan = state.after_exit.as_ref().ok_or(Reason::IdentityChanged)?;
+    plan.validate(state)?;
+    let policy = state
+        .terminal_policy
+        .as_ref()
+        .ok_or(Reason::IdentityChanged)?;
+    let seal: Seal = serde_json::from_slice(bytes).map_err(|_| Reason::IdentityChanged)?;
     if seal.schema != SEAL_SCHEMA
-        || seal.owner != journal.state.owner
-        || seal.roots != RootPins::capture(journal)?
-        || seal.catalog_incarnation != journal.state.catalog_incarnation
-        || seal.package_manifest_sha256 != journal.state.package_manifest_sha256
+        || seal.owner != state.owner
+        || seal.roots != roots
+        || seal.catalog_incarnation != state.catalog_incarnation
+        || seal.package_manifest_sha256 != state.package_manifest_sha256
         || serde_json::to_vec(&seal.package_files).ok()
-            != serde_json::to_vec(&journal.state.package_files).ok()
+            != serde_json::to_vec(&state.package_files).ok()
         || seal.runner.identity != plan.runner.identity
         || seal.runner.digest != plan.runner.digest
         || seal.parent_exit.identity != plan.parent_exit.identity
@@ -651,16 +682,11 @@ fn read_seal(journal: &Journal, end: Instant) -> Result<Seal, Reason> {
     seal.policy.validate()?;
     if serde_json::to_vec(&seal.policy).ok() != serde_json::to_vec(policy).ok()
         || serde_json::to_vec(&seal.metadata).ok()
-            != serde_json::to_vec(&journal.state.private_metadata).ok()
+            != serde_json::to_vec(&state.private_metadata).ok()
     {
         return Err(Reason::IdentityChanged);
     }
-    verify(&journal.root, &seal.owner_file, policy, end, false)?;
-    let manifest_bytes =
-        update_state::read(&journal.root.join(&plan.manifest.relative), INVENTORY_LIMIT)
-            .map_err(|_| Reason::IdentityChanged)?
-            .ok_or(Reason::IdentityChanged)?;
-    let manifest = Manifest::parse(&manifest_bytes).map_err(|_| Reason::IdentityChanged)?;
+    let manifest = Manifest::parse(manifest_bytes).map_err(|_| Reason::IdentityChanged)?;
     let app = format!(
         "{}/{}",
         manifest.field("dir").map_err(|_| Reason::IdentityChanged)?,
@@ -881,6 +907,8 @@ fn exit_lock(
                 return Ok(guard);
             }
             Err(fs::TryLockError::WouldBlock) if wait => {
+                #[cfg(test)]
+                observe_cleanup_admission(CleanupAdmissionEvent::ExitWouldBlock(path.clone()), end);
                 std::thread::sleep(
                     Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
                 );
@@ -892,6 +920,9 @@ fn exit_lock(
 /// No stderr/stdout, subprocess exit/PID query or ambient installation fallback.
 /// --recover is accepted only when executing the exact sealed private runner.
 pub(super) fn intercept(args: &[OsString]) -> Option<i32> {
+    if let Some(result) = managed_reinstall_handoff::intercept(args) {
+        return Some(result);
+    }
     if args.first().is_none_or(|arg| arg != CHILD) {
         return None;
     }
@@ -961,6 +992,8 @@ fn run_child(
     if plan.nonce != nonce || (!recover && plan.deadline_tick != Some(tick)) {
         return Err(Reason::IdentityChanged);
     }
+    #[cfg(test)]
+    observe_cleanup_admission(CleanupAdmissionEvent::BeforeImage, end);
     let running = std::env::current_exe().map_err(|_| Reason::IdentityChanged)?;
     if fs::canonicalize(&running).map_err(|_| Reason::IdentityChanged)?
         != fs::canonicalize(journal.root.join(&plan.runner.relative))
@@ -1316,9 +1349,7 @@ fn completion_history(journal: &Journal, seal: &Seal, end: Instant) -> Result<()
     {
         return Err(Reason::IdentityChanged);
     }
-    let mut previous: Option<DeferredCleanup> = None;
-    for sequence in 1..=journal.state.sequence {
-        time(end)?;
+    completion_history_records(&journal.state, seal, end, |sequence| {
         let relative = format!("state-{sequence:06}.json");
         let proof = private_proof(&journal.root, &relative, &seal.policy, end)?;
         let bytes = update_state::read(&journal.root.join(relative), INVENTORY_LIMIT)
@@ -1327,13 +1358,28 @@ fn completion_history(journal: &Journal, seal: &Seal, end: Instant) -> Result<()
         if format!("{:x}", Sha256::digest(&bytes)) != proof.digest {
             return Err(Reason::IdentityChanged);
         }
+        verify(&journal.root, &proof, &seal.policy, end, false)?;
+        Ok(bytes)
+    })
+}
+
+fn completion_history_records(
+    latest: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+    mut read: impl FnMut(u64) -> Result<Vec<u8>, Reason>,
+) -> Result<(), Reason> {
+    let mut previous: Option<DeferredCleanup> = None;
+    for sequence in 1..=latest.sequence {
+        time(end)?;
+        let bytes = read(sequence)?;
         let state: DeferredCleanup =
             serde_json::from_slice(&bytes).map_err(|_| Reason::IdentityChanged)?;
         if state.schema != STATE_SCHEMA
             || state.owner != seal.owner
             || state.sequence != sequence
             || state.catalog_incarnation != seal.catalog_incarnation
-            || state.catalog_file_identity != journal.state.catalog_file_identity
+            || state.catalog_file_identity != latest.catalog_file_identity
             || state.package_manifest_sha256 != seal.package_manifest_sha256
         {
             return Err(Reason::IdentityChanged);
@@ -1347,8 +1393,7 @@ fn completion_history(journal: &Journal, seal: &Seal, end: Instant) -> Result<()
                 (&plan.manifest, &seal.manifest),
                 (
                     &plan.seal,
-                    &journal
-                        .state
+                    &latest
                         .after_exit
                         .as_ref()
                         .ok_or(Reason::IdentityChanged)?
@@ -1391,14 +1436,16 @@ fn completion_history(journal: &Journal, seal: &Seal, end: Instant) -> Result<()
                 }
             }
         }
-        verify(&journal.root, &proof, &seal.policy, end, false)?;
         previous = Some(state);
     }
     time(end)
 }
 
-fn completion_prerequisites(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
-    let state = &journal.state;
+fn completion_prerequisites(
+    state: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+) -> Result<(), Reason> {
     let report = &state.report;
     let plan = state
         .after_exit
@@ -1442,7 +1489,7 @@ fn completion_prerequisites(journal: &Journal, seal: &Seal, end: Instant) -> Res
 }
 
 fn precompletion_receipt(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
-    completion_prerequisites(journal, seal, end)?;
+    completion_prerequisites(&journal.state, seal, end)?;
     let report = &journal.state.report;
     let plan = journal
         .state
@@ -1468,18 +1515,24 @@ fn precompletion_receipt(journal: &Journal, seal: &Seal, end: Instant) -> Result
 }
 
 fn completed_receipt(journal: &Journal, seal: &Seal, end: Instant) -> Result<Option<u64>, Reason> {
-    completion_prerequisites(journal, seal, end)?;
-    let report = &journal.state.report;
-    let plan = journal
-        .state
-        .after_exit
-        .as_ref()
-        .ok_or(Reason::IdentityChanged)?;
+    completed_receipt_records(&journal.state, seal, end, |sequence| {
+        validated_tail_result(journal, seal, sequence, end)
+    })
+}
+
+fn completed_receipt_records(
+    state: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+    mut tail: impl FnMut(u64) -> Result<Option<TailReceiptCompletion>, Reason>,
+) -> Result<Option<u64>, Reason> {
+    completion_prerequisites(state, seal, end)?;
+    let report = &state.report;
+    let plan = state.after_exit.as_ref().ok_or(Reason::IdentityChanged)?;
     let tail_sequence = if let Some(sequence) = plan.tail_handoff_sequence {
         if !cfg!(windows)
             || plan.tail.is_none()
-            || validated_tail_result(journal, seal, sequence, end)?
-                != Some(TailReceiptCompletion::Complete)
+            || tail(sequence)? != Some(TailReceiptCompletion::Complete)
         {
             return Err(Reason::AfterExitCleanupPending);
         }
@@ -1519,10 +1572,28 @@ fn require_absent(
 }
 
 fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Result<(), Reason> {
-    let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    completed_payload_at(
+        &journal.prefix,
+        &journal.catalog,
+        &journal.root,
+        &journal.state,
+        seal,
+        end,
+    )
+}
+
+fn completed_payload_at(
+    prefix: &Path,
+    catalog: &Path,
+    journal_root: &Path,
+    state: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+) -> Result<(), Reason> {
+    let root = catalog.parent().ok_or(Reason::IdentityChanged)?;
     for proof in &seal.package_files {
         require_absent(
-            &journal.prefix,
+            prefix,
             proof,
             &seal.policy,
             Reason::AfterExitCleanupPending,
@@ -1546,7 +1617,7 @@ fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Res
     {
         verify(root, proof, &seal.policy, end, false)?;
     }
-    for group in &journal.state.groups {
+    for group in &state.groups {
         if !group.removed {
             return Err(match group.kind {
                 GroupKind::Corpus => Reason::CorpusCleanupPending,
@@ -1565,9 +1636,9 @@ fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Res
             )?;
         }
     }
-    if !journal.state.owner.keep_data {
+    if !state.owner.keep_data {
         // A forged group list cannot hide a surviving main database or sibling.
-        for main in [&journal.catalog, &SqliteControlStore::path(root)] {
+        for main in [catalog, SqliteControlStore::path(root).as_path()] {
             for suffix in ["", "-wal", "-shm"] {
                 let name = format!(
                     "{}{suffix}",
@@ -1585,7 +1656,7 @@ fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Res
         }
     }
     require_absent(
-        &journal.root,
+        journal_root,
         &seal.runner,
         &seal.policy,
         Reason::AfterExitCleanupPending,
@@ -1593,7 +1664,7 @@ fn completed_payload_absent(journal: &Journal, seal: &Seal, end: Instant) -> Res
     )?;
     if let Some(tail) = &seal.tail {
         require_absent(
-            &journal.root,
+            journal_root,
             tail,
             &seal.policy,
             Reason::AfterExitCleanupPending,
@@ -2184,10 +2255,21 @@ fn writer_proof_with_open(
     end: Instant,
     open_file: impl FnOnce(&Path) -> Result<fs::File, Reason>,
 ) -> Result<OwnedFile, Reason> {
-    time(end)?;
     let root = journal.catalog.parent().ok_or(Reason::IdentityChanged)?;
+    writer_proof_at(root, journal.data_identity, writer, policy, end, open_file)
+}
+
+fn writer_proof_at(
+    root: &Path,
+    root_identity: RootIdentity,
+    writer: &mut WriterLease,
+    policy: &TerminalPolicy,
+    end: Instant,
+    open_file: impl FnOnce(&Path) -> Result<fs::File, Reason>,
+) -> Result<OwnedFile, Reason> {
+    time(end)?;
     if writer.path() != root.join("writer.lock")
-        || RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != journal.data_identity
+        || RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != root_identity
         || policy.overlaps(writer.path())?
     {
         return Err(Reason::IdentityChanged);
@@ -2219,7 +2301,7 @@ fn writer_proof_with_open(
     writer
         .validate_current(root)
         .map_err(|_| Reason::IdentityChanged)?;
-    if RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != journal.data_identity {
+    if RootIdentity::read(root).map_err(|_| Reason::IdentityChanged)? != root_identity {
         return Err(Reason::IdentityChanged);
     }
     time(end)?;
@@ -2728,26 +2810,7 @@ fn validate_borrowed_keep_data_with_owner(
             )
             .map_err(control_error)?;
         time(end)?;
-        let policy = &status.policy;
-        if !journal.state.owner.keep_data
-            || seal.owner != journal.state.owner
-            || policy.installation_id.as_str() != journal.state.owner.installation_id
-            || &policy.installation_id != installation.installation_id()
-            || seal.catalog_incarnation != journal.state.catalog_incarnation
-            || status.catalog_incarnation.as_ref().map(ControlId::as_str)
-                != Some(seal.catalog_incarnation.as_str())
-            || policy.maintenance.state != MaintenanceState::Uninstalling
-            || policy.maintenance.owner.as_ref().map(ControlId::as_str)
-                != Some(journal.state.owner.nonce.as_str())
-            || policy.control_seq.get() != seal.policy.control_seq
-            || policy.policy_epoch.get() != seal.policy.policy_epoch
-            || serde_json::to_vec(&terminal_regions(policy))
-                .map_err(|_| Reason::MaintenanceConflict)?
-                != serde_json::to_vec(&seal.policy.regions)
-                    .map_err(|_| Reason::MaintenanceConflict)?
-        {
-            return Err(Reason::MaintenanceConflict);
-        }
+        validate_keep_status(&journal.state, seal, &status, installation)?;
         time(end)?;
         #[cfg(test)]
         tests::before_borrowed_keep_data_check(tests::BorrowedKeepDataCheck::Catalog)
@@ -2764,6 +2827,33 @@ fn validate_borrowed_keep_data_with_owner(
     control
         .with_runtime_deadline(end, || Ok(inspect()))
         .map_err(control_error)?
+}
+
+fn validate_keep_status(
+    state: &DeferredCleanup,
+    seal: &Seal,
+    status: &ControlStatus,
+    installation: &InstallationLockAuthority<'_>,
+) -> Result<(), Reason> {
+    let policy = &status.policy;
+    if !state.owner.keep_data
+        || seal.owner != state.owner
+        || policy.installation_id.as_str() != state.owner.installation_id
+        || &policy.installation_id != installation.installation_id()
+        || seal.catalog_incarnation != state.catalog_incarnation
+        || status.catalog_incarnation.as_ref().map(ControlId::as_str)
+            != Some(seal.catalog_incarnation.as_str())
+        || policy.maintenance.state != MaintenanceState::Uninstalling
+        || policy.maintenance.owner.as_ref().map(ControlId::as_str)
+            != Some(state.owner.nonce.as_str())
+        || policy.control_seq.get() != seal.policy.control_seq
+        || policy.policy_epoch.get() != seal.policy.policy_epoch
+        || serde_json::to_vec(&terminal_regions(policy)).map_err(|_| Reason::MaintenanceConflict)?
+            != serde_json::to_vec(&seal.policy.regions).map_err(|_| Reason::MaintenanceConflict)?
+    {
+        return Err(Reason::MaintenanceConflict);
+    }
+    Ok(())
 }
 
 fn validate_keep_fence(
@@ -2842,6 +2932,8 @@ fn remove_exact(
     policy: &TerminalPolicy,
     end: Instant,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    observe_cleanup_admission(CleanupAdmissionEvent::BeforeDelete, end);
     let invalid = |_| std::io::Error::other("owned cleanup identity changed");
     verify(base, proof, policy, end, false).map_err(invalid)?;
     let path = base.join(&proof.relative);
