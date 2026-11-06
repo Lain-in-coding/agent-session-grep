@@ -1,12 +1,13 @@
 //! Real SQLite/WAL and OS-lock tests under synthetic private roots.
 use agent_session_grep_adapters_sqlite::{
     SqliteControlStore, WriterLease,
-    control::{BackupPurpose, BackupRegistration, BackupState},
+    control::{BackupPurpose, BackupRegistration, BackupState, InstallationLockAuthority},
     managed_locks::{ExclusiveGuard, JobLockKey, LockKind, SharedGuard},
     managed_maintenance::{
         BackupAttention, BackupOutcome, MaintenanceCatalog, PurgeOutcome, RestoreOutcome,
-        apply_restore, inspect_catalog_identity, inspect_restore_inventory, prepare_restore,
-        prepare_restore_exact, purge_backup, verify_backup, verify_backup_until,
+        apply_restore, inspect_catalog_identity, inspect_restore_inventory,
+        inspect_uninstall_catalog_identity, prepare_restore, prepare_restore_exact, purge_backup,
+        verify_backup, verify_backup_until,
     },
     managed_store::ManagedStore,
 };
@@ -2753,6 +2754,355 @@ fn readonly_identity_rejects_wrong_root_invalid_identity_and_expired_or_locked_a
         inspect_catalog_identity(&f.control, &f.catalog, success_end()),
         Err(PortError::SchemaIncompatible(_))
     ));
+}
+
+fn uninstall_identity_guards(
+    f: &Fixture,
+    fence: MaintenanceFence,
+) -> (InstallationLockAuthority<'_>, ExclusiveGuard, ManagedStore) {
+    let until = success_end();
+    // Keep an ordinary reader open before fencing so the inspected connection
+    // is not the last catalog connection and SQLite siblings remain stable.
+    let reader = ManagedStore::open_with_deadline(&f.catalog, &f.control, until).unwrap();
+    let owner = acquire_until(&f.root, LockKind::PolicyOwner, until);
+    let installation = prepare(&f.control, until, |_| {
+        let installation = f
+            .control
+            .bind_installation(&f.prefix, &f.installation_lock)?;
+        if fence.state != MaintenanceState::Idle {
+            let bound = f.control.bind_control_root(&owner)?;
+            f.control.begin_maintenance(
+                f.control.status()?.policy.control_seq,
+                &id("path-uninstall"),
+                &bound,
+                &installation,
+                fence,
+            )?;
+        }
+        Ok(installation)
+    })
+    .unwrap();
+    (installation, owner, reader)
+}
+
+fn uninstall_identity_fence() -> MaintenanceFence {
+    MaintenanceFence {
+        state: MaintenanceState::Uninstalling,
+        owner: Some(id("path-uninstall")),
+        phase: Some(MaintenancePhase::Quiescing),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityFile {
+    Lock(u64),
+    SharedMemory,
+    Bytes(Vec<u8>),
+}
+
+fn uninstall_identity_files(
+    root: &Path,
+) -> std::collections::BTreeMap<std::ffi::OsString, IdentityFile> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name();
+            let artifact = if name.to_str().unwrap().ends_with(".lock") {
+                // Preserve names/types/lengths without reading another handle's
+                // locked byte range on Windows. Held guards prove ownership.
+                IdentityFile::Lock(entry.metadata().unwrap().len())
+            } else if name.to_str().unwrap().ends_with("-shm") {
+                IdentityFile::SharedMemory
+            } else {
+                IdentityFile::Bytes(std::fs::read(entry.path()).unwrap())
+            };
+            (name, artifact)
+        })
+        .collect()
+}
+
+#[test]
+fn uninstall_identity_borrows_the_fence_without_mutation_or_ordinary_admission() {
+    let f = Fixture::new();
+    let (installation, owner, reader) = uninstall_identity_guards(&f, uninstall_identity_fence());
+    let before = prepare(&f.control, success_end(), |_| f.control.status()).unwrap();
+    let files = uninstall_identity_files(&f.root);
+    let prefix_files = uninstall_identity_files(&f.prefix);
+    let until = success_end();
+    let probe = until + Duration::from_secs(1);
+    let identity = inspect_uninstall_catalog_identity(
+        &f.control,
+        &f.catalog,
+        &installation,
+        &owner,
+        &id("path-uninstall"),
+        until,
+    )
+    .unwrap();
+    assert_eq!(identity.installation, id("installation"));
+    assert_eq!(identity.incarnation, id("original_incarnation"));
+    assert_eq!(identity.schema, 22);
+    assert_eq!(identity.generation, 0);
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert!(matches!(
+        inspect_catalog_identity(&f.control, &f.catalog, end()),
+        Err(PortError::WriterBusy(reason))
+            if reason == "catalog identity admission requires idle maintenance"
+    ));
+    assert_eq!(
+        prepare(&f.control, success_end(), |_| f.control.status()).unwrap(),
+        before
+    );
+    assert_eq!(uninstall_identity_files(&f.root), files);
+    assert_eq!(uninstall_identity_files(&f.prefix), prefix_files);
+    owner.validate_current(&f.root).unwrap();
+    f.installation_lock.validate_current(&f.prefix).unwrap();
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(&f.root, LockKind::PolicyOwner),
+        Err(PortError::WriterBusy(_))
+    ));
+    assert!(matches!(
+        ExclusiveGuard::try_acquire(&f.prefix, f.installation_lock.kind().clone()),
+        Err(PortError::WriterBusy(_))
+    ));
+    drop(reader);
+    drop(ExclusiveGuard::try_acquire(&f.root, LockKind::CatalogHandles).unwrap());
+}
+
+#[test]
+fn uninstall_identity_refuses_idle_other_states_and_wrong_phase_without_effects() {
+    for fence in [
+        MaintenanceFence::idle(),
+        MaintenanceFence {
+            state: MaintenanceState::Updating,
+            ..uninstall_identity_fence()
+        },
+        MaintenanceFence {
+            state: MaintenanceState::Recovering,
+            phase: Some(MaintenancePhase::Reconciling),
+            ..uninstall_identity_fence()
+        },
+        MaintenanceFence {
+            phase: Some(MaintenancePhase::Failed),
+            ..uninstall_identity_fence()
+        },
+    ] {
+        let f = Fixture::new();
+        let (installation, owner, _reader) = uninstall_identity_guards(&f, fence);
+        let before = prepare(&f.control, success_end(), |_| f.control.status()).unwrap();
+        let files = uninstall_identity_files(&f.root);
+        assert!(matches!(
+            inspect_uninstall_catalog_identity(
+                &f.control,
+                &f.catalog,
+                &installation,
+                &owner,
+                &id("path-uninstall"),
+                success_end(),
+            ),
+            Err(PortError::InvalidRequest(reason))
+                if reason == "catalog identity admission requires this uninstall fence"
+        ));
+        assert_eq!(uninstall_identity_files(&f.root), files);
+        assert_eq!(
+            prepare(&f.control, success_end(), |_| f.control.status()).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn uninstall_identity_refuses_wrong_owner_root_kind_and_installation() {
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let (installation, owner, _reader) = uninstall_identity_guards(&f, uninstall_identity_fence());
+    let (other_installation, other_owner, _other_reader) =
+        uninstall_identity_guards(&other, uninstall_identity_fence());
+    let wrong_kind = acquire(&f.root, LockKind::Background);
+    let files = uninstall_identity_files(&f.root);
+    let other_files = uninstall_identity_files(&other.root);
+    let operation = id("path-uninstall");
+    let wrong_operation = id("another-operation");
+    for (catalog, authority, policy_owner, nonce) in [
+        (&f.catalog, &installation, &owner, &wrong_operation),
+        (&f.catalog, &installation, &other_owner, &operation),
+        (&f.catalog, &installation, &wrong_kind, &operation),
+        (&f.catalog, &other_installation, &owner, &operation),
+        (&other.catalog, &installation, &owner, &operation),
+    ] {
+        assert!(matches!(
+            inspect_uninstall_catalog_identity(
+                &f.control,
+                catalog,
+                authority,
+                policy_owner,
+                nonce,
+                success_end(),
+            ),
+            Err(PortError::InvalidRequest(_))
+        ));
+        assert_eq!(uninstall_identity_files(&f.root), files);
+        assert_eq!(uninstall_identity_files(&other.root), other_files);
+    }
+    assert_eq!(
+        inspect_uninstall_catalog_identity(
+            &f.control,
+            &f.catalog,
+            &installation,
+            &owner,
+            &operation,
+            success_end(),
+        )
+        .unwrap()
+        .incarnation,
+        id("original_incarnation")
+    );
+}
+
+#[test]
+fn uninstall_identity_refuses_incompatible_catalog_without_repair() {
+    let f = Fixture::new();
+    let (installation, owner, _reader) = uninstall_identity_guards(&f, uninstall_identity_fence());
+    {
+        let raw = rusqlite::Connection::open(&f.catalog).unwrap();
+        raw.pragma_update(None, "user_version", 999).unwrap();
+    }
+    let files = uninstall_identity_files(&f.root);
+    assert!(matches!(
+        inspect_uninstall_catalog_identity(
+            &f.control,
+            &f.catalog,
+            &installation,
+            &owner,
+            &id("path-uninstall"),
+            success_end(),
+        ),
+        Err(PortError::SchemaIncompatible(reason))
+            if reason == "managed catalog identity is unavailable"
+    ));
+    assert_eq!(uninstall_identity_files(&f.root), files);
+}
+
+#[test]
+fn uninstall_identity_preserves_original_and_earlier_ends_and_restores_scope() {
+    let f = Fixture::new();
+    let (installation, owner, reader) = uninstall_identity_guards(&f, uninstall_identity_fence());
+    drop(reader);
+    let blocker = acquire(&f.root, LockKind::CatalogHandles);
+    let files = uninstall_identity_files(&f.root);
+    assert!(matches!(
+        inspect_uninstall_catalog_identity(
+            &f.control,
+            &f.catalog,
+            &installation,
+            &owner,
+            &id("path-uninstall"),
+            Instant::now(),
+        ),
+        Err(PortError::WriterBusy(reason)) if reason == "control runtime deadline reached"
+    ));
+    assert_eq!(uninstall_identity_files(&f.root), files);
+    let outer_end = Instant::now() + Duration::from_secs(1);
+    let requested_end = outer_end + Duration::from_secs(5);
+    let probe = requested_end + Duration::from_secs(1);
+    let result = f.control.with_runtime_deadline(outer_end, || {
+        let result = inspect_uninstall_catalog_identity(
+            &f.control,
+            &f.catalog,
+            &installation,
+            &owner,
+            &id("path-uninstall"),
+            requested_end,
+        );
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            outer_end
+        );
+        result
+    });
+    let returned = Instant::now();
+    assert!(matches!(
+        result,
+        Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+    ));
+    assert!(returned >= outer_end);
+    assert!(
+        returned < requested_end,
+        "catalog wait renewed the original end"
+    );
+    assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), probe);
+    assert_eq!(uninstall_identity_files(&f.root), files);
+    owner.validate_current(&f.root).unwrap();
+    f.installation_lock.validate_current(&f.prefix).unwrap();
+    drop(blocker);
+    assert!(
+        inspect_uninstall_catalog_identity(
+            &f.control,
+            &f.catalog,
+            &installation,
+            &owner,
+            &id("path-uninstall"),
+            success_end(),
+        )
+        .is_ok()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_identity_refuses_replaced_guard_inodes_then_reuses_original_guards() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let f = Fixture::new();
+    let (installation, owner, _reader) = uninstall_identity_guards(&f, uninstall_identity_fence());
+    let prefix_locks: Vec<_> = std::fs::read_dir(&f.prefix)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(prefix_locks.len(), 1);
+    for path in [prefix_locks[0].clone(), f.root.join("policy-owner.lock")] {
+        let aside = path.with_extension("displaced.lock");
+        std::fs::rename(&path, &aside).unwrap();
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap(),
+        );
+        let files = uninstall_identity_files(&f.root);
+        let prefix_files = uninstall_identity_files(&f.prefix);
+        assert!(matches!(
+            inspect_uninstall_catalog_identity(
+                &f.control,
+                &f.catalog,
+                &installation,
+                &owner,
+                &id("path-uninstall"),
+                success_end(),
+            ),
+            Err(PortError::SourceIo(reason))
+                if reason == "managed lock storage or request is invalid (site=current, step=replaced)"
+        ));
+        assert_eq!(uninstall_identity_files(&f.root), files);
+        assert_eq!(uninstall_identity_files(&f.prefix), prefix_files);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        assert!(
+            inspect_uninstall_catalog_identity(
+                &f.control,
+                &f.catalog,
+                &installation,
+                &owner,
+                &id("path-uninstall"),
+                success_end(),
+            )
+            .is_ok()
+        );
+    }
 }
 
 #[test]

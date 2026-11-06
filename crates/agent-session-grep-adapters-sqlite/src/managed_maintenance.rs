@@ -23,8 +23,8 @@ use crate::{
 use agent_session_grep_ports::{
     PortError, PortResult, SearchProvider,
     control::{
-        CanonicalLocator, ControlId, ControlStore, MaintenanceState, ReadPolicy,
-        RequestIntersection,
+        CanonicalLocator, ControlId, ControlStatus, ControlStore, MaintenancePhase,
+        MaintenanceState, ReadPolicy, RequestIntersection,
     },
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, backup};
@@ -2460,6 +2460,54 @@ pub fn inspect_catalog_identity(
     catalog: &Path,
     deadline: Instant,
 ) -> PortResult<CatalogIdentity> {
+    inspect_catalog_identity_with_admission(control, catalog, deadline, |status| {
+        if status.policy.maintenance.state != MaintenanceState::Idle {
+            return Err(busy("catalog identity admission requires idle maintenance"));
+        }
+        Ok(())
+    })
+}
+
+/// Source-free identity inspection for the already fenced uninstall PATH step.
+/// The caller retains the real prefix and PolicyOwner guards. This grants no
+/// catalog read permission, fence adoption, journal or native-write authority.
+pub fn inspect_uninstall_catalog_identity(
+    control: &SqliteControlStore,
+    catalog: &Path,
+    installation: &InstallationLockAuthority<'_>,
+    policy_owner: &ExclusiveGuard,
+    operation: &ControlId,
+    deadline: Instant,
+) -> PortResult<CatalogIdentity> {
+    inspect_catalog_identity_with_admission(control, catalog, deadline, |status| {
+        if policy_owner.kind() != &LockKind::PolicyOwner
+            || !control.matches_root(policy_owner.root_identity())
+        {
+            return Err(invalid(
+                "uninstall identity requires the control policy owner",
+            ));
+        }
+        policy_owner.validate_current(control.private_root())?;
+        installation.validate_current(control)?;
+        let fence = &status.policy.maintenance;
+        if fence.state != MaintenanceState::Uninstalling
+            || fence.owner.as_ref() != Some(operation)
+            || fence.phase != Some(MaintenancePhase::Quiescing)
+        {
+            return Err(invalid(
+                "catalog identity admission requires this uninstall fence",
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn inspect_catalog_identity_with_admission(
+    control: &SqliteControlStore,
+    catalog: &Path,
+    deadline: Instant,
+    admit: impl Fn(&ControlStatus) -> PortResult<()>,
+) -> PortResult<CatalogIdentity> {
     let deadline = SqliteControlStore::effective_runtime_deadline(deadline);
     control.with_runtime_deadline(deadline, || {
         check_deadline(deadline)?;
@@ -2473,9 +2521,7 @@ pub fn inspect_catalog_identity(
             return Err(invalid("catalog is not in the control root"));
         }
         let before = control.status()?;
-        if before.policy.maintenance.state != MaintenanceState::Idle {
-            return Err(busy("catalog identity admission requires idle maintenance"));
-        }
+        admit(&before)?;
         let handles = loop {
             check_deadline(deadline)?;
             match SharedGuard::try_acquire(parent, LockKind::CatalogHandles) {
@@ -2512,6 +2558,7 @@ pub fn inspect_catalog_identity(
         {
             return Err(busy("catalog policy changed during identity admission"));
         }
+        admit(&after)?;
         check_deadline(deadline)?;
         Ok(identity)
     })

@@ -691,6 +691,12 @@ impl InstallationLockAuthority<'_> {
     pub(crate) fn validate(&self, store: &SqliteControlStore) -> PortResult<()> {
         self.validate_bound(store, || Ok(store.status()?.policy.installation_id))
     }
+    /// Recheck the held prefix lock inode before the existing binding checks.
+    /// This borrows the original guard; it never releases or reacquires it.
+    pub(crate) fn validate_current(&self, store: &SqliteControlStore) -> PortResult<()> {
+        self.guard.validate_current(&self.prefix)?;
+        self.validate(store)
+    }
     /// Same root/kind/prefix/receipt checks as `validate`, comparing the
     /// installation recorded in one snapshot the caller already read through
     /// this connection instead of issuing a second default-budget status read.
