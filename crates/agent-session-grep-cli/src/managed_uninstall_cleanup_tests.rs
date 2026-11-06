@@ -556,8 +556,12 @@ impl PackageFixture {
         journal.save(deadline()).unwrap();
         let install_lock =
             update_state::acquire_installation_lock(&self.prefix, deadline()).unwrap();
+        // Each independent preparation request keeps one explicit end.
+        // Tail execution and cleanup retain their own original budgets.
         let installation = control
-            .bind_installation(&self.prefix, &install_lock)
+            .with_runtime_deadline(deadline(), || {
+                control.bind_installation(&self.prefix, &install_lock)
+            })
             .unwrap();
         journal.state.purge_prerequisite_complete = true;
         fence(control, &installation, &mut journal, deadline()).unwrap();
@@ -569,17 +573,20 @@ impl PackageFixture {
             drop(guards);
         } else {
             let operation = id(&journal.state.owner.nonce);
-            let intent = RetirementIntent::bind(
+            let intent = RetirementIntent::bind_with_deadline(
                 control,
                 &self.catalog,
                 &self.prefix,
                 &install_lock,
                 &operation,
+                deadline(),
             )
             .unwrap();
             journal.state.retirement_intent_captured = true;
             let guards = cleanup_data(control, &mut journal, Some(&intent), deadline()).unwrap();
-            let _ = intent.refresh(control, &guards.policy_owner).unwrap();
+            let _ = intent
+                .refresh_with_deadline(control, &guards.policy_owner, deadline())
+                .unwrap();
             drop(guards);
         }
         journal.save(deadline()).unwrap();
@@ -1522,16 +1529,19 @@ fn tail_handoff(fixture: &mut PackageFixture, keep: bool) -> (Journal, Seal) {
         let installation =
             update_state::acquire_installation_lock(&fixture.prefix, deadline()).unwrap();
         let operation = id(&journal.state.owner.nonce);
-        let intent = RetirementIntent::bind(
+        let intent = RetirementIntent::bind_with_deadline(
             &control,
             &fixture.catalog,
             &fixture.prefix,
             &installation,
             &operation,
+            deadline(),
         )
         .unwrap();
         let guards = cleanup_data(&control, &mut journal, Some(&intent), deadline()).unwrap();
-        let refreshed = intent.refresh(&control, &guards.policy_owner).unwrap();
+        let refreshed = intent
+            .refresh_with_deadline(&control, &guards.policy_owner, deadline())
+            .unwrap();
         drop(control);
         terminal_handoff(&mut journal, &refreshed, guards.retirement(), deadline()).unwrap();
     }
