@@ -2710,7 +2710,15 @@ fn m2_workbuddy_independent_metadata_selection_revoke_and_paused_original() {
     let metadata_selection = m2_selection(&f, &metadata);
     f.revoke(&metadata_selection);
     f.wait(|f| m2_receipt_stale(f, &source));
-    assert!(f.has_text("wbindependentoriginalneedle"));
+    // Purge may still hold the catalog gate. Retry only observations with
+    // no answer; a definite loss of the selected original remains a failure.
+    f.wait(
+        |f| match f.observe(f.text_state("wbindependentoriginalneedle")) {
+            Some(true) => true,
+            Some(false) => panic!("selected original disappeared after metadata revoke"),
+            None => false,
+        },
+    );
     m2_assert_no_metadata_enrichment(&f, "wbindependentoriginalneedle");
     let (withdrawn, cycle) = m2_post_revoke_cycle_attempted(&f, 3);
     assert_eq!(cycle.state, CycleState::Partial);
