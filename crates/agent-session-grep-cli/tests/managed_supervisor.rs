@@ -974,7 +974,15 @@ fn actual_image_startup_admission_is_separate_from_live_control_polls() {
     fs::write(&pointer, b"{}\n").unwrap();
     // Live control observation neither rehashes the large image nor rereads
     // package metadata. Its worker and original control authority stay bound.
-    assert_eq!(harness.supervisor.tick().unwrap(), SupervisorState::Running);
+    harness.until(|supervisor, state, _| {
+        assert_eq!(supervisor.child_id(), Some(worker));
+        assert_eq!(supervisor.policy().unexpected_exits(), 0);
+        match state {
+            SupervisorState::Running => true,
+            SupervisorState::Busy => false,
+            other => panic!("unexpected live control state: {other:?}"),
+        }
+    });
     assert_eq!(harness.supervisor.child_id(), Some(worker));
     fixture.desired(DesiredUpdates::Stopped);
     harness.until(|_, state, _| state == SupervisorState::Finished);
