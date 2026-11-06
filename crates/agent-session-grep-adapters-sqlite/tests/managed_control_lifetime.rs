@@ -8,7 +8,7 @@ use agent_session_grep_adapters_sqlite::{
         RetiredControlFile, RetirementBinding, RetirementDrainGuards, RetirementIntent,
         validate_retirement,
     },
-    managed_locks::{ExclusiveGuard, JobLockKey, LockKind, SharedGuard},
+    managed_locks::{ExclusiveGuard, JobLockKey, LockKind, RootIdentity, SharedGuard},
     managed_store::ManagedStore,
 };
 use agent_session_grep_ports::{PortError, PortResult, control::*};
@@ -192,6 +192,289 @@ fn expected<'a>(
         catalog_incarnation: incarnation,
         operation,
     }
+}
+
+// Include directory names as well as bytes so validation cannot silently create,
+// promote or remove fixture state. No provider paths are traversed.
+fn inventory_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut inventory = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            let bytes = if metadata.is_dir() {
+                pending.push(path.clone());
+                None
+            } else {
+                assert!(metadata.is_file());
+                // Empty rendezvous files may be exclusively locked on Windows.
+                // Their metadata proves empty bytes without a second read.
+                Some(if metadata.len() == 0 {
+                    Vec::new()
+                } else {
+                    fs::read(&path).unwrap()
+                })
+            };
+            inventory.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+        }
+    }
+    inventory
+}
+
+#[test]
+fn borrowed_retirement_binding_validates_repeatedly_without_unlocking_or_writing() {
+    let mut f = Fixture::new();
+    f.fence();
+    let status = acquire(|| f.control.as_ref().unwrap().status());
+    let intent = bind_intent(
+        f.control.as_ref().unwrap(),
+        &f.catalog,
+        &f.prefix,
+        &f.installation,
+    );
+    let drains = Drains::new(&f.root);
+    drop(f.control.take());
+    let retirement = acquire(|| intent.try_acquire(drains.proof()));
+    retirement.publish_marker().unwrap();
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    let contender = fs::File::open(f.root.join("control-handles.lock")).unwrap();
+    let operation = id("synthetic-uninstall");
+    let end = Instant::now() + Duration::from_secs(30);
+    for _ in 0..3 {
+        retirement
+            .validate_expected_binding_with_deadline(
+                RootIdentity::read(&f.root).unwrap(),
+                RootIdentity::read(&f.prefix).unwrap(),
+                expected(
+                    &status.policy.installation_id,
+                    status.catalog_incarnation.as_ref().unwrap(),
+                    &operation,
+                ),
+                (status.policy.control_seq, status.policy.policy_epoch),
+                end,
+            )
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    }
+    drop(retirement);
+    contender.try_lock().unwrap();
+}
+
+#[test]
+fn borrowed_retirement_binding_rejects_each_wrong_expected_field() {
+    let mut f = Fixture::new();
+    f.fence();
+    let status = acquire(|| f.control.as_ref().unwrap().status());
+    let intent = bind_intent(
+        f.control.as_ref().unwrap(),
+        &f.catalog,
+        &f.prefix,
+        &f.installation,
+    );
+    let drains = Drains::new(&f.root);
+    drop(f.control.take());
+    let retirement = acquire(|| intent.try_acquire(drains.proof()));
+    retirement.publish_marker().unwrap();
+    let root = RootIdentity::read(&f.root).unwrap();
+    let prefix = RootIdentity::read(&f.prefix).unwrap();
+    let unrelated = RootIdentity::read(f._temp.path()).unwrap();
+    let operation = id("synthetic-uninstall");
+    let wrong = id("synthetic-wrong-binding");
+    let installation = &status.policy.installation_id;
+    let incarnation = status.catalog_incarnation.as_ref().unwrap();
+    let seq = status.policy.control_seq;
+    let epoch = status.policy.policy_epoch;
+    let before = inventory_bytes(&f.root);
+    let prefix_before = inventory_bytes(&f.prefix);
+    let end = Instant::now() + Duration::from_secs(30);
+    for (data, package, install, catalog, owner, counters) in [
+        (
+            unrelated,
+            prefix,
+            installation,
+            incarnation,
+            &operation,
+            (seq, epoch),
+        ),
+        (
+            root,
+            unrelated,
+            installation,
+            incarnation,
+            &operation,
+            (seq, epoch),
+        ),
+        (root, prefix, &wrong, incarnation, &operation, (seq, epoch)),
+        (root, prefix, installation, &wrong, &operation, (seq, epoch)),
+        (
+            root,
+            prefix,
+            installation,
+            incarnation,
+            &wrong,
+            (seq, epoch),
+        ),
+        (
+            root,
+            prefix,
+            installation,
+            incarnation,
+            &operation,
+            (ControlSeq::new(seq.get() + 1).unwrap(), epoch),
+        ),
+        (
+            root,
+            prefix,
+            installation,
+            incarnation,
+            &operation,
+            (seq, PolicyEpoch::new(epoch.get() + 1).unwrap()),
+        ),
+    ] {
+        assert!(matches!(
+            retirement.validate_expected_binding_with_deadline(
+                data,
+                package,
+                expected(install, catalog, owner),
+                counters,
+                end,
+            ),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+    }
+}
+
+#[test]
+fn borrowed_retirement_binding_refuses_pending_both_corrupt_and_absent_markers() {
+    let mut f = Fixture::new();
+    f.fence();
+    let status = acquire(|| f.control.as_ref().unwrap().status());
+    let intent = bind_intent(
+        f.control.as_ref().unwrap(),
+        &f.catalog,
+        &f.prefix,
+        &f.installation,
+    );
+    let drains = Drains::new(&f.root);
+    drop(f.control.take());
+    let retirement = acquire(|| intent.try_acquire(drains.proof()));
+    retirement.publish_marker().unwrap();
+    let published = f.root.join(RETIREMENT_MARKER);
+    let pending = f.root.join(RETIREMENT_PENDING_MARKER);
+    let marker = fs::read(&published).unwrap();
+    let operation = id("synthetic-uninstall");
+    let end = Instant::now() + Duration::from_secs(30);
+    let inspect = || {
+        retirement.validate_expected_binding_with_deadline(
+            RootIdentity::read(&f.root).unwrap(),
+            RootIdentity::read(&f.prefix).unwrap(),
+            expected(
+                &status.policy.installation_id,
+                status.catalog_incarnation.as_ref().unwrap(),
+                &operation,
+            ),
+            (status.policy.control_seq, status.policy.policy_epoch),
+            end,
+        )
+    };
+    inspect().unwrap();
+    let refuse_unchanged = || {
+        let before = inventory_bytes(&f.root);
+        let prefix_before = inventory_bytes(&f.prefix);
+        assert!(inspect().is_err());
+        assert_eq!(inventory_bytes(&f.root), before);
+        assert_eq!(inventory_bytes(&f.prefix), prefix_before);
+        assert_busy(ExclusiveGuard::try_acquire(
+            &f.root,
+            LockKind::ControlHandles,
+        ));
+    };
+    // Both markers, then pending only: inspection must never finish publication.
+    fs::write(&pending, &marker).unwrap();
+    refuse_unchanged();
+    fs::remove_file(&pending).unwrap();
+    fs::rename(&published, &pending).unwrap();
+    refuse_unchanged();
+    assert!(!published.exists());
+    assert_eq!(fs::read(&pending).unwrap(), marker);
+    fs::rename(&pending, &published).unwrap();
+    fs::write(&published, b"{").unwrap();
+    refuse_unchanged();
+    fs::remove_file(&published).unwrap();
+    refuse_unchanged();
+}
+
+#[test]
+fn borrowed_retirement_binding_refuses_expiry_and_replaced_held_lock() {
+    let mut f = Fixture::new();
+    f.fence();
+    let status = acquire(|| f.control.as_ref().unwrap().status());
+    let intent = bind_intent(
+        f.control.as_ref().unwrap(),
+        &f.catalog,
+        &f.prefix,
+        &f.installation,
+    );
+    let drains = Drains::new(&f.root);
+    drop(f.control.take());
+    let retirement = acquire(|| intent.try_acquire(drains.proof()));
+    retirement.publish_marker().unwrap();
+    let operation = id("synthetic-uninstall");
+    let root = RootIdentity::read(&f.root).unwrap();
+    let prefix = RootIdentity::read(&f.prefix).unwrap();
+    let inspect = |end| {
+        retirement.validate_expected_binding_with_deadline(
+            root,
+            prefix,
+            expected(
+                &status.policy.installation_id,
+                status.catalog_incarnation.as_ref().unwrap(),
+                &operation,
+            ),
+            (status.policy.control_seq, status.policy.policy_epoch),
+            end,
+        )
+    };
+    let before = inventory_bytes(&f.root);
+    assert_busy(inspect(Instant::now()));
+    assert_eq!(inventory_bytes(&f.root), before);
+    let end = Instant::now() + Duration::from_secs(30);
+    inspect(end).unwrap();
+    let lock_path = f.root.join("catalog-handles.lock");
+    let displaced = f.root.join("synthetic-old-catalog-lock");
+    match fs::rename(&lock_path, &displaced) {
+        Ok(()) => {}
+        #[cfg(windows)]
+        Err(error) => {
+            assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+            inspect(end).unwrap();
+            assert_eq!(inventory_bytes(&f.root), before);
+            return;
+        }
+        #[cfg(not(windows))]
+        Err(error) => panic!("{error}"),
+    }
+    fs::write(&lock_path, b"").unwrap();
+    let replaced = inventory_bytes(&f.root);
+    assert!(inspect(end).is_err());
+    assert_eq!(inventory_bytes(&f.root), replaced);
+    assert_eq!(fs::metadata(&lock_path).unwrap().len(), 0);
+    assert_eq!(fs::metadata(&displaced).unwrap().len(), 0);
+    assert_busy(ExclusiveGuard::try_acquire(
+        &f.root,
+        LockKind::ControlHandles,
+    ));
 }
 
 #[test]

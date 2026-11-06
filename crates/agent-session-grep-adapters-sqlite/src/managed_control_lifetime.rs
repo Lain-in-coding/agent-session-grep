@@ -548,6 +548,35 @@ impl<'a> ControlRetirement<'a> {
         with_retirement_deadline(end, |_| self.validate_marker())
     }
 
+    /// Check an existing retirement against the caller's exact terminal receipt.
+    /// The expected values grant no authority: the published marker, absence of
+    /// pending state and every retained guard must validate independently. This
+    /// neither resumes publication nor proves that payload cleanup is complete.
+    pub fn validate_expected_binding_with_deadline(
+        &self,
+        control_root: RootIdentity,
+        prefix_root: RootIdentity,
+        expected: RetirementBinding<'_>,
+        terminal: (ControlSeq, PolicyEpoch),
+        end: Instant,
+    ) -> PortResult<()> {
+        with_retirement_deadline(end, |_| {
+            self.validate_marker()?;
+            let marker = &self.intent.marker;
+            if self.intent.root_identity != control_root
+                || self.intent.prefix_identity != prefix_root
+                || marker.installation_id != expected.installation.as_str()
+                || marker.catalog_incarnation != expected.catalog_incarnation.as_str()
+                || marker.operation_id != expected.operation.as_str()
+                || marker.control_seq != terminal.0.get()
+                || marker.policy_epoch != terminal.1.get()
+            {
+                return Err(changed());
+            }
+            Ok(())
+        })
+    }
+
     pub fn remove_control_file_with_deadline(
         &self,
         file: RetiredControlFile,
