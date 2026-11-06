@@ -138,21 +138,69 @@ pub(crate) fn validate_selection(provider: &str, path: &Path) -> Result<(), CliE
     source_selection(provider, path).map(drop)
 }
 
+// Non-test builds expand to the original expression or attempt closure: no
+// observer state, clocks, extra calls or output exist outside unit-test builds.
+#[cfg(not(test))]
+macro_rules! observe_history_control {
+    ($phase:ident, $deadline:expr, $operation:expr) => {
+        $operation
+    };
+}
+#[cfg(test)]
+macro_rules! observe_history_control {
+    ($phase:ident, $deadline:expr, $operation:expr) => {
+        history_admission_observation::observe(
+            history_admission_observation::Phase::$phase,
+            $deadline,
+            || $operation,
+        )
+    };
+}
+#[cfg(not(test))]
+macro_rules! observe_history_attempt {
+    ($phase:ident, $deadline:expr, $attempt:expr) => {
+        $attempt
+    };
+}
+// Each retried attempt runs the same closure once through the observer.
+#[cfg(test)]
+macro_rules! observe_history_attempt {
+    ($phase:ident, $deadline:expr, $attempt:expr) => {{
+        let mut attempt = $attempt;
+        move || {
+            history_admission_observation::observe(
+                history_admission_observation::Phase::$phase,
+                $deadline,
+                &mut attempt,
+            )
+        }
+    }};
+}
+
+// rustfmt would add argument commas that the reviewed production expressions
+// do not have; keep the non-test expansion literally equal to them.
+#[rustfmt::skip]
 pub(crate) fn add_selected_history(
     provider: &str,
     path: &Path,
     identity: &crate::setup_hosts::SetupIdentity,
     deadline: Instant,
 ) -> Result<Value, CliError> {
-    retry_control(deadline, || identity.validate_before(deadline)).map_err(port)?;
+    observe_history_control!(Validate, deadline, retry_control(deadline,
+        observe_history_attempt!(ValidateAttempt, deadline, || identity.validate_before(deadline))))
+    .map_err(port)?;
     let provider = SearchProvider::parse(provider).ok_or_else(|| CliError::usage(SOURCES_HELP))?;
     let request = source_selection(provider, path)?;
-    let control =
-        retry_control(deadline, || identity.writable_control_before(deadline)).map_err(port)?;
-    let change = committed_control_mutation(&control, deadline, || {
-        identity.validate_before(deadline)?;
-        control.add_selection(control.status()?.policy.control_seq, request.clone())
-    })
+    let control = observe_history_control!(Writable, deadline, retry_control(deadline,
+        observe_history_attempt!(WritableAttempt, deadline,
+            || identity.writable_control_before(deadline))))
+    .map_err(port)?;
+    let change = observe_history_control!(Mutation, deadline, committed_control_mutation(&control,
+        deadline, observe_history_attempt!(MutationAttempt, deadline, || {
+            observe_history_control!(MutationValidate, deadline, identity.validate_before(deadline))?;
+            control.add_selection(observe_history_control!(MutationStatus, deadline,
+                control.status())?.policy.control_seq, request.clone())
+        })))
     .map_err(port)?;
     // The selection commit is the operation's point of no return. A later
     // identity/deadline check cannot undo it and must not turn a successful
@@ -974,6 +1022,271 @@ pub(crate) fn run(
         RetrievalMode::Lexical,
     );
     Ok(outcome)
+}
+
+#[cfg(test)]
+pub(crate) mod history_admission_observation {
+    use super::PortError;
+    use std::{cell::RefCell, fmt, time::Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Phase {
+        Validate,
+        ValidateAttempt,
+        Writable,
+        WritableAttempt,
+        Mutation,
+        MutationAttempt,
+        MutationValidate,
+        MutationStatus,
+    }
+    const PHASES: [Phase; 8] = [
+        Phase::Validate,
+        Phase::ValidateAttempt,
+        Phase::Writable,
+        Phase::WritableAttempt,
+        Phase::Mutation,
+        Phase::MutationAttempt,
+        Phase::MutationValidate,
+        Phase::MutationStatus,
+    ];
+    const CAPACITY: usize = 32;
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        phase: Phase,
+        entered: Instant,
+        returned: Instant,
+        end: Instant,
+        outcome: &'static str,
+    }
+    struct Observation {
+        started: Instant,
+        end: Instant,
+        completed: [u32; PHASES.len()],
+        succeeded: [u32; PHASES.len()],
+        samples: [Option<Sample>; CAPACITY],
+        next: usize,
+        overwritten: u32,
+        first_busy: Option<Sample>,
+        first_lock_busy: Option<Sample>,
+    }
+    thread_local! {
+        static OBSERVATION: RefCell<Option<Observation>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Recording {
+        active: bool,
+    }
+    impl Recording {
+        pub(crate) fn start(started: Instant, end: Instant) -> Self {
+            let active = OBSERVATION
+                .try_with(|slot| {
+                    let Ok(mut slot) = slot.try_borrow_mut() else {
+                        return false;
+                    };
+                    if slot.is_some() {
+                        return false;
+                    }
+                    *slot = Some(Observation {
+                        started,
+                        end,
+                        completed: [0; PHASES.len()],
+                        succeeded: [0; PHASES.len()],
+                        samples: [None; CAPACITY],
+                        next: 0,
+                        overwritten: 0,
+                        first_busy: None,
+                        first_lock_busy: None,
+                    });
+                    true
+                })
+                .unwrap_or(false);
+            Self { active }
+        }
+
+        pub(crate) fn finish(self) -> Report {
+            Report(if self.active {
+                OBSERVATION
+                    .try_with(|slot| slot.try_borrow_mut().ok()?.take())
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            })
+        }
+    }
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = OBSERVATION.try_with(|slot| {
+                    if let Ok(mut slot) = slot.try_borrow_mut() {
+                        *slot = None;
+                    }
+                });
+            }
+        }
+    }
+
+    fn outcome<T>(result: &Result<T, PortError>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(PortError::WriterBusy(message)) => match message.as_str() {
+                "control deadline reached" => "control_attempt_threshold",
+                "control runtime deadline reached" => "control_runtime_deadline",
+                "control retry deadline reached" => "control_retry_deadline",
+                "managed lock is busy" => "managed_lock_busy",
+                "control storage is busy" => "control_storage_busy",
+                "control shared memory is still mapped" => "control_shm_mapped",
+                "writer lease is already held" => "writer_lease_busy",
+                "managed catalog is busy" => "catalog_busy",
+                "managed catalog deadline reached" => "catalog_deadline",
+                _ => "writer_busy_other",
+            },
+            Err(PortError::GenerationMismatch(_)) => "generation_mismatch",
+            Err(PortError::DeadlineExceeded(_)) => "deadline_exceeded",
+            Err(PortError::InvalidRequest(_)) => "invalid_request",
+            Err(PortError::Backend(_)) => "backend",
+            Err(PortError::SourceIo(_)) => "source_io",
+            Err(PortError::SchemaIncompatible(_)) => "schema_incompatible",
+            Err(PortError::NotFound(_)) => "not_found",
+            Err(PortError::SnapshotChanged(_)) => "snapshot_changed",
+        }
+    }
+
+    pub(super) fn observe<T>(
+        phase: Phase,
+        end: Instant,
+        operation: impl FnOnce() -> Result<T, PortError>,
+    ) -> Result<T, PortError> {
+        let active = OBSERVATION
+            .try_with(|slot| slot.try_borrow().is_ok_and(|slot| slot.is_some()))
+            .unwrap_or(false);
+        if !active {
+            return operation();
+        }
+        let entered = Instant::now();
+        let result = operation();
+        let sample = Sample {
+            phase,
+            entered,
+            returned: Instant::now(),
+            end,
+            outcome: outcome(&result),
+        };
+        // Never retain a TLS borrow across the real receiver. Observation failure
+        // cannot replace its result or add another invocation.
+        let _ = OBSERVATION.try_with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return;
+            };
+            let Some(observed) = slot.as_mut() else {
+                return;
+            };
+            if let Some(count) = observed.completed.get_mut(phase as usize) {
+                *count = count.saturating_add(1);
+            }
+            if result.is_ok()
+                && let Some(count) = observed.succeeded.get_mut(phase as usize)
+            {
+                *count = count.saturating_add(1);
+            }
+            if matches!(&result, Err(PortError::WriterBusy(_))) && observed.first_busy.is_none() {
+                observed.first_busy = Some(sample);
+            }
+            if sample.outcome == "managed_lock_busy" && observed.first_lock_busy.is_none() {
+                observed.first_lock_busy = Some(sample);
+            }
+            if let Some(entry) = observed.samples.get_mut(observed.next) {
+                if entry.is_some() {
+                    observed.overwritten = observed.overwritten.saturating_add(1);
+                }
+                *entry = Some(sample);
+            }
+            observed.next = (observed.next + 1) % CAPACITY;
+        });
+        result
+    }
+
+    pub(crate) struct Report(Option<Observation>);
+    impl Report {
+        pub(crate) fn lock_overlap(&self, drop_started: Instant) -> &'static str {
+            match self.0.as_ref() {
+                None => "observation_unavailable",
+                Some(observed) => match observed.first_lock_busy {
+                    Some(sample) if sample.returned < drop_started => {
+                        "managed_lock_busy_before_drop"
+                    }
+                    Some(_) => "managed_lock_busy_at_or_after_drop_start",
+                    None => "no_observed_managed_lock_busy",
+                },
+            }
+        }
+    }
+    impl Observation {
+        fn write_sample(&self, f: &mut fmt::Formatter<'_>, sample: Sample) -> fmt::Result {
+            write!(
+                f,
+                "{:?}(entry_ms={},return_ms={},end_ms={},same_end={},outcome={})",
+                sample.phase,
+                sample
+                    .entered
+                    .saturating_duration_since(self.started)
+                    .as_millis(),
+                sample
+                    .returned
+                    .saturating_duration_since(self.started)
+                    .as_millis(),
+                sample
+                    .end
+                    .saturating_duration_since(self.started)
+                    .as_millis(),
+                sample.end == self.end,
+                sample.outcome,
+            )
+        }
+    }
+    impl fmt::Display for Report {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let Some(observed) = self.0.as_ref() else {
+                return f.write_str("receiver=unavailable");
+            };
+            write!(
+                f,
+                "receiver_overwritten={}; completed/ok=[",
+                observed.overwritten
+            )?;
+            for ((phase, completed), succeeded) in PHASES
+                .iter()
+                .zip(observed.completed)
+                .zip(observed.succeeded)
+            {
+                write!(f, "{phase:?}:{completed}/{succeeded};")?;
+            }
+            for (label, sample) in [
+                ("first_busy", observed.first_busy),
+                ("first_lock_busy", observed.first_lock_busy),
+            ] {
+                write!(f, "] {label}=[")?;
+                if let Some(sample) = sample {
+                    observed.write_sample(f, sample)?;
+                }
+            }
+            f.write_str("] recent_returns=[")?;
+            for sample in observed
+                .samples
+                .iter()
+                .cycle()
+                .skip(observed.next)
+                .take(CAPACITY)
+                .flatten()
+            {
+                observed.write_sample(f, *sample)?;
+                f.write_str(";")?;
+            }
+            f.write_str("]")
+        }
+    }
 }
 
 #[cfg(test)]

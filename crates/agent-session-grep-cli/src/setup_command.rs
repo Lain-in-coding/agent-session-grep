@@ -1306,14 +1306,44 @@ mod m2_tests {
                 .unwrap();
         let started = Instant::now();
         let end = started + Duration::from_secs(2);
+        let recording =
+            managed_control::history_admission_observation::Recording::start(started, end);
         let release = std::thread::spawn(move || {
+            let holder_entry = Instant::now();
             std::thread::sleep(Duration::from_millis(500));
+            let drop_started = Instant::now();
             drop(guard);
+            (holder_entry, drop_started, Instant::now())
         });
+        let mut request_calls = 0;
+        let request_entry = Instant::now();
+        request_calls += 1;
         let result = managed_control::add_selected_history("zcode", &source, &identity, end);
-        release.join().unwrap();
-        let selection =
-            result.expect("transient control admission must use remaining caller budget");
+        let request_return = Instant::now();
+        let (holder_entry, drop_started, holder_released) = release.join().unwrap();
+        let join_return = Instant::now();
+        let receiver = recording.finish();
+        let selection = result.unwrap_or_else(|error| {
+            let offset = |at: Instant| at.saturating_duration_since(started).as_millis();
+            panic!(
+                "transient control admission must use remaining caller budget: \
+                 code={:?}; calls={request_calls}; end_ms={}; \
+                 request_entry_ms={}; request_return_ms={}; remaining_ms={}; overdue_ms={}; \
+                 holder_entry_ms={}; holder_drop_start_ms={}; holder_released_ms={}; \
+                 join_return_ms={}; overlap={}; {receiver}",
+                error.0.code,
+                offset(end),
+                offset(request_entry),
+                offset(request_return),
+                end.saturating_duration_since(request_return).as_millis(),
+                request_return.saturating_duration_since(end).as_millis(),
+                offset(holder_entry),
+                offset(drop_started),
+                offset(holder_released),
+                offset(join_return),
+                receiver.lock_overlap(drop_started),
+            )
+        });
         assert_eq!(selection["enabled"], true);
         assert_eq!(selection["provider"], "zcode");
         // A committed selection stays successful if acknowledgement or thread
