@@ -169,7 +169,7 @@ pub(crate) struct VersionIdentity {
     pub(crate) launcher_protocol: u32,
 }
 impl VersionIdentity {
-    fn validate(&self) -> Result<(), CliError> {
+    pub(crate) fn validate(&self) -> Result<(), CliError> {
         if semver::Version::parse(&self.version).is_err()
             || !MANAGED_TARGETS.contains(&self.target.as_str())
             || !hex(&self.source_commit, 40)
@@ -219,7 +219,7 @@ pub(crate) struct Checkpoint {
     pub(crate) catalog_schema: u32,
 }
 impl Checkpoint {
-    fn validate(&self) -> Result<(), CliError> {
+    pub(crate) fn validate(&self) -> Result<(), CliError> {
         if !valid_id(&self.installation_id)
             || !valid_id(&self.catalog_incarnation)
             || !matches!(

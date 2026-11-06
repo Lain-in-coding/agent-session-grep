@@ -49,6 +49,7 @@ pub mod update_check;
 #[cfg(test)]
 mod update_check_tests;
 mod update_command;
+pub mod update_schema_transition;
 mod update_state;
 
 #[cfg(test)]
@@ -162,6 +163,9 @@ impl From<PortError> for CliError {
 
 pub fn run_cli() {
     let native_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = update_schema_transition::intercept(&native_args) {
+        std::process::exit(code);
+    }
     if let Some(code) = managed_emit::intercept(&native_args) {
         std::process::exit(code);
     }
