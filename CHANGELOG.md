@@ -343,6 +343,26 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Fixed
 
+- Codex setup preserves unrelated original `config.toml` bytes, comments,
+  ordering and line endings while applying ASG-owned registration changes.
+  Interrupted edits recover from their recorded exchange state; owned
+  formatting changes are reported without claiming byte preservation.
+- Background inventory control checks now retain one original observation
+  deadline across catalog opening and inventory reads, instead of acquiring
+  a fresh default control budget after a delay. This does not impose a hard
+  deadline on synchronous catalog opening or source-inventory SQL.
+- Update restart warnings now identify the failed restart category while
+  preserving the recorded update journal, paused intent and hard-error
+  behavior. Partial restart failure remains `restart_failed`.
+- Exact-mode Claude Code and Codex sources no longer issue unbound fallback
+  hint probes before their first successful observation. Probe-less first
+  turns can still use remembered dirtiness to choose their next exact attempt.
+- An exact-mode source that has published in the current cycle can be checked
+  again for a later append while other sources still owe first-turn work.
+  These post-success probes are limited by the actual time spent serving those
+  first turns, leaving service opportunities for the remaining sources. Epoch
+  probes, original deadlines, membership proof and final-pass rules are
+  unchanged. Real-package five-second freshness still requires acceptance.
 - Preserve native-manager error categories during update restart handling;
   failures under running intent still report partial `restart_failed`.
 - Avoid a duplicate Windows directory-handle metadata query while retaining

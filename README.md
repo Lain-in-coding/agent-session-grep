@@ -113,6 +113,39 @@ extracted package, install both command names, select assistant histories and
 verify MCP loading after restarting the host. The artifacts are unsigned unless
 the release notes explicitly say otherwise.
 
+Choose the assistants to configure and the existing history roots to index
+during installation. To make those choices after a package-only install, run
+the installed command with explicit histories, for example:
+
+A package-only install leaves PATH unchanged. Until the installed directory
+is on your shell's PATH, replace `asg` in the commands below with the full
+path to its launcher: `<prefix>/asg` on Unix, or
+`& '<prefix>\asg.exe'` in PowerShell.
+
+```text
+asg setup --host claude --host codex --history claude-code "<selected-claude-root>" --history codex "<selected-codex-root>"
+asg sources list
+asg background status
+asg search "authentication refactor"
+asg show <msg-id>
+```
+
+Replace each placeholder with your chosen history root or a returned message
+ID. Setup starts permitted background updates and configures owned login
+startup unless `--no-autostart` is selected. Existing paused or stopped intent
+is preserved. Host choices without `--history` grant no history access.
+Restart the selected assistants and complete their normal MCP trust or
+enablement confirmation. Ask an assistant to find a prior decision, cite its
+original evidence and continue the current work; configuration success alone
+does not establish that the host loaded ASG.
+
+`background status` reports worker liveness, not complete or current history.
+Ordinary searches can return previously indexed evidence while the selected
+history is still updating. `asg background pause` stops updates while keeping
+stored history readable; `asg background resume` resumes them. See the install
+guide for scoped latest reads, revocation, upgrade and recovery. The candidate
+still requires the six-host and native-package acceptance runs.
+
 For source-checkout development, the installers build the release binary and
 install both `agent-session-grep` and `asg`; they print a PATH hint but do not
 edit PATH for you.
@@ -135,8 +168,8 @@ agent-session-grep --version
 asg --version
 ```
 
-Then use either command name. Data commands default to the platform data
-directory reported by `asg config paths` (the catalog lives at
+For this source workflow, use either command name. Data commands default to the
+platform data directory reported by `asg config paths` (the catalog lives at
 `<data>/asg.db`); pass `--db <path>` to override it. Reading commands never
 create a catalog: if none exists they fail with an explicit
 `sync --discover` instruction instead of pretending there were no results.
