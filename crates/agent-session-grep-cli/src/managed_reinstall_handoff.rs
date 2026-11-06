@@ -3564,6 +3564,8 @@ mod tests {
                 holder.try_lock().unwrap();
                 let observed = Rc::new(Cell::new(0));
                 let captured = Rc::clone(&observed);
+                let first_remaining = Rc::new(Cell::new(None));
+                let captured_remaining = Rc::clone(&first_remaining);
                 let prefix_path = fixture.prefix.join(INSTALLATION_LOCK);
                 let held_path = path.clone();
                 // The supplied end is fixed for this entire call. No hook
@@ -3574,6 +3576,12 @@ mod tests {
                         assert_eq!(actual_end, until);
                         if actual != event {
                             return;
+                        }
+                        if captured.get() == 0 {
+                            // Capture the API refusal time before this observer
+                            // performs any additional native-file probes.
+                            captured_remaining
+                                .set(Some(actual_end.saturating_duration_since(Instant::now())));
                         }
                         captured.set(captured.get() + 1);
                         if captured.get() != 1 {
@@ -3607,8 +3615,23 @@ mod tests {
                     },
                     || fixture.run_until(until),
                 );
-                assert_eq!(result, Err(refusal), "{keep}/{case}");
-                assert!(observed.get() > 0, "wrong refusal boundary: {keep}/{case}");
+                let returned_expired = Instant::now() >= until;
+                assert!(
+                    observed.get() > 0,
+                    "wrong refusal boundary: {keep}/{case}; result={result:?}"
+                );
+                let refused_before_deadline_then_expired = case == "control-handles"
+                    && result == Err(Reason::Deadline)
+                    && first_remaining
+                        .get()
+                        .is_some_and(|remaining| !remaining.is_zero())
+                    && returned_expired;
+                assert!(
+                    result == Err(refusal) || refused_before_deadline_then_expired,
+                    "{keep}/{case}: result={result:?}, expected={refusal:?}, observed={}, first_remaining={:?}, returned_expired={returned_expired}",
+                    observed.get(),
+                    first_remaining.get(),
+                );
                 contenders.assert_available_except(Some(&path));
                 drop(holder);
                 contenders.assert_available_except(None);
