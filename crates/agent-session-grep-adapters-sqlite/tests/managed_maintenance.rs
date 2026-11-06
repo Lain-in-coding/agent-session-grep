@@ -21,6 +21,20 @@ fn id(v: &str) -> ControlId {
 fn end() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
+/// Expected-success preparation and subject calls in this file, and calls that
+/// expect a typed non-deadline error, test ownership, classification and
+/// receipt semantics, not latency. SUCCESS_BUDGET is a semantic-test budget:
+/// some production callers give these adapter calls 30-120 s (uninstall and
+/// migrate 30 s, update recovery 120 s), while the path and autostart commands
+/// give 5 s, and a full parallel workspace run has stretched these calls past a
+/// 5 s end. Ordinary `open_with_deadline` and `with_read` requests keep
+/// `end()`. Calls whose property is a deadline, a Busy or `is_err`-only refusal
+/// or an explicit short end keep `end()` or their own explicit ends. Native and
+/// performance gates own latency.
+const SUCCESS_BUDGET: Duration = Duration::from_secs(30);
+fn success_end() -> Instant {
+    Instant::now() + SUCCESS_BUDGET
+}
 fn fixture_phase<T>(
     requested_end: Instant,
     operation: impl FnOnce(Instant) -> Result<T, PortError>,
@@ -165,7 +179,7 @@ fn prepare<T>(
     result
 }
 fn acquire(root: &Path, kind: LockKind) -> ExclusiveGuard {
-    acquire_until(root, kind, end())
+    acquire_until(root, kind, success_end())
 }
 fn acquire_until(root: &Path, kind: LockKind, end: Instant) -> ExclusiveGuard {
     loop {
@@ -185,7 +199,7 @@ fn retry_expected_success<T>(
     // the short default control runtime check even though each fixture owns
     // its root. Retry only typed contention inside one explicit bounded scope;
     // failure-path tests below keep asserting WriterBusy without this helper.
-    let end = end();
+    let end = success_end();
     loop {
         match operation() {
             Err(PortError::WriterBusy(_)) if Instant::now() < end => {
@@ -259,7 +273,7 @@ impl Fixture {
         // uses its own private root. Give setup one explicit bounded scope;
         // tests that assert caller deadlines still pass their own short ends.
         retry_expected_success(|| {
-            self.control.with_runtime_deadline(end(), || {
+            self.control.with_runtime_deadline(success_end(), || {
                 let installation = self
                     .control
                     .bind_installation(&self.prefix, &self.installation_lock)?;
@@ -294,7 +308,7 @@ impl Fixture {
                     .bind_installation(&self.prefix, &self.installation_lock),
             )?;
             let started = Instant::now();
-            let open_end = end();
+            let open_end = success_end();
             let catalog = diagnose_failure(
                 &mut reported[1],
                 "backup.open",
@@ -309,7 +323,7 @@ impl Fixture {
                 ),
             )?;
             let started = Instant::now();
-            let backup_end = end();
+            let backup_end = success_end();
             diagnose_failure(
                 &mut reported[2],
                 "backup.create",
@@ -408,7 +422,7 @@ fn fixture_setup_honors_earlier_outer_end_and_expiry_before_effects() {
 #[test]
 fn fixture_catalog_preparation_missing_scope_or_expired_end_has_no_effects() {
     let f = Fixture::new();
-    let requested_end = end();
+    let requested_end = success_end();
     let probe = requested_end + Duration::from_secs(1);
     let catalog = f.root.join("uncreated-catalog.db");
     let before = prepare(&f.control, requested_end, |_| f.control.status()).unwrap();
@@ -457,7 +471,7 @@ fn normal_open_stays_closed_while_authorized_maintenance_works() {
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(catalog.identity().incarnation, id("original_incarnation"));
@@ -499,7 +513,7 @@ fn exclusive_gate_proves_drain_before_any_catalog_maintenance() {
             &installation,
             &id("owner"),
             &f.catalog,
-            end()
+            success_end()
         )
         .is_ok()
     );
@@ -597,12 +611,7 @@ fn logical_wal_backup_is_bound_and_never_copies_control_pause() {
             .is_err()
     );
     drop(conn);
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_pause(&f);
     let verified = verify_backup(&f.control, &id("backup")).unwrap();
     assert_eq!(verified.metadata().digest, meta.digest);
     let installation = f
@@ -610,7 +619,7 @@ fn logical_wal_backup_is_bound_and_never_copies_control_pause() {
         .bind_installation(&f.prefix, &f.installation_lock)
         .unwrap();
     let started = Instant::now();
-    let restore_end = end();
+    let restore_end = success_end();
     let mut reported = false;
     let restored = diagnose_failure(
         &mut reported,
@@ -647,7 +656,7 @@ fn interrupted_backup_is_owned_before_content_and_is_not_silently_overwritten() 
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert!(
@@ -715,7 +724,7 @@ fn interrupted_backup_is_owned_before_content_and_is_not_silently_overwritten() 
                 &id("partial"),
                 BackupPurpose::BetaRollback,
                 2,
-                end()
+                success_end()
             )
             .unwrap(),
         BackupOutcome::Attention(_)
@@ -767,6 +776,35 @@ fn select(f: &Fixture, relative: &str, kind: RootKind) -> Selection {
     })
     .unwrap()
     .value
+}
+
+// Expected-success control writes and reads outside the subject call. Without
+// a caller scope each would use the short default busy end, which parallel
+// workspace load can exhaust before the call starts. Each gets one explicit
+// bounded scope; subject calls keep their own ends and failure-path tests keep
+// asserting the short defaults directly.
+fn scoped_revoke(f: &Fixture, selection: &ControlId, now_ms: i64) {
+    prepare(&f.control, success_end(), |_| {
+        f.control.revoke_selection(
+            f.control.status()?.policy.control_seq,
+            selection,
+            None,
+            now_ms,
+        )
+    })
+    .unwrap();
+}
+fn scoped_pause(f: &Fixture) {
+    prepare(&f.control, success_end(), |_| {
+        f.control.set_desired_updates(
+            f.control.status()?.policy.control_seq,
+            DesiredUpdates::Paused,
+        )
+    })
+    .unwrap();
+}
+fn scoped_status(f: &Fixture) -> ControlStatus {
+    prepare(&f.control, success_end(), |_| f.control.status()).unwrap()
 }
 
 fn bind_source(f: &Fixture, source: &str, relative: &str) {
@@ -995,7 +1033,7 @@ fn recovery_discovery_in_scope(f: &Fixture, as_of: bool, end: Instant) -> Result
 fn fixture_discovery_preparation_keeps_one_end_and_single_effects() {
     for as_of in [false, true] {
         let f = Fixture::new();
-        let outer = end();
+        let outer = success_end();
         let probe = outer + Duration::from_secs(1);
         let mut preparation_calls = 0;
         f.control
@@ -1042,7 +1080,7 @@ fn fixture_discovery_preparation_keeps_one_end_and_single_effects() {
 #[test]
 fn fixture_discovery_preparation_missing_scope_or_expired_end_has_no_effects() {
     let f = Fixture::new();
-    let requested_end = end();
+    let requested_end = success_end();
     let probe = requested_end + Duration::from_secs(1);
     let before = prepare(&f.control, requested_end, |_| f.control.status()).unwrap();
     let originals = recovery_originals(&f.catalog);
@@ -1113,7 +1151,7 @@ fn recovery_originals(path: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 #[test]
 fn normal_exact_discovery_open_preserves_original_content_and_proof() {
     let f = Fixture::new();
-    recovery_discovery(&f, false, end());
+    recovery_discovery(&f, false, success_end());
     let originals = recovery_originals(&f.catalog);
     let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
     let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
@@ -1135,39 +1173,27 @@ fn normal_exact_discovery_open_preserves_original_content_and_proof() {
 #[test]
 fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_receipts() {
     let f = Fixture::new();
-    recovery_discovery(&f, true, end());
+    recovery_discovery(&f, true, success_end());
     let denied = select(&f, "denied", RootKind::Root);
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &denied.id,
-            None,
-            12,
-        )
-        .unwrap();
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_revoke(&f, &denied.id, 12);
+    scoped_pause(&f);
     f.fence("owner");
     let originals = recovery_originals(&f.catalog);
     let discoveries = recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts");
     let members = recovery_rows(&f.catalog, "SELECT * FROM discovery_sources");
     assert_eq!(discoveries.len(), 2);
     assert_eq!(members.len(), 2);
-    let before = f.control.status().unwrap();
-    let installation = f
-        .control
-        .bind_installation(&f.prefix, &f.installation_lock)
-        .unwrap();
+    let before = scoped_status(&f);
+    let installation = prepare(&f.control, success_end(), |_| {
+        f.control.bind_installation(&f.prefix, &f.installation_lock)
+    })
+    .unwrap();
     let mut catalog = MaintenanceCatalog::open_authorized(
         &f.control,
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
@@ -1178,13 +1204,13 @@ fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_re
             &id("original_incarnation"),
             &id("recovered"),
             13,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_sources").is_empty());
     assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts").is_empty());
     assert_eq!(recovery_originals(&f.catalog), originals);
-    let after = f.control.status().unwrap();
+    let after = scoped_status(&f);
     assert_eq!(after.desired_updates, before.desired_updates);
     assert_eq!(after.policy.selections, before.policy.selections);
     assert_eq!(after.policy.exclusions, before.policy.exclusions);
@@ -1220,13 +1246,13 @@ fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_re
             &id("original_incarnation"),
             &id("recovered"),
             14,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_receipts").is_empty());
     assert!(recovery_rows(&f.catalog, "SELECT * FROM discovery_sources").is_empty());
     assert_eq!(recovery_originals(&f.catalog), originals);
-    assert_eq!(f.control.status().unwrap(), after);
+    assert_eq!(scoped_status(&f), after);
     assert_eq!(
         recovery_rows(&f.catalog, "SELECT destructive_epoch FROM store_metadata"),
         vec![vec![rusqlite::types::Value::Integer(1)]],
@@ -1236,7 +1262,7 @@ fn owned_recovery_clears_as_of_discovery_and_replay_without_changing_original_re
 #[test]
 fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_effects() {
     let f = Fixture::new();
-    recovery_discovery(&f, true, end());
+    recovery_discovery(&f, true, success_end());
     let other = Fixture::new();
     f.fence("owner");
     other.fence("owner");
@@ -1253,7 +1279,7 @@ fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_eff
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let before = f.control.status().unwrap();
@@ -1329,7 +1355,7 @@ fn discovery_cleanup_refuses_wrong_owner_root_and_expired_nested_end_without_eff
 #[test]
 fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
     let f = Fixture::new();
-    recovery_discovery(&f, true, end());
+    recovery_discovery(&f, true, success_end());
     f.fence("owner");
     let installation = f
         .control
@@ -1340,7 +1366,7 @@ fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let originals = recovery_originals(&f.catalog);
@@ -1354,7 +1380,12 @@ fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
     )
     .unwrap();
     assert!(matches!(
-        catalog.clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end()),
+        catalog.clear_discovery_after_recovery(
+            &f.control,
+            &installation,
+            &id("owner"),
+            success_end()
+        ),
         Err(PortError::SchemaIncompatible(_)),
     ));
     assert_eq!(
@@ -1371,12 +1402,12 @@ fn discovery_cleanup_rolls_back_both_tables_when_parent_delete_fails() {
     conn.execute_batch("DROP TRIGGER refuse_discovery_delete")
         .unwrap();
     catalog
-        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end())
+        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     let identity = catalog.identity().clone();
     let retained = recovery_rows(&f.catalog, "SELECT * FROM retained_source_receipts");
     catalog
-        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), end())
+        .clear_discovery_after_recovery(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     assert_eq!(catalog.identity(), &identity);
     assert_eq!(
@@ -1406,7 +1437,7 @@ fn installation_association_is_explicit_and_wrong_prefix_cannot_authorize_recove
     let bound = f.control.bind_control_root(&prefix_guard).unwrap();
     let receipt_before = std::fs::read(f.root.join("installation-prefix.json")).unwrap();
     f.control
-        .record_verified_installation_prefix(&f.prefix, &f.installation_lock, &bound, end())
+        .record_verified_installation_prefix(&f.prefix, &f.installation_lock, &bound, success_end())
         .unwrap();
     assert_eq!(
         receipt_before,
@@ -1468,7 +1499,7 @@ fn installation_association_is_explicit_and_wrong_prefix_cannot_authorize_recove
                 &f.prefix,
                 &f.installation_lock,
                 &other_bound,
-                end(),
+                success_end(),
             )
             .unwrap();
         unbound
@@ -1517,7 +1548,7 @@ fn backup_and_rotation_reject_another_control_root_even_with_matching_installati
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let before = f.control.status().unwrap();
@@ -1668,7 +1699,7 @@ fn whole_catalog_coverage_rejects_unclassified_legacy_membership_and_derived_row
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(
@@ -1680,7 +1711,7 @@ fn whole_catalog_coverage_rejects_unclassified_legacy_membership_and_derived_row
                 &id("unclassified"),
                 BackupPurpose::BetaRollback,
                 6,
-                end()
+                success_end()
             )
             .unwrap(),
         BackupOutcome::Attention(BackupAttention::CoverageMismatch)
@@ -1698,7 +1729,7 @@ fn whole_catalog_coverage_rejects_unclassified_legacy_membership_and_derived_row
                 &id("orphan_derived"),
                 BackupPurpose::BetaRollback,
                 6,
-                end()
+                success_end()
             )
             .unwrap(),
         BackupOutcome::Attention(BackupAttention::CoverageMismatch)
@@ -1786,7 +1817,7 @@ fn classified_legacy_and_in_db_derived_rows_are_included_in_logical_backup() {
         &id("backup"),
         &id("fts_restore"),
         &f.root.join("fts_restore.db"),
-        end(),
+        success_end(),
     )
     .unwrap();
     assert!(matches!(prepared, RestoreOutcome::Prepared(_)));
@@ -1817,26 +1848,14 @@ fn restore_rechecks_revoke_after_preparation_and_never_clears_pause_or_deny() {
         &id("backup"),
         &id("restored"),
         &f.root.join("restored.db"),
-        end(),
+        success_end(),
     )
     .unwrap();
     let RestoreOutcome::Prepared(prepared) = prepared else {
         panic!("restore refused before revoke")
     };
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &selected.id,
-            None,
-            7,
-        )
-        .unwrap();
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_revoke(&f, &selected.id, 7);
+    scoped_pause(&f);
     let before = f.control.status().unwrap();
     let jobs = f.control.purge_jobs().unwrap();
     let lock = acquire(&f.root, LockKind::PolicyOwner);
@@ -1866,7 +1885,7 @@ fn restore_rechecks_revoke_after_preparation_and_never_clears_pause_or_deny() {
             &id("backup"),
             &id("restored_again"),
             &f.root.join("refused.db"),
-            end()
+            success_end()
         )
         .unwrap(),
         RestoreOutcome::Attention(BackupAttention::PolicyMismatch)
@@ -1878,20 +1897,8 @@ fn restore_rechecks_revoke_after_preparation_and_never_clears_pause_or_deny() {
 fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
     let f = Fixture::new();
     let selected = select(&f, "selected", RootKind::Root);
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &selected.id,
-            None,
-            4,
-        )
-        .unwrap();
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_revoke(&f, &selected.id, 4);
+    scoped_pause(&f);
     f.fence("owner");
     let installation = f
         .control
@@ -1902,7 +1909,7 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let policy_before = f.control.status().unwrap().policy;
@@ -1915,7 +1922,7 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
             &id("original_incarnation"),
             &id("recovered"),
             8,
-            end(),
+            success_end(),
         )
         .unwrap();
     let after = f.control.status().unwrap();
@@ -1949,7 +1956,7 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
             &id("original_incarnation"),
             &id("recovered"),
             20,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert_eq!(f.control.status().unwrap(), after);
@@ -1966,7 +1973,7 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     reopened
@@ -1977,7 +1984,7 @@ fn rotate_after_recovery_is_idempotent_and_preserves_pause_denial_and_audit() {
             &id("original_incarnation"),
             &id("recovered"),
             30,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert_eq!(f.control.status().unwrap(), after);
@@ -2026,7 +2033,7 @@ fn backup_sequence_contender(root: &Path) -> std::thread::JoinHandle<()> {
         std::thread::sleep(Duration::from_millis(400));
         conn.execute_batch("COMMIT").unwrap();
     });
-    held.recv_timeout(Duration::from_secs(5)).unwrap();
+    held.recv_timeout(SUCCESS_BUDGET).unwrap();
     thread
 }
 
@@ -2051,7 +2058,7 @@ fn backup_quarantine_retries_busy_and_sequence_race_in_the_same_request() {
     .unwrap();
     let before = f.control.status().unwrap();
     let contender = backup_sequence_contender(&f.root);
-    let outcome = purge_backup(&f.control, &installation, &id("backup"), 7, end());
+    let outcome = purge_backup(&f.control, &installation, &id("backup"), 7, success_end());
     contender.join().unwrap();
     assert!(matches!(
         outcome.unwrap(),
@@ -2105,7 +2112,7 @@ fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
     })
     .unwrap();
     assert!(matches!(
-        purge_backup(&f.control, &installation, &id("backup"), 7, end()).unwrap(),
+        purge_backup(&f.control, &installation, &id("backup"), 7, success_end()).unwrap(),
         PurgeOutcome::PendingCleanup { .. }
     ));
     let pending = retry_expected_success(|| f.control.backup_records())
@@ -2132,7 +2139,7 @@ fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
     drop(pinned);
     let before_finalize = f.control.status().unwrap();
     let contender = backup_sequence_contender(&f.root);
-    let finalized = purge_backup(&f.control, &installation, &id("backup"), 9, end());
+    let finalized = purge_backup(&f.control, &installation, &id("backup"), 9, success_end());
     contender.join().unwrap();
     assert!(matches!(
         finalized.unwrap(),
@@ -2154,7 +2161,7 @@ fn failed_unlink_retains_quarantine_accounting_across_reallow_then_retries() {
         "one writer and one finalization; cleanup must not quarantine again"
     );
     assert!(matches!(
-        purge_backup(&f.control, &installation, &id("backup"), 10, end()).unwrap(),
+        purge_backup(&f.control, &installation, &id("backup"), 10, success_end()).unwrap(),
         PurgeOutcome::Purged {
             artifact_removed: true,
             ..
@@ -2183,7 +2190,7 @@ fn recovery_reconciles_catalog_commit_before_control_ack_without_rotating_twice(
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let before = f.control.status().unwrap();
@@ -2235,7 +2242,7 @@ fn recovery_reconciles_catalog_commit_before_control_ack_without_rotating_twice(
             &id("original_incarnation"),
             &id("recovered"),
             10,
-            end(),
+            success_end(),
         )
         .unwrap();
     let after = f.control.status().unwrap();
@@ -2257,7 +2264,7 @@ fn recovery_reconciles_catalog_commit_before_control_ack_without_rotating_twice(
             &id("original_incarnation"),
             &id("recovered"),
             11,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert_eq!(f.control.status().unwrap(), after);
@@ -2360,7 +2367,7 @@ fn recovery_clears_catalog_progress_barriers_and_confirmations_retaining_audit_a
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
@@ -2371,7 +2378,7 @@ fn recovery_clears_catalog_progress_barriers_and_confirmations_retaining_audit_a
             &id("original_incarnation"),
             &id("recovered"),
             12,
-            end(),
+            success_end(),
         )
         .unwrap();
     let progress = f.control.source_progress(&id("source_a")).unwrap().unwrap();
@@ -2399,7 +2406,7 @@ fn recovery_clears_catalog_progress_barriers_and_confirmations_retaining_audit_a
             &id("original_incarnation"),
             &id("recovered"),
             13,
-            end(),
+            success_end(),
         )
         .unwrap();
     assert_eq!(f.control.status().unwrap(), status);
@@ -2493,7 +2500,7 @@ fn has_table(path: &Path, name: &str) -> bool {
     .unwrap()
 }
 fn finish_fence(f: &Fixture, owner: &str) {
-    prepare(&f.control, end(), |end| {
+    prepare(&f.control, success_end(), |end| {
         let installation = f
             .control
             .bind_installation(&f.prefix, &f.installation_lock)?;
@@ -2515,7 +2522,7 @@ fn readonly_identity_admits_exact_old_schema_without_mutating_or_granting_read_a
     let f = Fixture::new();
     historical_schema(&f, 21);
     let before = std::fs::read(&f.catalog).unwrap();
-    let identity = inspect_catalog_identity(&f.control, &f.catalog, end()).unwrap();
+    let identity = inspect_catalog_identity(&f.control, &f.catalog, success_end()).unwrap();
     assert_eq!(identity.schema, 21);
     assert_eq!(identity.incarnation, id("original_incarnation"));
     assert_eq!(identity.generation, 0);
@@ -2556,7 +2563,7 @@ fn readonly_identity_rejects_wrong_root_invalid_identity_and_expired_or_locked_a
     .unwrap();
     drop(conn);
     assert!(matches!(
-        inspect_catalog_identity(&f.control, &f.catalog, end()),
+        inspect_catalog_identity(&f.control, &f.catalog, success_end()),
         Err(PortError::SchemaIncompatible(_))
     ));
 }
@@ -2567,20 +2574,8 @@ fn owned_schema21_migration_preserves_identity_namespace_originals_and_control_d
     historical_content(&f);
     historical_schema(&f, 21);
     let denied = select(&f, "denied", RootKind::Root);
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &denied.id,
-            None,
-            5,
-        )
-        .unwrap();
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_revoke(&f, &denied.id, 5);
+    scoped_pause(&f);
     assert!(ManagedStore::open(&f.catalog, &f.control).is_err());
     f.fence("owner");
     let before = f.control.status().unwrap();
@@ -2594,12 +2589,12 @@ fn owned_schema21_migration_preserves_identity_namespace_originals_and_control_d
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     let original = catalog.identity().clone();
     let migrated = catalog
-        .migrate_to_current(&f.control, &installation, &id("owner"), end())
+        .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     assert_eq!(migrated.schema, 22);
     assert_eq!(migrated.installation, original.installation);
@@ -2607,7 +2602,7 @@ fn owned_schema21_migration_preserves_identity_namespace_originals_and_control_d
     assert_eq!(migrated.generation, 7);
     assert_eq!(
         catalog
-            .migrate_to_current(&f.control, &installation, &id("owner"), end())
+            .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
             .unwrap(),
         migrated
     );
@@ -2672,13 +2667,13 @@ fn managed20_uses_canonical_owned_transaction_and_adds_no_receipt_or_context_pro
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(catalog.identity().schema, 20);
     assert_eq!(
         catalog
-            .migrate_to_current(&f.control, &installation, &id("owner"), end())
+            .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
             .unwrap()
             .schema,
         22
@@ -2739,7 +2734,7 @@ fn schema_migration_requires_fence_drain_owner_identity_and_original_deadline() 
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert!(
@@ -2758,7 +2753,7 @@ fn schema_migration_requires_fence_drain_owner_identity_and_original_deadline() 
         .unwrap();
     drop(raw);
     assert!(matches!(
-        catalog.migrate_to_current(&f.control, &installation, &id("owner"), end()),
+        catalog.migrate_to_current(&f.control, &installation, &id("owner"), success_end()),
         Err(PortError::SchemaIncompatible(_))
     ));
     assert_eq!(schema(&f.catalog), 21);
@@ -2783,7 +2778,7 @@ fn canonical_migration_rolls_back_all_additive_tables_if_ddl_preimage_is_invalid
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert!(
@@ -2824,7 +2819,7 @@ fn old21_backup_defaults_to_current22_without_mutating_registered_original_image
         &metadata.backup_id,
         &id("current_recovery"),
         &f.root.join("current_restore.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("restore refused")
@@ -2883,7 +2878,7 @@ fn old21_backup_defaults_to_current22_without_mutating_registered_original_image
             .unwrap(),
         "unknown"
     );
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     assert!(inventory.incomplete());
     assert_eq!(inventory.staged_images().len(), 1);
     assert!(!inventory.receipts()[0].complete());
@@ -2895,12 +2890,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
     let f = Fixture::new();
     historical_content(&f);
     historical_schema(&f, 21);
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_pause(&f);
     f.fence("owner");
     let metadata = f.backup();
     let backup = f.root.join(&metadata.relative_locator);
@@ -2914,11 +2904,11 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
-        .migrate_to_current(&f.control, &installation, &id("owner"), end())
+        .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     let RestoreOutcome::Prepared(prepared) = prepare_restore_exact(
         &f.control,
@@ -2927,7 +2917,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
         &metadata.backup_id,
         &id("rollback_recovery"),
         &f.root.join("rollback.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("exact restore refused")
@@ -2945,7 +2935,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
         &id("owner"),
         &prepared,
         20,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(catalog.identity().schema, 21);
@@ -2959,7 +2949,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
     assert_eq!(after.policy.selections, before.policy.selections);
     assert_eq!(after.policy.revocations, before.policy.revocations);
     assert_eq!(after.catalog_incarnation, Some(id("rollback_recovery")));
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     assert!(!inventory.incomplete());
     assert!(inventory.staged_images().is_empty());
     assert_eq!(inventory.receipts().len(), 1);
@@ -2996,7 +2986,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
             .read_policy(RequestIntersection::Selected)
             .unwrap(),
         "rollback_recovery",
-        end(),
+        success_end(),
     )
     .unwrap();
     let progress = read.source_progress().unwrap();
@@ -3012,7 +3002,7 @@ fn exact21_program_rollback_preserves_backup_and_publishes_before_control_ack() 
     drop(read);
     drop(conn);
     drop(_handles);
-    let admitted = inspect_catalog_identity(&f.control, &f.catalog, end()).unwrap();
+    let admitted = inspect_catalog_identity(&f.control, &f.catalog, success_end()).unwrap();
     assert_eq!(admitted.schema, 21);
 }
 
@@ -3034,7 +3024,7 @@ fn repeated_exact_prepare_reuses_only_the_owned_unchanged_side_and_rejects_indep
         &metadata.backup_id,
         &id("repeat_recovery"),
         &side,
-        end(),
+        success_end(),
     )
     .unwrap();
     let before = std::fs::read(&side).unwrap();
@@ -3046,7 +3036,7 @@ fn repeated_exact_prepare_reuses_only_the_owned_unchanged_side_and_rejects_indep
             &metadata.backup_id,
             &id("repeat_recovery"),
             &side,
-            end()
+            success_end()
         )
         .unwrap(),
         first
@@ -3118,7 +3108,7 @@ fn old20_current_recovery_is_verified_but_exact20_program_rollback_is_refused() 
         &metadata.backup_id,
         &id("current20"),
         &f.root.join("current20.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("current recovery refused")
@@ -3146,12 +3136,12 @@ fn retry_owned_side_after_copy_commit_before_prepared_receipt_is_idempotent() {
         &metadata.backup_id,
         &id("interrupted_prepare"),
         &side,
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
     };
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     let receipt = f.root.join(inventory.receipts()[0].relative_locator());
     let original = std::fs::read(&receipt).unwrap();
     let mut lines: Vec<_> = original.split_inclusive(|byte| *byte == b'\n').collect();
@@ -3167,7 +3157,7 @@ fn retry_owned_side_after_copy_commit_before_prepared_receipt_is_idempotent() {
         &metadata.backup_id,
         &id("interrupted_prepare"),
         &side,
-        end(),
+        success_end(),
     )
     .unwrap();
     let RestoreOutcome::Prepared(repeated) = repeated else {
@@ -3182,12 +3172,7 @@ fn retry_owned_side_after_copy_commit_before_prepared_receipt_is_idempotent() {
 fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_and_paused_state() {
     let f = Fixture::new();
     historical_schema(&f, 21);
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_pause(&f);
     f.fence("owner");
     let metadata = f.backup();
     let installation = f
@@ -3199,11 +3184,11 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
-        .migrate_to_current(&f.control, &installation, &id("owner"), end())
+        .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     let RestoreOutcome::Prepared(prepared) = prepare_restore_exact(
         &f.control,
@@ -3212,7 +3197,7 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &metadata.backup_id,
         &id("ack_recovery"),
         &f.root.join("ack_restore.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
@@ -3224,10 +3209,10 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &id("owner"),
         &prepared,
         20,
-        end(),
+        success_end(),
     )
     .unwrap();
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     let path = f.root.join(inventory.receipts()[0].relative_locator());
     let bytes = std::fs::read(&path).unwrap();
     let mut lines: Vec<_> = bytes.split_inclusive(|b| *b == b'\n').collect();
@@ -3249,7 +3234,7 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &metadata.backup_id,
         &id("ack_recovery"),
         prepared.side_path(),
-        end(),
+        success_end(),
     )
     .unwrap();
     let RestoreOutcome::Prepared(retry) = retry else {
@@ -3260,7 +3245,7 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     apply_restore(
@@ -3270,7 +3255,7 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &id("owner"),
         &retry,
         21,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(schema(&f.catalog), 21);
@@ -3292,12 +3277,12 @@ fn exact_restore_retry_after_publication_before_control_ack_retains_displaced_an
         &id("owner"),
         &retry,
         22,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(f.control.status().unwrap(), after);
     assert_eq!(std::fs::read(&path).unwrap(), receipt);
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     assert!(!inventory.incomplete());
     assert!(inventory.staged_images().is_empty());
 }
@@ -3317,11 +3302,11 @@ fn exact_restore_failure_keeps_live_and_side_when_displaced_path_is_independentl
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
-        .migrate_to_current(&f.control, &installation, &id("owner"), end())
+        .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     let side = f.root.join("occupied.db");
     let recovery = id("occupied_recovery");
@@ -3332,7 +3317,7 @@ fn exact_restore_failure_keeps_live_and_side_when_displaced_path_is_independentl
         &metadata.backup_id,
         &recovery,
         &side,
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
@@ -3407,11 +3392,11 @@ fn native_file_delete_sharing_blocks_restore_without_losing_current_and_retry_su
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     catalog
-        .migrate_to_current(&f.control, &installation, &id("owner"), end())
+        .migrate_to_current(&f.control, &installation, &id("owner"), success_end())
         .unwrap();
     let RestoreOutcome::Prepared(prepared) = prepare_restore_exact(
         &f.control,
@@ -3420,7 +3405,7 @@ fn native_file_delete_sharing_blocks_restore_without_losing_current_and_retry_su
         &metadata.backup_id,
         &id("sharing_recovery"),
         &f.root.join("sharing.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
@@ -3456,7 +3441,7 @@ fn native_file_delete_sharing_blocks_restore_without_losing_current_and_retry_su
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     apply_restore(
@@ -3466,7 +3451,7 @@ fn native_file_delete_sharing_blocks_restore_without_losing_current_and_retry_su
         &id("owner"),
         &prepared,
         21,
-        end(),
+        success_end(),
     )
     .unwrap();
     assert_eq!(schema(&f.catalog), 21);
@@ -3524,12 +3509,7 @@ fn restored_current22_ordinary_read_keeps_whitespace_and_historical_proof_while_
     managed::finalize_publications_in_tx(&tx, &mut [publication]).unwrap();
     tx.commit().unwrap();
     drop(conn);
-    f.control
-        .set_desired_updates(
-            f.control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Paused,
-        )
-        .unwrap();
+    scoped_pause(&f);
     f.fence("owner");
     let metadata = f.backup();
     let installation = f
@@ -3543,7 +3523,7 @@ fn restored_current22_ordinary_read_keeps_whitespace_and_historical_proof_while_
         &metadata.backup_id,
         &id("paused_recovery"),
         &f.root.join("paused.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
@@ -3553,7 +3533,7 @@ fn restored_current22_ordinary_read_keeps_whitespace_and_historical_proof_while_
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     apply_restore(
@@ -3563,7 +3543,7 @@ fn restored_current22_ordinary_read_keeps_whitespace_and_historical_proof_while_
         &id("owner"),
         &prepared,
         20,
-        end(),
+        success_end(),
     )
     .unwrap();
     drop(catalog);
@@ -3592,14 +3572,7 @@ fn restored_current22_ordinary_read_keeps_whitespace_and_historical_proof_while_
         f.control.status().unwrap().desired_updates,
         DesiredUpdates::Paused
     );
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &selected.id,
-            None,
-            21,
-        )
-        .unwrap();
+    scoped_revoke(&f, &selected.id, 21);
     // The durable revoke blocks emission immediately while its real drain is
     // pending. Recovery never clears that denial to manufacture an empty read.
     assert!(matches!(
@@ -3639,7 +3612,7 @@ fn completed_restore_receipt_stays_classifiable_after_policy_purges_covered_back
         &metadata.backup_id,
         &id("purged_inventory"),
         &f.root.join("purged_inventory.db"),
-        end(),
+        success_end(),
     )
     .unwrap() else {
         panic!("refused")
@@ -3649,7 +3622,7 @@ fn completed_restore_receipt_stays_classifiable_after_policy_purges_covered_back
         &installation,
         &id("owner"),
         &f.catalog,
-        end(),
+        success_end(),
     )
     .unwrap();
     apply_restore(
@@ -3659,28 +3632,28 @@ fn completed_restore_receipt_stays_classifiable_after_policy_purges_covered_back
         &id("owner"),
         &prepared,
         20,
-        end(),
+        success_end(),
     )
     .unwrap();
     drop(catalog);
-    f.control
-        .revoke_selection(
-            f.control.status().unwrap().policy.control_seq,
-            &selected.id,
-            None,
-            21,
-        )
-        .unwrap();
+    scoped_revoke(&f, &selected.id, 21);
     for backup in f.control.backup_records().unwrap() {
         assert!(matches!(
-            purge_backup(&f.control, &installation, &backup.backup_id, 22, end()).unwrap(),
+            purge_backup(
+                &f.control,
+                &installation,
+                &backup.backup_id,
+                22,
+                success_end()
+            )
+            .unwrap(),
             PurgeOutcome::Purged {
                 artifact_removed: true,
                 ..
             }
         ));
     }
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     assert!(!inventory.incomplete());
     assert!(inventory.staged_images().is_empty());
     assert!(inventory.receipts()[0].complete());
@@ -3703,10 +3676,10 @@ fn copied_restore_receipt_cannot_authorize_another_physical_control_root() {
         &metadata.backup_id,
         &id("copied_receipt"),
         &f.root.join("copied.db"),
-        end(),
+        success_end(),
     )
     .unwrap();
-    let inventory = inspect_restore_inventory(&f.control, &f.catalog, end()).unwrap();
+    let inventory = inspect_restore_inventory(&f.control, &f.catalog, success_end()).unwrap();
     let receipt = &inventory.receipts()[0];
     let other = Fixture::new();
     let destination = other.root.join(receipt.relative_locator());
