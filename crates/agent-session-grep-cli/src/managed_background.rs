@@ -8446,13 +8446,41 @@ mod control_deadline_tests {
                     control.register_worker(seq, &worker, std::process::id(), 1)
                 })
                 .unwrap();
-                let store = ManagedStore::create(
+                // Only catalog policy admission uses the fixture's
+                // preparation end; creation and acknowledgement keep their
+                // existing ordering outside that temporary scope.
+                let create_started = Instant::now();
+                let scope_probe = scope_end + Duration::from_secs(1);
+                let previous_scope = SqliteControlStore::effective_runtime_deadline(scope_probe);
+                let effective_end = previous_scope.min(scope_end);
+                let store = ManagedStore::create_with_deadline(
                     &db,
                     &control,
                     ControlId::parse("pending-catalog").unwrap(),
                     1,
+                    scope_end,
                 )
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "phase=fixture_catalog_create calls=1 error={} \
+                         runtime_deadline={} elapsed={:?} remaining={:?} \
+                         inherited_earlier={}",
+                        ScheduleTestHooks::error_label(&error),
+                        matches!(
+                            &error,
+                            PortError::WriterBusy(reason)
+                                if reason == "control runtime deadline reached"
+                        ),
+                        create_started.elapsed(),
+                        effective_end.saturating_duration_since(Instant::now()),
+                        effective_end < scope_end,
+                    )
+                });
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(scope_probe),
+                    previous_scope,
+                    "phase=fixture_catalog_create scope must be restored"
+                );
                 control
                     .with_runtime_deadline(scope_end, || {
                         store.reconcile_progress(&control, &worker)
