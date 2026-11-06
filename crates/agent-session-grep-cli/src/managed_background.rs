@@ -16175,11 +16175,80 @@ mod control_deadline_tests {
                     .control_seq,
                 before
             );
-            assert!(
-                resume_pending(&fixture, &mut schedule, &boot, &mut pending)
-                    .unwrap()
-                    .idle()
-            );
+            // run_cycle keeps the fixture scope. Acceptance gets production's
+            // fresh 250 ms window, which a machine-wide stall can exhaust
+            // before the Idle heartbeat commits. Production then keeps the
+            // confirmed slot and retries on its next cadence, so only that
+            // exact refusal is retried, and every refusal must leave the result
+            // owned, unfinished again and unpublished.
+            let mut refusals = 0;
+            loop {
+                let cadence = Instant::now();
+                match run_cycle(
+                    &fixture.db,
+                    &fixture.control,
+                    &fixture.worker(),
+                    &boot,
+                    1,
+                    fixture.scope_end,
+                    &mut pending,
+                    &mut schedule,
+                )
+                .unwrap()
+                {
+                    CycleResult::Idle(IdleReady::Observed(observed)) => {
+                        assert_eq!(observed, token);
+                    }
+                    CycleResult::Idle(IdleReady::Empty) => {
+                        panic!("the confirmed result became an empty idle")
+                    }
+                    CycleResult::Work(_) => panic!("the confirmed result started new work"),
+                }
+                let accepted = accept_idle_boundary(
+                    &fixture.db,
+                    &fixture.control,
+                    &fixture.worker(),
+                    &IdleReady::Observed(token.clone()),
+                    &mut pending,
+                    &mut schedule,
+                    Instant::now() + CONTROL_BUDGET,
+                );
+                match accepted {
+                    Ok(Some(accepted)) => {
+                        assert!(accepted.outcome.idle());
+                        break;
+                    }
+                    Err(PortError::WriterBusy(reason))
+                        if reason == "control runtime deadline reached" && refusals < 2 =>
+                    {
+                        refusals += 1;
+                        let intent = pending.as_ref().unwrap();
+                        assert_eq!(intent.token, token);
+                        assert!(intent.completion_confirmed);
+                        assert_eq!(
+                            fixture.read_control(|control| control.cycle(token.cycle_seq)),
+                            terminal
+                        );
+                        assert_eq!(publication_counts(&fixture), counts);
+                        std::thread::sleep(CADENCE.saturating_sub(cadence.elapsed()));
+                    }
+                    Err(PortError::WriterBusy(reason))
+                        if reason == "control runtime deadline reached" =>
+                    {
+                        panic!(
+                            "acceptance refused the exact window on all {} attempts",
+                            refusals + 1
+                        )
+                    }
+                    Ok(None) => {
+                        panic!("the confirmed result was dropped after {refusals} refusals")
+                    }
+                    Err(error) => panic!(
+                        "acceptance failed after {refusals} exact window refusals: {}",
+                        ScheduleTestHooks::error_label(&error)
+                    ),
+                }
+            }
             assert_eq!(
                 fixture.read_control(|control| control.cycle(token.cycle_seq)),
                 terminal
