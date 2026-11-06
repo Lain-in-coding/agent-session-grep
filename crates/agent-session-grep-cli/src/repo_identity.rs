@@ -26,12 +26,143 @@ use std::process::{Child, Command, Stdio};
 /// 截断会破坏身份唯一性，把两个仓库并成一个。
 pub const REPO_SLUG_MAX_CHARS: usize = 255;
 
+/// Admit only bounded remote syntax from transcript metadata. This is pure:
+/// neither the URL nor the original cwd is opened, resolved or passed to Git.
+pub(crate) fn transcript_repository_slug(url: &str) -> Option<String> {
+    if url.is_empty()
+        || url.len() > agent_session_grep_ports::TRANSCRIPT_REPOSITORY_URL_MAX_BYTES
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+        || url.contains(['?', '#', '\\', '%'])
+    {
+        return None;
+    }
+    let raw = url.strip_suffix('/').unwrap_or(url);
+    let (host, path) = if let Some(rest) = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .or_else(|| raw.strip_prefix("ssh://git@"))
+    {
+        split_slash(rest)?
+    } else if let Some(rest) = raw.strip_prefix("git@") {
+        split_scp(rest)?
+    } else {
+        if raw.contains('@') || raw.contains("://") {
+            return None;
+        }
+        // Unlike the legacy normalizer, A cannot interpret host/owner/name as
+        // a remote: the same spelling is a relative directory. Require an
+        // explicit URL scheme or SCP separator before admitting authority.
+        split_scp(raw)?
+    };
+    if host.len() < 2
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return None;
+    }
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if segments.next().is_some()
+        || [owner, name]
+            .iter()
+            .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains([':', '@']))
+    {
+        return None;
+    }
+    normalize_remote_url(url).filter(|slug| slug.len() <= 512)
+}
+
+/// Rejecting unsafe A evidence must preserve Unusable, never enable fallback.
+pub(crate) fn admit_transcript_repository(
+    observation: &mut agent_session_grep_ports::RepositoryObservation,
+) {
+    use agent_session_grep_ports::RepositoryObservation;
+    if let RepositoryObservation::Resolved(origin) = observation
+        && transcript_repository_slug(&origin.url).is_none()
+    {
+        *observation = RepositoryObservation::Unusable;
+    }
+}
+
+/// Derive from the actual batch, never recompute/guess a canonical Session ID.
+pub(crate) fn transcript_repository_claims(
+    staged: &agent_session_grep_application::StagedBatch,
+    batch: &agent_session_grep_adapters_sqlite::SourceBatch,
+) -> Vec<agent_session_grep_ports::managed::RepositoryClaim> {
+    use agent_session_grep_domain::IdKind;
+    use agent_session_grep_ports::{MetadataResolution, RepositoryObservation};
+    let observation = &staged.report.session_observation;
+    let RepositoryObservation::Resolved(origin) = &observation.repository else {
+        return Vec::new();
+    };
+    if batch.provider_id.as_deref() != Some("codex")
+        || !batch.relation_complete
+        || staged.report.skipped != 0
+        || staged.messages.is_empty()
+        || staged
+            .messages
+            .iter()
+            .any(|message| message.session.is_some())
+        || observation.multi_session
+        || !observation.pair_observed
+        || staged.report.session_native_id.as_ref() != Some(&origin.provider_session_id)
+        || observation.provider_session_id
+            != MetadataResolution::Resolved(origin.provider_session_id.clone())
+        || !matches!(&observation.original_working_directory,
+            MetadataResolution::Resolved(cwd) if !cwd.is_empty())
+        || origin.record_span.0 >= origin.record_span.1
+        || !batch
+            .len_bytes
+            .is_some_and(|len| len >= 0 && origin.record_span.1 <= len as u64)
+    {
+        return Vec::new();
+    }
+    let Some(slug) = transcript_repository_slug(&origin.url) else {
+        return Vec::new();
+    };
+    let mut sessions = batch
+        .entries
+        .iter()
+        .filter(|(id, _, _)| id.kind() == IdKind::Session);
+    let Some((session, _, _)) = sessions.next() else {
+        return Vec::new();
+    };
+    if sessions.next().is_some()
+        || batch.placements.is_empty()
+        || batch.placements.iter().any(|p| &p.session_id != session)
+        || !batch.resume_claims.iter().any(|claim| {
+            claim.session_id == session.as_str()
+                && claim.provider_id == "codex"
+                && claim.pair_observed
+                && claim.provider_session_id_state == "resolved"
+                && claim.provider_session_id.as_ref() == Some(&origin.provider_session_id)
+                && claim.original_working_directory_state == "resolved"
+        })
+    {
+        return Vec::new();
+    }
+    vec![agent_session_grep_ports::managed::RepositoryClaim {
+        session_id: session.clone(),
+        slug,
+    }]
+}
+
 /// 运行一次 git 取 stdout（trim）；spawn 失败 / 非零退出 / 非 UTF-8 /
 /// 空输出一律 `None`。
 ///
 /// 这是**改动前**的串行原语：重叠派发不可用时解析器回退到它，五个仓库
 /// 上下文的语义矩阵也用它做对照，保证回退路径与旧行为逐字一致。
 fn git_output(args: &[&str]) -> Option<String> {
+    #[cfg(test)]
+    assert_git_allowed();
     let output = Command::new("git").args(args).output().ok()?;
     parse_git_output(output)
 }
@@ -72,6 +203,8 @@ fn git_origin_url(toplevel: &str) -> Option<String> {
 /// `.git` 内 cwd / 非仓库等，调用方必须丢弃 URL 结果。URL 探测从 cwd 出发
 /// （改动前从 toplevel 出发）；git 自行向上发现同一仓库，输出等价。
 fn git_toplevel_and_origin_url(cwd: &str) -> (Option<String>, Option<String>) {
+    #[cfg(test)]
+    assert_git_allowed();
     fn spawn(args: &[&str]) -> Option<Child> {
         Command::new("git")
             .args(args)
@@ -233,6 +366,8 @@ pub struct GitRepoSlugResolver {
 
 impl RepoSlugResolver for GitRepoSlugResolver {
     fn resolve(&self, cwd: &str) -> Option<String> {
+        #[cfg(test)]
+        assert_git_allowed();
         if cwd.trim().is_empty() {
             return None;
         }
@@ -279,10 +414,343 @@ impl RepoSlugResolver for GitRepoSlugResolver {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FORBID_GIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn assert_git_allowed() {
+    FORBID_GIT.with(|flag| assert!(!flag.get(), "transcript repository path attempted Git I/O"));
+}
+
+/// A real worker test trips before any legacy resolver filesystem/process work.
+/// Thread-local ownership avoids changing PATH or another test's environment.
+#[cfg(test)]
+pub(crate) fn without_git<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORBID_GIT.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(FORBID_GIT.with(|flag| flag.replace(true)));
+    operation()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn transcript_repository_url_gate_rejects_unsafe_and_unsupported_without_echo() {
+        use agent_session_grep_ports::{RepositoryObservation, TranscriptRepository};
+        let overlong =
+            "x".repeat(agent_session_grep_ports::TRANSCRIPT_REPOSITORY_URL_MAX_BYTES + 1);
+        let userinfo = format!(
+            "https://{}:{}@example.test/owner/project",
+            "synthetic", "value"
+        );
+        let urls = [
+            userinfo.as_str(),
+            "https://git@example.test/owner/project",
+            "https://example.test/owner/project?private=value",
+            "https://example.test/owner/project#private",
+            "https://example.test/owner/project\u{0}",
+            "https://example.test/owner/project\n",
+            " https://example.test/owner/project",
+            "file:///synthetic/owner/project",
+            "/synthetic/owner/project",
+            "C:/synthetic/project",
+            "C:\\synthetic\\project",
+            "../owner/project",
+            "./owner/project",
+            "relative/owner/project",
+            "example.test/owner/project",
+            "ext::synthetic",
+            "fd::synthetic",
+            "git://example.test/owner/project",
+            "ssh://user@example.test/owner/project",
+            "https://example.test:443/owner/project",
+            "git@example.test:22/owner/project",
+            "https://example.test/group/subgroup/project",
+            "https://example.test//owner/project.git",
+            "https://example.test/owner/..",
+            "https://example.test/../project",
+            "https://example.test/owner/.git",
+            "https://example.test/owner/project//",
+            "https://example.test/owner/project%3Fprivate",
+            "https://example.test/owner/proj:ect",
+            "https://bad@host/owner/project",
+            overlong.as_str(),
+        ];
+        without_git(|| {
+            for (index, url) in urls.iter().enumerate() {
+                let mut observed = RepositoryObservation::Resolved(TranscriptRepository {
+                    provider_session_id: "synthetic-session".into(),
+                    url: (*url).into(),
+                    record_span: (0, 12),
+                });
+                admit_transcript_repository(&mut observed);
+                assert_eq!(observed, RepositoryObservation::Unusable, "case {index}");
+                assert_eq!(format!("{observed:?}"), "Unusable");
+                assert!(transcript_repository_slug(url).is_none(), "case {index}");
+            }
+        });
+    }
+
+    #[test]
+    fn transcript_repository_url_gate_preserves_supported_remote_forms() {
+        for url in [
+            "https://example.test/owner/project.git",
+            "http://example.test/owner/project",
+            "ssh://git@example.test/owner/project.git",
+            "git@example.test:owner/project.git",
+            "example.test:owner/project",
+            "https://example.test/owner/project/",
+        ] {
+            assert_eq!(
+                without_git(|| transcript_repository_slug(url)).as_deref(),
+                Some("example.test/owner/project")
+            );
+        }
+    }
+
+    fn transcript_stage(bytes: &[u8]) -> agent_session_grep_application::StagedBatch {
+        let parsed = crate::managed_source_parse::stage(
+            "codex",
+            &agent_session_grep_ports::SliceSource::new(bytes),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(parsed.completeness.is_complete());
+        parsed.staged
+    }
+
+    fn transcript_batch(
+        staged: &agent_session_grep_application::StagedBatch,
+        len: usize,
+        namespace: &str,
+    ) -> agent_session_grep_adapters_sqlite::SourceBatch {
+        crate::staged_to_source_with_provider_namespace(
+            "synthetic/rollout.jsonl",
+            staged,
+            "codex",
+            "codex/rollout-jsonl-v1",
+            "synthetic-fingerprint",
+            len as u64,
+            Some("codex"),
+            Some(namespace),
+        )
+        .unwrap()
+    }
+
+    const TRANSCRIPT: &str = concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"synthetic-session\",",
+        "\"cwd\":\"synthetic-workspace\",\"git\":{\"repository_url\":\"https://example.test/owner/project.git\"}}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"synthetic-message\",",
+        "\"role\":\"user\",\"content\":\"synthetic repository text\"}}\n",
+    );
+
+    #[test]
+    fn transcript_repository_claim_uses_actual_namespace_session_and_anchor() {
+        use agent_session_grep_domain::{SessionIdentityNamespace, StableId};
+        without_git(|| {
+            let staged = transcript_stage(TRANSCRIPT.as_bytes());
+            let mut ids = Vec::new();
+            for namespace in ["synthetic-namespace-a", "synthetic-namespace-b"] {
+                let batch = transcript_batch(&staged, TRANSCRIPT.len(), namespace);
+                let claims = transcript_repository_claims(&staged, &batch);
+                assert_eq!(claims.len(), 1);
+                assert_eq!(claims[0].session_id, batch.placements[0].session_id);
+                assert_eq!(
+                    claims[0].session_id,
+                    StableId::native_session_scoped(
+                        &SessionIdentityNamespace {
+                            provider_id: "codex",
+                            installation_namespace: namespace
+                        },
+                        "synthetic-session",
+                    )
+                );
+                assert_eq!(claims[0].slug, "example.test/owner/project");
+                ids.push(claims[0].session_id.clone());
+                let agent_session_grep_ports::RepositoryObservation::Resolved(origin) =
+                    &staged.report.session_observation.repository
+                else {
+                    panic!("resolved origin")
+                };
+                assert_eq!(
+                    &TRANSCRIPT.as_bytes()
+                        [origin.record_span.0 as usize..origin.record_span.1 as usize],
+                    TRANSCRIPT.lines().next().unwrap().as_bytes()
+                );
+                assert!(
+                    !String::from_utf8(serde_json::to_vec(&claims).unwrap())
+                        .unwrap()
+                        .contains("https://")
+                );
+            }
+            assert_ne!(ids[0], ids[1]);
+        });
+    }
+
+    #[test]
+    fn transcript_repository_numeric_git_prevents_a_later_claim_without_losing_resume() {
+        use agent_session_grep_ports::RepositoryObservation;
+        without_git(|| {
+            let baseline = transcript_stage(TRANSCRIPT.as_bytes());
+            let baseline_batch =
+                transcript_batch(&baseline, TRANSCRIPT.len(), "synthetic-namespace");
+            assert_eq!(
+                transcript_repository_claims(&baseline, &baseline_batch).len(),
+                1
+            );
+            for value in [
+                "1.5",
+                "-1.5",
+                "1e3",
+                "18446744073709551616",
+                "-9223372036854775809",
+            ] {
+                let input = format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"synthetic-session\",\
+                     \"cwd\":\"synthetic-workspace\",\"git\":{value}}}}}\n{TRANSCRIPT}"
+                );
+                let staged = transcript_stage(input.as_bytes());
+                assert_eq!(
+                    staged.report.session_observation.repository,
+                    RepositoryObservation::Ambiguous,
+                    "numeric case {value}"
+                );
+                assert!(staged.report.diagnostics.is_empty());
+                assert_eq!(staged.messages.len(), 1);
+                let batch = transcript_batch(&staged, input.len(), "synthetic-namespace");
+                assert_eq!(batch.placements.len(), 1);
+                assert_eq!(batch.resume_claims, baseline_batch.resume_claims);
+                assert_eq!(
+                    batch.placements[0].session_id,
+                    baseline_batch.placements[0].session_id
+                );
+                assert!(transcript_repository_claims(&staged, &batch).is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn transcript_repository_header_only_keeps_native_session_and_resume() {
+        use agent_session_grep_domain::{IdKind, SessionIdentityNamespace, StableId};
+        without_git(|| {
+            let namespace = "synthetic-namespace";
+            let expected_session = StableId::native_session_scoped(
+                &SessionIdentityNamespace {
+                    provider_id: "codex",
+                    installation_namespace: namespace,
+                },
+                "synthetic-session",
+            );
+            let baseline_header = r#"{"type":"session_meta","payload":{"session_id":"synthetic-session","cwd":"synthetic-workspace"}}"#;
+            let baseline_staged = transcript_stage(baseline_header.as_bytes());
+            let baseline = transcript_batch(&baseline_staged, baseline_header.len(), namespace);
+            assert_eq!(baseline.resume_claims.len(), 1);
+            assert_eq!(
+                baseline.resume_claims[0].session_id,
+                expected_session.as_str()
+            );
+            assert!(baseline.resume_claims[0].pair_observed);
+            assert_eq!(
+                baseline.resume_claims[0].provider_session_id.as_deref(),
+                Some("synthetic-session")
+            );
+            assert_eq!(
+                baseline.resume_claims[0]
+                    .original_working_directory
+                    .as_deref(),
+                Some("synthetic-workspace")
+            );
+            for git in [
+                "",
+                r#","git":{"repository_url":"https://example.test/owner/project.git"}"#,
+                r#","git":{"repository_url":"https://example.test/owner/project.git?private=value"}"#,
+                r#","git":{"repository_url":42}"#,
+                r#","git":{"repository_url":"https://example.test/owner/project.git","repository_url":"https://example.test/owner/project.git"}"#,
+            ] {
+                let header = format!(
+                    r#"{{"type":"session_meta","payload":{{"session_id":"synthetic-session","cwd":"synthetic-workspace"{git}}}}}"#
+                );
+                let staged = transcript_stage(header.as_bytes());
+                let batch = transcript_batch(&staged, header.len(), namespace);
+                let sessions = batch
+                    .entries
+                    .iter()
+                    .filter(|(id, _, _)| id.kind() == IdKind::Session)
+                    .map(|(id, _, _)| id)
+                    .collect::<Vec<_>>();
+                assert_eq!(sessions, vec![&expected_session]);
+                assert_eq!(batch.resume_claims, baseline.resume_claims);
+                assert!(batch.placements.is_empty());
+                assert!(transcript_repository_claims(&staged, &batch).is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn transcript_repository_claim_refuses_header_unsafe_and_unbound_evidence() {
+        use agent_session_grep_ports::RepositoryObservation;
+        without_git(|| {
+            let header = TRANSCRIPT.lines().next().unwrap();
+            let staged = transcript_stage(header.as_bytes());
+            let batch = transcript_batch(&staged, header.len(), "synthetic-namespace");
+            assert!(transcript_repository_claims(&staged, &batch).is_empty());
+            let sessions = batch
+                .entries
+                .iter()
+                .filter(|(id, _, _)| id.kind() == agent_session_grep_domain::IdKind::Session)
+                .collect::<Vec<_>>();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(batch.resume_claims.len(), 1);
+            assert_eq!(batch.resume_claims[0].session_id, sessions[0].0.as_str());
+            assert!(batch.placements.is_empty());
+            let unsafe_url = TRANSCRIPT.replace("project.git", "project.git?private=value");
+            let staged = transcript_stage(unsafe_url.as_bytes());
+            assert_eq!(
+                staged.report.session_observation.repository,
+                RepositoryObservation::Unusable
+            );
+            let batch = transcript_batch(&staged, unsafe_url.len(), "synthetic-namespace");
+            assert!(transcript_repository_claims(&staged, &batch).is_empty());
+            for case in 0..7 {
+                let mut staged = transcript_stage(TRANSCRIPT.as_bytes());
+                let mut batch = transcript_batch(&staged, TRANSCRIPT.len(), "synthetic-namespace");
+                match case {
+                    0 => staged.report.skipped = 1,
+                    1 => batch.relation_complete = false,
+                    2 => batch.resume_claims[0].pair_observed = false,
+                    3 => batch.provider_id = Some("claude-code".into()),
+                    4 => {
+                        if let RepositoryObservation::Resolved(origin) =
+                            &mut staged.report.session_observation.repository
+                        {
+                            origin.record_span.1 = TRANSCRIPT.len() as u64 + 1;
+                        }
+                    }
+                    5 => {
+                        if let RepositoryObservation::Resolved(origin) =
+                            &mut staged.report.session_observation.repository
+                        {
+                            origin.provider_session_id = "another-session".into();
+                        }
+                    }
+                    _ => staged.report.session_observation.multi_session = true,
+                }
+                assert!(
+                    transcript_repository_claims(&staged, &batch).is_empty(),
+                    "case {case}"
+                );
+            }
+        });
+    }
 
     /// 测试专用组合：cwd → 检测本机 git 仓库并归一远端 URL，任何一步失败
     /// → None。生产路径走带缓存的 [`GitRepoSlugResolver`]（两级缓存把同一

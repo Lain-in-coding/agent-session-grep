@@ -123,6 +123,13 @@ fn typed_incomplete_zero_skips_returns_with_exact_single_parse_and_original_text
         token: &token,
     };
     let parsed = Cell::new(0);
+    let repository = agent_session_grep_ports::RepositoryObservation::Resolved(
+        agent_session_grep_ports::TranscriptRepository {
+            provider_session_id: "synthetic-session".into(),
+            url: "https://example.test/owner/project".into(),
+            record_span: (0, bytes.len() as u64),
+        },
+    );
     let (batch, proof) = stage_source_with_parser(&source, |input, sink| {
         parsed.set(parsed.get() + 1);
         // Trait-object vtables may be duplicated across codegen units; the
@@ -144,6 +151,10 @@ fn typed_incomplete_zero_skips_returns_with_exact_single_parse_and_original_text
             ParseReport {
                 committed: 1,
                 skipped: 0,
+                session_observation: ProviderSessionObservation {
+                    repository: repository.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             expected_proof,
@@ -158,6 +169,7 @@ fn typed_incomplete_zero_skips_returns_with_exact_single_parse_and_original_text
     assert_eq!(batch.messages[0].span, Some((0, bytes.len() as u64)));
     assert_eq!(batch.report.committed, 1);
     assert_eq!(batch.report.skipped, 0);
+    assert_eq!(batch.report.session_observation.repository, repository);
     assert!(
         !proof.complete,
         "zero skipped is not typed source completeness"
@@ -202,6 +214,13 @@ fn staging_retains_session_message_activity_usage_and_report_facts_without_recon
             original_working_directory: MetadataResolution::Missing,
             pair_observed: false,
             multi_session: false,
+            repository: agent_session_grep_ports::RepositoryObservation::Resolved(
+                agent_session_grep_ports::TranscriptRepository {
+                    provider_session_id: "synthetic-native-one".into(),
+                    url: "https://example.test/owner/project".into(),
+                    record_span: (0, 4),
+                },
+            ),
         },
     };
     let second_session = ProviderSessionIdentity {
@@ -211,6 +230,7 @@ fn staging_retains_session_message_activity_usage_and_report_facts_without_recon
             original_working_directory: MetadataResolution::Missing,
             pair_observed: false,
             multi_session: false,
+            repository: agent_session_grep_ports::RepositoryObservation::Unusable,
         },
     };
     let report = ParseReport {
@@ -223,6 +243,7 @@ fn staging_retains_session_message_activity_usage_and_report_facts_without_recon
             original_working_directory: MetadataResolution::Ambiguous,
             pair_observed: false,
             multi_session: true,
+            repository: agent_session_grep_ports::RepositoryObservation::Ambiguous,
         },
     };
     let (batch, proof) =

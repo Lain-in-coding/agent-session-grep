@@ -23,7 +23,8 @@ use agent_session_grep_domain::{
 };
 use agent_session_grep_ports::{
     AdapterManifest, CanonicalEventSink, Confidence, MessageEvent, MetadataResolution, ParseReport,
-    ProbeResult, ProviderAdapter, ProviderError, ToolActivityEvent, UsageEvent,
+    ProbeResult, ProviderAdapter, ProviderError, RepositoryObservation,
+    TRANSCRIPT_REPOSITORY_URL_MAX_BYTES, ToolActivityEvent, TranscriptRepository, UsageEvent,
     build_tool_activity, manifest_for,
 };
 use serde::{Deserialize, de::IgnoredAny};
@@ -281,6 +282,218 @@ struct RawPayload {
     /// 而非本会话用量——必须跳过，否则把父会话历史算到子会话头上。
     #[serde(default, rename = "forked_from_id")]
     forked_from_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum RawRepository {
+    #[default]
+    Missing,
+    Url(String),
+    Ambiguous,
+    Unusable,
+}
+
+/// Key of the one-entry map through which serde_json's `arbitrary_precision`
+/// feature (enabled for the workspace) hands a number that fits neither u64
+/// nor i64 to `visit_map`: decimals, exponents and out-of-range integers never
+/// reach `visit_f64`. serde_json keeps the token private (`number.rs`), so it
+/// is repeated here. If serde_json renamed it, numeric `git` values would fall
+/// back to Missing and the numeric regression tests below would fail.
+const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+impl<'de> Deserialize<'de> for RawRepository {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct GitVisitor;
+        impl<'de> serde::de::Visitor<'de> for GitVisitor {
+            type Value = RawRepository;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("optional git metadata")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawRepository::Missing)
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawRepository::Unusable)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut seen = false;
+                let mut number = false;
+                let mut result = RawRepository::Missing;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == SERDE_JSON_NUMBER_TOKEN {
+                        // A number is malformed git metadata, so it must stay
+                        // Unusable: Missing would let a later header resolve.
+                        map.next_value::<IgnoredAny>()?;
+                        number = true;
+                        continue;
+                    }
+                    if key != "repository_url" {
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    }
+                    // Count duplicate keys even when their values agree; Value's
+                    // last-key-wins object conversion would lose this evidence.
+                    if seen {
+                        map.next_value::<IgnoredAny>()?;
+                        result = RawRepository::Ambiguous;
+                        continue;
+                    }
+                    seen = true;
+                    result = match map.next_value::<serde_json::Value>()? {
+                        serde_json::Value::Null => RawRepository::Missing,
+                        serde_json::Value::String(url)
+                            if !url.is_empty()
+                                && url.len() <= TRANSCRIPT_REPOSITORY_URL_MAX_BYTES
+                                && !url.chars().any(|c| c.is_control() || c.is_whitespace()) =>
+                        {
+                            RawRepository::Url(url)
+                        }
+                        _ => RawRepository::Unusable,
+                    };
+                }
+                Ok(if number {
+                    RawRepository::Unusable
+                } else {
+                    result
+                })
+            }
+        }
+        deserializer.deserialize_any(GitVisitor)
+    }
+}
+
+/// Repository evidence of one `session_meta` line, decoded from the same line
+/// bytes as [`RawLine`]. `git` is deliberately absent from [`RawPayload`]: the
+/// derived struct decoder rejects a duplicated declared field, which would skip
+/// the whole record and lose its independent session_id/cwd, message, activity
+/// and usage facts. Only this view reads `git`; every other key stays ignored.
+struct SessionMetaRepository(RawRepository);
+
+impl<'de> Deserialize<'de> for SessionMetaRepository {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LineVisitor;
+        impl<'de> serde::de::Visitor<'de> for LineVisitor {
+            type Value = SessionMetaRepository;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a session_meta record")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut repository = RawRepository::Missing;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "payload" {
+                        // RawLine already rejects a duplicated envelope key.
+                        repository = map
+                            .next_value::<Option<PayloadRepository>>()?
+                            .map_or(RawRepository::Missing, |payload| payload.0);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(SessionMetaRepository(repository))
+            }
+        }
+        deserializer.deserialize_map(LineVisitor)
+    }
+}
+
+/// The `git` member of one payload object. A repeated payload-level `git` is
+/// conflicting evidence even when the values agree; it is consumed and folded
+/// to Ambiguous instead of failing the record or letting the last value win.
+struct PayloadRepository(RawRepository);
+
+impl<'de> Deserialize<'de> for PayloadRepository {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PayloadVisitor;
+        impl<'de> serde::de::Visitor<'de> for PayloadVisitor {
+            type Value = PayloadRepository;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a session_meta payload")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut repository: Option<RawRepository> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "git" {
+                        map.next_value::<IgnoredAny>()?;
+                    } else if repository.is_some() {
+                        map.next_value::<IgnoredAny>()?;
+                        repository = Some(RawRepository::Ambiguous);
+                    } else {
+                        repository = Some(map.next_value::<RawRepository>()?);
+                    }
+                }
+                Ok(PayloadRepository(repository.unwrap_or_default()))
+            }
+        }
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+fn observe_repository(
+    previous: &mut RepositoryObservation,
+    git: &RawRepository,
+    payload: &RawPayload,
+    first_session: Option<&str>,
+    paired_cwd: &MetadataResolution<String>,
+    span: (u64, u64),
+) {
+    let observed = match git {
+        RawRepository::Missing => return,
+        RawRepository::Ambiguous => RepositoryObservation::Ambiguous,
+        RawRepository::Unusable => RepositoryObservation::Unusable,
+        RawRepository::Url(url) => {
+            let sid = payload.session_id.as_deref().map(str::trim);
+            let cwd = payload.cwd.as_deref().map(str::trim);
+            match (sid, cwd, paired_cwd) {
+                (Some(sid), Some(cwd), MetadataResolution::Resolved(paired))
+                    if !sid.is_empty()
+                        && !cwd.is_empty()
+                        && first_session == Some(sid)
+                        && paired == cwd =>
+                {
+                    RepositoryObservation::Resolved(TranscriptRepository {
+                        provider_session_id: sid.to_owned(),
+                        url: url.clone(),
+                        record_span: span,
+                    })
+                }
+                _ => RepositoryObservation::Unusable,
+            }
+        }
+    };
+    *previous = if matches!(previous, RepositoryObservation::Missing) {
+        observed
+    } else {
+        // A later valid observation never repairs an unsafe/cross-record one.
+        RepositoryObservation::Ambiguous
+    };
 }
 
 impl RawPayload {
@@ -941,6 +1154,20 @@ impl ProviderAdapter for CodexAdapter {
                         report.session_observation.pair_observed = true;
                     }
                 }
+                if let Some(payload) = &rec.payload {
+                    // A view that cannot decode is unusable evidence, never
+                    // absence and never a reason to skip the record.
+                    let git = serde_json::from_str::<SessionMetaRepository>(parse_line)
+                        .map_or(RawRepository::Unusable, |line| line.0);
+                    observe_repository(
+                        &mut report.session_observation.repository,
+                        &git,
+                        payload,
+                        report.session_native_id.as_deref(),
+                        &report.session_observation.original_working_directory,
+                        (start, end),
+                    );
+                }
                 // fork 子会话（subagent）：本文件 token_count 的累计量继承自
                 // 父会话，下一条 token_count 是继承基线——标记吸收，绝不把
                 // 父会话历史 emit 成子会话用量。
@@ -1091,6 +1318,9 @@ impl ProviderAdapter for CodexAdapter {
             // 已观测 pair 值或 Missing，由上层按 multi_session 判定不可恢复。
             report.session_observation.multi_session = true;
             report.session_observation.provider_session_id = MetadataResolution::Ambiguous;
+            if report.session_observation.repository != RepositoryObservation::Missing {
+                report.session_observation.repository = RepositoryObservation::Ambiguous;
+            }
             let mut id_list = session_ids
                 .iter()
                 .take(SESSION_ID_LIST_LIMIT)
@@ -1205,6 +1435,380 @@ mod tests {
 {"timestamp":"2026-07-19T23:40:01.000Z","type":"response_item","payload":{"type":"message","id":"msg_u1","role":"user","content":[{"type":"input_text","text":"how do I configure the sandbox"}]}}
 {"timestamp":"2026-07-19T23:40:02.500Z","type":"response_item","payload":{"type":"message","id":"msg_a1","role":"assistant","content":[{"type":"output_text","text":"set the policy"},{"type":"output_text","text":"in config.toml"}]}}
 {"timestamp":"2026-07-19T23:40:02.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[]}}"#;
+
+    fn repository_header(payload: serde_json::Value) -> String {
+        serde_json::json!({"type":"session_meta","payload":payload}).to_string()
+    }
+
+    fn repository_report(headers: &[String], messages: bool) -> ParseReport {
+        let mut input = headers.join("\r\n");
+        if messages {
+            input.push('\n');
+            input.push_str(r#"{"type":"response_item","payload":{"type":"message","id":"synthetic-message","role":"user","content":"synthetic repository test"}}"#);
+        }
+        let mut sink = CollectingSink::default();
+        let report = CodexAdapter::new()
+            .parse(input.as_bytes(), &mut sink)
+            .unwrap();
+        assert_eq!(report.committed, usize::from(messages));
+        assert_eq!(sink.messages.len(), usize::from(messages));
+        assert_eq!(report.skipped, 0);
+        report
+    }
+
+    #[test]
+    fn transcript_repository_same_record_span_and_resume_pair_are_preserved() {
+        let header = repository_header(serde_json::json!({
+            "session_id":"synthetic-session", "cwd":"synthetic-workspace",
+            "git":{"repository_url":"https://example.test/owner/project.git"}
+        }));
+        let prefix = "\u{feff}\r\n";
+        let mut bytes = format!("{prefix}{header}\r\n").into_bytes();
+        bytes.extend_from_slice(r#"{"type":"response_item","payload":{"type":"message","id":"synthetic-message","role":"user","content":"synthetic 原文"}}"#.as_bytes());
+        let report = CodexAdapter::new()
+            .parse(&bytes, &mut CollectingSink::default())
+            .unwrap();
+        let RepositoryObservation::Resolved(origin) = &report.session_observation.repository else {
+            panic!("expected same-record repository observation")
+        };
+        assert_eq!(origin.provider_session_id, "synthetic-session");
+        assert_eq!(origin.url, "https://example.test/owner/project.git");
+        assert_eq!(
+            origin.record_span,
+            (prefix.len() as u64, (prefix.len() + header.len()) as u64)
+        );
+        assert_eq!(
+            &bytes[origin.record_span.0 as usize..origin.record_span.1 as usize],
+            header.as_bytes()
+        );
+        assert!(report.session_observation.pair_observed);
+        assert_eq!(
+            report.session_native_id.as_deref(),
+            Some("synthetic-session")
+        );
+        assert!(!format!("{origin:?}").contains("example.test"));
+    }
+
+    #[test]
+    fn transcript_repository_missing_and_turn_context_do_not_guess() {
+        for git in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"branch":"synthetic", "commit_hash":"synthetic"})),
+            Some(serde_json::json!({"repository_url":null})),
+        ] {
+            let mut payload =
+                serde_json::json!({"session_id":"synthetic-session","cwd":"synthetic-workspace"});
+            if let Some(git) = git {
+                payload["git"] = git;
+            }
+            let ignored = serde_json::json!({"type":"turn_context","payload":{
+                "session_id":"synthetic-session","cwd":"synthetic-workspace",
+                "git":{"repository_url":"https://example.test/owner/ignored"}
+            }})
+            .to_string();
+            let report = repository_report(&[repository_header(payload), ignored], true);
+            assert_eq!(
+                report.session_observation.repository,
+                RepositoryObservation::Missing
+            );
+            assert!(report.session_observation.pair_observed);
+        }
+    }
+
+    #[test]
+    fn transcript_repository_malformed_is_unusable_without_losing_messages_or_resume() {
+        for git in [
+            serde_json::json!(false),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!("unsupported"),
+            serde_json::json!({"repository_url":42}),
+            serde_json::json!({"repository_url":""}),
+            serde_json::json!({"repository_url":" "}),
+            serde_json::json!({"repository_url":"https://example.test/owner/project\n"}),
+            serde_json::json!({"repository_url":"x".repeat(TRANSCRIPT_REPOSITORY_URL_MAX_BYTES+1)}),
+        ] {
+            let header = repository_header(serde_json::json!({
+                "session_id":"synthetic-session","cwd":"synthetic-workspace","git":git
+            }));
+            let report = repository_report(&[header], true);
+            assert_eq!(
+                report.session_observation.repository,
+                RepositoryObservation::Unusable
+            );
+            assert!(report.session_observation.pair_observed);
+            assert!(
+                report.diagnostics.is_empty(),
+                "metadata values never enter diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_repository_numeric_git_cannot_be_repaired_by_a_later_header() {
+        let valid = repository_header(serde_json::json!({
+            "session_id":"synthetic-session","cwd":"synthetic-workspace",
+            "git":{"repository_url":"https://example.test/owner/project"}
+        }));
+        // Keep the original numeric spelling. Serializing through Value could
+        // turn an exponent into an integer and miss the actual visitor path.
+        for value in [
+            "1.5",
+            "-1.5",
+            "1e3",
+            "18446744073709551616",
+            "-9223372036854775809",
+        ] {
+            let numeric = format!(
+                r#"{{"type":"session_meta","payload":{{"session_id":"synthetic-session","cwd":"synthetic-workspace","git":{value}}}}}"#
+            );
+            for messages in [false, true] {
+                let report = repository_report(std::slice::from_ref(&numeric), messages);
+                assert_eq!(
+                    report.session_observation.repository,
+                    RepositoryObservation::Unusable,
+                    "numeric case {value}"
+                );
+                assert_eq!(
+                    report.session_observation.provider_session_id,
+                    MetadataResolution::Resolved("synthetic-session".into())
+                );
+                assert_eq!(
+                    report.session_observation.original_working_directory,
+                    MetadataResolution::Resolved("synthetic-workspace".into())
+                );
+                assert!(report.session_observation.pair_observed);
+                assert!(report.diagnostics.is_empty());
+                for headers in [
+                    [numeric.clone(), valid.clone()],
+                    [valid.clone(), numeric.clone()],
+                ] {
+                    let report = repository_report(&headers, messages);
+                    assert_eq!(
+                        report.session_observation.repository,
+                        RepositoryObservation::Ambiguous,
+                        "numeric case {value}"
+                    );
+                    assert!(report.session_observation.pair_observed);
+                    assert!(report.diagnostics.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_repository_cross_record_pair_is_unusable() {
+        let pair = repository_header(serde_json::json!({
+            "session_id":"synthetic-session","cwd":"synthetic-workspace"
+        }));
+        for payload in [
+            serde_json::json!({"session_id":"synthetic-session","git":{"repository_url":"https://example.test/owner/project"}}),
+            serde_json::json!({"cwd":"synthetic-workspace","git":{"repository_url":"https://example.test/owner/project"}}),
+            serde_json::json!({"id":"synthetic-session","cwd":"synthetic-workspace","git":{"repository_url":"https://example.test/owner/project"}}),
+            serde_json::json!({"session_id":"synthetic-session","cwd":"different-workspace","git":{"repository_url":"https://example.test/owner/project"}}),
+        ] {
+            let report = repository_report(&[pair.clone(), repository_header(payload)], true);
+            assert_eq!(
+                report.session_observation.repository,
+                RepositoryObservation::Unusable
+            );
+            assert!(report.session_observation.pair_observed);
+        }
+    }
+
+    #[test]
+    fn transcript_repository_duplicate_conflicting_and_multisession_are_ambiguous() {
+        let header = |sid, name| {
+            repository_header(serde_json::json!({
+                "session_id":sid, "cwd":"synthetic-workspace",
+                "git":{"repository_url":format!("https://example.test/owner/{name}")}
+            }))
+        };
+        for second in [
+            header("synthetic-one", "project"),
+            header("synthetic-one", "different"),
+            header("synthetic-two", "project"),
+            repository_header(
+                serde_json::json!({"session_id":"synthetic-two","cwd":"synthetic-workspace"}),
+            ),
+        ] {
+            let report = repository_report(&[header("synthetic-one", "project"), second], true);
+            assert_eq!(
+                report.session_observation.repository,
+                RepositoryObservation::Ambiguous
+            );
+        }
+        let report = repository_report(&[r#"{"type":"session_meta","payload":{"session_id":"synthetic-one","cwd":"synthetic-workspace","git":{"repository_url":"https://example.test/owner/project","repository_url":"https://example.test/owner/project"}}}"#.into()], true);
+        assert_eq!(
+            report.session_observation.repository,
+            RepositoryObservation::Ambiguous
+        );
+    }
+
+    #[test]
+    fn transcript_repository_duplicate_payload_git_keeps_header_and_resume() {
+        let baseline = repository_header(serde_json::json!({
+            "session_id":"synthetic-session","cwd":"synthetic-workspace"
+        }));
+        let baseline_probe = CodexAdapter::new().probe(baseline.as_bytes()).unwrap();
+        for git in [
+            r#""git":{"repository_url":"https://example.test/owner/project"},"git":{"repository_url":"https://example.test/owner/project"}"#,
+            r#""git":{"repository_url":"https://example.test/owner/project"},"git":{"repository_url":"https://example.test/owner/different"}"#,
+            r#""git":{"repository_url":"https://example.test/owner/project"},"git":null"#,
+            r#""git":null,"git":{"repository_url":"https://example.test/owner/project"}"#,
+            r#""git":{"repository_url":"https://example.test/owner/project"},"g\u0069t":null"#,
+        ] {
+            let header = format!(
+                r#"{{"type":"session_meta","payload":{{"session_id":"synthetic-session","cwd":"synthetic-workspace",{git}}}}}"#
+            );
+            assert_eq!(
+                CodexAdapter::new().probe(header.as_bytes()).unwrap(),
+                baseline_probe
+            );
+            for messages in [false, true] {
+                let report = repository_report(std::slice::from_ref(&header), messages);
+                assert_eq!(
+                    report.session_native_id.as_deref(),
+                    Some("synthetic-session")
+                );
+                assert_eq!(
+                    report.session_observation.provider_session_id,
+                    MetadataResolution::Resolved("synthetic-session".into())
+                );
+                assert_eq!(
+                    report.session_observation.original_working_directory,
+                    MetadataResolution::Resolved("synthetic-workspace".into())
+                );
+                assert!(report.session_observation.pair_observed);
+                assert_eq!(
+                    report.session_observation.repository,
+                    RepositoryObservation::Ambiguous
+                );
+                assert!(report.diagnostics.is_empty());
+            }
+        }
+        // Only optional git changed: duplicate identity fields still fail the
+        // original derived decoder rather than acquiring last-value-wins.
+        let duplicate_session_id = r#"{"type":"session_meta","payload":{"session_id":"synthetic-session","session_id":"synthetic-session","cwd":"synthetic-workspace"}}"#;
+        let report = CodexAdapter::new()
+            .parse(
+                duplicate_session_id.as_bytes(),
+                &mut CollectingSink::default(),
+            )
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert!(report.session_native_id.is_none());
+    }
+
+    #[test]
+    fn transcript_repository_duplicate_git_on_other_records_keeps_events() {
+        let records = [
+            serde_json::json!({"type":"session_meta","payload":{
+                "session_id":"synthetic-session","cwd":"synthetic-workspace"
+            }}),
+            assistant_message("synthetic-message", "synthetic activity and usage"),
+            response_item(serde_json::json!({
+                "type":"custom_tool_call","id":"call_1","tool_call_id":"call_1",
+                "name":"shell","arguments":"{\"command\":\"cat config.toml\"}"
+            })),
+            response_item(serde_json::json!({
+                "type":"function_call_output","id":"fco_1","call_id":"call_1",
+                "output":"synthetic output","is_error":false
+            })),
+            token_count(serde_json::json!({
+                "total_token_usage":usage_obj(10, 2, 3, 1),
+                "last_token_usage":usage_obj(10, 2, 3, 1)
+            })),
+        ];
+        let lines = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let parse = |input: &str| {
+            let mut sink = CollectingSink::default();
+            let report = CodexAdapter::new()
+                .parse(input.as_bytes(), &mut sink)
+                .unwrap();
+            (report, sink)
+        };
+        let baseline = lines.join("\n");
+        let baseline_probe = CodexAdapter::new().probe(baseline.as_bytes()).unwrap();
+        let (baseline_report, baseline_sink) = parse(&baseline);
+        assert_eq!(baseline_report.committed, 1);
+        assert_eq!(baseline_report.skipped, 0);
+        assert_eq!(baseline_sink.messages.len(), 1);
+        assert_eq!(baseline_sink.activities.len(), 1);
+        assert_eq!(baseline_sink.usages.len(), 1);
+        assert_eq!(
+            baseline_report.session_observation.repository,
+            RepositoryObservation::Missing
+        );
+        for (index, original) in lines.iter().enumerate().skip(1) {
+            let mut duplicate = lines.clone();
+            duplicate[index] = original.replacen(
+                "\"payload\":{",
+                "\"payload\":{\"git\":{\"repository_url\":\"https://example.test/owner/ignored\"},\"git\":null,",
+                1,
+            );
+            assert_ne!(&duplicate[index], original);
+            let input = duplicate.join("\n");
+            assert_eq!(
+                CodexAdapter::new().probe(input.as_bytes()).unwrap(),
+                baseline_probe
+            );
+            let (report, sink) = parse(&input);
+            assert_eq!(report, baseline_report);
+            assert_eq!(sink.messages.len(), baseline_sink.messages.len());
+            for (actual, expected) in sink.messages.iter().zip(&baseline_sink.messages) {
+                // Spans differ because the optional bytes were inserted.
+                assert_eq!(
+                    (
+                        actual.seq,
+                        &actual.native_id,
+                        &actual.parent_native_id,
+                        &actual.role,
+                        &actual.text,
+                        &actual.timestamp,
+                        actual.is_sidechain
+                    ),
+                    (
+                        expected.seq,
+                        &expected.native_id,
+                        &expected.parent_native_id,
+                        &expected.role,
+                        &expected.text,
+                        &expected.timestamp,
+                        expected.is_sidechain
+                    )
+                );
+            }
+            assert_eq!(sink.activities.len(), baseline_sink.activities.len());
+            for (actual, expected) in sink.activities.iter().zip(&baseline_sink.activities) {
+                assert_eq!(actual.message_native_id, expected.message_native_id);
+                assert_eq!(actual.activity, expected.activity);
+            }
+            assert_eq!(sink.usages.len(), baseline_sink.usages.len());
+            for (actual, expected) in sink.usages.iter().zip(&baseline_sink.usages) {
+                assert_eq!(actual.message_native_id, expected.message_native_id);
+                assert_eq!(actual.usage, expected.usage);
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_repository_header_only_never_emits_messages() {
+        let header = repository_header(serde_json::json!({
+            "session_id":"synthetic-session","cwd":"synthetic-workspace",
+            "git":{"repository_url":"https://example.test/owner/project"}
+        }));
+        let report = repository_report(&[header], false);
+        assert!(matches!(
+            report.session_observation.repository,
+            RepositoryObservation::Resolved(_)
+        ));
+    }
 
     #[test]
     fn probe_confirms_codex_rollout() {

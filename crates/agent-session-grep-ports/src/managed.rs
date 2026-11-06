@@ -114,8 +114,9 @@ pub struct SourceObservation {
     pub observed_at_ms: i64,
     pub committed_at_ms: i64,
     pub selections: Vec<SelectionProof>,
-    /// Derived from this source's verified paired resume claim by the existing
-    /// repository resolver; never copied from global merged repo tables.
+    /// Derived from this complete source's same-record transcript repository
+    /// observation and paired resume claim, mapped to its actual canonical batch
+    /// Session. Never resolved from cwd or copied from global merged repo tables.
     pub repositories: Vec<RepositoryClaim>,
 }
 

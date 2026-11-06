@@ -243,7 +243,10 @@ pub fn stage(
         )
         .into());
     }
-    let (staged, variant_id, format, antigravity) = parsed;
+    let (mut staged, variant_id, format, antigravity) = parsed;
+    crate::repo_identity::admit_transcript_repository(
+        &mut staged.report.session_observation.repository,
+    );
     let incomplete = if antigravity
         .as_ref()
         .is_some_and(|observed| !observed.complete)

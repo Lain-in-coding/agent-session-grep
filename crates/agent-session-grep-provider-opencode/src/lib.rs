@@ -159,6 +159,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                             .unwrap_or_default(),
                         pair_observed: cwd.is_some(),
                         multi_session: false,
+                        repository: Default::default(),
                     },
                 },
             );

@@ -6137,6 +6137,13 @@ fn observe_source(
     } else if let Some(transition) = &mut context.authority {
         transition.expected_prior = writer.authority_prior(control, &transition.key, end)?;
     }
+    if state == ObservationState::Complete
+        && !soft_deleted
+        && let Some((staged, _)) = &parsed
+    {
+        observation.repositories =
+            crate::repo_identity::transcript_repository_claims(staged, &batch);
+    }
     context.validate()?;
     admit(control, policy, advisory, &source.path, &source.id, end)?;
     verify_snapshot_with_deadline(&source.path, &snapshot, input_limit, end)?;
@@ -8626,6 +8633,7 @@ mod control_deadline_tests {
     use super::*;
     use crate::update_state::EpochRefusal;
     use agent_session_grep_ports::managed::{ProjectionQuery, ProjectionRead};
+    use rusqlite::Connection;
     use std::{cell::Cell, io::Write, rc::Rc};
 
     thread_local! {
@@ -9327,6 +9335,470 @@ mod control_deadline_tests {
         file.write_all(&synthetic_record(provider, id, text))
             .unwrap();
         file.sync_all().unwrap();
+    }
+
+    fn transcript_repository_bytes(payload: serde_json::Value, message: bool) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":payload
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        if message {
+            bytes.extend(synthetic_record(
+                SearchProvider::Codex,
+                "synthetic-repo-message",
+                "repositoryneedle",
+            ));
+        }
+        bytes
+    }
+
+    fn transcript_repository_payload() -> serde_json::Value {
+        serde_json::json!({
+            "session_id":"synthetic-repo-session","cwd":"synthetic-workspace",
+            "git":{"repository_url":"https://example.test/owner/project.git"}
+        })
+    }
+
+    fn assert_transcript_repository_projection(fixture: &CycleFixture, expected: Option<&str>) {
+        use agent_session_grep_ports::managed::{EntityData, EntityKind};
+        fixture
+            .control
+            .with_runtime_deadline(fixture.scope_end, || {
+                ManagedStore::open(&fixture.db, &fixture.control)?.with_read(
+                    &fixture.control,
+                    RequestIntersection::Selected,
+                    fixture.scope_end,
+                    |read| {
+                        let hits = read.query_lexical(
+                            "repositoryneedle",
+                            &ProjectionQuery::default(),
+                            10,
+                        )?;
+                        assert_eq!(hits.hits.len(), 1);
+                        let message = &hits.hits[0].projection;
+                        let occurrence = message.occurrence.as_ref().unwrap();
+                        assert_eq!(occurrence.data.project_id.as_deref(), expected);
+                        let session = &occurrence.data.placement.session_id;
+                        let ids = std::slice::from_ref(session);
+                        let sessions =
+                            read.entities(EntityKind::Session, ids, &ProjectionQuery::default())?;
+                        assert_eq!(sessions.len(), 1);
+                        let EntityData::Session(data) = &sessions[0].data else {
+                            panic!("session projection")
+                        };
+                        assert_eq!(&data.session.id, session);
+                        assert_eq!(data.repo_slug.as_deref(), expected);
+                        let repos = read.entities(
+                            EntityKind::Repository,
+                            ids,
+                            &ProjectionQuery::default(),
+                        )?;
+                        assert_eq!(repos.len(), usize::from(expected.is_some()));
+                        if let Some(slug) = expected {
+                            let EntityData::Repository(repo) = &repos[0].data else {
+                                panic!("repository projection")
+                            };
+                            assert_eq!(&repo.session_id, session);
+                            assert_eq!(repo.slug, slug);
+                            assert_eq!(repos[0].proof.source_id, message.proof.source_id);
+                            assert_eq!(repos[0].proof.revision, message.proof.revision);
+                            assert_eq!(sessions[0].proof.revision, message.proof.revision);
+                            let mut query = ProjectionQuery::default();
+                            query.filters.repo = Some(slug.into());
+                            assert_eq!(
+                                read.query_lexical("repositoryneedle", &query, 10)?
+                                    .hits
+                                    .len(),
+                                1
+                            );
+                            query.filters.repo = Some("example.test/owner/unknown".into());
+                            assert!(
+                                read.query_lexical("repositoryneedle", &query, 10)?
+                                    .hits
+                                    .is_empty()
+                            );
+                        }
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn transcript_repository_worker_publishes_and_reparses_without_git() {
+        crate::repo_identity::without_git(|| {
+            let fixture = CycleFixture::new_for_provider(SearchProvider::Codex);
+            let path = fixture.write_source(
+                "repository.jsonl",
+                SearchProvider::Codex,
+                "repositoryneedle",
+            );
+            let bytes = transcript_repository_bytes(transcript_repository_payload(), true);
+            std::fs::write(&path, &bytes).unwrap();
+            let mut schedule = SourceScheduleState::default();
+            let parses = Rc::new(Cell::new(0));
+            schedule.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let parses = parses.clone();
+                move |event| {
+                    if matches!(event, ScheduleTestEvent::BeforeParse(..)) {
+                        parses.set(parses.get() + 1);
+                    }
+                    Ok(())
+                }
+            });
+            let boot = ObservationClock::new(Instant::now());
+            let (result, cycle) = fixture.production_cycle(&mut schedule, &boot);
+            assert!(result.unwrap().idle());
+            assert_eq!(cycle.state, CycleState::Committed);
+            assert_eq!(parses.get(), 1);
+            assert_transcript_repository_projection(&fixture, Some("example.test/owner/project"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let stored_parser = || {
+                Connection::open(&fixture.db)
+                    .unwrap()
+                    .query_row(
+                        "SELECT r.parser_version FROM source_heads h
+                     JOIN source_revision_receipts r ON r.revision_id=h.latest_receipt_id",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(stored_parser(), PARSER_SEMANTIC_VERSION);
+
+            // Nonempty prior repository proof stays refresh-ineligible: an
+            // unchanged latest request must still parse the exact transcript.
+            assert!(fixture.scheduled(&mut schedule, &boot).0.unwrap());
+            assert_eq!(parses.get(), 2);
+            assert_transcript_repository_projection(&fixture, Some("example.test/owner/project"));
+
+            // Existing source/receipt lineage at the prior parser version must
+            // be reparsed even with unchanged bytes. This edits only synthetic
+            // version evidence; no repository claim is injected.
+            let conn = Connection::open(&fixture.db).unwrap();
+            conn.execute(
+                "UPDATE source_scans SET parser_version=?1",
+                [PARSER_SEMANTIC_VERSION - 1],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE source_revision_receipts SET parser_version=?1",
+                [PARSER_SEMANTIC_VERSION - 1],
+            )
+            .unwrap();
+            drop(conn);
+            let mut restarted = SourceScheduleState::default();
+            let reparses = Rc::new(Cell::new(0));
+            restarted.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let reparses = reparses.clone();
+                move |event| {
+                    if matches!(event, ScheduleTestEvent::BeforeParse(..)) {
+                        reparses.set(reparses.get() + 1);
+                    }
+                    Ok(())
+                }
+            });
+            assert!(
+                fixture
+                    .production_cycle(&mut restarted, &boot)
+                    .0
+                    .unwrap()
+                    .idle()
+            );
+            assert_eq!(reparses.get(), 1);
+            assert_transcript_repository_projection(&fixture, Some("example.test/owner/project"));
+            assert_eq!(stored_parser(), PARSER_SEMANTIC_VERSION);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn transcript_repository_worker_header_only_reparse_preserves_session_and_resume() {
+        use agent_session_grep_ports::managed::{EntityData, ResumeValue};
+        crate::repo_identity::without_git(|| {
+            let fixture = CycleFixture::new_for_provider(SearchProvider::Codex);
+            let path = fixture.write_source(
+                "repository-header.jsonl",
+                SearchProvider::Codex,
+                "repositoryneedle",
+            );
+            let bytes = transcript_repository_bytes(transcript_repository_payload(), false);
+            std::fs::write(&path, &bytes).unwrap();
+            let boot = ObservationClock::new(Instant::now());
+            let (result, cycle) =
+                fixture.production_cycle(&mut SourceScheduleState::default(), &boot);
+            assert!(result.unwrap().idle());
+            assert_eq!(cycle.state, CycleState::Committed);
+            let stored = || {
+                let conn = Connection::open(&fixture.db).unwrap();
+                let parser = conn
+                    .query_row(
+                        "SELECT r.parser_version FROM source_heads h
+                         JOIN source_revision_receipts r ON r.revision_id=h.latest_receipt_id",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .unwrap();
+                let mut statement = conn
+                    .prepare(
+                        "SELECT kind,entity_id,payload FROM source_entity_projections
+                         WHERE kind IN ('session','resume_claim','repo_identity')
+                         ORDER BY kind,entity_id",
+                    )
+                    .unwrap();
+                let entities = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut statement = conn
+                    .prepare(
+                        "SELECT session_id FROM source_session_projections ORDER BY session_id",
+                    )
+                    .unwrap();
+                let sessions = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                (parser, entities, sessions)
+            };
+            let before = stored();
+            assert_eq!(before.0, PARSER_SEMANTIC_VERSION);
+            assert_eq!(before.1.len(), 2);
+            assert_eq!(before.2.len(), 1);
+            for (kind, id, payload) in &before.1 {
+                assert_eq!(id, &before.2[0]);
+                match serde_json::from_slice::<EntityData>(payload).unwrap() {
+                    EntityData::Session(data) => {
+                        assert_eq!(kind, "session");
+                        assert_eq!(data.session.id.as_str(), id.as_str());
+                        assert!(data.repo_slug.is_none());
+                    }
+                    EntityData::Resume(data) => {
+                        assert_eq!(kind, "resume_claim");
+                        assert_eq!(data.session_id.as_str(), id.as_str());
+                        assert_eq!(data.provider_id, "codex");
+                        assert_eq!(
+                            data.provider_session_id,
+                            ResumeValue::Resolved("synthetic-repo-session".into())
+                        );
+                        assert_eq!(
+                            data.original_working_directory,
+                            ResumeValue::Resolved("synthetic-workspace".into())
+                        );
+                        assert!(data.pair_observed);
+                    }
+                    _ => panic!("unexpected header-only repository projection"),
+                }
+            }
+            let prior = fixture.sources()[0].latest_receipt.clone();
+            // These are the original empty-message Session/resume projections.
+            // Mark only their stored parser lineage as stale (3 for this A-only
+            // change), keeping the transcript bytes and every projection intact.
+            let previous_parser = PARSER_SEMANTIC_VERSION - 1;
+            let conn = Connection::open(&fixture.db).unwrap();
+            conn.execute(
+                "UPDATE source_scans SET parser_version=?1",
+                [previous_parser],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE source_revision_receipts SET parser_version=?1",
+                [previous_parser],
+            )
+            .unwrap();
+            drop(conn);
+            let stale = stored();
+            assert_eq!(stale.0, previous_parser);
+            assert_eq!(stale.1, before.1);
+            assert_eq!(stale.2, before.2);
+            let mut restarted = SourceScheduleState::default();
+            let parses = Rc::new(Cell::new(0));
+            restarted.hooks = scheduler_hooks(Rc::new(Cell::new(Duration::ZERO)), {
+                let parses = parses.clone();
+                move |event| {
+                    if matches!(event, ScheduleTestEvent::BeforeParse(..)) {
+                        parses.set(parses.get() + 1);
+                    }
+                    Ok(())
+                }
+            });
+            let (result, cycle) = fixture.production_cycle(&mut restarted, &boot);
+            assert!(result.unwrap().idle());
+            assert_eq!(cycle.state, CycleState::Committed);
+            assert_eq!(
+                parses.get(),
+                1,
+                "old parser evidence must force one reparse"
+            );
+            assert_eq!(stored(), before);
+            assert_ne!(fixture.sources()[0].latest_receipt, prior);
+            assert_eq!(fixture.hits("repositoryneedle"), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn transcript_repository_worker_incomplete_and_pending_rewrite_preserve_old_projection() {
+        crate::repo_identity::without_git(|| {
+            let fixture = CycleFixture::new_for_provider(SearchProvider::Codex);
+            let path = fixture.write_source(
+                "repository.jsonl",
+                SearchProvider::Codex,
+                "repositoryneedle",
+            );
+            let original = transcript_repository_bytes(transcript_repository_payload(), true);
+            std::fs::write(&path, &original).unwrap();
+            let mut schedule = SourceScheduleState::default();
+            let mut boot = ObservationClock::new(Instant::now());
+            assert!(
+                fixture
+                    .production_cycle(&mut schedule, &boot)
+                    .0
+                    .unwrap()
+                    .idle()
+            );
+            let before = fixture.sources()[0].latest_receipt.clone();
+            let mut partial = original.clone();
+            partial.extend_from_slice(b"{\"type\":");
+            std::fs::write(&path, &partial).unwrap();
+            let (result, cycle, _) = fixture.scheduled(&mut schedule, &boot);
+            assert!(!result.unwrap());
+            assert_eq!(cycle.state, CycleState::Partial);
+            assert_eq!(fixture.sources()[0].latest_receipt, before);
+            assert_transcript_repository_projection(&fixture, Some("example.test/owner/project"));
+            assert_eq!(std::fs::read(&path).unwrap(), partial);
+
+            let mut missing = transcript_repository_payload();
+            missing.as_object_mut().unwrap().remove("git");
+            let rewrite = transcript_repository_bytes(missing, true);
+            std::fs::write(&path, &rewrite).unwrap();
+            let (result, cycle, _) = fixture.scheduled(&mut schedule, &boot);
+            assert!(
+                !result.unwrap(),
+                "first rewrite observation is not confirmed"
+            );
+            assert_eq!(cycle.state, CycleState::Partial);
+            assert_eq!(fixture.sources()[0].latest_receipt, before);
+            assert_transcript_repository_projection(&fixture, Some("example.test/owner/project"));
+            assert_eq!(std::fs::read(&path).unwrap(), rewrite);
+
+            // Advance the existing test confirmation clock, not a sleep or a
+            // renewed source budget. A complete confirmed Missing replaces A.
+            boot.started -= Duration::from_millis((CONFIRMATION_MS + 1) as u64);
+            assert!(fixture.scheduled(&mut schedule, &boot).0.unwrap());
+            assert_transcript_repository_projection(&fixture, None);
+            assert_ne!(fixture.sources()[0].latest_receipt, before);
+            assert_eq!(std::fs::read(&path).unwrap(), rewrite);
+        });
+    }
+
+    #[test]
+    fn transcript_repository_worker_negatives_and_claude_do_not_use_git() {
+        crate::repo_identity::without_git(|| {
+            for case in 0..7 {
+                let provider = if case == 6 {
+                    SearchProvider::Claude
+                } else {
+                    SearchProvider::Codex
+                };
+                let fixture = CycleFixture::new_for_provider(provider);
+                let path = fixture.write_source("repository.jsonl", provider, "repositoryneedle");
+                let mut payload = transcript_repository_payload();
+                let mut bytes = match case {
+                    0 => {
+                        payload["git"]["repository_url"] =
+                            serde_json::json!("https://example.test/owner/project?private=value");
+                        transcript_repository_bytes(payload, true)
+                    }
+                    1 => {
+                        payload["git"] = serde_json::json!("malformed");
+                        transcript_repository_bytes(payload, true)
+                    }
+                    2 => {
+                        payload.as_object_mut().unwrap().remove("cwd");
+                        transcript_repository_bytes(payload, true)
+                    }
+                    3 => {
+                        let mut bytes = transcript_repository_bytes(payload.clone(), false);
+                        bytes.extend(transcript_repository_bytes(payload, true));
+                        bytes
+                    }
+                    4 => transcript_repository_bytes(payload, false),
+                    5 => {
+                        payload.as_object_mut().unwrap().remove("git");
+                        transcript_repository_bytes(payload, true)
+                    }
+                    _ => {
+                        let mut row: serde_json::Value = serde_json::from_slice(&synthetic_record(
+                            provider,
+                            "synthetic-repo-message",
+                            "repositoryneedle",
+                        ))
+                        .unwrap();
+                        row["cwd"] = serde_json::json!("synthetic-workspace");
+                        row["gitBranch"] = serde_json::json!("synthetic-branch");
+                        let mut bytes = serde_json::to_vec(&row).unwrap();
+                        bytes.push(b'\n');
+                        bytes
+                    }
+                };
+                if case == 2 {
+                    // A later cwd-only record cannot repair the unpaired URL.
+                    bytes.extend(transcript_repository_bytes(
+                        serde_json::json!({"session_id":"synthetic-repo-session","cwd":"synthetic-workspace"}), false));
+                }
+                std::fs::write(&path, &bytes).unwrap();
+                let mut schedule = SourceScheduleState::default();
+                let boot = ObservationClock::new(Instant::now());
+                assert!(
+                    fixture
+                        .production_cycle(&mut schedule, &boot)
+                        .0
+                        .unwrap()
+                        .idle(),
+                    "case {case}"
+                );
+                if case == 4 {
+                    assert_eq!(fixture.hits("repositoryneedle"), 0);
+                    let conn = Connection::open(&fixture.db).unwrap();
+                    for (kind, expected) in
+                        [("repo_identity", 0), ("session", 1), ("resume_claim", 1)]
+                    {
+                        assert_eq!(
+                            conn.query_row(
+                                "SELECT COUNT(*) FROM source_entity_projections WHERE kind=?1",
+                                [kind],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                    }
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM source_session_projections",
+                            [],
+                            |row| { row.get::<_, i64>(0) }
+                        )
+                        .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_transcript_repository_projection(&fixture, None);
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        });
     }
 
     fn scheduler_hooks(

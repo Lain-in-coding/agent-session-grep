@@ -1113,6 +1113,41 @@ pub enum MetadataResolution<T> {
     Ambiguous,
 }
 
+/// Bounded private transcript metadata, not a Git-metadata access capability.
+pub const TRANSCRIPT_REPOSITORY_URL_MAX_BYTES: usize = 4096;
+
+/// Repository metadata from one source parse. Only Missing can permit a future
+/// separately authorized fallback; invalid or conflicting evidence is not absence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RepositoryObservation {
+    #[default]
+    Missing,
+    /// A unique same-record observation, still subject to URL admission and
+    /// mapping to the actual canonical batch Session before publication.
+    Resolved(TranscriptRepository),
+    Ambiguous,
+    Unusable,
+}
+
+/// Private same-record evidence. Never serialize this into public provenance or
+/// diagnostics. The URL is not a filesystem locator and must never be opened.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TranscriptRepository {
+    /// The provider Session ID co-observed with cwd and URL, not a canonical ID.
+    pub provider_session_id: String,
+    pub url: String,
+    /// Exact verified snapshot bytes of the metadata record, end exclusive and
+    /// excluding its line terminator, in the same coordinates as MessageEvent.
+    pub record_span: (u64, u64),
+}
+
+impl std::fmt::Debug for TranscriptRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranscriptRepository")
+            .finish_non_exhaustive()
+    }
+}
+
 /// 一次权威的 Provider-native Session Resume Metadata 观察（ADR-0009）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderSessionObservation {
@@ -1122,6 +1157,8 @@ pub struct ProviderSessionObservation {
     pub pair_observed: bool,
     /// Source 携带多个不同 native Session ID（现有诊断契约的 typed 映射）。
     pub multi_session: bool,
+    /// Transcript-origin repository evidence; independent of resume eligibility.
+    pub repository: RepositoryObservation,
 }
 
 /// 只读、固定形状的会话 Resume Metadata 投影（ADR-0009）：字段恒在、

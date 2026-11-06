@@ -937,6 +937,81 @@ fn codex_canonical_parser_retains_exact_original_session_and_usage() {
     assert_eq!(parsed.staged.usage_events[0].usage.cache_read_tokens, 4);
     assert_eq!(parsed.staged.usage_events[0].usage.output_tokens, 6);
 }
+
+#[test]
+fn transcript_repository_codex_uses_one_full_parse_and_preserves_existing_facts() {
+    use agent_session_grep_ports::RepositoryObservation;
+    let mut records = codex_rows();
+    records[0]["payload"]["cwd"] = json!("synthetic-workspace");
+    let baseline = stage("codex", &SliceSource::new(&rows(&records)), end()).unwrap();
+    records[0]["payload"]["git"] = json!({
+        "repository_url":"https://example.test/owner/project.git",
+        "branch":"synthetic-branch", "commit_hash":"synthetic-commit"
+    });
+    let bytes = rows(&records);
+    let source = CountSource::new(&bytes);
+    let parsed = crate::repo_identity::without_git(|| stage("codex", &source, end())).unwrap();
+    assert!(parsed.completeness.is_complete());
+    // This short fixture fits the bounded probe sample: one sample read and
+    // one complete parse, with no third pass to recover repository evidence.
+    assert_eq!(source.opens.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(
+        source.bytes_read.load(AtomicOrdering::Relaxed),
+        2 * bytes.len()
+    );
+    assert_eq!(parsed.staged.usage_events, baseline.staged.usage_events);
+    assert_eq!(parsed.staged.activities, baseline.staged.activities);
+    assert_eq!(
+        parsed.staged.report.session_native_id,
+        baseline.staged.report.session_native_id
+    );
+    assert_eq!(
+        parsed.staged.report.session_observation.provider_session_id,
+        baseline
+            .staged
+            .report
+            .session_observation
+            .provider_session_id
+    );
+    assert_eq!(
+        parsed
+            .staged
+            .report
+            .session_observation
+            .original_working_directory,
+        baseline
+            .staged
+            .report
+            .session_observation
+            .original_working_directory
+    );
+    assert_eq!(
+        parsed.staged.report.committed,
+        baseline.staged.report.committed
+    );
+    assert_eq!(parsed.staged.report.skipped, baseline.staged.report.skipped);
+    assert_eq!(
+        parsed.staged.messages[0].text,
+        baseline.staged.messages[0].text
+    );
+    assert_eq!(
+        parsed.staged.messages[0].native_id,
+        baseline.staged.messages[0].native_id
+    );
+    let RepositoryObservation::Resolved(origin) =
+        &parsed.staged.report.session_observation.repository
+    else {
+        panic!("same-parse repository evidence")
+    };
+    assert_eq!(origin.provider_session_id, "synthetic-codex-session");
+    let original: Value = serde_json::from_slice(
+        &bytes[origin.record_span.0 as usize..origin.record_span.1 as usize],
+    )
+    .unwrap();
+    assert_eq!(original["payload"]["git"]["repository_url"], origin.url);
+    assert!(origin.record_span.1 < parsed.staged.messages[0].span.unwrap().0);
+}
+
 #[test]
 fn workbuddy_uses_its_independent_native_parser_and_keeps_anchored_activity() {
     let bytes = rows(&wb_rows());

@@ -758,6 +758,7 @@ pub fn inspect_snapshot(bytes: &[u8], end: Instant) -> Result<ZCodeSnapshot> {
                         .unwrap_or_default(),
                     pair_observed: directory.is_some(),
                     multi_session: false,
+                    repository: Default::default(),
                 },
             },
         };
@@ -990,6 +991,7 @@ fn emit_snapshot(
                 original_working_directory: MetadataResolution::Ambiguous,
                 pair_observed: false,
                 multi_session: true,
+                repository: Default::default(),
             }
         }
     }

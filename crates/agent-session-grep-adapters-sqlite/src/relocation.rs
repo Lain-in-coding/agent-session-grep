@@ -2252,6 +2252,7 @@ mod empty_placeholder_review_tests {
                 original_working_directory: agent_session_grep_ports::MetadataResolution::Missing,
                 pair_observed: false,
                 multi_session: false,
+                repository: Default::default(),
             },
         )];
         source.len_bytes = Some(8);

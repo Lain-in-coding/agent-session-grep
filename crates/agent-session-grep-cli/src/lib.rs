@@ -6519,6 +6519,7 @@ mod tests {
                 original_working_directory: MetadataResolution::Resolved(cwd.into()),
                 pair_observed: true,
                 multi_session: false,
+                repository: Default::default(),
             },
         };
         let mut staged = staged_batch(

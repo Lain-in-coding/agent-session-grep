@@ -676,6 +676,7 @@ fn parse_with_limits(
                         original_working_directory: MetadataResolution::Missing,
                         pair_observed: false,
                         multi_session: false,
+                        repository: Default::default(),
                     },
                 },
             });
