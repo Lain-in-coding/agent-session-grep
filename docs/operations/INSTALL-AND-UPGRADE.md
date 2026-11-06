@@ -144,6 +144,13 @@ unowned settings, provider histories and shared parents remain. A durable
 uninstall fence blocks new evidence and updates. Missing verified after-exit
 helpers, locked images, unknown artifacts or incomplete drain remain pending
 (exit10); retry/status evidence must not be treated as completed deletion.
+If owned PATH removal is incomplete, uninstall retains its recovery records
+and stops before deleting data or scheduling package cleanup. After resolving
+the reported setting conflict, repeat the same uninstall command with the
+same `--keep-data` choice. Recovery reconciles a recorded PATH change whose
+acknowledgement was interrupted; it preserves independent settings. Keep the
+private records until the operation completes. A missing or corrupt ownership
+record is a recovery problem and does not mean the setting was never owned.
 Actual default/keep-data and native recovery drills are still under verification.
 The historical source uninstaller below does not implement this managed policy.
 

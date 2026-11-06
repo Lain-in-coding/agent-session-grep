@@ -27,6 +27,11 @@ four native packages or Beta maturity; no provider is promoted here.
 
 ### Added
 
+- Managed uninstall now removes owned user PATH entries under its existing
+  maintenance fence and installation lock. Incomplete PATH removal stops
+  downstream data and package cleanup, including recovery of older terminal
+  journals. Interrupted native changes retain their original intent and
+  preserve independent settings; missing ownership records stay pending.
 - Cursor `state.vscdb` gains a second, additive variant (`cursor/disk-kv-v1`)
   covering the `cursorDiskKV` table (`composerData:<id>` metadata +
   `bubbleId:<composerId>:<bubbleId>` bodies), a surface the ItemTable-only
