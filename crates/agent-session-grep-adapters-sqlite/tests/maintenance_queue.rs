@@ -184,27 +184,38 @@ fn concurrent_first_open_is_serialized_inside_initialization_transaction() {
     let root = dir.path().to_owned();
     let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
-        .map(|i| {
+        .map(|_| {
             let root = root.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                let q = SqliteMaintenanceQueue::open(&root).unwrap();
-                q.enqueue(&job(&format!("{i}"))).unwrap();
+                SqliteMaintenanceQueue::open(&root)
             })
         })
         .collect();
-    for t in threads {
-        t.join().unwrap();
+    // Join every opener before propagating a failure, so no worker outlives
+    // the fixture. Keep first-open contention separate from later writes.
+    let opened: Vec<_> = threads.into_iter().map(|thread| thread.join()).collect();
+    let queues: Vec<_> = opened
+        .into_iter()
+        .map(|opened| opened.unwrap().unwrap())
+        .collect();
+    for (index, queue) in queues.iter().enumerate() {
+        let expected = job(&format!("{index}"));
+        assert_eq!(queue.enqueue(&expected).unwrap().id, expected.id);
     }
+    let mut ids: Vec<_> = SqliteMaintenanceQueue::open_existing(&root)
+        .unwrap()
+        .unwrap()
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    ids.sort();
     assert_eq!(
-        SqliteMaintenanceQueue::open_existing(&root)
-            .unwrap()
-            .unwrap()
-            .list(None)
-            .unwrap()
-            .len(),
-        8
+        ids,
+        (0..8).map(|index| format!("{index}")).collect::<Vec<_>>()
     );
 }
 #[test]
