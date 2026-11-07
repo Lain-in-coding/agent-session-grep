@@ -1029,123 +1029,224 @@ fn prepare_restart_warning_journal<'a>(
     agent_session_grep_ports::control::Selection,
 ) {
     use agent_session_grep_ports::control::{RootKind, ScopeRegion, SelectionRequest};
-    control
-        .set_desired_updates(
-            control.status().unwrap().policy.control_seq,
-            DesiredUpdates::Running,
-        )
-        .unwrap();
-    let selected = control
-        .add_selection(
-            control.status().unwrap().policy.control_seq,
-            SelectionRequest {
-                region: ScopeRegion {
-                    provider: agent_session_grep_ports::SearchProvider::Claude,
-                    locator: agent_session_grep_ports::control::CanonicalLocator::from_path(root)
+    let expected_end = SqliteControlStore::effective_runtime_deadline(end);
+    let probe = end + Duration::from_secs(1);
+    with_update_deadline(control, end, || {
+        control
+            .set_desired_updates(
+                control.status().unwrap().policy.control_seq,
+                DesiredUpdates::Running,
+            )
+            .unwrap();
+        let selected = control
+            .add_selection(
+                control.status().unwrap().policy.control_seq,
+                SelectionRequest {
+                    region: ScopeRegion {
+                        provider: agent_session_grep_ports::SearchProvider::Claude,
+                        locator: agent_session_grep_ports::control::CanonicalLocator::from_path(
+                            root,
+                        )
                         .unwrap(),
-                    kind: RootKind::Root,
+                        kind: RootKind::Root,
+                    },
+                    root_identity: Some(ControlId::parse("source_root").unwrap()),
+                    now_ms: 2,
                 },
-                root_identity: Some(ControlId::parse("source_root").unwrap()),
-                now_ms: 2,
+            )
+            .unwrap()
+            .value;
+        let identity =
+            agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
+                control, db, end,
+            )
+            .unwrap();
+        let status = control.status().unwrap();
+        let owner = ControlId::parse("owner").unwrap();
+        let mut new = build_identity();
+        new.version = "0.2.0-beta.2".into();
+        new.relative_dir = format!("versions/{}-{}", new.version, "b".repeat(12));
+        let state = State::new(UpdateStart {
+            update_id: ControlId::parse("ordering_update").unwrap(),
+            owner: owner.clone(),
+            old: build_identity(),
+            new,
+            archive_sha256: "c".repeat(64),
+            manifest_sha256: "d".repeat(64),
+            old_pointer_generation: 1,
+            stable_launcher_sha256: "e".repeat(64),
+            catalog: db.to_path_buf(),
+            checkpoint: Checkpoint {
+                installation_id: identity.installation.as_str().into(),
+                policy_epoch: status.policy.policy_epoch.get() as u64,
+                control_seq: status.policy.control_seq.get() as u64,
+                desired_updates: "running".into(),
+                catalog_incarnation: identity.incarnation.as_str().into(),
+                catalog_generation: identity.generation,
+                catalog_schema: identity.schema,
             },
-        )
-        .unwrap()
-        .value;
-    let identity =
-        agent_session_grep_adapters_sqlite::managed_maintenance::inspect_catalog_identity(
-            control, db, end,
-        )
+        })
         .unwrap();
-    let status = control.status().unwrap();
-    let owner = ControlId::parse("owner").unwrap();
-    let mut new = build_identity();
-    new.version = "0.2.0-beta.2".into();
-    new.relative_dir = format!("versions/{}-{}", new.version, "b".repeat(12));
-    let state = State::new(UpdateStart {
-        update_id: ControlId::parse("ordering_update").unwrap(),
-        owner: owner.clone(),
-        old: build_identity(),
-        new,
-        archive_sha256: "c".repeat(64),
-        manifest_sha256: "d".repeat(64),
-        old_pointer_generation: 1,
-        stable_launcher_sha256: "e".repeat(64),
-        catalog: db.to_path_buf(),
-        checkpoint: Checkpoint {
-            installation_id: identity.installation.as_str().into(),
-            policy_epoch: status.policy.policy_epoch.get() as u64,
-            control_seq: status.policy.control_seq.get() as u64,
-            desired_updates: "running".into(),
-            catalog_incarnation: identity.incarnation.as_str().into(),
-            catalog_generation: identity.generation,
-            catalog_schema: identity.schema,
-        },
-    })
-    .unwrap();
-    let mut journal = Journal::create(prefix, lock, state, end).unwrap();
-    journal.transition(Phase::Verified, end).unwrap();
-    set_fence(
-        control,
-        installation,
-        &owner,
-        root,
-        MaintenancePhase::Quiescing,
-        false,
-        end,
-    )
-    .unwrap();
-    journal.transition(Phase::Quiescing, end).unwrap();
-    let catalog =
-        MaintenanceCatalog::open_authorized(control, installation, &owner, db, end).unwrap();
-    journal.state.quiesced_checkpoint = Some(
-        quiesced_checkpoint(
-            &control.status().unwrap(),
-            catalog.identity(),
-            &journal.state.checkpoint,
-        )
-        .unwrap(),
-    );
-    // Production persists the post-drain checkpoint before the backup;
-    // a durable successor may not change both in one transition.
-    journal.save(end).unwrap();
-    let BackupOutcome::Created(backup) = catalog
-        .create_backup(
+        let mut journal = Journal::create(prefix, lock, state, end).unwrap();
+        journal.transition(Phase::Verified, end).unwrap();
+        set_fence(
             control,
             installation,
             &owner,
-            &ControlId::parse("ordering_backup").unwrap(),
-            BackupPurpose::BetaRollback,
-            3,
-            end,
-        )
-        .unwrap()
-    else {
-        panic!("fixture backup refused")
-    };
-    drop(catalog);
-    journal.state.backup = Some(backup_reference(backup));
-    journal.transition(Phase::BackedUp, end).unwrap();
-    journal.state.staged = true;
-    journal.transition(Phase::Staged, end).unwrap();
-    journal.state.migrated = true;
-    journal.transition(Phase::Migrated, end).unwrap();
-    let pointer = journal
-        .state
-        .new
-        .pointer(journal.state.new_pointer_generation, "2026-10-31T00:00:00Z")
-        .unwrap();
-    journal
-        .replace_metadata(
-            MetadataFile::Current,
-            &serde_json::to_vec(&pointer).unwrap(),
+            root,
+            MaintenancePhase::Quiescing,
+            false,
             end,
         )
         .unwrap();
-    journal.transition(Phase::Switched, end).unwrap();
-    journal.state.self_checked = true;
-    journal.transition(Phase::SelfChecked, end).unwrap();
+        journal.transition(Phase::Quiescing, end).unwrap();
+        let catalog =
+            MaintenanceCatalog::open_authorized(control, installation, &owner, db, end).unwrap();
+        journal.state.quiesced_checkpoint = Some(
+            quiesced_checkpoint(
+                &control.status().unwrap(),
+                catalog.identity(),
+                &journal.state.checkpoint,
+            )
+            .unwrap(),
+        );
+        // Production persists the post-drain checkpoint before the backup;
+        // a durable successor may not change both in one transition.
+        journal.save(end).unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            expected_end,
+            "restart-warning backup preparation must retain its incoming control end"
+        );
+        let BackupOutcome::Created(backup) = catalog
+            .create_backup(
+                control,
+                installation,
+                &owner,
+                &ControlId::parse("ordering_backup").unwrap(),
+                BackupPurpose::BetaRollback,
+                3,
+                end,
+            )
+            .unwrap()
+        else {
+            panic!("fixture backup refused")
+        };
+        drop(catalog);
+        journal.state.backup = Some(backup_reference(backup));
+        journal.transition(Phase::BackedUp, end).unwrap();
+        journal.state.staged = true;
+        journal.transition(Phase::Staged, end).unwrap();
+        journal.state.migrated = true;
+        journal.transition(Phase::Migrated, end).unwrap();
+        let pointer = journal
+            .state
+            .new
+            .pointer(journal.state.new_pointer_generation, "2026-10-31T00:00:00Z")
+            .unwrap();
+        journal
+            .replace_metadata(
+                MetadataFile::Current,
+                &serde_json::to_vec(&pointer).unwrap(),
+                end,
+            )
+            .unwrap();
+        journal.transition(Phase::Switched, end).unwrap();
+        journal.state.self_checked = true;
+        journal.transition(Phase::SelfChecked, end).unwrap();
 
-    (owner, journal, selected)
+        Ok((owner, journal, selected))
+    })
+    .expect("restart-warning journal preparation")
+}
+
+#[test]
+fn restart_warning_preparation_uses_original_and_earlier_scope() {
+    for earlier_outer in [false, true] {
+        with_idle_admission(|control, installation, root, db, prefix, lock| {
+            let end = Instant::now() + Duration::from_secs(10);
+            let probe = end + Duration::from_secs(1);
+            let previous = SqliteControlStore::effective_runtime_deadline(probe);
+            let prepare = || {
+                let before = SqliteControlStore::effective_runtime_deadline(probe);
+                let (_, journal, _) = prepare_restart_warning_journal(
+                    control,
+                    installation,
+                    root,
+                    db,
+                    prefix,
+                    lock,
+                    end,
+                );
+                assert_eq!(journal.state.phase, Phase::SelfChecked);
+                assert!(journal.state.backup.is_some());
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(probe),
+                    before
+                );
+                Ok(())
+            };
+            if earlier_outer {
+                with_update_deadline(control, end - Duration::from_secs(1), prepare).unwrap();
+            } else {
+                prepare().unwrap();
+            }
+            assert_eq!(
+                SqliteControlStore::effective_runtime_deadline(probe),
+                previous
+            );
+        });
+    }
+}
+
+#[test]
+fn restart_warning_preparation_expiry_has_no_policy_journal_or_backup_effects() {
+    with_idle_admission(|control, installation, root, db, prefix, lock| {
+        let observation_end = Instant::now() + Duration::from_secs(10);
+        let observe = || {
+            with_update_deadline(control, observation_end, || {
+                Ok((
+                    control.status().map_err(port)?,
+                    control.backup_records().map_err(port)?,
+                ))
+            })
+            .unwrap()
+        };
+        let before = observe();
+        assert!(before.1.is_empty());
+        let entries = || {
+            let mut entries = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let before_entries = entries();
+        let journal_path = prefix.join("update");
+        assert!(!journal_path.exists());
+        let probe = observation_end + Duration::from_secs(1);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = prepare_restart_warning_journal(
+                control,
+                installation,
+                root,
+                db,
+                prefix,
+                lock,
+                Instant::now() - Duration::from_millis(1),
+            );
+        }));
+        assert!(refused.is_err());
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        assert_eq!(observe(), before);
+        assert_eq!(entries(), before_entries);
+        assert!(!journal_path.exists());
+    });
 }
 
 #[test]
