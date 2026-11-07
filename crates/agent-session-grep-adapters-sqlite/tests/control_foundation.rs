@@ -1419,6 +1419,223 @@ fn source_ack(c: &ObservationCycle, s: &SelectionRevision, receipt: bool) -> Sou
 }
 
 #[test]
+fn source_acknowledgement_changed_and_idempotent_results_match_durable_rows() {
+    use rusqlite::types::Value::{Integer, Null, Text};
+    use std::time::{Duration, Instant};
+
+    let (_temp, root, store, worker, selection) = worker_setup();
+    store
+        .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+            set_catalog(&store, &worker, "catalog_a");
+            let barrier = latest(&store, &selection, 140);
+            let cycle = store
+                .start_cycle(current(&store), &worker, barrier.required_cycle_seq, 141)?
+                .value;
+            let before_status = store.status()?;
+            let ack = source_ack(&cycle, &selection, true);
+            let mut expected_change = ControlChange {
+                control_seq: ControlSeq::new(before_status.policy.control_seq.get() + 1)?,
+                policy_epoch: before_status.policy.policy_epoch,
+                changed: true,
+                value: SourceProgress {
+                    source_id: id("source_f"),
+                    provider: SearchProvider::Claude,
+                    last_attempt_at_ms: Some(200),
+                    last_observation: Some(cycle.token.clone()),
+                    receipt: ack.receipt.clone(),
+                    coverage: Coverage::Complete,
+                    update_state: UpdateState::Idle,
+                    backfill_state: BackfillState::Complete,
+                    error: None,
+                    confirmation: None,
+                },
+            };
+            let conn = raw(&root);
+            let mut expected_rows = control_rows_from(&conn);
+            let (mut meta, seq_column) = conn
+                .query_row("SELECT * FROM control_meta", [], |row| {
+                    let values = (0..row.as_ref().column_count())
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok((values, row.as_ref().column_index("control_seq")?))
+                })
+                .unwrap();
+            let mut source = [
+                Text("source_f".into()),
+                Text("claude-code".into()),
+                Integer(200),
+                Integer(cycle.token.cycle_seq.get()),
+                Text("revision_digest".into()),
+                Integer(cycle.token.cycle_seq.get()),
+                Text("catalog_a".into()),
+                Integer(7),
+                Text("complete".into()),
+                Text("idle".into()),
+                Null,
+                Text("complete".into()),
+                Null,
+                Null,
+                Null,
+                Null,
+                Null,
+                Null,
+                Null,
+                Null,
+                Null,
+            ];
+            let mut failed = ack.clone();
+            failed.attempted_at_ms = 201;
+            failed.coverage = Coverage::Partial;
+            failed.update_state = UpdateState::Deferred;
+            failed.error = Some(BackgroundFailure::SourceChanged);
+            failed.receipt = None;
+            for (attempt, input) in [ack, failed].into_iter().enumerate() {
+                if attempt == 1 {
+                    expected_change.control_seq =
+                        ControlSeq::new(expected_change.control_seq.get() + 1)?;
+                    expected_change.value.last_attempt_at_ms = Some(201);
+                    expected_change.value.coverage = Coverage::Partial;
+                    expected_change.value.update_state = UpdateState::Deferred;
+                    expected_change.value.error = Some(BackgroundFailure::SourceChanged);
+                    source[2] = Integer(201);
+                    source[8] = Text("partial".into());
+                    source[9] = Text("deferred".into());
+                    source[10] = Text("source_changed".into());
+                }
+                meta[seq_column] = Integer(expected_change.control_seq.get());
+                for (name, rows) in &mut expected_rows {
+                    match name.as_str() {
+                        "control_meta" => *rows = vec![format!("{meta:?}")],
+                        "source_updates" => *rows = vec![format!("{source:?}")],
+                        _ => {}
+                    }
+                }
+                let result = store.acknowledge_source(current(&store), &worker, input.clone())?;
+                assert_eq!(result, expected_change);
+                assert!(
+                    control_rows_from(&conn) == expected_rows,
+                    "acknowledgement changed unexpected durable fields"
+                );
+                let repeated = store.acknowledge_source(result.control_seq, &worker, input)?;
+                assert_eq!(
+                    repeated,
+                    ControlChange {
+                        changed: false,
+                        ..expected_change.clone()
+                    }
+                );
+                assert!(
+                    control_rows_from(&conn) == expected_rows,
+                    "idempotent acknowledgement changed durable rows"
+                );
+            }
+            let mut expected_status = before_status;
+            expected_status.policy.control_seq = expected_change.control_seq;
+            assert_eq!(store.status()?, expected_status);
+            assert_eq!(
+                store.source_progress(&id("source_f"))?,
+                Some(expected_change.value)
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn source_acknowledgement_rechecks_cas_boot_selection_provider_and_receipt() {
+    use std::time::{Duration, Instant};
+
+    let (_temp, root, store, worker, selection) = worker_setup();
+    store
+        .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+            set_catalog(&store, &worker, "catalog_a");
+            let barrier = latest(&store, &selection, 140);
+            let cycle = store
+                .start_cycle(current(&store), &worker, barrier.required_cycle_seq, 141)?
+                .value;
+            let expected = current(&store);
+            let ack = source_ack(&cycle, &selection, true);
+            let before = control_rows(&root);
+            assert!(matches!(
+                store.acknowledge_source(zero(), &worker, ack.clone()),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            assert!(control_rows(&root) == before);
+            let stale = store.bind_worker(&worker.lock, id("stale_boot"))?;
+            assert!(matches!(
+                store.acknowledge_source(expected, &stale, ack.clone()),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            assert!(control_rows(&root) == before);
+            for case in 0..6 {
+                let mut rejected = ack.clone();
+                match case {
+                    0 => rejected.token.worker_boot_id = id("wrong_boot"),
+                    1 => rejected.selection.root_identity = id("wrong_root"),
+                    2 => rejected.provider = SearchProvider::Codex,
+                    3 => {
+                        rejected.receipt.as_mut().unwrap().token.worker_boot_id = id("wrong_boot");
+                    }
+                    4 => {
+                        rejected.receipt.as_mut().unwrap().catalog_incarnation =
+                            id("wrong_catalog");
+                    }
+                    5 => rejected.selection.revision = zero(),
+                    _ => unreachable!(),
+                }
+                let error = store
+                    .acknowledge_source(expected, &worker, rejected)
+                    .unwrap_err();
+                assert!(
+                    if case == 2 {
+                        matches!(error, PortError::InvalidRequest(_))
+                    } else {
+                        matches!(error, PortError::GenerationMismatch(_))
+                    },
+                    "wrong rejection category for case {case}"
+                );
+                assert!(
+                    control_rows(&root) == before,
+                    "rejected case {case} wrote rows"
+                );
+            }
+            // A later invocation must decode the worker's current advisory
+            // state even when the same source and observation token are used.
+            let busy = store.heartbeat_worker(
+                expected,
+                &worker,
+                UpdateState::Busy,
+                Some(BackgroundFailure::Busy),
+                201,
+            )?;
+            let blocked = control_rows(&root);
+            assert!(matches!(
+                store.acknowledge_source(busy.control_seq, &worker, ack.clone()),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            assert!(control_rows(&root) == blocked);
+            let ready = store.heartbeat_worker(
+                busy.control_seq,
+                &worker,
+                UpdateState::Running,
+                None,
+                202,
+            )?;
+            let accepted = store.acknowledge_source(ready.control_seq, &worker, ack.clone())?;
+            assert_eq!(accepted.value.receipt, ack.receipt);
+            let paused = store.set_desired_updates(accepted.control_seq, DesiredUpdates::Paused)?;
+            let blocked = control_rows(&root);
+            assert!(matches!(
+                store.acknowledge_source(paused.control_seq, &worker, ack),
+                Err(PortError::GenerationMismatch(_))
+            ));
+            assert!(control_rows(&root) == blocked);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn queued_barriers_coalesce_and_started_cycle_never_accepts_new_admission() {
     let (_temp, root, store, worker, s) = worker_setup();
     let a = latest(&store, &s, 500);

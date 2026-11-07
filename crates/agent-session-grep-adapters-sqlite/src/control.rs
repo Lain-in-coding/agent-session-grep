@@ -2280,12 +2280,24 @@ impl SqliteControlStore {
         expected: ControlSeq,
         operation: impl FnOnce(&Connection, &ControlStatus) -> PortResult<(bool, bool, T)>,
     ) -> PortResult<ControlChange<T>> {
+        self.mutate_with_runtime(expected, |conn, status, _runtime| operation(conn, status))
+    }
+
+    fn mutate_with_runtime<T>(
+        &self,
+        expected: ControlSeq,
+        operation: impl FnOnce(
+            &Connection,
+            &ControlStatus,
+            &RuntimeState,
+        ) -> PortResult<(bool, bool, T)>,
+    ) -> PortResult<ControlChange<T>> {
         if !self.writable {
             return Err(invalid());
         }
         if runtime_deadline().is_none() {
             return self.with_runtime_deadline(Instant::now() + BUSY_TIMEOUT, || {
-                self.mutate(expected, operation)
+                self.mutate_with_runtime(expected, operation)
             });
         }
         runtime_tick()?;
@@ -2295,11 +2307,13 @@ impl SqliteControlStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let current = load_status(&tx)?;
+        let current = load_status_core(&tx)?;
+        let runtime = load_runtime(&tx, &current)?;
         if current.policy.control_seq != expected {
             return Err(conflict());
         }
-        let (changed, policy_changed, value) = operation(&tx, &current)?;
+        let (changed, policy_changed, value) = operation(&tx, &current, &runtime)?;
+        drop(runtime);
         let next_seq = if changed {
             increment(expected.get())?
         } else {
@@ -6478,11 +6492,12 @@ impl BackgroundControl for SqliteControlStore {
         ack: SourceAcknowledgement,
     ) -> PortResult<ControlChange<SourceProgress>> {
         checked_time(ack.attempted_at_ms)?;
-        self.mutate(expected, |conn, status| {
-            let runtime = load_runtime(conn, status)?;
+        self.mutate_with_runtime(expected, |conn, status, runtime| {
+            // Preserve the deadline boundary of the removed duplicate load.
+            runtime_tick()?;
             let c = cycle_owned(
                 self.root_identity,
-                &runtime,
+                runtime,
                 status,
                 authority,
                 ack.token.cycle_seq,
@@ -8726,6 +8741,469 @@ mod runtime_deadline_tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn source_ack_fixture() -> (
+        tempfile::TempDir,
+        SqliteControlStore,
+        ScopedWorker,
+        SourceAcknowledgement,
+    ) {
+        let (temp, control) = running_fixture();
+        let root = temp.path().join("private");
+        let worker = ScopedWorker {
+            installation: cid("synthetic-deadline-installation"),
+            boot: cid("boot_ack"),
+            root: RootIdentity::read(&root).unwrap(),
+            lock: ExclusiveGuard::try_acquire(&root, LockKind::Background).unwrap(),
+        };
+        let ack = control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                #[cfg(windows)]
+                let locator = CanonicalLocator::parse(r"C:\synthetic-ack")?;
+                #[cfg(not(windows))]
+                let locator = CanonicalLocator::parse("/synthetic-ack")?;
+                let selected = control.add_selection(
+                    seq(0)?,
+                    SelectionRequest {
+                        region: ScopeRegion {
+                            provider: SearchProvider::Claude,
+                            locator,
+                            kind: RootKind::Exact,
+                        },
+                        root_identity: Some(cid("ack-root")),
+                        now_ms: 1,
+                    },
+                )?;
+                let registered = control.register_worker(selected.control_seq, &worker, 7, 2)?;
+                let owner = cid("ack-recovery");
+                let fenced = control.set_maintenance(
+                    registered.control_seq,
+                    &owner,
+                    MaintenanceFence {
+                        state: MaintenanceState::Recovering,
+                        owner: Some(owner.clone()),
+                        phase: Some(MaintenancePhase::Reconciling),
+                    },
+                )?;
+                let reset =
+                    control.reset_progress(fenced.control_seq, &worker, &cid("ack-catalog"), 3)?;
+                let idle =
+                    control.set_maintenance(reset.control_seq, &owner, MaintenanceFence::idle())?;
+                let selection = SelectionRevision {
+                    selection_id: selected.value.id,
+                    revision: selected.value.revision,
+                    root_identity: cid("ack-root"),
+                };
+                let queued = control.queue_cycle(idle.control_seq, vec![selection.clone()])?;
+                let CycleAdmission::Queued(queued_cycle) = queued.value else {
+                    panic!("source acknowledgement fixture was blocked");
+                };
+                let cycle = control.start_cycle(
+                    queued.control_seq,
+                    &worker,
+                    queued_cycle.token.cycle_seq,
+                    4,
+                )?;
+                Ok(SourceAcknowledgement {
+                    source_id: cid("ack-source"),
+                    provider: SearchProvider::Claude,
+                    token: cycle.value.token.clone(),
+                    selection,
+                    attempted_at_ms: 5,
+                    coverage: Coverage::Complete,
+                    update_state: UpdateState::Idle,
+                    backfill_state: BackfillState::Complete,
+                    error: None,
+                    receipt: Some(SourceReceiptSummary {
+                        token: cycle.value.token,
+                        revision: cid("ack-revision"),
+                        catalog_incarnation: cid("ack-catalog"),
+                        catalog_generation: seq(7)?,
+                    }),
+                    confirmation: None,
+                })
+            })
+            .unwrap();
+        (temp, control, worker, ack)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum AckSql {
+        RuntimeDecode,
+        SourceDecode,
+        Expired,
+        SourceWrite,
+        SequenceWrite,
+        Commit,
+        Rollback,
+    }
+
+    thread_local! {
+        static ACK_SQL: RefCell<Vec<AckSql>> = const { RefCell::new(Vec::new()) };
+        static ACK_EXPIRE_AFTER_SOURCE_DECODE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn traced_ack<T>(
+        control: &SqliteControlStore,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Vec<AckSql>) {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+        struct Reset<'a>(&'a SqliteControlStore);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .conn
+                    .borrow()
+                    .trace_v2(TraceEventCodes::empty(), None);
+                ACK_SQL.with(|events| events.borrow_mut().clear());
+                ACK_EXPIRE_AFTER_SOURCE_DECODE.with(|armed| armed.set(false));
+            }
+        }
+
+        ACK_SQL.with(|events| events.borrow_mut().clear());
+        control.conn.borrow().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                if let TraceEvent::Profile(statement, _) = &event
+                    && ACK_EXPIRE_AFTER_SOURCE_DECODE.with(Cell::get)
+                    && statement
+                        .sql()
+                        .starts_with("SELECT source_id,provider_id,last_attempt_at_ms,")
+                {
+                    ACK_EXPIRE_AFTER_SOURCE_DECODE.with(|armed| armed.set(false));
+                    RUNTIME_DEADLINE.with(|end| end.set(Some(Instant::now())));
+                    ACK_SQL.with(|events| events.borrow_mut().push(AckSql::Expired));
+                }
+                let TraceEvent::Stmt(_, sql) = event else {
+                    return;
+                };
+                let sql = sql.trim();
+                // This SELECT executes exactly once on entry to the full
+                // staged runtime decoder, never in pruning or core policy.
+                let event = if sql == "SELECT next_cycle_seq FROM control_meta WHERE singleton=1" {
+                    AckSql::RuntimeDecode
+                } else if sql.starts_with("SELECT source_id,provider_id,last_attempt_at_ms,") {
+                    AckSql::SourceDecode
+                } else if sql.starts_with("INSERT INTO source_updates(") {
+                    AckSql::SourceWrite
+                } else if sql.starts_with("UPDATE control_meta SET control_seq=") {
+                    AckSql::SequenceWrite
+                } else if sql == "COMMIT" {
+                    AckSql::Commit
+                } else if sql == "ROLLBACK" {
+                    AckSql::Rollback
+                } else {
+                    return;
+                };
+                ACK_SQL.with(|events| events.borrow_mut().push(event));
+            }),
+        );
+        let reset = Reset(control);
+        let result = operation();
+        let events = ACK_SQL.with(|events| std::mem::take(&mut *events.borrow_mut()));
+        drop(reset);
+        (result, events)
+    }
+
+    #[test]
+    fn source_acknowledgement_decodes_runtime_once_before_and_once_after_write() {
+        use AckSql::*;
+
+        let (_temp, control, worker, ack) = source_ack_fixture();
+        control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let before = control.status()?;
+                let (result, events) = traced_ack(&control, || {
+                    control.acknowledge_source(before.policy.control_seq, &worker, ack.clone())
+                });
+                let change = result?;
+                assert!(change.changed);
+                assert_eq!(
+                    change.control_seq.get(),
+                    before.policy.control_seq.get() + 1
+                );
+                assert_eq!(change.policy_epoch, before.policy.policy_epoch);
+                assert_eq!(change.value.receipt, ack.receipt);
+                assert_eq!(change.value.last_observation, Some(ack.token.clone()));
+                assert_eq!(change.value.coverage, Coverage::Complete);
+                assert_eq!(
+                    events,
+                    [
+                        RuntimeDecode,
+                        SourceDecode,
+                        SourceWrite,
+                        SequenceWrite,
+                        RuntimeDecode,
+                        SourceDecode,
+                        Commit,
+                    ]
+                );
+
+                let (repeated, events) = traced_ack(&control, || {
+                    control.acknowledge_source(change.control_seq, &worker, ack.clone())
+                });
+                let expected = ControlChange {
+                    changed: false,
+                    ..change.clone()
+                };
+                assert_eq!(repeated?, expected);
+                assert_eq!(
+                    events,
+                    [
+                        RuntimeDecode,
+                        SourceDecode,
+                        RuntimeDecode,
+                        SourceDecode,
+                        Commit
+                    ]
+                );
+                assert_eq!(control.source_progress(&ack.source_id)?, Some(change.value));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn source_acknowledgement_rejects_unrelated_runtime_corruption_before_write() {
+        use AckSql::*;
+
+        let (_temp, control, worker, ack) = source_ack_fixture();
+        control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let before = control.status()?;
+                insert_source_row(&control, "unrelated-source", "claude-code");
+                control
+                    .conn
+                    .borrow()
+                    .execute(
+                        "UPDATE source_updates SET coverage='unknown' WHERE source_id='unrelated-source'",
+                        [],
+                    )
+                    .unwrap();
+                let commits = runtime_commit_seq();
+                // Full runtime validation still precedes the CAS comparison.
+                for expected in [before.policy.control_seq, seq(0)?] {
+                    let (result, events) = traced_ack(&control, || {
+                        control.acknowledge_source(expected, &worker, ack.clone())
+                    });
+                    assert!(matches!(result, Err(PortError::SchemaIncompatible(_))));
+                    assert_eq!(events, [RuntimeDecode, SourceDecode, Rollback]);
+                }
+                assert_eq!(runtime_commit_seq(), commits);
+                assert_eq!(source_row_count(&control, ack.source_id.as_str()), 0);
+                assert_eq!(source_row_count(&control, "unrelated-source"), 1);
+                assert_eq!(control.lifecycle_status()?, before);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn source_acknowledgement_postwrite_runtime_validation_rolls_back() {
+        use AckSql::*;
+
+        let (_temp, control, worker, ack) = source_ack_fixture();
+        control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                let before = control.status()?;
+                // TEMP injection preserves the admitted main schema. The
+                // write succeeds, but its receipt no longer names a cycle.
+                control.conn.borrow().execute_batch(
+                    "CREATE TEMP TRIGGER corrupt_ack_receipt AFTER INSERT ON main.source_updates
+                     BEGIN
+                         UPDATE source_updates SET receipt_cycle=999999 WHERE source_id=NEW.source_id;
+                     END;",
+                ).unwrap();
+                let commits = runtime_commit_seq();
+                let (result, events) = traced_ack(&control, || {
+                    control.acknowledge_source(before.policy.control_seq, &worker, ack.clone())
+                });
+                assert!(matches!(result, Err(PortError::SchemaIncompatible(_))));
+                assert_eq!(
+                    events,
+                    [
+                        RuntimeDecode,
+                        SourceDecode,
+                        SourceWrite,
+                        SequenceWrite,
+                        RuntimeDecode,
+                        SourceDecode,
+                        Rollback,
+                    ]
+                );
+                assert_eq!(runtime_commit_seq(), commits);
+                assert_eq!(control.status()?, before);
+                assert_eq!(source_row_count(&control, ack.source_id.as_str()), 0);
+                control.conn.borrow().execute_batch("DROP TRIGGER corrupt_ack_receipt").unwrap();
+                let recovered =
+                    control.acknowledge_source(before.policy.control_seq, &worker, ack.clone())?;
+                assert!(recovered.changed);
+                assert_eq!(recovered.value.receipt, ack.receipt);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn source_acknowledgement_keeps_deadline_check_before_authority() {
+        use AckSql::*;
+
+        struct ObservedWorker<'a> {
+            worker: &'a ScopedWorker,
+            calls: Cell<usize>,
+            received_end: Cell<Option<Instant>>,
+        }
+        impl WorkerAuthority for ObservedWorker<'_> {
+            fn installation_id(&self) -> &ControlId {
+                self.worker.installation_id()
+            }
+            fn boot_id(&self) -> &ControlId {
+                self.worker.boot_id()
+            }
+            fn root_binding(&self) -> PhysicalRootBinding {
+                self.worker.root_binding()
+            }
+            fn validate(&self) -> PortResult<()> {
+                self.calls.set(self.calls.get() + 1);
+                self.received_end.set(runtime_deadline());
+                self.worker.validate()
+            }
+        }
+
+        let (_temp, control, worker, ack) = source_ack_fixture();
+        let outer = Instant::now() + Duration::from_secs(8);
+        let observed = ObservedWorker {
+            worker: &worker,
+            calls: Cell::new(0),
+            received_end: Cell::new(None),
+        };
+        control
+            .with_runtime_deadline(outer, || {
+                let before = control.status()?;
+                let commits = runtime_commit_seq();
+                let (expired, events) = traced_ack(&control, || {
+                    control.with_runtime_deadline(Instant::now(), || {
+                        control.acknowledge_source(
+                            before.policy.control_seq,
+                            &observed,
+                            ack.clone(),
+                        )
+                    })
+                });
+                assert!(matches!(expired, Err(PortError::WriterBusy(_))));
+                assert!(events.is_empty());
+                ACK_EXPIRE_AFTER_SOURCE_DECODE.with(|armed| armed.set(true));
+                let (result, events) = traced_ack(&control, || {
+                    control.with_runtime_deadline(outer + Duration::from_secs(8), || {
+                        control.acknowledge_source(
+                            before.policy.control_seq,
+                            &observed,
+                            ack.clone(),
+                        )
+                    })
+                });
+                assert!(matches!(result, Err(PortError::WriterBusy(_))));
+                assert_eq!(events, [RuntimeDecode, SourceDecode, Expired, Rollback]);
+                assert_eq!(observed.calls.get(), 0);
+                assert_eq!(runtime_commit_seq(), commits);
+                assert_eq!(runtime_deadline(), Some(outer));
+                assert_eq!(control.status()?, before);
+                assert_eq!(source_row_count(&control, ack.source_id.as_str()), 0);
+                let changed =
+                    control.with_runtime_deadline(outer + Duration::from_secs(8), || {
+                        control.acknowledge_source(
+                            before.policy.control_seq,
+                            &observed,
+                            ack.clone(),
+                        )
+                    })?;
+                assert!(changed.changed);
+                assert_eq!(observed.calls.get(), 1);
+                assert_eq!(observed.received_end.get(), Some(outer));
+                assert_eq!(changed.value.receipt, ack.receipt);
+                assert_eq!(runtime_deadline(), Some(outer));
+                Ok(())
+            })
+            .unwrap();
+        assert!(runtime_deadline().is_none());
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+    }
+
+    #[test]
+    fn mutation_runtime_borrow_releases_and_rolls_back_after_interrupt_and_unwind() {
+        let (_temp, control) = fixture();
+        let before = control
+            .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || control.status())
+            .unwrap();
+        for unwind in [false, true] {
+            let commits = runtime_commit_seq();
+            let (result, events) = traced_ack(&control, || {
+                catch_unwind(AssertUnwindSafe(|| {
+                    control.with_runtime_deadline(Instant::now() + Duration::from_secs(8), || {
+                        control.mutate(before.policy.control_seq, |conn, _| {
+                            conn.execute(
+                                "INSERT INTO source_updates(source_id,provider_id,coverage,update_state,backfill_state)
+                                 VALUES('interrupted-source','claude-code','empty','offline','pending')",
+                                [],
+                            )
+                            .map_err(sql_error)?;
+                            if unwind {
+                                panic!("synthetic mutation unwind after write");
+                            }
+                            // Shorten the active end after an actual write;
+                            // the installed handler must interrupt real SQL.
+                            RUNTIME_DEADLINE.with(|end| end.set(Some(Instant::now())));
+                            let raw: rusqlite::Result<i64> = conn.query_row(
+                                "WITH RECURSIVE n(value) AS (
+                                     VALUES(0) UNION ALL SELECT value+1 FROM n WHERE value<1000000
+                                 ) SELECT sum(value) FROM n",
+                                [],
+                                |row| row.get(0),
+                            );
+                            assert!(matches!(&raw, Err(error)
+                                if error.sqlite_error_code()
+                                    == Some(rusqlite::ErrorCode::OperationInterrupted)));
+                            raw.map(|value| (true, false, value)).map_err(sql_error)
+                        })
+                    })
+                }))
+            });
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result, Ok(Err(PortError::WriterBusy(_)))));
+            }
+            assert!(events.contains(&AckSql::SourceWrite));
+            assert!(!events.contains(&AckSql::Commit));
+            assert_eq!(runtime_commit_seq(), commits);
+            assert!(runtime_deadline().is_none());
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+            let conn = control.conn.borrow();
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                250
+            );
+            let sum: i64 = conn
+                .query_row(
+                    "WITH RECURSIVE n(value) AS (
+                         VALUES(0) UNION ALL SELECT value+1 FROM n WHERE value<10000
+                     ) SELECT sum(value) FROM n",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sum, 50_005_000);
+            drop(conn);
+            assert_eq!(source_row_count(&control, "interrupted-source"), 0);
+            let after = control
+                .with_runtime_deadline(Instant::now() + Duration::from_secs(8), || control.status())
+                .unwrap();
+            assert_eq!(after, before);
+        }
     }
 
     #[test]
