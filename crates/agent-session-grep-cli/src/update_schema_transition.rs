@@ -1,9 +1,12 @@
-//! Pure records for the one repository-proof schema transition.
+//! Records and bound journal I/O for the one repository-proof schema transition.
 //!
 //! Successful decoding establishes record agreement only. It never verifies a
 //! file, running executable, root, lock, old-directory absence or complete v2
-//! state. The internal command is deliberately an unconditional effect-free
-//! refusal until the complete transition protocol is available.
+//! state. The runtime receiver separately requires retained native locks. The
+//! internal command remains an effect-free refusal until the complete process
+//! admission and transition protocol are available.
+#[path = "update_schema_transition_runtime.rs"]
+pub mod runtime;
 #[path = "update_schema_transition_state.rs"]
 pub mod state;
 
@@ -526,6 +529,20 @@ pub struct SupersedeGuardV2 {
 }
 
 impl SupersedeGuardV2 {
+    fn initial(admission: &AdmissionV2, state: &state::StateV2) -> Result<Self> {
+        let record = GuardRecord {
+            schema: GUARD_SCHEMA.into(),
+            mode: admission.record.mode,
+            update_id: admission.record.update_id.clone(),
+            owner_nonce: admission.record.owner_nonce.clone(),
+            prefix_binding: admission.record.prefix.identity.clone(),
+            admission_sha256: sha256(admission.raw_bytes()),
+            initial_state_sha256: sha256(state.raw_bytes()),
+        };
+        let raw = encode(&record)?;
+        Self::decode(&raw)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let record: GuardRecord = decode(bytes)?;
         record.validate()?;
@@ -594,6 +611,29 @@ pub struct Invocation {
 }
 
 impl Invocation {
+    /// Publish only the first native journal under actual retained locks.
+    /// Package/channel admission and SQL authority remain separate; parsing
+    /// or initializing this record does not enable the reserved command.
+    pub fn initialize_bound_journal(
+        &self,
+        admission: &AdmissionV2,
+        locks: runtime::JournalLocks<'_>,
+        end: std::time::Instant,
+    ) -> std::result::Result<runtime::Publication, runtime::PublicationError> {
+        runtime::initialize(self, admission, locks, end)
+    }
+
+    /// Open an already guarded continuation under the caller's retained native
+    /// locks and original end. This does not admit an executable or open SQL;
+    /// the public command remains closed until the process handoff is wired.
+    pub fn open_bound_journal<'a>(
+        &self,
+        locks: runtime::JournalLocks<'a>,
+        end: std::time::Instant,
+    ) -> std::result::Result<runtime::Journal<'a>, runtime::PublicationError> {
+        runtime::Journal::open(self, locks, end)
+    }
+
     pub fn parse(args: &[OsString]) -> Result<Self> {
         require(args.first().is_some_and(|word| word == COMMAND) && matches!(args.len(), 13 | 19))?;
         let mut fields = BTreeMap::new();

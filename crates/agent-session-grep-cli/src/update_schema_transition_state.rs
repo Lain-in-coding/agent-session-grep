@@ -2832,6 +2832,63 @@ fn find_record<'a>(
 }
 
 impl StateV2 {
+    /// Canonical first state. Only the native initializer may publish it after
+    /// its immutable admission and final refusal guard are durably bound.
+    pub(super) fn initial(admission: &AdmissionV2) -> Result<Self> {
+        admission.record.validate()?;
+        let suffix = &admission.record.update_id["update_".len()..];
+        let image = |role, component: &str, name: &str| {
+            let artifact_id = format!("transition_{component}_{suffix}");
+            ImageSlot {
+                role,
+                relative_locator: format!("backups/{artifact_id}/{name}"),
+                artifact_id,
+                root_binding: admission.record.control_root.identity.clone(),
+                coverage_ref: None,
+                parent: ParentState::AbsentUnderBoundRoot,
+                image: ImageState::Absent,
+                manifest: ManifestState::Absent,
+                sidecars: Sidecars {
+                    wal: SidecarState::Absent,
+                    shm: SidecarState::Absent,
+                    journal: SidecarState::Absent,
+                },
+            }
+        };
+        let record = StateRecord {
+            schema: STATE_SCHEMA.into(),
+            mode: admission.record.mode,
+            update_id: admission.record.update_id.clone(),
+            owner_nonce: admission.record.owner_nonce.clone(),
+            prefix_binding: admission.record.prefix.identity.clone(),
+            control_binding: admission.record.control_root.identity.clone(),
+            admission_sha256: sha256(admission.raw_bytes()),
+            seq: 1,
+            predecessor_sha256: None,
+            phase: PhaseV2::Verified,
+            quiesced: None,
+            preimages: Preimages {
+                catalog: image(ImageRole::CatalogPreimage, "catalog", "catalog.db"),
+                control: image(ImageRole::ControlPreimage, "control", "control.db"),
+            },
+            stage: StageProgress::Unstarted,
+            catalog_component: ComponentProgress::Unstarted,
+            control_component: ComponentProgress::Unstarted,
+            metadata: MetadataLedger {
+                slots: std::array::from_fn(|_| MetadataSlot::Untouched),
+            },
+            forward_pair_readback: None,
+            self_check: None,
+            requests_open_intent: None,
+            rollback: None,
+            pending: None,
+            last_failure: None,
+        };
+        record.validate(admission)?;
+        let raw = super::encode(&record)?;
+        Ok(Self { record, raw })
+    }
+
     pub fn decode(bytes: &[u8], admission: &AdmissionV2) -> Result<Self> {
         super::bounded(bytes)?;
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
