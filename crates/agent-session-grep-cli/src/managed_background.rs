@@ -8942,6 +8942,7 @@ mod control_deadline_tests {
         tick_count: usize,
         waits: [Option<Instant>; 32],
         wait_count: usize,
+        resume_prerun_busy: usize,
         runs: usize,
         acceptances: usize,
         phase: &'static str,
@@ -9481,6 +9482,9 @@ mod control_deadline_tests {
                                 && pending.as_ref() == saved.as_ref()
                                 && schedule.closed_idle_at.is_none() =>
                         {
+                            if matches!(trace.phase, "quiesce" | "current") {
+                                trace.resume_prerun_busy += 1;
+                            }
                             if Instant::now() >= end {
                                 return Err(error);
                             }
@@ -10616,9 +10620,11 @@ mod control_deadline_tests {
             );
             assert_eq!(finishes, 1);
             assert_eq!(
-                trace.wait_count, 1,
-                "even a spent tick calls the wait boundary"
+                trace.wait_count,
+                1 + trace.resume_prerun_busy,
+                "each pre-run Busy and the spent acceptance tick call the wait boundary"
             );
+            assert_eq!(trace.tick_count, trace.runs + trace.resume_prerun_busy);
             assert_drive_cadence(&trace, outer);
             let proof = proof.borrow();
             assert_eq!((proof.plans, proof.observations, proof.accepted), (1, 1, 1));
