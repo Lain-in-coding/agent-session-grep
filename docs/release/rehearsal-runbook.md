@@ -525,6 +525,12 @@ installers must reach this flow without a private command or manual record
 removal. These gates are currently open; a storage receiver test or identical
 package repeat-install success does not satisfy them.
 
+Include a stop after payload completion and while activation inputs are pending.
+The next invocation must retain the exact original pointer/receipt bytes and
+record identity, and reject torn, duplicate or replaced records before opening
+the control database. Verify actual process exit before retrying; matching file
+contents alone do not prove that the previous process released its resources.
+
 **Run id**: `reinstall-<platform>-<date>`.
 
 ---

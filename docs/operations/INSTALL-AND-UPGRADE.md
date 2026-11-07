@@ -781,6 +781,10 @@ look new. The internal keep-data receiver has an exact final control transition,
 but automatic activation, old setup/PATH ownership retirement, the empty-data
 creation path and the full repeated uninstall/install drill remain required
 before this becomes a supported installer flow.
+An interrupted internal handoff can retain prepared activation inputs while
+the installation is still incomplete. Preserve those records and source
+history; their presence does not authorize starting the package or manually
+copying its pointer and receipt into place.
 
 ## Existing source installation
 
