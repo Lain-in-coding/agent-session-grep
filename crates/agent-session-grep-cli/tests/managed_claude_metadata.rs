@@ -62,19 +62,105 @@ fn command(temp: &Path) -> Command {
     command
 }
 
-fn read(temp: &Path, db: &Path, args: &[&str]) -> Value {
+fn diagnostic_label(value: Option<&Value>, allowed: &[&'static str]) -> &'static str {
+    match value {
+        None | Some(Value::Null) => "missing",
+        Some(Value::String(value)) => allowed
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == value.as_str())
+            .unwrap_or("unrecognized"),
+        Some(_) => "invalid_type",
+    }
+}
+
+fn read(
+    temp: &Path,
+    db: &Path,
+    args: &[&str],
+    phase: &'static str,
+    original_outer_end: Option<Instant>,
+    call_sequence: &mut u32,
+) -> Value {
+    *call_sequence += 1;
+    let call_seq = *call_sequence;
+    let started = Instant::now();
     let output = command(temp)
         .args(["--robot", "--db"])
         .arg(db)
         .args(args)
-        .output()
-        .unwrap();
+        .output();
+    let finished = Instant::now();
+    let expired_before = original_outer_end.map(|end| started >= end);
+    let expired_after = original_outer_end.map(|end| finished >= end);
+    let elapsed = finished.duration_since(started);
+    let output = output.unwrap_or_else(|error| {
+        panic!(
+            "synthetic metadata read I/O failed: phase={phase} call_seq={call_seq} \
+             error_kind={:?} elapsed={elapsed:?} original_outer_end_expired_before={expired_before:?} \
+             original_outer_end_expired_after={expired_after:?}",
+            error.kind(),
+        )
+    });
+    // Parse before the exit assertion so exit 6 retains its canonical reason.
+    // Never print raw output, envelope messages/details, argv, paths, or IDs.
+    let parsed = serde_json::from_slice::<Value>(&output.stdout);
+    let envelope = parsed.as_ref().ok();
+    let command = diagnostic_label(
+        envelope.and_then(|value| value.get("command")),
+        &["background", "search", "show", "context"],
+    );
+    let code = diagnostic_label(
+        envelope.and_then(|value| value.pointer("/error/code")),
+        &[
+            "invalid_request",
+            "not_found",
+            "source_io",
+            "source_changed",
+            "snapshot_failed",
+            "catalog_error",
+            "provider_error",
+            "capability_not_supported",
+            "writer_busy",
+            "deadline_exceeded",
+            "schema_incompatible",
+            "cursor_invalid",
+            "cursor_expired",
+            "generation_mismatch",
+            "update_recovery_required",
+            "internal",
+        ],
+    );
+    let retryable = envelope
+        .and_then(|value| value.pointer("/error/retryable"))
+        .and_then(Value::as_bool);
+    let json_error = parsed
+        .as_ref()
+        .err()
+        .map(|error| (error.classify(), error.line(), error.column()));
+    eprintln!(
+        "synthetic metadata read: phase={phase} call_seq={call_seq} exit={:?} \
+         command={command} error_code={code} retryable={retryable:?} elapsed={elapsed:?} \
+         original_outer_end_expired_before={expired_before:?} \
+         original_outer_end_expired_after={expired_after:?} \
+         original_remaining_before={:?} original_remaining_after={:?} json_error={json_error:?} \
+         stdout_bytes={} stdout_blake3={} stderr_bytes={} stderr_blake3={}",
+        output.status.code(),
+        original_outer_end.map(|end| end.saturating_duration_since(started)),
+        original_outer_end.map(|end| end.saturating_duration_since(finished)),
+        output.stdout.len(),
+        blake3::hash(&output.stdout).to_hex(),
+        output.stderr.len(),
+        blake3::hash(&output.stderr).to_hex(),
+    );
     assert!(
         matches!(output.status.code(), Some(0 | 10)),
-        "synthetic metadata read failed: exit={:?}",
-        output.status.code()
+        "synthetic metadata read failed: phase={phase} call_seq={call_seq} exit={:?}",
+        output.status.code(),
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    parsed.unwrap_or_else(|_| {
+        panic!("synthetic metadata read invalid JSON: phase={phase} call_seq={call_seq}")
+    })
 }
 
 fn diagnose_latest_failure(db: &Path) {
@@ -198,9 +284,17 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
         .spawn()
         .unwrap();
     let mut worker = Worker { child, temp };
+    let mut call_sequence = 0_u32;
     let end = Instant::now() + Duration::from_secs(10);
     loop {
-        let status = read(worker.temp.path(), &db, &["background", "status"]);
+        let status = read(
+            worker.temp.path(),
+            &db,
+            &["background", "status"],
+            "background_status",
+            Some(end),
+            &mut call_sequence,
+        );
         if status["data"]["running"] == true {
             break;
         }
@@ -228,7 +322,9 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
             diagnose_latest_failure(&db);
             panic!(
                 "synthetic metadata latest expired: attempts={attempts}, \
-                 transient={transient:?}, last freshness={last}"
+                 transient_count={}, last_freshness_blake3={}",
+                transient.len(),
+                blake3::hash(last.to_string().as_bytes()).to_hex(),
             );
         }
         attempts += 1;
@@ -243,6 +339,9 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
                 "--max-wait-ms",
                 wait.as_str(),
             ],
+            "latest_search",
+            Some(latest_end),
+            &mut call_sequence,
         );
         let freshness = &search["data"]["freshness"];
         if freshness["latest_satisfied"] == true {
@@ -253,7 +352,19 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
             diagnose_latest_failure(&db);
             panic!(
                 "synthetic metadata latest failed: attempts={attempts}, \
-                 transient={transient:?}, reason={reason}, freshness={freshness}"
+                 transient_count={}, reason={}, freshness_blake3={}",
+                transient.len(),
+                diagnostic_label(
+                    freshness.get("reason"),
+                    &[
+                        "busy",
+                        "deferred",
+                        "source_changed",
+                        "writer_busy",
+                        "deadline_exceeded",
+                    ],
+                ),
+                blake3::hash(freshness.to_string().as_bytes()).to_hex(),
             );
         }
         last.clone_from(freshness);
@@ -264,7 +375,9 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
             diagnose_latest_failure(&db);
             panic!(
                 "synthetic metadata worker exited during latest: attempts={attempts}, \
-                 transient={transient:?}, last freshness={last}"
+                 transient_count={}, last_freshness_blake3={}",
+                transient.len(),
+                blake3::hash(last.to_string().as_bytes()).to_hex(),
             );
         }
         // Each admission takes the control write lock; stay well below the
@@ -274,8 +387,10 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
     };
     let freshness = &search["data"]["freshness"];
     assert_eq!(
-        freshness["latest_satisfied"], true,
-        "synthetic metadata latest failed: freshness={freshness}"
+        freshness["latest_satisfied"],
+        true,
+        "synthetic metadata latest failed: freshness_blake3={}",
+        blake3::hash(freshness.to_string().as_bytes()).to_hex(),
     );
     assert_eq!(freshness["coverage"], "complete");
     assert_eq!(freshness["pending_sources"], 0);
@@ -301,7 +416,14 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
     );
     let message = proof["message_id"].as_str().unwrap();
     let session = proof["session_id"].as_str().unwrap();
-    let show = read(worker.temp.path(), &db, &["show", message]);
+    let show = read(
+        worker.temp.path(),
+        &db,
+        &["show", message],
+        "show",
+        None,
+        &mut call_sequence,
+    );
     assert_eq!(show["data"]["entity"]["text"], original);
     let context = read(
         worker.temp.path(),
@@ -314,6 +436,9 @@ fn claude_runtime_metadata_publishes_original_and_satisfies_latest() {
             "--max-bytes",
             "32768",
         ],
+        "context",
+        None,
+        &mut call_sequence,
     );
     let messages = context["data"]["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
