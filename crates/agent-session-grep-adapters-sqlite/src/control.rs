@@ -20,7 +20,7 @@ mod reinstall_connection;
 mod reinstall_records;
 pub use reinstall_commitment::{
     ReinstallCommitmentPair, ReinstallImageMatch, ReinstallPreparationRead,
-    ReinstallSnapshotBinding,
+    ReinstallSnapshotBinding, ReinstallTerminalCommit,
 };
 pub use reinstall_connection::{
     ReinstallCleanupBinding, ReinstallClosed, ReinstallClosedResources, ReinstallConnectionError,
@@ -32,7 +32,7 @@ pub use reinstall_connection::{
 pub use reinstall_records::{
     ReinstallAck, ReinstallCatalogIdentity, ReinstallContext, ReinstallDigest,
     ReinstallFileBinding, ReinstallFiles, ReinstallImage, ReinstallPrep, ReinstallRoots,
-    ReinstallShmBinding,
+    ReinstallShmBinding, ReinstallTerminal,
 };
 
 const VERSION: i64 = 2;

@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 const PREP_SCHEMA: &str = "asg.reinstall-keep-transfer-prep/v1";
 const ACK_SCHEMA: &str = "asg.reinstall-keep-transfer-ack/v1";
+const TERMINAL_SCHEMA: &str = "asg.reinstall-terminal-control/v1";
 const CLOSE_POLICY: &str = "no-close-checkpoint/v1";
 const RECORD_LIMIT: usize = 8192;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -471,6 +472,71 @@ impl ReinstallAck {
         let ack: Self = decode(bytes)?;
         ack.validate(prep)?;
         Ok(ack)
+    }
+}
+
+/// Fixed final-control comparison data. It grants no package or SQL authority.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReinstallTerminal {
+    schema: String,
+    prep_sha256: ReinstallDigest,
+    ack_sha256: ReinstallDigest,
+    payload_complete_sha256: ReinstallDigest,
+    retired_ownership_sha256: ReinstallDigest,
+    control_final: ReinstallImage,
+}
+
+impl ReinstallTerminal {
+    pub(super) fn new(
+        prep: &ReinstallPrep,
+        ack: &ReinstallAck,
+        payload_complete_sha256: ReinstallDigest,
+        retired_ownership_sha256: ReinstallDigest,
+        control_final: ReinstallImage,
+    ) -> PortResult<Self> {
+        let record = Self {
+            schema: TERMINAL_SCHEMA.into(),
+            prep_sha256: prep.sha256()?,
+            ack_sha256: ReinstallDigest::of_bytes(&ack.encode(prep)?),
+            payload_complete_sha256,
+            retired_ownership_sha256,
+            control_final,
+        };
+        record.validate(prep, ack)?;
+        Ok(record)
+    }
+
+    pub(super) fn validate(&self, prep: &ReinstallPrep, ack: &ReinstallAck) -> PortResult<()> {
+        prep.validate()?;
+        ack.validate(prep)?;
+        self.control_final.validate(prep.context(), prep.files())?;
+        if self.schema != TERMINAL_SCHEMA
+            || self.prep_sha256 != prep.sha256()?
+            || self.ack_sha256 != ReinstallDigest::of_bytes(&ack.encode(prep)?)
+            || prep.context.old_control_seq.checked_add(2).is_none()
+            || self.control_final.sha256 == prep.after().sha256
+            || self.control_final.tables[0].rows != prep.after().tables[0].rows
+            || self.control_final.tables[1..] != prep.after().tables[1..]
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub fn final_image(&self) -> &ReinstallImage {
+        &self.control_final
+    }
+
+    pub fn encode(&self, prep: &ReinstallPrep, ack: &ReinstallAck) -> PortResult<Vec<u8>> {
+        self.validate(prep, ack)?;
+        encode(self)
+    }
+
+    pub fn decode(bytes: &[u8], prep: &ReinstallPrep, ack: &ReinstallAck) -> PortResult<Self> {
+        let record: Self = decode(bytes)?;
+        record.validate(prep, ack)?;
+        Ok(record)
     }
 }
 

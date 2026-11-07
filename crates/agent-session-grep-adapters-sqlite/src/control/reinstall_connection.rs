@@ -2274,7 +2274,7 @@ fn reinstall_file_identity(file: &fs::File) -> PortResult<(u64, u64)> {
     }
 }
 
-fn verify_reinstall_connection(
+pub(super) fn verify_reinstall_connection(
     conn: &Connection,
     path: &Path,
     expected: (u64, u64),

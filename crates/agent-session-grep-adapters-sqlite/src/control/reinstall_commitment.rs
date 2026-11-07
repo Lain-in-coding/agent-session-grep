@@ -1,5 +1,6 @@
 //! Complete current-schema control commitments for the private keep-data
-//! transfer. All row and relationship reads share one deferred transaction.
+//! transfer. Row and relationship reads share one transaction; terminal control
+//! publication compares its full before/after images in the write transaction.
 use super::{
     reinstall_records::{TABLE_COUNT, TableDigest},
     *,
@@ -37,6 +38,20 @@ impl ReinstallCommitmentPair {
 pub enum ReinstallImageMatch {
     Before,
     After,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReinstallTerminalCommit {
+    Committed,
+    AlreadyCommitted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    Current,
+    Adopt,
+    Terminal,
+    Recovering,
 }
 
 impl SqliteControlStore {
@@ -80,6 +95,166 @@ impl SqliteControlStore {
         })
     }
 
+    /// Compute the exact final image without writing or admitting a package.
+    /// Only the verified q+1 image can prepare this fixed terminal comparison.
+    pub fn prepare_reinstall_terminal_with_deadline(
+        &self,
+        binding: ReinstallSnapshotBinding<'_, '_>,
+        prep: &ReinstallPrep,
+        ack: &ReinstallAck,
+        payload_complete: ReinstallDigest,
+        retired_ownership: ReinstallDigest,
+        end: Instant,
+    ) -> PortResult<ReinstallTerminal> {
+        self.with_runtime_deadline(end, || {
+            prep.validate()?;
+            ack.encode(prep)?;
+            self.validate_reinstall_read_binding(&binding)?;
+            let handles = ReinstallHandlesPin::open(&self.private_root)?;
+            let (current, terminal) = {
+                let mut conn = self.conn.borrow_mut();
+                configure_runtime_deadline(&conn)?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(sql_error)?;
+                let images = self.reinstall_images_in_transaction(
+                    &tx,
+                    &binding,
+                    prep.context(),
+                    prep.files(),
+                    Projection::Terminal,
+                )?;
+                runtime_tick()?;
+                tx.commit().map_err(sql_error)?;
+                images
+            };
+            if current != *prep.after() {
+                return Err(conflict());
+            }
+            handles.validate()?;
+            self.validate_reinstall_read_binding(&binding)?;
+            runtime_tick()?;
+            ReinstallTerminal::new(
+                prep,
+                ack,
+                payload_complete,
+                retired_ownership,
+                terminal.ok_or_else(corrupt)?,
+            )
+        })
+    }
+
+    /// Commit only the fixed terminal control image under the caller's real
+    /// guards. The coordinator must first publish its activation prerequisites.
+    /// An error can be an uncertain COMMIT; only exact independent reentry
+    /// establishes before or final state. No metadata or catalog is changed.
+    pub fn commit_reinstall_terminal_with_deadline(
+        &self,
+        binding: ReinstallSnapshotBinding<'_, '_>,
+        prep: &ReinstallPrep,
+        ack: &ReinstallAck,
+        terminal: &ReinstallTerminal,
+        end: Instant,
+    ) -> PortResult<ReinstallTerminalCommit> {
+        self.with_runtime_deadline(end, || {
+            if !self.writable {
+                return Err(invalid());
+            }
+            terminal.validate(prep, ack)?;
+            self.validate_reinstall_read_binding(&binding)?;
+            let handles = ReinstallHandlesPin::open(&self.private_root)?;
+            let mut conn = self.conn.borrow_mut();
+            configure_runtime_deadline(&conn)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let (current, counterpart) = self.reinstall_images_in_transaction(
+                &tx,
+                &binding,
+                prep.context(),
+                prep.files(),
+                Projection::Recovering,
+            )?;
+            let counterpart = counterpart.ok_or_else(corrupt)?;
+            if current == *terminal.final_image() {
+                if counterpart != *prep.after() {
+                    return Err(conflict());
+                }
+                handles.validate()?;
+                binding.owner.guard.validate_current(&self.private_root)?;
+                binding
+                    .installation
+                    .guard
+                    .validate_current(&binding.installation.prefix)?;
+                reinstall_connection::verify_reinstall_connection(
+                    &tx,
+                    &Self::path(&self.private_root),
+                    prep.files().control_main.identity,
+                )?;
+                verify_sidecars(&Self::path(&self.private_root))?;
+                runtime_tick()?;
+                tx.commit().map_err(sql_error)?;
+                return Ok(ReinstallTerminalCommit::AlreadyCommitted);
+            }
+            if current != *prep.after() || counterpart != *terminal.final_image() {
+                return Err(conflict());
+            }
+            let context = prep.context();
+            let sequence = context.old_control_seq.checked_add(1).ok_or_else(invalid)?;
+            let final_sequence = sequence.checked_add(1).ok_or_else(invalid)?;
+            runtime_tick()?;
+            let changed = tx
+                .execute(
+                    "UPDATE control_meta SET control_seq=?1,maintenance_state='idle',
+                 maintenance_owner=NULL,maintenance_phase=NULL
+                 WHERE singleton=1 AND control_seq=?2 AND policy_epoch=?3
+                 AND maintenance_state='recovering' AND maintenance_owner=?4
+                 AND maintenance_phase='reconciling'",
+                    params![
+                        final_sequence,
+                        sequence,
+                        context.policy_epoch,
+                        context.operation
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(conflict());
+            }
+            #[cfg(test)]
+            tests::observe(Step::TerminalUpdated)?;
+            let (after, restored) = self.reinstall_images_in_transaction(
+                &tx,
+                &binding,
+                context,
+                prep.files(),
+                Projection::Recovering,
+            )?;
+            if after != *terminal.final_image() || restored.as_ref() != Some(prep.after()) {
+                return Err(conflict());
+            }
+            handles.validate()?;
+            binding.owner.validate(self)?;
+            binding.owner.guard.validate_current(&self.private_root)?;
+            binding
+                .installation
+                .guard
+                .validate_current(&binding.installation.prefix)?;
+            reinstall_connection::verify_reinstall_connection(
+                &tx,
+                &Self::path(&self.private_root),
+                prep.files().control_main.identity,
+            )?;
+            verify_sidecars(&Self::path(&self.private_root))?;
+            runtime_tick()?;
+            tx.commit().map_err(sql_error)?;
+            mark_runtime_committed();
+            #[cfg(test)]
+            tests::observe(Step::TerminalCommitted)?;
+            Ok(ReinstallTerminalCommit::Committed)
+        })
+    }
+
     fn reinstall_images(
         &self,
         binding: &ReinstallSnapshotBinding<'_, '_>,
@@ -100,60 +275,17 @@ impl SqliteControlStore {
         let handles = ReinstallHandlesPin::open(&self.private_root)?;
         let result = {
             let mut conn = self.conn.borrow_mut();
-            // This entry consumes the foundation's already configured connection;
-            // it cannot silently turn an ordinary connection into a transfer open.
-            if !conn
-                .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
-                .map_err(sql_error)?
-            {
-                return Err(invalid());
-            }
             configure_runtime_deadline(&conn)?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Deferred)
                 .map_err(sql_error)?;
-            for (query, expected) in [
-                ("PRAGMA user_version", VERSION),
-                ("PRAGMA application_id", APPLICATION_ID),
-                ("PRAGMA wal_autocheckpoint", 0),
-                ("PRAGMA journal_size_limit", -1),
-            ] {
-                if tx
-                    .query_row(query, [], |r| r.get::<_, i64>(0))
-                    .map_err(sql_error)?
-                    != expected
-                {
-                    return Err(corrupt());
-                }
-            }
-            if tx
-                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
-                .map_err(sql_error)?
-                != "wal"
-            {
-                return Err(corrupt());
-            }
-            validate_schema(&tx)?;
-            let unexpected: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-                     WHERE name LIKE 'sqlite_%'
-                       AND NOT (type='index' AND sql IS NULL
-                                AND name GLOB 'sqlite_autoindex_*'))",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            require(!unexpected)?;
-            let state = read_meta(&tx, context, derive)?;
-            binding
-                .installation
-                .validate_bound(self, || ControlId::parse(&state.installation))?;
-            binding
-                .installation
-                .guard
-                .validate_current(&binding.installation.prefix)?;
-            let result = stream(&tx, context, files, &state, derive)?;
+            let projection = if derive {
+                Projection::Adopt
+            } else {
+                Projection::Current
+            };
+            let result =
+                self.reinstall_images_in_transaction(&tx, binding, context, files, projection)?;
             runtime_tick()?;
             tx.commit().map_err(sql_error)?;
             result
@@ -165,6 +297,75 @@ impl SqliteControlStore {
             .validate_bound(self, || ControlId::parse(&context.installation))?;
         runtime_tick()?;
         Ok(result)
+    }
+
+    fn reinstall_images_in_transaction(
+        &self,
+        conn: &Connection,
+        binding: &ReinstallSnapshotBinding<'_, '_>,
+        context: &ReinstallContext,
+        files: &ReinstallFiles,
+        projection: Projection,
+    ) -> PortResult<(ReinstallImage, Option<ReinstallImage>)> {
+        runtime_tick()?;
+        context.validate()?;
+        files.validate()?;
+        if binding.control_root != self.root_identity
+            || binding.owner.identity != self.root_identity
+            || binding.sealed != SealedControlFile::from_recorded(files.control_main.identity)
+            || !conn
+                .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+                .map_err(sql_error)?
+        {
+            return Err(invalid());
+        }
+        for (query, expected) in [
+            ("PRAGMA user_version", VERSION),
+            ("PRAGMA application_id", APPLICATION_ID),
+            ("PRAGMA wal_autocheckpoint", 0),
+            ("PRAGMA journal_size_limit", -1),
+        ] {
+            if conn
+                .query_row(query, [], |r| r.get::<_, i64>(0))
+                .map_err(sql_error)?
+                != expected
+            {
+                return Err(corrupt());
+            }
+        }
+        if conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .map_err(sql_error)?
+            != "wal"
+        {
+            return Err(corrupt());
+        }
+        validate_schema(conn)?;
+        let unexpected: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE name LIKE 'sqlite_%'
+               AND NOT (type='index' AND sql IS NULL
+                        AND name GLOB 'sqlite_autoindex_*'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        require(!unexpected)?;
+        let state = read_meta(conn, context, projection)?;
+        binding
+            .installation
+            .validate_bound(self, || ControlId::parse(&state.installation))?;
+        binding
+            .installation
+            .guard
+            .validate_current(&binding.installation.prefix)?;
+        let projection = if projection == Projection::Recovering && !state.terminal {
+            Projection::Terminal
+        } else {
+            projection
+        };
+        stream(conn, context, files, &state, projection)
     }
 
     fn validate_reinstall_read_binding(
@@ -367,6 +568,7 @@ struct Meta {
     epoch: i64,
     sequence: i64,
     next_cycle: i64,
+    terminal: bool,
 }
 
 fn require(ok: bool) -> PortResult<()> {
@@ -392,7 +594,11 @@ fn failure(value: Option<&str>) -> PortResult<()> {
     value.map(failure_decode).transpose().map(drop)
 }
 
-fn read_meta(conn: &Connection, context: &ReinstallContext, derive: bool) -> PortResult<Meta> {
+fn read_meta(
+    conn: &Connection,
+    context: &ReinstallContext,
+    projection: Projection,
+) -> PortResult<Meta> {
     let mut statement = conn
         .prepare(&format!(
             "SELECT {} FROM control_meta",
@@ -416,7 +622,17 @@ fn read_meta(conn: &Connection, context: &ReinstallContext, derive: bool) -> Por
         && row.maintenance_state == "recovering"
         && row.maintenance_owner == Some(context.operation.as_str())
         && row.maintenance_phase == Some("reconciling");
-    if !(before || !derive && after) {
+    let terminal = Some(row.control_seq) == context.old_control_seq.checked_add(2)
+        && row.maintenance_state == "idle"
+        && row.maintenance_owner.is_none()
+        && row.maintenance_phase.is_none();
+    let allowed = match projection {
+        Projection::Current => before || after,
+        Projection::Adopt => before,
+        Projection::Terminal => after,
+        Projection::Recovering => after || terminal,
+    };
+    if !allowed {
         return Err(conflict());
     }
     let result = Meta {
@@ -425,6 +641,7 @@ fn read_meta(conn: &Connection, context: &ReinstallContext, derive: bool) -> Por
         epoch: row.policy_epoch,
         sequence: row.control_seq,
         next_cycle: row.next_cycle_seq,
+        terminal,
     };
     require(rows.next().map_err(sql_error)?.is_none())?;
     Ok(result)
@@ -839,8 +1056,9 @@ fn stream(
     context: &ReinstallContext,
     files: &ReinstallFiles,
     meta: &Meta,
-    derive: bool,
+    projection: Projection,
 ) -> PortResult<(ReinstallImage, Option<ReinstallImage>)> {
+    let derive = projection != Projection::Current;
     let empty = TableDigest {
         rows: 0,
         sha256: ReinstallDigest([0; 32]),
@@ -906,12 +1124,29 @@ fn stream(
         MetaRow,
         |r: &MetaRow<'_>| r.validate(),
         |r: &MetaRow<'_>, h: &mut Sha256| -> PortResult<()> {
-            let changed = MetaRow {
-                control_seq: r.control_seq.checked_add(1).ok_or_else(corrupt)?,
-                maintenance_state: "recovering",
-                maintenance_owner: Some(context.operation.as_str()),
-                maintenance_phase: Some("reconciling"),
-                ..r.clone()
+            let changed = match projection {
+                Projection::Adopt => MetaRow {
+                    control_seq: r.control_seq.checked_add(1).ok_or_else(corrupt)?,
+                    maintenance_state: "recovering",
+                    maintenance_owner: Some(context.operation.as_str()),
+                    maintenance_phase: Some("reconciling"),
+                    ..r.clone()
+                },
+                Projection::Terminal => MetaRow {
+                    control_seq: context.old_control_seq.checked_add(2).ok_or_else(corrupt)?,
+                    maintenance_state: "idle",
+                    maintenance_owner: None,
+                    maintenance_phase: None,
+                    ..r.clone()
+                },
+                Projection::Recovering => MetaRow {
+                    control_seq: context.old_control_seq.checked_add(1).ok_or_else(corrupt)?,
+                    maintenance_state: "recovering",
+                    maintenance_owner: Some(context.operation.as_str()),
+                    maintenance_phase: Some("reconciling"),
+                    ..r.clone()
+                },
+                Projection::Current => r.clone(),
             };
             changed.feed(h);
             Ok(())
@@ -925,6 +1160,10 @@ fn stream(
         SourceRow,
         |r: &SourceRow<'_>| r.validate(meta),
         |r: &SourceRow<'_>, h: &mut Sha256| -> PortResult<()> {
+            if projection != Projection::Adopt {
+                r.feed(h);
+                return Ok(());
+            }
             let changed = SourceRow {
                 coverage: if r.receipt_cycle.is_none() {
                     "empty"
@@ -954,6 +1193,10 @@ fn stream(
         CycleRow,
         |r: &CycleRow<'_>| r.validate(meta),
         |r: &CycleRow<'_>, h: &mut Sha256| -> PortResult<()> {
+            if projection != Projection::Adopt {
+                r.feed(h);
+                return Ok(());
+            }
             let changed = CycleRow {
                 state: if matches!(r.state, "queued" | "observing") {
                     "aborted"
@@ -972,6 +1215,10 @@ fn stream(
         BarrierRow,
         |r: &BarrierRow<'_>| r.validate(meta),
         |r: &BarrierRow<'_>, h: &mut Sha256| -> PortResult<()> {
+            if projection != Projection::Adopt {
+                r.feed(h);
+                return Ok(());
+            }
             let pending = matches!(r.state, "pending" | "awaiting_catalog");
             let changed = BarrierRow {
                 state: if pending { "blocked" } else { r.state },
@@ -1189,6 +1436,8 @@ fn validate_live_capacity(conn: &Connection) -> PortResult<()> {
 enum Step {
     Row(u16, u64),
     Table(u16),
+    TerminalUpdated,
+    TerminalCommitted,
 }
 
 #[cfg(test)]
@@ -1522,6 +1771,46 @@ mod tests {
             });
         }
 
+        fn terminal(&self, prep: &ReinstallPrep) -> (ReinstallAck, ReinstallTerminal) {
+            let ack = ReinstallAck::from_observations(
+                prep,
+                ReinstallCatalogIdentity {
+                    installation: self.context.installation.clone(),
+                    incarnation: self.context.incarnation.clone(),
+                    schema: crate::SCHEMA_VERSION as u32,
+                    generation: 0,
+                },
+                self.files(),
+            )
+            .unwrap();
+            let terminal = self
+                .with_binding(|binding| {
+                    self.store.prepare_reinstall_terminal_with_deadline(
+                        binding,
+                        prep,
+                        &ack,
+                        ReinstallDigest::of_bytes(b"fixed-payload-complete"),
+                        ReinstallDigest::of_bytes(b"fixed-retired-ownership"),
+                        end(),
+                    )
+                })
+                .unwrap();
+            (ack, terminal)
+        }
+
+        fn finish_terminal(
+            &self,
+            prep: &ReinstallPrep,
+            ack: &ReinstallAck,
+            terminal: &ReinstallTerminal,
+            until: Instant,
+        ) -> PortResult<ReinstallTerminalCommit> {
+            self.with_binding(|binding| {
+                self.store
+                    .commit_reinstall_terminal_with_deadline(binding, prep, ack, terminal, until)
+            })
+        }
+
         fn seed_history(&self, cycles: i64, selections: i64, wide_ids: bool) {
             let mut conn = self.store.conn.borrow_mut();
             let tx = conn.transaction().unwrap();
@@ -1690,6 +1979,258 @@ mod tests {
         .unwrap();
         let bytes = ack.encode(&prep).unwrap();
         assert!(ReinstallAck::decode(&bytes, &prep).is_ok());
+    }
+
+    #[test]
+    fn terminal_control_commits_once_and_preserves_policy_and_hidden_history() {
+        for desired in ["paused", "stopped", "running"] {
+            let f = Fixture::new();
+            f.seed_history(3, 1, false);
+            f.store
+                .conn
+                .borrow()
+                .execute("UPDATE control_meta SET desired_updates=?1", [desired])
+                .unwrap();
+            f.store
+                .conn
+                .borrow()
+                .execute("UPDATE selections SET enabled=0,revoked_at_ms=2", [])
+                .unwrap();
+            let prep = f.prepare(&f.files(), end()).unwrap();
+            f.adopt();
+            let before = f.durable_bytes();
+            let (ack, terminal) = f.terminal(&prep);
+            assert!(before == f.durable_bytes());
+            assert!(terminal.final_image().tables[1..] == prep.after().tables[1..]);
+            let bytes = terminal.encode(&prep, &ack).unwrap();
+            assert!(ReinstallTerminal::decode(&bytes, &prep, &ack).unwrap() == terminal);
+            let commits = runtime_commit_seq();
+            assert_eq!(
+                f.finish_terminal(&prep, &ack, &terminal, end()).unwrap(),
+                ReinstallTerminalCommit::Committed
+            );
+            assert_eq!(runtime_commit_seq(), commits + 1);
+            let status = f
+                .store
+                .with_runtime_deadline(end(), || f.store.lifecycle_status())
+                .unwrap();
+            assert_eq!(status.desired_updates, desired_decode(desired).unwrap());
+            assert_eq!(
+                status.policy.control_seq.get(),
+                f.context.old_control_seq + 2
+            );
+            assert_eq!(status.policy.policy_epoch.get(), f.context.policy_epoch);
+            assert_eq!(status.policy.maintenance, MaintenanceFence::idle());
+            assert!(
+                f.compare(&prep, end()).is_err(),
+                "ordinary transfer must reject terminal"
+            );
+            let after = f.durable_bytes();
+            for _ in 0..2 {
+                assert_eq!(
+                    f.finish_terminal(&prep, &ack, &terminal, end()).unwrap(),
+                    ReinstallTerminalCommit::AlreadyCommitted
+                );
+            }
+            assert_eq!(runtime_commit_seq(), commits + 1);
+            assert!(after == f.durable_bytes());
+            assert_eq!(runtime_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn terminal_control_failure_after_update_rolls_back_without_new_epoch_or_receipt() {
+        for fail in ["refusal", "expiry", "unwind"] {
+            let f = Fixture::new();
+            let prep = f.prepare(&f.files(), end()).unwrap();
+            f.adopt();
+            let (ack, terminal) = f.terminal(&prep);
+            let before = f.durable_bytes();
+            let commits = runtime_commit_seq();
+            let reached = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&reached);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                with_hook(
+                    move |step| {
+                        if step == Step::TerminalUpdated {
+                            observed.fetch_add(1, Ordering::Relaxed);
+                            match fail {
+                                "refusal" => return Err(conflict()),
+                                "expiry" => {
+                                    RUNTIME_DEADLINE.with(|slot| slot.set(Some(Instant::now())))
+                                }
+                                "unwind" => panic!("fixed terminal precommit interruption"),
+                                _ => unreachable!(),
+                            }
+                        }
+                        Ok(())
+                    },
+                    || f.finish_terminal(&prep, &ack, &terminal, end()),
+                )
+            }));
+            assert_eq!(reached.load(Ordering::Relaxed), 1);
+            match (fail, result) {
+                ("unwind", Err(_)) => {}
+                ("expiry", Ok(Err(PortError::WriterBusy(_)))) => {}
+                ("refusal", Ok(Err(PortError::GenerationMismatch(_)))) => {}
+                _ => panic!("wrong terminal failure classification"),
+            }
+            assert_eq!(runtime_commit_seq(), commits);
+            assert_eq!(runtime_deadline(), None);
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+            assert!(before == f.durable_bytes());
+            assert_eq!(f.compare(&prep, end()).unwrap(), ReinstallImageMatch::After);
+            assert_eq!(
+                f.finish_terminal(&prep, &ack, &terminal, end()).unwrap(),
+                ReinstallTerminalCommit::Committed
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_control_refuses_changed_history_and_forged_final_policy() {
+        let f = Fixture::new();
+        f.seed_history(3, 1, false);
+        let prep = f.prepare(&f.files(), end()).unwrap();
+        f.adopt();
+        let (ack, terminal) = f.terminal(&prep);
+        let before = f.durable_bytes();
+        assert!(
+            f.finish_terminal(&prep, &ack, &terminal, Instant::now())
+                .is_err()
+        );
+        assert!(before == f.durable_bytes());
+        f.store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE cycle_selections SET discovered_count=2,observed_count=2,committed_count=2
+             WHERE cycle_seq=1",
+                [],
+            )
+            .unwrap();
+        let changed = f.durable_bytes();
+        assert!(matches!(
+            f.finish_terminal(&prep, &ack, &terminal, end()),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert!(changed == f.durable_bytes());
+        f.store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE cycle_selections SET discovered_count=1,observed_count=1,committed_count=1
+             WHERE cycle_seq=1",
+                [],
+            )
+            .unwrap();
+        f.finish_terminal(&prep, &ack, &terminal, end()).unwrap();
+        f.store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE control_meta SET desired_updates='running',autostart_enabled=1",
+                [],
+            )
+            .unwrap();
+        let changed = f.durable_bytes();
+        // An attacker-controlled final meta hash must still fail the reverse
+        // q+1 projection against the original immutable Prep.after.
+        let actual = {
+            let conn = f.store.conn.borrow();
+            let state = read_meta(&conn, &f.context, Projection::Recovering).unwrap();
+            stream(
+                &conn,
+                &f.context,
+                prep.files(),
+                &state,
+                Projection::Recovering,
+            )
+            .unwrap()
+            .0
+        };
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&terminal.encode(&prep, &ack).unwrap()).unwrap();
+        forged["control_final"] = serde_json::to_value(actual).unwrap();
+        let typed: ReinstallTerminal = serde_json::from_value(forged).unwrap();
+        let encoded = typed.encode(&prep, &ack).unwrap();
+        let forged = ReinstallTerminal::decode(&encoded, &prep, &ack).unwrap();
+        assert!(matches!(
+            f.finish_terminal(&prep, &ack, &forged, end()),
+            Err(PortError::GenerationMismatch(_))
+        ));
+        assert!(changed == f.durable_bytes());
+    }
+
+    #[test]
+    fn terminal_control_lost_ack_reentry_has_no_second_update() {
+        let f = Fixture::new();
+        let prep = f.prepare(&f.files(), end()).unwrap();
+        f.adopt();
+        let (ack, terminal) = f.terminal(&prep);
+        let commits = runtime_commit_seq();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&reached);
+        let lost = with_hook(
+            move |step| {
+                if step == Step::TerminalCommitted {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    return Err(PortError::Backend(
+                        "fixed lost terminal acknowledgement".into(),
+                    ));
+                }
+                Ok(())
+            },
+            || f.finish_terminal(&prep, &ack, &terminal, end()),
+        );
+        assert!(matches!(lost, Err(PortError::Backend(_))));
+        assert_eq!(reached.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime_commit_seq(), commits + 1);
+        assert_eq!(runtime_deadline(), None);
+        let actual = f.durable_bytes();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&mutations);
+        f.store
+            .conn
+            .borrow()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Update { .. }
+                        | AuthAction::Insert { .. }
+                        | AuthAction::Delete { .. }
+                ) {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        let requested = end();
+        let earlier = requested - Duration::from_secs(1);
+        let outer =
+            RuntimeDeadlineScope::enter_with_busy(earlier, Duration::from_millis(17)).unwrap();
+        assert_eq!(
+            f.finish_terminal(&prep, &ack, &terminal, requested)
+                .unwrap(),
+            ReinstallTerminalCommit::AlreadyCommitted
+        );
+        assert_eq!(runtime_deadline(), Some(earlier));
+        assert_eq!(
+            RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+            Duration::from_millis(17)
+        );
+        drop(outer);
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(mutations.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime_commit_seq(), commits + 1);
+        assert!(actual == f.durable_bytes());
+        f.store
+            .conn
+            .borrow()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
     }
 
     #[test]
