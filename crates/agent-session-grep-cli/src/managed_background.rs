@@ -2104,6 +2104,8 @@ fn run_cycle(
             .push((EpochSite::Plan, reason));
     }
     let epoch_plan_allowed = epoch_plan.is_ok();
+    #[cfg(test)]
+    wal_worker_tests::prepare_observation_diagnostics(&schedule.hooks);
     let result = observe_cycle(
         db,
         control,
@@ -2623,7 +2625,7 @@ type ObservationRefusal = (
 );
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SourceAttemptPhase {
     #[default]
     Prepare,
@@ -6790,6 +6792,8 @@ mod wal_worker_tests {
         expired_before_completion: bool,
         observation_error: Option<String>,
         observation_error_kind: Option<&'static str>,
+        first_observation_refusal: Option<ObservationRefusal>,
+        observation_refusal: Option<ObservationRefusal>,
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -7056,6 +7060,14 @@ mod wal_worker_tests {
         });
     }
 
+    pub(super) fn prepare_observation_diagnostics(schedule: &ScheduleTestHooks) {
+        if HOOKS.with(|hooks| hooks.borrow().is_some()) {
+            schedule.observation_diagnostics.set(true);
+            schedule.first_observation_refusal.set(None);
+            schedule.observation_refusal.set(None);
+        }
+    }
+
     pub(super) fn configure_completion(
         schedule: &ScheduleTestHooks,
         pending: &Option<PendingCycle>,
@@ -7085,6 +7097,8 @@ mod wal_worker_tests {
                     expired_before_completion: Instant::now() >= completion_end,
                     observation_error: error.map(|error| format!("{error:?}")),
                     observation_error_kind: error.map(ScheduleTestHooks::error_label),
+                    first_observation_refusal: schedule.first_observation_refusal.get(),
+                    observation_refusal: schedule.observation_refusal.get(),
                 });
             }
         });
@@ -7678,10 +7692,9 @@ mod wal_worker_tests {
             mut inspect: impl FnMut(&Event),
         ) -> IdleProof {
             let snapshot = idle_snapshot(&first);
-            let completion = snapshot
-                .completion
-                .clone()
-                .expect("idle wait requires an actual successful observation");
+            let completion = snapshot.completion.clone().unwrap_or_else(|| {
+                panic!("idle wait requires an actual successful observation: first={first:?}")
+            });
             let observed = completion.intent.observed.as_ref().unwrap_or_else(|| {
                 panic!("unconfirmed observation cannot justify an idle wait: {completion:?}")
             });
@@ -9544,6 +9557,70 @@ mod control_deadline_tests {
             accepted?
                 .map(|accepted| accepted.outcome)
                 .ok_or_else(changed)
+        }
+
+        /// This positive preservation fixture already owns a real observation.
+        /// Run it once, then enter the production cadence driver only after its
+        /// actual acceptance refusal has supplied the saved-ready trace.
+        fn resume_observed_at_cadence(
+            &self,
+            schedule: &mut SourceScheduleState,
+            boot: &ObservationClock,
+            pending: &mut Option<PendingCycle>,
+            on_first_busy: impl FnOnce(
+                &mut Option<PendingCycle>,
+                &mut SourceScheduleState,
+            ) -> PortResult<()>,
+        ) -> PortResult<CycleOutcome> {
+            let original = pending.as_ref().ok_or_else(changed)?.clone();
+            if original
+                .observed
+                .as_ref()
+                .is_none_or(|seen| !seen.outcome.idle())
+            {
+                return Err(changed());
+            }
+            let end = SqliteControlStore::effective_runtime_deadline(self.scope_end);
+            let worker = self.worker();
+            let mut trace = CycleDriveTrace {
+                tick_count: 1,
+                runs: 1,
+                phase: "run",
+                ..Default::default()
+            };
+            trace.ticks[0] = Some(Instant::now());
+            let run = run_cycle(
+                &self.db,
+                &self.control,
+                &worker,
+                boot,
+                1,
+                end,
+                pending,
+                schedule,
+            )?;
+            let CycleResult::Idle(ready @ IdleReady::Observed(_)) = run else {
+                return Err(changed());
+            };
+            let current = pending.as_ref().ok_or_else(changed)?;
+            if current.token != original.token
+                || current.finish != original.finish
+                || current.observed != original.observed
+                || !current.completion_confirmed
+            {
+                return Err(changed());
+            }
+            trace.first_ready = Some(current.clone());
+            let accepted =
+                self.accept_driver_idle(&worker, &ready, pending, schedule, end, &mut trace);
+            let result = match accepted {
+                Err(PortError::WriterBusy(_)) => {
+                    self.drive_production_cycle(schedule, boot, pending, &mut trace, on_first_busy)
+                }
+                other => other,
+            };
+            assert_drive_cadence(&trace, end);
+            result
         }
 
         fn accept_cycle(
@@ -17651,7 +17728,27 @@ mod control_deadline_tests {
         let progress = fixture.read_control(|control| control.source_progress_inventory());
         let cycle = fixture.read_control(|control| control.cycle(token.cycle_seq));
         assert_eq!(
-            resume_pending(fixture, schedule, boot, pending).unwrap(),
+            fixture
+                .resume_observed_at_cadence(schedule, boot, pending, |retained, schedule| {
+                    let retained = retained.as_ref().ok_or_else(changed)?;
+                    assert_eq!(retained.token, token);
+                    assert!(retained.completion_confirmed);
+                    assert_eq!(retained.observed.as_ref().unwrap().outcome, outcome);
+                    assert!(schedule.closed_idle_at.is_none());
+                    assert_eq!(publication_counts(fixture), publications);
+                    assert_eq!(
+                        fixture.read_control(|control| control.source_progress_inventory()),
+                        progress
+                    );
+                    assert_eq!(
+                        fixture
+                            .read_control(|control| control.background_status())
+                            .next_cycle_seq,
+                        next
+                    );
+                    Ok(())
+                },)
+                .unwrap(),
             outcome
         );
         assert!(pending.is_none());
@@ -17670,6 +17767,36 @@ mod control_deadline_tests {
         assert_eq!(terminal.token, token);
         assert_eq!(terminal.selections, cycle.selections);
         assert_eq!(terminal.state, finish_state(outcome.finish()));
+    }
+
+    #[test]
+    fn pending_idle_preserved_observation_survives_real_acceptance_expiry() {
+        let fixture = CycleFixture::new();
+        let source = fixture.write_source(
+            "preserved.jsonl",
+            SearchProvider::Claude,
+            "preserved original",
+        );
+        let original = std::fs::read(&source).unwrap();
+        let boot = ObservationClock::new(Instant::now());
+        let mut schedule = SourceScheduleState::default();
+        let mut pending = expired_completion(&fixture, &mut schedule, &boot);
+        assert!(pending.as_ref().unwrap().observed.is_some());
+        assert!(!pending.as_ref().unwrap().completion_confirmed);
+        let proof = Rc::new(RefCell::new(IdleExpiryProbe::default()));
+        schedule.hooks = expire_real_idle_heartbeat(&proof, fixture.scope_end, false);
+        let (_, finishes) = wal_worker_tests::count_direct_finishes(|| {
+            assert_pending_idle_preserves_observation(&fixture, &mut schedule, &boot, &mut pending);
+        });
+        assert_eq!(finishes, 1, "only the original pending finish may execute");
+        let proof = proof.borrow();
+        assert_eq!(
+            (proof.plans, proof.observations, proof.publications),
+            (0, 0, 0)
+        );
+        assert_eq!(proof.heartbeats, 2);
+        assert_eq!(proof.accepted, 1);
+        assert_eq!(std::fs::read(source).unwrap(), original);
     }
 
     #[test]
