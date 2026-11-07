@@ -881,15 +881,26 @@ mod identity_tests {
         let identity = SetupIdentity::capture(&path).unwrap();
         let install = install(&base.join("pkg"));
         let guard = fixture_guard(path.parent().unwrap(), LockKind::ControlHandles);
-        let end = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let end = started + Duration::from_secs(2);
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(500));
             drop(guard);
+            Instant::now()
         });
         let result = record_installation_binding(&install, &path, &identity, end);
-        release.join().unwrap();
+        let returned = Instant::now();
+        let released = release.join().unwrap();
+        let joined = Instant::now();
         result.expect("binding must retain the original end through control admission");
-        assert!(Instant::now() < end);
+        assert!(
+            returned < end,
+            "setup_binding_timing returned={:?} released={:?} joined={:?} allowance={:?}",
+            returned.duration_since(started),
+            released.duration_since(started),
+            joined.duration_since(started),
+            end.duration_since(started),
+        );
         identity.validate().unwrap();
         let binding: Value = serde_json::from_slice(
             &fs::read(path.parent().unwrap().join("installation-prefix.json")).unwrap(),
