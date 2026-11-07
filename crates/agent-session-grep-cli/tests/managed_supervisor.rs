@@ -1164,10 +1164,13 @@ fn stopped_before_launch_never_creates_worker() {
     let fixture = Fixture::new();
     fixture.desired(DesiredUpdates::Stopped);
     let mut harness = fixture.supervised();
-    assert_eq!(
-        harness.supervisor.tick().unwrap(),
-        SupervisorState::Finished
-    );
+    harness.until(|supervisor, state, _| {
+        stopped_observed(
+            state,
+            supervisor.child_id(),
+            supervisor.policy().unexpected_exits(),
+        )
+    });
     assert_eq!(harness.supervisor.child_id(), None);
     assert!(
         fixture
@@ -1178,6 +1181,36 @@ fn stopped_before_launch_never_creates_worker() {
             .boot_id
             .is_none()
     );
+}
+
+fn stopped_observed(state: SupervisorState, child: Option<u32>, exits: u8) -> bool {
+    assert_eq!(child, None, "stopped supervisor started a child");
+    assert_eq!(exits, 0, "stopped supervisor recorded a crash");
+    match state {
+        SupervisorState::Finished => true,
+        SupervisorState::Busy => false,
+        other => panic!("unexpected stopped supervisor observation: {other:?}"),
+    }
+}
+
+#[test]
+fn stopped_observation_requires_finished_without_any_child_or_crash() {
+    assert!(!stopped_observed(SupervisorState::Busy, None, 0));
+    assert!(stopped_observed(SupervisorState::Finished, None, 0));
+    for (state, child, exits) in [
+        (SupervisorState::Running, Some(7), 0),
+        (SupervisorState::Ready, None, 0),
+        (SupervisorState::Backoff, None, 0),
+        (SupervisorState::Paused, None, 0),
+        (SupervisorState::Busy, Some(7), 0),
+        (SupervisorState::Finished, Some(7), 0),
+        (SupervisorState::Finished, None, 1),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| stopped_observed(state, child, exits)).is_err(),
+            "invalid stopped observation was accepted"
+        );
+    }
 }
 
 #[test]

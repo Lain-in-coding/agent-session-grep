@@ -746,8 +746,20 @@ fn explicit_restart_sequence_and_autostart_mirror_preserve_pause_and_permission(
 fn supervisor_failure_requires_its_actual_root_lock_and_preserves_worker_authority() {
     let (_temp, root, store) = setup();
     let (_other_temp, other_root, _other) = setup();
-    let before = store.status().unwrap();
-    let worker_before = store.background_status().unwrap();
+    let observe = || {
+        let requested = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let probe = requested + std::time::Duration::from_secs(1);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let result = store.with_runtime_deadline(requested, || {
+            Ok((store.status()?, store.background_status()?))
+        });
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        result.unwrap()
+    };
+    let (before, worker_before) = observe();
     let wrong = exclusive_guard(&other_root, LockKind::Supervisor);
     assert!(
         store
@@ -764,15 +776,10 @@ fn supervisor_failure_requires_its_actual_root_lock_and_preserves_worker_authori
     let failed = store
         .report_supervisor_failure(before.policy.control_seq, &supervisor, true)
         .unwrap();
-    assert!(store.status().unwrap().supervisor_failed);
-    assert_eq!(
-        store.background_status().unwrap().worker,
-        worker_before.worker
-    );
-    assert_eq!(
-        store.status().unwrap().policy.policy_epoch,
-        before.policy.policy_epoch
-    );
+    let (after, worker_after) = observe();
+    assert!(after.supervisor_failed);
+    assert_eq!(worker_after.worker, worker_before.worker);
+    assert_eq!(after.policy.policy_epoch, before.policy.policy_epoch);
     assert!(
         !store
             .report_supervisor_failure(failed.control_seq, &supervisor, true)
@@ -782,7 +789,10 @@ fn supervisor_failure_requires_its_actual_root_lock_and_preserves_worker_authori
     store
         .report_supervisor_failure(failed.control_seq, &supervisor, false)
         .unwrap();
-    assert!(!store.status().unwrap().supervisor_failed);
+    let (cleared, worker_cleared) = observe();
+    assert!(!cleared.supervisor_failed);
+    assert_eq!(worker_cleared.worker, worker_before.worker);
+    assert_eq!(cleared.policy.policy_epoch, before.policy.policy_epoch);
 }
 
 #[test]
