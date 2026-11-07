@@ -348,6 +348,15 @@ impl Guard {
         create: bool,
     ) -> PortResult<Self> {
         let root = RootDirectory::open(root)?;
+        Self::acquire_opened(root, kind, mode, create)
+    }
+
+    fn acquire_opened(
+        root: RootDirectory,
+        kind: LockKind,
+        mode: Mode,
+        create: bool,
+    ) -> PortResult<Self> {
         let file = root.open_lock(&kind, create, if create { "lock" } else { "existing" })?;
         let identity = platform::identity(&file).map_err(lock_io("acquire", "identity"))?;
         let claim = Claim::acquire(
@@ -514,6 +523,48 @@ pub(crate) fn validate_writer_handle(held: &File, candidate: &File) -> PortResul
     Ok(())
 }
 
+/// The existing writer's parent stays pinned across transition admission and
+/// every later currency check. This exposes neither a raw root nor new authority.
+pub(crate) struct TransitionWriterRoot {
+    directory: RootDirectory,
+}
+
+impl fmt::Debug for TransitionWriterRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TransitionWriterRoot([private])")
+    }
+}
+
+impl TransitionWriterRoot {
+    pub(crate) fn open(root: &Path, expected: RootIdentity) -> PortResult<Self> {
+        let directory = RootDirectory::open(root)?;
+        if directory.identity != expected {
+            return Err(lock_invalid("transition_writer", "root"));
+        }
+        Ok(Self { directory })
+    }
+
+    pub(crate) fn open_writer(&self) -> PortResult<File> {
+        let file = platform::open_lock(&self.directory, "writer.lock", false)
+            .map_err(lock_io("transition_writer", "open"))?;
+        // Writer files deliberately retain their nonempty diagnostic records.
+        validate_writer_handle(&file, &file)?;
+        Ok(file)
+    }
+
+    pub(crate) fn validate(&self, root: &Path, held: &File) -> PortResult<()> {
+        if RootIdentity::read(root)? != self.directory.identity {
+            return Err(lock_invalid("transition_writer", "root"));
+        }
+        let named = self.open_writer()?;
+        validate_writer_handle(held, &named)?;
+        if RootIdentity::read(root)? != self.directory.identity {
+            return Err(lock_invalid("transition_writer", "replaced"));
+        }
+        Ok(())
+    }
+}
+
 fn validate_child_name(name: &str) -> PortResult<()> {
     if name.is_empty()
         || name.len() > 128
@@ -603,6 +654,36 @@ impl ExclusiveGuard {
     /// Callers retain this capability until protected work is complete.
     pub fn try_acquire(root: &Path, kind: LockKind) -> PortResult<Self> {
         Guard::acquire(root, kind, Mode::Exclusive).map(Self)
+    }
+
+    /// Transition admission requires an existing persistent rendezvous. It
+    /// creates no file and never repairs or substitutes a missing lock/root.
+    pub fn try_acquire_for_transition(
+        root: &Path,
+        expected: RootIdentity,
+        kind: LockKind,
+    ) -> PortResult<Self> {
+        if !matches!(
+            &kind,
+            LockKind::ControlHandles
+                | LockKind::Supervisor
+                | LockKind::Background
+                | LockKind::HistoryReaders
+                | LockKind::CatalogHandles
+                | LockKind::PolicyEmission
+                | LockKind::PolicyOwner
+        ) && !matches!(&kind, LockKind::MaintenanceJob(key)
+            if key.0 == crate::control::PURGE_LOCK_KEY)
+        {
+            return Err(lock_invalid("transition", "kind"));
+        }
+        let directory = RootDirectory::open(root)?;
+        if directory.identity != expected {
+            return Err(lock_invalid("transition", "root"));
+        }
+        let guard = Guard::acquire_opened(directory, kind, Mode::Exclusive, false)?;
+        guard.validate_current(root)?;
+        Ok(Self(guard))
     }
 
     /// Read-only admission may reuse an existing create rendezvous without
@@ -1344,6 +1425,94 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn transition_locks_require_existing_exact_roots_and_closed_kinds() {
+        let kinds = [
+            LockKind::ControlHandles,
+            LockKind::Supervisor,
+            LockKind::Background,
+            LockKind::MaintenanceJob(JobLockKey::parse(crate::control::PURGE_LOCK_KEY).unwrap()),
+            LockKind::HistoryReaders,
+            LockKind::CatalogHandles,
+            LockKind::PolicyEmission,
+            LockKind::PolicyOwner,
+        ];
+        for kind in kinds {
+            let root = agent_session_grep_testkit::tempdir().unwrap();
+            let expected = RootIdentity::read(root.path()).unwrap();
+            assert!(
+                ExclusiveGuard::try_acquire_for_transition(root.path(), expected, kind.clone())
+                    .is_err()
+            );
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            drop(ExclusiveGuard::try_acquire(root.path(), kind.clone()).unwrap());
+            let path = root.path().join(kind.filename());
+            let before = fs::read(&path).unwrap();
+            let guard =
+                ExclusiveGuard::try_acquire_for_transition(root.path(), expected, kind.clone())
+                    .unwrap();
+            assert_eq!(guard.root_identity(), expected);
+            assert_busy(ExclusiveGuard::try_acquire(root.path(), kind.clone()));
+            guard.validate_current(root.path()).unwrap();
+            assert_os_exclusive_busy(root.path(), &kind);
+            drop(guard);
+            drop(ExclusiveGuard::try_acquire(root.path(), kind.clone()).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
+        let expected = RootIdentity::read(root.path()).unwrap();
+        let foreign = RootIdentity::read(other.path()).unwrap();
+        for kind in [
+            LockKind::ControlCreate,
+            LockKind::MaintenanceJob(JobLockKey::parse("installation-update").unwrap()),
+            LockKind::MaintenanceJob(JobLockKey::parse("other-purge").unwrap()),
+        ] {
+            assert!(
+                ExclusiveGuard::try_acquire_for_transition(root.path(), expected, kind).is_err()
+            );
+        }
+        assert!(
+            ExclusiveGuard::try_acquire_for_transition(root.path(), foreign, LockKind::Background)
+                .is_err()
+        );
+        let missing = root.path().join("missing-root");
+        assert!(
+            ExclusiveGuard::try_acquire_for_transition(&missing, expected, LockKind::Background)
+                .is_err()
+        );
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn transition_locks_preserve_content_and_reject_hardlink_aliases() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let expected = RootIdentity::read(root.path()).unwrap();
+        let path = root.path().join(LockKind::Background.filename());
+        fs::write(&path, b"unexpected lock contents").unwrap();
+        assert!(
+            ExclusiveGuard::try_acquire_for_transition(root.path(), expected, LockKind::Background)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"unexpected lock contents");
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, []).unwrap();
+        let alias = root.path().join("original-lock-alias");
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(
+            ExclusiveGuard::try_acquire_for_transition(root.path(), expected, LockKind::Background)
+                .is_err()
+        );
+        assert!(alias.exists());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        fs::remove_file(&alias).unwrap();
+        drop(
+            ExclusiveGuard::try_acquire_for_transition(root.path(), expected, LockKind::Background)
+                .unwrap(),
+        );
     }
 
     #[test]

@@ -75,7 +75,10 @@ fn path_key(path: &Path) -> String {
 pub struct WriterLease {
     path: PathBuf,
     key: String,
-    file: File,
+    file: Option<File>,
+    // Transition admission retains this actual parent through file and claim
+    // release; ordinary writer acquisition preserves its existing behavior.
+    transition_root: Option<crate::managed_locks::TransitionWriterRoot>,
 }
 
 impl WriterLease {
@@ -147,7 +150,51 @@ impl WriterLease {
             return Err(backend(e));
         }
 
-        Ok(WriterLease { path, key, file })
+        Ok(WriterLease {
+            path,
+            key,
+            file: Some(file),
+            transition_root: None,
+        })
+    }
+
+    /// Acquire only the already-existing writer for an exact transition root.
+    /// No directory, lock file, diagnostic record or repair is created here.
+    pub fn try_acquire_for_transition(
+        data_root: &Path,
+        expected: crate::managed_locks::RootIdentity,
+    ) -> PortResult<Self> {
+        let root = crate::managed_locks::TransitionWriterRoot::open(data_root, expected)?;
+        let path = data_root.join("writer.lock");
+        let key = path_key(&path);
+        {
+            let mut held = held_paths()
+                .lock()
+                .map_err(|_| PortError::Backend("writer lease registry unavailable".into()))?;
+            if held.iter().any(|k| paths_same_dir(k, &path)) || held.contains(&key) {
+                return Err(held_error());
+            }
+            held.insert(key.clone());
+        }
+        // Install cleanup before opening/locking so error and unwind follow
+        // the same file-before-claim-before-root release order as success.
+        let mut lease = Self {
+            path,
+            key,
+            file: None,
+            transition_root: Some(root),
+        };
+        let file = lease.transition_root.as_ref().unwrap().open_writer()?;
+        lease.file = Some(file);
+        lock_exclusive(lease.file())?;
+        #[cfg(test)]
+        tests::after_transition_lock();
+        lease.validate_current(data_root)?;
+        Ok(lease)
+    }
+
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("writer lease has an owned file")
     }
 
     /// lease 文件路径（诊断用）。
@@ -162,21 +209,26 @@ impl WriterLease {
         if self.path != root.join("writer.lock") {
             return Err(PortError::SourceIo("writer lease binding changed".into()));
         }
-        crate::managed_locks::validate_writer_file(root, &self.file)
+        if let Some(pinned) = &self.transition_root {
+            pinned.validate(root, self.file())
+        } else {
+            crate::managed_locks::validate_writer_file(root, self.file())
+        }
     }
 
     /// Verify a caller's already opened proof file is this retained locked file.
     /// Only metadata is inspected; neither handle is locked, read or exposed.
     /// Callers must also validate the current name and pinned physical root.
     pub fn validate_proof_file(&self, candidate: &File) -> PortResult<()> {
-        crate::managed_locks::validate_writer_handle(&self.file, candidate)
+        crate::managed_locks::validate_writer_handle(self.file(), candidate)
     }
 
     /// 读回本进程写入的 lease record（同一持锁句柄，避免 Windows error 33）。
     pub fn read_record(&mut self) -> PortResult<String> {
-        self.file.seek(SeekFrom::Start(0)).map_err(backend)?;
+        let file = self.file.as_mut().expect("writer lease has an owned file");
+        file.seek(SeekFrom::Start(0)).map_err(backend)?;
         let mut buf = String::new();
-        self.file.read_to_string(&mut buf).map_err(backend)?;
+        file.read_to_string(&mut buf).map_err(backend)?;
         Ok(buf)
     }
 }
@@ -192,9 +244,10 @@ fn write_record(file: &mut File, record: &str) -> std::io::Result<()> {
 /// 回滚 [`WriterLease::try_acquire`] 早期的进程内登记。任何失败路径都必须调用，
 /// 否则本进程会永久拒绝该 data root。
 fn remove_claim(key: &str) {
-    if let Ok(mut held) = held_paths().lock() {
-        held.remove(key);
-    }
+    held_paths()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(key);
 }
 
 /// 粗略判断两个 lock 路径是否指向同一目录下的 writer.lock（canonicalize 失败时的后备）。
@@ -208,16 +261,30 @@ fn paths_same_dir(held_key: &str, candidate: &Path) -> bool {
 
 impl Drop for WriterLease {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-        if let Ok(mut held) = held_paths().lock() {
-            held.remove(&self.key);
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+            drop(file);
         }
+        remove_claim(&self.key);
+        // transition_root remains live until after this Drop body.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static AFTER_TRANSITION_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_transition_lock() {
+        let hook = AFTER_TRANSITION_LOCK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     #[test]
     fn acquire_and_read_record() {
@@ -226,6 +293,177 @@ mod tests {
         let rec = lease.read_record().unwrap();
         assert!(rec.contains("pid="), "record={rec}");
         assert!(rec.contains("fencing_token="), "record={rec}");
+    }
+
+    #[test]
+    fn transition_writer_requires_existing_root_and_preserves_record_and_os_lock() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let expected = crate::managed_locks::RootIdentity::read(root.path()).unwrap();
+        let missing_root = root.path().join("not-created");
+        assert!(WriterLease::try_acquire_for_transition(&missing_root, expected).is_err());
+        assert!(!missing_root.exists());
+        assert!(WriterLease::try_acquire_for_transition(root.path(), expected).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let original = {
+            let mut ordinary = WriterLease::try_acquire(root.path()).unwrap();
+            assert!(matches!(
+                WriterLease::try_acquire_for_transition(root.path(), expected),
+                Err(PortError::WriterBusy(_))
+            ));
+            ordinary.read_record().unwrap()
+        };
+        let mut lease = WriterLease::try_acquire_for_transition(root.path(), expected).unwrap();
+        assert_eq!(lease.read_record().unwrap(), original);
+        assert!(matches!(
+            WriterLease::try_acquire(root.path()),
+            Err(PortError::WriterBusy(_))
+        ));
+        assert!(matches!(
+            WriterLease::try_acquire_for_transition(root.path(), expected),
+            Err(PortError::WriterBusy(_))
+        ));
+        let mut contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease.path())
+            .unwrap();
+        for _ in 0..3 {
+            lease.validate_current(root.path()).unwrap();
+            assert!(matches!(
+                lock_exclusive(&contender),
+                Err(PortError::WriterBusy(_))
+            ));
+            assert_eq!(lease.read_record().unwrap(), original);
+        }
+        drop(lease);
+        lock_exclusive(&contender).unwrap();
+        contender.seek(SeekFrom::Start(0)).unwrap();
+        let mut after = String::new();
+        contender.read_to_string(&mut after).unwrap();
+        assert_eq!(after, original);
+        FileExt::unlock(&contender).unwrap();
+        drop(contender);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("writer.lock")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn transition_writer_rejects_wrong_root_links_and_releases_failed_claims() {
+        let root = agent_session_grep_testkit::tempdir().unwrap();
+        let other = agent_session_grep_testkit::tempdir().unwrap();
+        let expected = crate::managed_locks::RootIdentity::read(root.path()).unwrap();
+        let foreign = crate::managed_locks::RootIdentity::read(other.path()).unwrap();
+        let path = root.path().join("writer.lock");
+        std::fs::write(&path, b"retained writer diagnostics").unwrap();
+        assert!(WriterLease::try_acquire_for_transition(root.path(), foreign).is_err());
+        let alias = root.path().join("writer-alias");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(WriterLease::try_acquire_for_transition(root.path(), expected).is_err());
+        assert!(alias.exists());
+        std::fs::remove_file(&alias).unwrap();
+        let mut blocker = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        lock_exclusive(&blocker).unwrap();
+        assert!(matches!(
+            WriterLease::try_acquire_for_transition(root.path(), expected),
+            Err(PortError::WriterBusy(_))
+        ));
+        blocker.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = String::new();
+        blocker.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "retained writer diagnostics");
+        FileExt::unlock(&blocker).unwrap();
+        drop(blocker);
+        AFTER_TRANSITION_LOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| {
+                panic!("synthetic partial transition writer unwind");
+            }));
+        });
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _lease = WriterLease::try_acquire_for_transition(root.path(), expected);
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _lease =
+                    WriterLease::try_acquire_for_transition(root.path(), expected).unwrap();
+                panic!("synthetic held transition writer unwind");
+            })
+            .is_err()
+        );
+        let lease = WriterLease::try_acquire_for_transition(root.path(), expected).unwrap();
+        assert!(lease.validate_current(other.path()).is_err());
+        lease.validate_current(root.path()).unwrap();
+        drop(lease);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"retained writer diagnostics"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_writer_rejects_symlinks_and_retained_root_replacement() {
+        use std::os::unix::fs::symlink;
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        let expected = crate::managed_locks::RootIdentity::read(&root).unwrap();
+        let actual = temp.path().join("actual-writer");
+        std::fs::write(&actual, b"original").unwrap();
+        symlink(&actual, root.join("writer.lock")).unwrap();
+        assert!(WriterLease::try_acquire_for_transition(&root, expected).is_err());
+        assert_eq!(std::fs::read(&actual).unwrap(), b"original");
+        std::fs::remove_file(root.join("writer.lock")).unwrap();
+        std::fs::write(root.join("writer.lock"), b"retained").unwrap();
+        let mut lease = WriterLease::try_acquire_for_transition(&root, expected).unwrap();
+        let moved = temp.path().join("original-data");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("writer.lock"), b"retained").unwrap();
+        assert!(lease.validate_current(&root).is_err());
+        assert_eq!(lease.read_record().unwrap(), "retained");
+        assert_eq!(
+            std::fs::read(root.join("writer.lock")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_writer_post_lock_replacement_rejects_and_releases_old_file() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let expected = crate::managed_locks::RootIdentity::read(&root).unwrap();
+        let path = root.join("writer.lock");
+        let old = root.join("previous-writer");
+        std::fs::write(&path, b"retained diagnostics").unwrap();
+        AFTER_TRANSITION_LOCK.with(|slot| {
+            let path = path.clone();
+            let old = old.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&path, &old).unwrap();
+                std::fs::write(&path, b"retained diagnostics").unwrap();
+            }));
+        });
+        assert!(WriterLease::try_acquire_for_transition(&root, expected).is_err());
+        let original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&old)
+            .unwrap();
+        lock_exclusive(&original).unwrap();
+        FileExt::unlock(&original).unwrap();
+        drop(WriterLease::try_acquire_for_transition(&root, expected).unwrap());
+        assert_eq!(std::fs::read(&old).unwrap(), b"retained diagnostics");
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained diagnostics");
     }
 
     #[test]
