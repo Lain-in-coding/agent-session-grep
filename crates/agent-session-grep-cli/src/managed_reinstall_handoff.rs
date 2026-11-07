@@ -4618,6 +4618,7 @@ mod tests {
         static HISTORY_READ: RefCell<Option<(PathBuf, usize)>> = const { RefCell::new(None) };
         static PAYLOAD_PHASE_SAMPLES: RefCell<Vec<PayloadPhaseSample>> = const { RefCell::new(Vec::new()) };
         static PAYLOAD_WORK_SAMPLES: RefCell<Vec<PayloadWorkSample>> = const { RefCell::new(Vec::new()) };
+        static PAYLOAD_OWNER_COST: Cell<Option<(Duration, Duration, Duration)>> = const { Cell::new(None) };
         static PAYLOAD_BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static PAYLOAD_SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static PAYLOAD_BATCH_EXPIRY: Cell<bool> = const { Cell::new(false) };
@@ -4774,6 +4775,12 @@ mod tests {
         let result = owner.publish_payloads();
         let samples = PAYLOAD_PHASE_SAMPLES.with_borrow_mut(std::mem::take);
         let work = PAYLOAD_WORK_SAMPLES.with_borrow_mut(std::mem::take);
+        if result.is_err() {
+            eprintln!(
+                "payload_owner_cost={:?}",
+                PAYLOAD_OWNER_COST.with(Cell::get)
+            );
+        }
         let stage_totals = std::array::from_fn::<_, 4, _>(|index| {
             samples
                 .iter()
@@ -5726,10 +5733,20 @@ mod tests {
     }
 
     fn payload_owner(fixture: &Fixture) -> KeepAcknowledged {
-        match fixture
-            .incoming_handoff(end())
-            .and_then(IncomingHandoff::finish)
-        {
+        let until = end();
+        let started = Instant::now();
+        let admitted = fixture.incoming_handoff(until);
+        let prepared = Instant::now();
+        let result = admitted.and_then(IncomingHandoff::finish);
+        let finished = Instant::now();
+        PAYLOAD_OWNER_COST.with(|cost| {
+            cost.set(Some((
+                prepared.duration_since(started),
+                finished.duration_since(prepared),
+                until.saturating_duration_since(finished),
+            )))
+        });
+        match result {
             Ok(IncomingCompletion::KeepData(owner)) => *owner,
             Ok(_) => panic!("payload continuation bypassed keep-data"),
             Err(KeepHandoffError::Refused(reason)) => {
@@ -6112,7 +6129,12 @@ mod tests {
             },
             || owner.publish_payloads(),
         );
-        assert_eq!(result, Err(Reason::IdentityChanged));
+        assert_eq!(
+            result,
+            Err(Reason::IdentityChanged),
+            "payload_owner_cost={:?}",
+            PAYLOAD_OWNER_COST.with(Cell::get)
+        );
         let changed = snapshot_after.borrow_mut().take().unwrap();
         assert_eq!(snapshot_with_lock_bytes(&fixture, false), changed);
         for name in [
