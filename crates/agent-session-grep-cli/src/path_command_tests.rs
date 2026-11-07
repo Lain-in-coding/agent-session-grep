@@ -632,7 +632,11 @@ mod registry {
     }
     #[test]
     fn lost_ack_at_native_boundaries_recovers_only_with_durable_transaction_proof() {
-        for point in [Point::Prepared, Point::Applied, Point::Verified] {
+        for (point, subcase) in [
+            (Point::Prepared, "prepared"),
+            (Point::Applied, "applied"),
+            (Point::Verified, "verified"),
+        ] {
             let f = super::Fixture::new();
             let registry = Fixture::new();
             registry.set("raw expansion %SYNTHETIC_ROOT%", REG_EXPAND_SZ);
@@ -660,10 +664,60 @@ mod registry {
             );
             assert_eq!(recovered.owned, Some(true));
             assert!(!recovered.changed);
+            // Use the same one-shot request as Fixture::run, retaining the
+            // actual original end and native boundary observations on failure.
+            let location = registry.location();
+            let options = Options {
+                action: Action::Remove,
+                prefix: Some(f.prefix.clone()),
+            };
+            let mut remove_points = 0_u32;
+            let mut last_remove_point = "none";
+            let remove_started = Instant::now();
+            let remove_end = remove_started + FIXTURE_BUDGET;
+            let removed = perform(
+                &f.catalog,
+                options,
+                remove_end,
+                &mut |_| Ok(f.installation()),
+                &mut || {
+                    Ok(Environment {
+                        location: location.clone(),
+                        paths: Vec::new(),
+                    })
+                },
+                &mut |at| {
+                    remove_points += 1;
+                    last_remove_point = match at {
+                        Point::Prepared => "prepared",
+                        Point::Reserved => "reserved",
+                        Point::Applied => "applied",
+                        Point::Verified => "verified",
+                    };
+                    Ok(())
+                },
+            );
+            let remove_finished = Instant::now();
             assert_eq!(
-                f.run(Action::Remove, registry.location(), vec![], &mut |_| Ok(()))
-                    .status,
-                "complete"
+                removed.status,
+                "complete",
+                "phase=final_remove subcase={subcase} calls=1 reason={:?} \
+                 installation_bound={} owned={:?} registration_present={:?} changed={} \
+                 private_receipt_recorded={} native_points={remove_points} \
+                 last_native_point={last_remove_point} elapsed={:?} original_end={remove_end:?} \
+                 original_end_expired_before={} original_end_expired_after={} \
+                 original_remaining_before={:?} original_remaining_after={:?}",
+                removed.reason,
+                removed.installation_bound,
+                removed.owned,
+                removed.registration_present,
+                removed.changed,
+                removed.private_receipt_recorded,
+                remove_finished.duration_since(remove_started),
+                remove_started >= remove_end,
+                remove_finished >= remove_end,
+                remove_end.saturating_duration_since(remove_started),
+                remove_end.saturating_duration_since(remove_finished),
             );
             assert_eq!(
                 raw_path(&windows::read(&registry.subkey).unwrap())
