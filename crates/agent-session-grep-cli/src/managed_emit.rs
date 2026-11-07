@@ -630,10 +630,14 @@ fn helper() -> i32 {
     // failure still withholds the frame as a policy change.
     let budget_end = Instant::now() + CONTROL_READ_BUDGET;
     let (control, policy) = loop {
-        let attempt = SqliteControlStore::open_current_read_only(&request.root).and_then(|store| {
-            let policy = store.read_policy(RequestIntersection::Selected)?;
-            Ok((store, policy))
-        });
+        let attempt =
+            SqliteControlStore::open_current_read_only_with_deadline(&request.root, budget_end)
+                .and_then(|store| {
+                    let policy = store.with_runtime_deadline(budget_end, || {
+                        store.read_policy(RequestIntersection::Selected)
+                    })?;
+                    Ok((store, policy))
+                });
         match attempt {
             Ok(opened) => break opened,
             Err(PortError::WriterBusy(_)) if Instant::now() < budget_end => thread::sleep(
