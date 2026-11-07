@@ -16,10 +16,15 @@ use std::{
 pub(crate) use windows_private::VerifiedPrivateHandle;
 
 mod reinstall_commitment;
+mod reinstall_connection;
 mod reinstall_records;
 pub use reinstall_commitment::{
     ReinstallCommitmentPair, ReinstallImageMatch, ReinstallPreparationRead,
     ReinstallSnapshotBinding,
+};
+pub use reinstall_connection::{
+    ReinstallClosed, ReinstallClosedResources, ReinstallConnectionError, ReinstallControlOwner,
+    ReinstallOwnedGuards, ReinstallOwnedInput, ReinstallOwnedPins, ReinstallQueryOnlyCatalog,
 };
 pub use reinstall_records::{
     ReinstallAck, ReinstallCatalogIdentity, ReinstallContext, ReinstallDigest,

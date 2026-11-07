@@ -2599,6 +2599,37 @@ fn verify_quick_integrity(conn: &Connection) -> PortResult<()> {
     Ok(())
 }
 
+/// Identity-only catalog admission for the consuming reinstall owner. The
+/// caller already owns CatalogHandles, WriterLease, file pins and the original
+/// deadline; this helper acquires nothing and does not change SQLite policy.
+/// FTS integrity commands are deliberately excluded because they use INSERT.
+pub(crate) fn read_reinstall_catalog_identity(
+    conn: &Connection,
+    installation: &ControlId,
+    incarnation: &ControlId,
+    deadline: Instant,
+) -> PortResult<CatalogIdentity> {
+    check_deadline(deadline)?;
+    let snapshot = conn.unchecked_transaction().map_err(sql)?;
+    let query_only: i64 = snapshot
+        .query_row("PRAGMA query_only", [], |row| row.get(0))
+        .map_err(sql)?;
+    let journal: String = snapshot
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(sql)?;
+    if query_only != 1 || journal != "wal" {
+        return Err(incompatible("reinstall catalog policy is unavailable"));
+    }
+    let identity = validate_identity(&snapshot, installation)?;
+    if &identity.incarnation != incarnation {
+        return Err(incompatible("reinstall catalog incarnation changed"));
+    }
+    verify_quick_integrity(&snapshot)?;
+    check_deadline(deadline)?;
+    snapshot.commit().map_err(sql)?;
+    Ok(identity)
+}
+
 fn open_read_only(path: &Path, deadline: Instant) -> PortResult<Connection> {
     check_deadline(deadline)?;
     let conn = Connection::open_with_flags(
