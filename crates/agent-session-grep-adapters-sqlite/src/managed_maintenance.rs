@@ -2411,22 +2411,25 @@ fn withdrawn(policy: &ReadPolicy, coverage: &[CoveredSource]) -> bool {
 }
 
 fn acquire_exclusive(root: &Path, kind: LockKind, deadline: Instant) -> PortResult<ExclusiveGuard> {
-    loop {
-        check_deadline(deadline)?;
-        match ExclusiveGuard::try_acquire(root, kind.clone()) {
-            Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            result => return result,
-        }
-    }
+    acquire_until(deadline, || ExclusiveGuard::try_acquire(root, kind.clone()))
 }
 
 fn acquire_lease(root: &Path, deadline: Instant) -> PortResult<WriterLease> {
+    acquire_until(deadline, || WriterLease::try_acquire(root))
+}
+
+fn acquire_until<T>(
+    deadline: Instant,
+    mut attempt: impl FnMut() -> PortResult<T>,
+) -> PortResult<T> {
     loop {
         check_deadline(deadline)?;
-        match WriterLease::try_acquire(root) {
-            Err(PortError::WriterBusy(_)) if Instant::now() < deadline => {
+        match attempt() {
+            Err(PortError::WriterBusy(_)) => {
+                // The native attempt can cross the original end. Classify
+                // that contention here without renewing the request budget
+                // or replacing a hard identity/storage error with a timeout.
+                check_deadline(deadline)?;
                 std::thread::sleep(Duration::from_millis(2));
             }
             result => return result,
@@ -3475,6 +3478,105 @@ mod recovery_deadline_tests {
 
     fn id(value: &str) -> ControlId {
         ControlId::parse(value).unwrap()
+    }
+
+    #[test]
+    fn late_catalog_contention_returns_the_original_maintenance_deadline() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let reader =
+            crate::managed_locks::SharedGuard::try_acquire(temp.path(), LockKind::CatalogHandles)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let attempts = Cell::new(0);
+        let result = acquire_until(deadline, || {
+            attempts.set(attempts.get() + 1);
+            let result = ExclusiveGuard::try_acquire(temp.path(), LockKind::CatalogHandles);
+            assert!(matches!(result, Err(PortError::WriterBusy(_))));
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            result
+        });
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(
+            result,
+            Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+        ));
+        assert!(matches!(
+            ExclusiveGuard::try_acquire(temp.path(), LockKind::CatalogHandles),
+            Err(PortError::WriterBusy(_))
+        ));
+        drop(reader);
+        drop(
+            acquire_exclusive(
+                temp.path(),
+                LockKind::CatalogHandles,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn late_writer_contention_returns_the_original_maintenance_deadline() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let writer = WriterLease::try_acquire(temp.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let attempts = Cell::new(0);
+        let result = acquire_until(deadline, || {
+            attempts.set(attempts.get() + 1);
+            let result = WriterLease::try_acquire(temp.path());
+            assert!(matches!(result, Err(PortError::WriterBusy(_))));
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            result
+        });
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(
+            result,
+            Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+        ));
+        assert!(matches!(
+            WriterLease::try_acquire(temp.path()),
+            Err(PortError::WriterBusy(_))
+        ));
+        drop(writer);
+        drop(acquire_lease(temp.path(), Instant::now() + Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn maintenance_acquisition_preserves_expired_entry_and_late_hard_errors() {
+        let attempts = Cell::new(0);
+        let result = acquire_until(Instant::now(), || -> PortResult<()> {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(attempts.get(), 0);
+        assert!(matches!(
+            result,
+            Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+        ));
+
+        for error in [
+            invalid("synthetic identity refusal"),
+            storage(),
+            incompatible("synthetic schema refusal"),
+        ] {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let mut original = Some(error);
+            let expected = format!("{:?}", original.as_ref().unwrap());
+            let attempts = Cell::new(0);
+            let result = acquire_until(deadline, || -> PortResult<()> {
+                attempts.set(attempts.get() + 1);
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Err(original.take().unwrap())
+            });
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(format!("{:?}", result.unwrap_err()), expected);
+        }
     }
 
     #[test]

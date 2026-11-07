@@ -629,10 +629,16 @@ fn authorized_open_catalog_handle_contention_honors_earlier_outer_end() {
     let returned = Instant::now();
     // The exact reason distinguishes reaching the held catalog gate from
     // an earlier control-read timeout that would not exercise the drain.
-    assert!(matches!(
-        result,
-        Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(PortError::WriterBusy(reason)) if reason == "managed maintenance deadline reached"
+        ),
+        "catalog drain result={:?}; reached_outer={}; before_requested={}",
+        result.as_ref().err(),
+        returned >= outer_end,
+        returned < requested_end
+    );
     assert!(returned >= outer_end);
     assert!(
         returned < requested_end,
