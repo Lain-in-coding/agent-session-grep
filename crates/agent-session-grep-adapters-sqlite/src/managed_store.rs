@@ -76,6 +76,50 @@ pub struct WalCheckpointReport {
     pub wal_bytes_after: Option<u64>,
     /// Includes I/O, whose wall time is not bounded by the zero busy timeout.
     pub elapsed: Duration,
+    // Same-call Debug evidence only; never changes admission or physical work.
+    initial_admission: Option<AdmissionObservation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AdmissionObservation {
+    requested_end: Instant,
+    effective_end: Instant,
+    entered_remaining_us: i128,
+    returned_remaining_us: Option<i128>,
+    result: Option<&'static str>,
+}
+
+impl std::fmt::Debug for AdmissionObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionObservation")
+            .field("requested_end", &self.requested_end)
+            .field("effective_end", &self.effective_end)
+            .field("entered_remaining_us", &self.entered_remaining_us)
+            .field("returned_remaining_us", &self.returned_remaining_us)
+            .field("result", &self.result)
+            .finish()
+    }
+}
+
+fn remaining_us(end: Instant, now: Instant) -> i128 {
+    if end >= now {
+        end.duration_since(now).as_micros() as i128
+    } else {
+        -(now.duration_since(end).as_micros() as i128)
+    }
+}
+
+fn admission_result<T>(result: &PortResult<T>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(PortError::WriterBusy(message)) => match message.as_str() {
+            "control runtime deadline reached" => "deadline",
+            "control storage is busy" => "control_busy",
+            "managed control fence is active" => "active_fence",
+            _ => "other",
+        },
+        Err(_) => "other",
+    }
 }
 
 fn checkpoint_storage(error: rusqlite::Error) -> PortError {
@@ -587,6 +631,7 @@ impl ManagedStore {
             wal_bytes_before: None,
             wal_bytes_after: None,
             elapsed: Duration::ZERO,
+            initial_admission: None,
         };
         let handles = match SharedGuard::try_acquire(
             path.parent().ok_or_else(invalid)?,
@@ -605,8 +650,18 @@ impl ManagedStore {
             };
             #[cfg(test)]
             wal_tests::admission_enter(wal_tests::AdmissionStage::Initial, control_end);
+            let effective_end = SqliteControlStore::effective_runtime_deadline(control_end);
+            let initial = report.initial_admission.insert(AdmissionObservation {
+                requested_end: control_end,
+                effective_end,
+                entered_remaining_us: remaining_us(effective_end, Instant::now()),
+                returned_remaining_us: None,
+                result: None,
+            });
             let admitted =
                 checkpoint_admission(control, authority, handles.root_identity(), control_end);
+            initial.returned_remaining_us = Some(remaining_us(effective_end, Instant::now()));
+            initial.result = Some(admission_result(&admitted));
             #[cfg(test)]
             wal_tests::admission_return(wal_tests::AdmissionStage::Initial, &admitted);
             let policy = match admitted {
@@ -3786,15 +3841,6 @@ pub(crate) mod wal_tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct AdmissionObservation {
-        requested_end: Instant,
-        effective_end: Instant,
-        entered_remaining_us: i128,
-        returned_remaining_us: Option<i128>,
-        result: Option<&'static str>,
-    }
-
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     struct AdmissionDiagnostic {
         slots: [Option<AdmissionObservation>; 2],
@@ -3833,27 +3879,6 @@ pub(crate) mod wal_tests {
     impl Drop for ObserveAdmissions {
         fn drop(&mut self) {
             ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow_mut() = self.previous.take());
-        }
-    }
-
-    fn remaining_us(end: Instant, now: Instant) -> i128 {
-        if end >= now {
-            end.duration_since(now).as_micros() as i128
-        } else {
-            -(now.duration_since(end).as_micros() as i128)
-        }
-    }
-
-    fn admission_result<T>(result: &PortResult<T>) -> &'static str {
-        match result {
-            Ok(_) => "ok",
-            Err(PortError::WriterBusy(message)) => match message.as_str() {
-                "control runtime deadline reached" => "deadline",
-                "control storage is busy" => "control_busy",
-                "managed control fence is active" => "active_fence",
-                _ => "other",
-            },
-            Err(_) => "other",
         }
     }
 
@@ -4176,6 +4201,179 @@ pub(crate) mod wal_tests {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap()
+    }
+
+    fn report_initial_observation(
+        report: &WalCheckpointReport,
+        observed: &AdmissionDiagnostic,
+    ) -> AdmissionObservation {
+        let initial = report
+            .initial_admission
+            .expect("initial admission was called");
+        let enclosing = observed.slots[0].unwrap();
+        assert_eq!(initial.requested_end, enclosing.requested_end);
+        assert_eq!(initial.effective_end, enclosing.effective_end);
+        assert_eq!(initial.result, enclosing.result);
+        // Existing hooks bracket the exact production observation and one call.
+        assert!(initial.entered_remaining_us <= enclosing.entered_remaining_us);
+        let returned = initial.returned_remaining_us.unwrap();
+        assert!(returned >= enclosing.returned_remaining_us.unwrap());
+        assert!(initial.entered_remaining_us >= returned);
+        assert!(!observed.unexpected_observation);
+        initial
+    }
+
+    #[test]
+    fn wal_checkpoint_initial_report_records_healthy_call_order() {
+        let fixture = Fixture::new();
+        let _writer = fixture.seed();
+        let reader = fixture.reader();
+        let before = snapshot(&reader);
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        // Reuse the existing prepared-fixture end for the diagnostic checks.
+        // The production checkpoint's 250ms admission end is unchanged.
+        let end = Instant::now() + Duration::from_secs(5);
+        let prepared = ObservePreparedCheckpoint::start(end);
+        let diagnostic = ObserveAdmissions::start();
+        let report =
+            ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None)
+                .unwrap();
+        assert_eq!(report.outcome, WalCheckpointOutcome::Reset);
+        let observed = diagnostic.snapshot();
+        let initial = report_initial_observation(&report, &observed);
+        let pretruncate = observed.slots[1].unwrap();
+        assert_eq!(initial.requested_end, end);
+        assert_eq!(initial.effective_end, end);
+        assert_eq!(initial.result, Some("ok"));
+        assert_eq!(pretruncate.result, Some("ok"));
+        assert_eq!(pretruncate.requested_end, end);
+        assert_eq!(pretruncate.effective_end, end);
+        assert!(initial.returned_remaining_us.unwrap() >= pretruncate.entered_remaining_us);
+        assert_eq!(observed.physical_attempts, 1);
+        assert_eq!(prepared.finish(), (2, 1));
+        drop(diagnostic);
+        let cloned = report.clone();
+        assert_eq!(cloned.initial_admission, Some(initial));
+        assert!(format!("{cloned:?}").contains("initial_admission: Some(AdmissionObservation"));
+        assert_eq!(report.wal_bytes_after, Some(0));
+        assert_eq!(snapshot(&reader), before);
+    }
+
+    #[test]
+    fn wal_checkpoint_initial_report_records_fence_under_earlier_nested_end() {
+        let fixture = Fixture::new();
+        let _writer = fixture.seed();
+        let _reader = fixture.reader();
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        fixture
+            .control
+            .set_maintenance(
+                fixture.control.status().unwrap().policy.control_seq,
+                &id("owner"),
+                MaintenanceFence {
+                    state: MaintenanceState::Updating,
+                    owner: Some(id("owner")),
+                    phase: Some(MaintenancePhase::Quiescing),
+                },
+            )
+            .unwrap();
+        let before = std::fs::read(&fixture.catalog).unwrap();
+        let wal = std::fs::read(fixture.root.join("catalog.db-wal")).unwrap();
+        take_pragmas();
+        let requested_end = Instant::now() + Duration::from_secs(5);
+        let earlier_end = requested_end - Duration::from_secs(1);
+        let probe = requested_end + Duration::from_secs(1);
+        let previous_end = SqliteControlStore::effective_runtime_deadline(probe);
+        let prepared = ObservePreparedCheckpoint::start(requested_end);
+        let diagnostic = ObserveAdmissions::start();
+        let report = fixture
+            .control
+            .with_runtime_deadline(earlier_end, || {
+                fixture.control.with_runtime_deadline(requested_end, || {
+                    ManagedStore::checkpoint_wal(
+                        &fixture.catalog,
+                        &fixture.control,
+                        &authority,
+                        None,
+                    )
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous_end
+        );
+        assert_eq!(
+            report.outcome,
+            WalCheckpointOutcome::Deferred(WalDeferral::Fence)
+        );
+        let observed = diagnostic.snapshot();
+        let initial = report_initial_observation(&report, &observed);
+        assert_eq!(initial.requested_end, requested_end);
+        assert_eq!(initial.effective_end, earlier_end);
+        assert_eq!(initial.result, Some("active_fence"));
+        assert!(initial.entered_remaining_us > 0);
+        assert!(initial.returned_remaining_us.unwrap() > 0);
+        assert_eq!(observed.slots[1], None);
+        assert_eq!(observed.physical_attempts, 0);
+        assert_eq!(prepared.finish(), (1, 0));
+        assert!(report.incarnation.is_none());
+        assert!(report.wal_bytes_before.is_none());
+        assert!(take_pragmas().is_empty());
+        assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+        assert_eq!(
+            std::fs::read(fixture.root.join("catalog.db-wal")).unwrap(),
+            wal
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_initial_report_records_expiry_without_catalog_open() {
+        let fixture = Fixture::new();
+        let _writer = fixture.seed();
+        let _reader = fixture.reader();
+        let authority = fixture
+            .control
+            .bind_worker(&fixture.worker_lock, id("boot"))
+            .unwrap();
+        let before = std::fs::read(&fixture.catalog).unwrap();
+        let wal = std::fs::read(fixture.root.join("catalog.db-wal")).unwrap();
+        take_pragmas();
+        let expired = Instant::now();
+        let prepared = ObservePreparedCheckpoint::start(expired);
+        let diagnostic = ObserveAdmissions::start();
+        let report =
+            ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None)
+                .unwrap();
+        assert_eq!(
+            report.outcome,
+            WalCheckpointOutcome::Deferred(WalDeferral::Fence)
+        );
+        let observed = diagnostic.snapshot();
+        let initial = report_initial_observation(&report, &observed);
+        assert_eq!(initial.requested_end, expired);
+        assert_eq!(initial.effective_end, expired);
+        assert_eq!(initial.result, Some("deadline"));
+        assert!(initial.entered_remaining_us <= 0);
+        assert!(initial.returned_remaining_us.unwrap() <= 0);
+        assert_eq!(observed.slots[1], None);
+        assert_eq!(observed.physical_attempts, 0);
+        assert_eq!(prepared.finish(), (1, 0));
+        assert!(CONTROL_END.with(|slot| slot.get().is_none()));
+        assert!(report.incarnation.is_none());
+        assert!(report.wal_bytes_before.is_none());
+        assert!(take_pragmas().is_empty());
+        assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
+        assert_eq!(
+            std::fs::read(fixture.root.join("catalog.db-wal")).unwrap(),
+            wal
+        );
     }
 
     #[test]
