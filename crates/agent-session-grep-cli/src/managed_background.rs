@@ -10811,6 +10811,7 @@ mod control_deadline_tests {
                 hooks: expire_real_idle_heartbeat(&proof, fixture.scope_end, false),
                 ..Default::default()
             };
+            schedule.hooks.observation_diagnostics.set(true);
             let mut pending = None;
             let mut trace = CycleDriveTrace::default();
             let mut expected = None;
@@ -10903,6 +10904,43 @@ mod control_deadline_tests {
                     },
                 )
             });
+            let expected_refusal = if change == "schema" {
+                matches!(result, Err(PortError::SchemaIncompatible(_)))
+            } else {
+                matches!(result, Err(PortError::SnapshotChanged(_)))
+            };
+            if !expected_refusal {
+                let proof = proof.borrow();
+                eprintln!(
+                    "driver_drift change={change} busy_callbacks={busy_calls} \
+                     ticks={} runs={} acceptances={} phase={} error={:?} \
+                     observed={:?} first_refusal={:?} last_refusal={:?} source_refusal={:?} \
+                     plans={} attempts={} publications={} observations={} \
+                     validations={} heartbeats={} accepted={} pending_idle={:?} \
+                     remaining={:?}",
+                    trace.tick_count,
+                    trace.runs,
+                    trace.acceptances,
+                    trace.phase,
+                    trace.error,
+                    schedule.hooks.observation_result.get(),
+                    schedule.hooks.first_observation_refusal.get(),
+                    schedule.hooks.observation_refusal.get(),
+                    schedule.hooks.source_refusal.get(),
+                    proof.plans,
+                    proof.attempts,
+                    proof.publications,
+                    proof.observations,
+                    proof.validations,
+                    proof.heartbeats,
+                    proof.accepted,
+                    pending
+                        .as_ref()
+                        .and_then(|intent| intent.observed.as_ref())
+                        .map(|observed| observed.outcome.idle()),
+                    fixture.scope_end.saturating_duration_since(Instant::now()),
+                );
+            }
             if change == "schema" {
                 assert!(
                     matches!(result, Err(PortError::SchemaIncompatible(_))),
