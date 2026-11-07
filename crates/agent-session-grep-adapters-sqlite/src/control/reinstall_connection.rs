@@ -571,6 +571,8 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn validate_files(&mut self, allow_empty_wal: bool) -> PortResult<()> {
+        #[cfg(test)]
+        tests::observe_catalog_read(tests::CatalogReadStep::Files);
         let catalog_allow_empty = self
             .preparation
             .as_ref()
@@ -727,6 +729,16 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn read_control(&mut self) -> PortResult<ControlStatus> {
+        self.read_control_observed(None).map(|(status, _)| status)
+    }
+
+    /// The complete image match belongs only to this unchanged read. Returning
+    /// it lets one private caller inspect that result without rehashing every
+    /// retained table; no match is stored or reused by a later invocation.
+    fn read_control_observed(
+        &mut self,
+        expected_catalog: Option<&CatalogIdentity>,
+    ) -> PortResult<(ControlStatus, Option<ReinstallImageMatch>)> {
         self.validate_inputs(true)?;
         self.control_handle_lease()?
             .validate_admission(&self.input.root)?;
@@ -734,7 +746,7 @@ impl<R: 'static> Bundle<R> {
             self.rendezvous = Some(ReinstallHandlesPin::open(&self.input.root)?);
         }
         self.rendezvous.as_ref().ok_or_else(invalid)?.validate()?;
-        let status = {
+        let (status, matched) = {
             let store = self.store()?;
             {
                 let conn = store.conn.borrow();
@@ -766,18 +778,28 @@ impl<R: 'static> Bundle<R> {
                 SealedControlFile::from_recorded(self.input.files.control_main.identity),
                 self.end,
             )?;
-            if self.preparation.is_some() {
-                self.compare_prepared()?;
+            let matched = if self.preparation.is_some() {
+                Some(self.compare_prepared()?)
             } else {
                 self.input.expected.validate(&status)?;
-            }
-            status
+                None
+            };
+            (status, matched)
         };
         self.validate_receipt(&status)?;
+        if let Some(expected) = expected_catalog {
+            let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+            if prepared.stage != ReinstallPreparationStage::Published
+                || matched != Some(ReinstallImageMatch::After)
+            {
+                return Err(invalid());
+            }
+            self.validate_catalog_observation(expected)?;
+        }
         self.validate_files(true)?;
         self.rendezvous.as_ref().ok_or_else(invalid)?.validate()?;
         self.tick()?;
-        Ok(status)
+        Ok((status, matched))
     }
 
     fn compare_prepared(&self) -> PortResult<ReinstallImageMatch> {
@@ -785,6 +807,8 @@ impl<R: 'static> Bundle<R> {
         let store = self.store()?;
         let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
         let installation = self.installation();
+        #[cfg(test)]
+        tests::observe_commitment_comparison();
         let matched = store.compare_reinstall_commitment_with_deadline(
             ReinstallSnapshotBinding {
                 control_root: self.input.guards.policy_owner.root_identity(),
@@ -1125,13 +1149,12 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn validate_catalog(&mut self, expected: &CatalogIdentity) -> PortResult<()> {
-        self.read_control()?;
-        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
-        if prepared.stage != ReinstallPreparationStage::Published
-            || self.compare_prepared()? != ReinstallImageMatch::After
-        {
-            return Err(invalid());
-        }
+        self.read_control_observed(Some(expected)).map(|_| ())
+    }
+
+    /// Called inside the entry/exit file checks of the same read-only control
+    /// observation. No completed proof escapes for reuse by another phase.
+    fn validate_catalog_observation(&self, expected: &CatalogIdentity) -> PortResult<()> {
         let conn = self.catalog.as_ref().ok_or_else(invalid)?.get()?;
         require_close_policy(conn)?;
         verify_reinstall_connection(
@@ -1148,7 +1171,10 @@ impl<R: 'static> Bundle<R> {
         if &current != expected {
             return Err(conflict());
         }
-        self.validate_files(true)?;
+        #[cfg(test)]
+        tests::observe_catalog_read(tests::CatalogReadStep::Catalog);
+        #[cfg(test)]
+        tests::after_catalog_observation(&self.input.root.join(PREFIX_BINDING_FILE), self.end)?;
         self.tick()
     }
 
@@ -2458,6 +2484,32 @@ mod tests {
         ExpireAfter(PreparationSync),
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CatalogReadStep {
+        Files,
+        Catalog,
+    }
+
+    #[derive(Clone, Copy)]
+    enum CatalogReadFault {
+        Expire,
+        ChangeReceipt,
+    }
+
+    struct CatalogReadFaultScope(Option<CatalogReadFault>);
+
+    impl CatalogReadFaultScope {
+        fn start(fault: CatalogReadFault) -> Self {
+            Self(CATALOG_READ_FAULT.with(|slot| slot.replace(Some(fault))))
+        }
+    }
+
+    impl Drop for CatalogReadFaultScope {
+        fn drop(&mut self) {
+            CATALOG_READ_FAULT.with(|slot| slot.set(self.0));
+        }
+    }
+
     struct PreparationSyncObservation {
         previous_fault: Option<SyncFault>,
         previous_events: Vec<PreparationSync>,
@@ -2488,8 +2540,38 @@ mod tests {
         static FAIL_AFTER_ADOPTION: Cell<bool> = const { Cell::new(false) };
         static ADOPTION_COMMITS: Cell<usize> = const { Cell::new(0) };
         static WRITABLE_CONTROL_OPENS: Cell<usize> = const { Cell::new(0) };
+        static COMMITMENT_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+        static CATALOG_READ_STEPS: RefCell<Vec<CatalogReadStep>> = const { RefCell::new(Vec::new()) };
+        static CATALOG_READ_FAULT: Cell<Option<CatalogReadFault>> = const { Cell::new(None) };
         static PREPARATION_SYNC_FAULT: Cell<Option<SyncFault>> = const { Cell::new(None) };
         static PREPARATION_SYNCS: RefCell<Vec<PreparationSync>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn observe_catalog_read(step: CatalogReadStep) {
+        CATALOG_READ_STEPS.with_borrow_mut(|steps| steps.push(step));
+    }
+
+    pub(super) fn after_catalog_observation(path: &Path, end: Instant) -> PortResult<()> {
+        match CATALOG_READ_FAULT.with(|slot| slot.take()) {
+            Some(CatalogReadFault::Expire) => {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            }
+            Some(CatalogReadFault::ChangeReceipt) => {
+                let mut file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(io_error)?;
+                let mut byte = [0];
+                file.read_exact(&mut byte).map_err(io_error)?;
+                byte[0] ^= 1;
+                file.rewind().map_err(io_error)?;
+                file.write_all(&byte).map_err(io_error)?;
+                file.sync_all().map_err(io_error)?;
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     pub(super) fn before_preparation_sync(
@@ -2534,6 +2616,10 @@ mod tests {
         if writable {
             WRITABLE_CONTROL_OPENS.with(|count| count.set(count.get() + 1));
         }
+    }
+
+    pub(super) fn observe_commitment_comparison() {
+        COMMITMENT_COMPARISONS.with(|count| count.set(count.get() + 1));
     }
 
     pub(super) fn after_adoption() -> PortResult<()> {
@@ -3158,6 +3244,62 @@ mod tests {
         contenders(temp.path(), false);
     }
 
+    #[test]
+    fn acknowledged_publication_compares_one_fresh_complete_image_per_call() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let context = preparation_context(&input);
+        let root = input.root.clone();
+        let until = Instant::now() + Duration::from_secs(30);
+        let owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+        let (owner, prep) = owner.prepare(&context).unwrap();
+        publish_preparation_fixture(&owner, &prep);
+        let (owner, matched) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::Before);
+        let owner = owner.adopt_prepared().unwrap();
+        let catalog = owner
+            .open_query_only_catalog(cid("close-fixed-owner"))
+            .unwrap();
+        let (mut catalog, ack) = catalog.prepare_acknowledgement().unwrap();
+        assert_eq!(ack.catalog_identity().incarnation, context.incarnation);
+        let before = durable_snapshot(&root);
+        let original = &catalog.owned.bundle().input.retained as *const Retained;
+        for _ in 0..2 {
+            let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
+            CATALOG_READ_STEPS.with_borrow_mut(Vec::clear);
+            let view = catalog.acknowledgement_publication().unwrap();
+            assert_eq!(view.end, until);
+            assert!(std::ptr::eq(view.retained, original));
+            assert_eq!(COMMITMENT_COMPARISONS.with(Cell::get), comparisons + 1);
+            assert_eq!(
+                CATALOG_READ_STEPS.with_borrow(|steps| steps.clone()),
+                [
+                    CatalogReadStep::Files,
+                    CatalogReadStep::Catalog,
+                    CatalogReadStep::Files,
+                ],
+                "one read-only catalog observation must be bracketed by two full file checks"
+            );
+            assert!(matches!(
+                SharedGuard::try_acquire(&root, LockKind::CatalogHandles),
+                Err(PortError::WriterBusy(_))
+            ));
+        }
+        // A later independent request still reads the current catalog rather
+        // than treating the previous successful comparison as authorization.
+        let generation = catalog.identity.generation;
+        catalog.identity.generation += 1;
+        let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
+        assert!(catalog.acknowledgement_publication().is_err());
+        assert_eq!(COMMITMENT_COMPARISONS.with(Cell::get), comparisons + 1);
+        catalog.identity.generation = generation;
+        drop(catalog.close().unwrap().into_resources());
+        assert_eq!(durable_snapshot(&root), before);
+        contenders(temp.path(), false);
+    }
+
     fn arm_busy<R: 'static>(bundle: &mut Bundle<R>, catalog: bool) {
         let statement = if catalog {
             OutstandingStatement::prepare(bundle.catalog.as_ref().unwrap().get().unwrap())
@@ -3560,6 +3702,69 @@ mod tests {
                     assert_eq!(ADOPTION_COMMITS.with(Cell::get), 0);
                     drop(error);
                 }
+                "adoption-catalog-expired" | "adoption-catalog-receipt" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    publish_preparation_fixture(&prepared, &prep);
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    let adopted = prepared.adopt_prepared().unwrap();
+                    let catalog = adopted
+                        .open_query_only_catalog(cid("close-fixed-owner"))
+                        .unwrap();
+                    let (mut catalog, _) = catalog.prepare_acknowledgement().unwrap();
+                    let admitted = durable_snapshot(&root);
+                    let expired = mode == "adoption-catalog-expired";
+                    let original_end = until.min(Instant::now() + Duration::from_secs(5));
+                    let outer = RuntimeDeadlineScope::enter(original_end).unwrap();
+                    let _fault = CatalogReadFaultScope::start(if expired {
+                        CatalogReadFault::Expire
+                    } else {
+                        CatalogReadFault::ChangeReceipt
+                    });
+                    CATALOG_READ_STEPS.with_borrow_mut(Vec::clear);
+                    let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
+                    let error = match catalog.acknowledgement_publication() {
+                        Ok(_) => panic!("catalog observation bypassed its final checks"),
+                        Err(error) => error,
+                    };
+                    assert!(CATALOG_READ_FAULT.with(|slot| slot.get().is_none()));
+                    assert_eq!(COMMITMENT_COMPARISONS.with(Cell::get), comparisons + 1);
+                    let expected = if expired {
+                        assert!(matches!(error, PortError::WriterBusy(_)));
+                        assert!(Instant::now() >= original_end);
+                        vec![CatalogReadStep::Files, CatalogReadStep::Catalog]
+                    } else {
+                        assert!(matches!(error, PortError::GenerationMismatch(_)));
+                        vec![
+                            CatalogReadStep::Files,
+                            CatalogReadStep::Catalog,
+                            CatalogReadStep::Files,
+                        ]
+                    };
+                    assert_eq!(
+                        CATALOG_READ_STEPS.with_borrow(|steps| steps.clone()),
+                        expected
+                    );
+                    assert_eq!(catalog.owned.bundle().end, original_end);
+                    assert_eq!(runtime_deadline(), Some(original_end));
+                    drop(outer);
+                    let after = durable_snapshot(&root);
+                    for (name, bytes) in &admitted {
+                        if !expired && name == PREFIX_BINDING_FILE {
+                            let mut changed = bytes.clone();
+                            changed[0] ^= 1;
+                            assert_eq!(after.get(name), Some(&changed));
+                        } else {
+                            assert_eq!(after.get(name), Some(bytes), "{name}");
+                        }
+                    }
+                    // A refused owner cannot close after E or repair the receipt.
+                    // Keep every connection and real guard until this child exits.
+                    drop(catalog);
+                }
                 "adoption-lost-ack" => {
                     let context = adoption_context.as_ref().unwrap();
                     let (prepared, prep) = owner.prepare(context).unwrap();
@@ -3731,10 +3936,14 @@ mod tests {
             }
         }
         let current = durable_snapshot(&root);
-        if mode == "adoption-lost-ack" {
+        if mode == "adoption-lost-ack" || mode.starts_with("adoption-catalog-") {
             assert_ne!(current.get("control.db-wal"), before.get("control.db-wal"));
             for (name, bytes) in &before {
-                if name != "control.db-wal" {
+                if mode == "adoption-catalog-receipt" && name == PREFIX_BINDING_FILE {
+                    let mut changed = bytes.clone();
+                    changed[0] ^= 1;
+                    assert_eq!(current.get(name), Some(&changed));
+                } else if name != "control.db-wal" {
                     assert_eq!(current.get(name), Some(bytes), "{name}");
                 }
             }
@@ -4516,6 +4725,13 @@ mod tests {
         child.finish(23);
         assert!(!temp.path().join("retained-dropped").exists());
         contenders(temp.path(), false);
+    }
+
+    #[test]
+    fn acknowledged_publication_keeps_final_file_check_and_expiry() {
+        for mode in ["adoption-catalog-expired", "adoption-catalog-receipt"] {
+            retained_case(mode);
+        }
     }
 
     #[test]
