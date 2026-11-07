@@ -43,7 +43,12 @@ fn private(path: &Path) {
 }
 
 fn write(path: &Path, raw: &[u8]) {
-    let mut file = platform::create_file(path).unwrap();
+    let parent = Directory::open(
+        path.parent().unwrap(),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let mut file = native::create(&parent, path.file_name().unwrap().to_str().unwrap()).unwrap();
     file.write_all(raw).unwrap();
     file.sync_all().unwrap();
 }
@@ -943,6 +948,48 @@ fn native_publication_metadata_pin_survives_replace_without_data_access_or_inher
     assert_eq!(old.raw, before.raw_bytes());
 }
 
+#[cfg(windows)]
+#[test]
+fn native_record_creation_binds_private_owner_at_create_time() {
+    let f = Fixture::new();
+    let parent = Directory::open(&f.run, f.end).unwrap();
+    let default_name = "default-owner.probe";
+    let default_path = f.run.join(default_name);
+    {
+        let mut file = platform::create_file(&default_path).unwrap();
+        file.write_all(b"retained default-owner control").unwrap();
+    }
+    let default = native::read(&parent, default_name).unwrap();
+    let same_owner = native::owner_matches(&parent, &default).unwrap();
+    assert_eq!(native::private_file(&parent, &default).is_ok(), same_owner);
+    let original = fs::read(&default_path).unwrap();
+    assert!(
+        matches!(native::create(&parent, default_name), Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(fs::read(&default_path).unwrap(), original);
+    assert_eq!(
+        native::owner_matches(&parent, &default).unwrap(),
+        same_owner
+    );
+
+    let bound = native::create(&parent, "bound-owner.probe").unwrap();
+    assert!(native::owner_matches(&parent, &bound).unwrap());
+    native::private_file(&parent, &bound).unwrap();
+    let mut flags = 0;
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: borrowed live file handle and exact writable flag output.
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::Foundation::GetHandleInformation(bound.as_raw_handle(), &mut flags)
+        },
+        0
+    );
+    assert_eq!(
+        flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+        0
+    );
+}
+
 #[test]
 fn native_publication_missing_active_recovers_only_exact_retained_pair() {
     let _reset = FaultReset;
@@ -1751,7 +1798,7 @@ fn native_initialization_missing_initial_after_final_guard_never_recreates_it() 
 fn native_initialization_retains_exclusions_and_preserves_an_earlier_end() {
     let (f, _) = before_initialization(false);
     let scope = SqliteControlStore::create(
-        &f._temp.path().join("scope"),
+        &fs::canonicalize(f._temp.path()).unwrap().join("scope"),
         &agent_session_grep_ports::control::ControlId::parse("scope-fixture").unwrap(),
         agent_session_grep_ports::control::DesiredUpdates::Paused,
     )

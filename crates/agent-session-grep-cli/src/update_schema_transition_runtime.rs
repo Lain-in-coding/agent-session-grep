@@ -1694,46 +1694,82 @@ mod native {
     use super::*;
     use std::{
         os::windows::{
+            ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt},
-            io::AsRawHandle,
+            io::{AsRawHandle, FromRawHandle},
         },
         ptr,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ALL_ACCESS,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileInformationByHandle,
     };
     use windows_sys::Win32::{
-        Foundation::LocalFree,
+        Foundation::{INVALID_HANDLE_VALUE, LocalFree},
         Security::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
             Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
             DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, IsValidSid,
-            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         },
     };
 
     pub(super) fn directory(parent: &Directory, name: &str) -> io::Result<File> {
         platform::directory(&parent.path.join(name))
     }
-    fn options(parent: &Directory, name: &str, write: bool, create: bool) -> io::Result<File> {
+    fn options(parent: &Directory, name: &str, write: bool) -> io::Result<File> {
         fs::OpenOptions::new()
             .read(true)
             .write(write)
-            .create_new(create)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(parent.path.join(name))
     }
     pub(super) fn read(parent: &Directory, name: &str) -> io::Result<File> {
-        options(parent, name, false, false)
+        options(parent, name, false)
     }
     pub(super) fn writable(parent: &Directory, name: &str) -> io::Result<File> {
-        options(parent, name, true, false)
+        options(parent, name, true)
     }
     pub(super) fn create(parent: &Directory, name: &str) -> io::Result<File> {
-        options(parent, name, true, true)
+        // Default file ownership comes from the creating token, not the
+        // parent. Elevated Windows tokens may default to a group owner.
+        // Bind this new file to the already validated private parent's exact
+        // owner and DACL atomically; never repair a preexisting record's ACL.
+        let security = security(&parent.file)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security.descriptor,
+            bInheritHandle: 0,
+        };
+        let path: Vec<u16> = parent
+            .path
+            .join(name)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: path and the parent-derived descriptor remain live through
+        // CREATE_NEW. The returned non-inheritable handle is owned exactly once.
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_handle(handle) };
+        private_file(parent, &file)?;
+        Ok(file)
     }
     pub(super) fn metadata_pin(parent: &Directory, name: &str) -> io::Result<File> {
         // access_mode(0) overrides data access; no create flags means
@@ -1788,6 +1824,12 @@ mod native {
         }
         Ok(result)
     }
+    #[cfg(test)]
+    pub(super) fn owner_matches(parent: &Directory, file: &File) -> io::Result<bool> {
+        let expected = security(&parent.file)?;
+        let actual = security(file)?;
+        Ok(unsafe { EqualSid(actual.owner, expected.owner) } != 0)
+    }
     pub(super) fn private_file(parent: &Directory, file: &File) -> io::Result<()> {
         let meta = file.metadata()?;
         if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -1805,9 +1847,14 @@ mod native {
         // Parent was checked against the application's exact private-directory
         // DACL. A file may inherit it, but may not add another principal or be
         // replaced with an externally writable hardlink.
-        if unsafe { EqualSid(actual.owner, parent_security.owner) } == 0
-            || unsafe { (*actual.acl).AceCount } != 1
-        {
+        if unsafe { EqualSid(actual.owner, parent_security.owner) } == 0 {
+            #[cfg(test)]
+            eprintln!("schema_transition_private_record refusal=owner");
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if unsafe { (*actual.acl).AceCount } != 1 {
+            #[cfg(test)]
+            eprintln!("schema_transition_private_record refusal=ace_count");
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let mut ace = ptr::null_mut();
