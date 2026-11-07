@@ -2,7 +2,8 @@
 //! Payload publication remains fenced; pointer/receipt and activation are later.
 use super::*;
 use crate::package_installation::{
-    IncomingPackageIdentity, ReinstallPayloadMember, VerifiedIncomingPackage,
+    IncomingActivationMetadata, IncomingPackageIdentity, ReinstallPayloadMember,
+    VerifiedIncomingPackage,
 };
 use agent_session_grep_adapters_sqlite::control::{
     ReinstallAck, ReinstallCleanupBinding, ReinstallConnectionError, ReinstallContext,
@@ -25,6 +26,33 @@ const KEEP_ACK: &str = "keep-transfer-ack";
 const KEEP_RECORD_LIMIT: u64 = 8192;
 const PAYLOAD_DIRECTORY: &str = ".asg-reinstall-payload";
 const PAYLOAD_SCHEMA: &str = "asg.reinstall-payload/v1";
+const ACTIVATION_INPUTS: &str = "activation-inputs";
+const ACTIVATION_INPUTS_SCHEMA: &str = "asg.reinstall-activation-inputs/v1";
+const ACTIVATION_INPUTS_LIMIT: u64 = 128 * 1024;
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ActivationInputsRecord {
+    schema: String,
+    intent_sha256: String,
+    prep_sha256: String,
+    ack_sha256: String,
+    payload_plan_sha256: String,
+    payload_complete_sha256: String,
+    identity: (u64, u64),
+    current: Vec<u8>,
+    receipt: Vec<u8>,
+}
+
+/// A newly created handle enters retention before identity lookup or encoding.
+/// Once bound, neither a new named file nor an equal body may replace this pin.
+struct RetainedActivationInputs {
+    file: File,
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+    record: Option<ActivationInputsRecord>,
+    stage: ReinstallPreparationStage,
+}
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +96,8 @@ struct PayloadSnapshot {
     boundary: usize,
     plan_stage: Option<ReinstallPreparationStage>,
     complete_stage: Option<ReinstallPreparationStage>,
+    complete_sha256: Option<String>,
+    activation_inputs: Option<ReinstallPreparationStage>,
 }
 
 /// A complete observation under the real owned locks. A payload-only batch
@@ -381,12 +411,14 @@ struct KeepDataRetention {
     parent_exit: ExitGuard,
     runner_exit: ExitGuard,
     incoming: VerifiedIncomingPackage,
+    incoming_activation: IncomingActivationMetadata,
     roots: PinnedRoots,
     locks: Vec<ExistingLockFile>,
     namespace_dirs: RefCell<Vec<File>>,
     sibling_pins: RefCell<Vec<ExistingLockFile>>,
     payload: RefCell<Option<PayloadPlan>>,
     payload_pins: RefCell<Vec<ExistingLockFile>>,
+    activation_inputs: RefCell<Option<RetainedActivationInputs>>,
     active: Option<Journal>,
     records: ResolvedRecords,
 }
@@ -748,6 +780,8 @@ fn payload_snapshot(
     {
         return Err(Reason::IdentityChanged);
     }
+    let activation_inputs =
+        activation_inputs_snapshot(retained, plan, complete.as_ref(), &names, &mut allowed, end)?;
     if names != allowed {
         return Err(Reason::UnclassifiedOwnedArtifact);
     }
@@ -768,12 +802,216 @@ fn payload_snapshot(
         }
     }
     time(end)?;
+    let complete_sha256 = complete.as_ref().map(|(bytes, _)| digest(bytes));
     Ok(PayloadSnapshot {
         overlay,
         boundary,
         plan_stage,
         complete_stage: complete.map(|(_, stage)| stage),
+        complete_sha256,
+        activation_inputs,
     })
+}
+
+fn activation_inputs_record(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    complete: &[u8],
+    identity: (u64, u64),
+) -> Result<ActivationInputsRecord, Reason> {
+    Ok(ActivationInputsRecord {
+        schema: ACTIVATION_INPUTS_SCHEMA.into(),
+        intent_sha256: plan.intent_sha256.clone(),
+        prep_sha256: plan.prep_sha256.clone(),
+        ack_sha256: plan.ack_sha256.clone(),
+        payload_plan_sha256: digest(&record_bytes(plan)?),
+        payload_complete_sha256: digest(complete),
+        identity,
+        current: retained.incoming_activation.current.clone(),
+        receipt: retained.incoming_activation.receipt.clone(),
+    })
+}
+
+fn open_activation_inputs(path: &Path, create: bool) -> Result<File, Reason> {
+    package_installation::ordinary(path.parent().ok_or(Reason::IdentityChanged)?)
+        .map_err(|_| Reason::IdentityChanged)?;
+    if !create {
+        package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+        // Only this self-bound record must remain open across its own rename.
+        // Other writers are excluded; ordinary package/payload pins are unchanged.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|_| Reason::FileLocked)
+}
+
+fn activation_inputs_bytes(
+    retained: &mut RetainedActivationInputs,
+    end: Instant,
+) -> Result<Vec<u8>, Reason> {
+    use std::io::Seek;
+    time(end)?;
+    let expected = retained.identity.ok_or(Reason::IdentityChanged)?;
+    package_installation::ordinary(&retained.path).map_err(|_| Reason::IdentityChanged)?;
+    if !single_file(&retained.file)?
+        || platform::identity(&retained.file).map_err(|_| Reason::IdentityChanged)? != expected
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    let size = retained
+        .file
+        .metadata()
+        .map_err(|_| Reason::FileLocked)?
+        .len();
+    if size > ACTIVATION_INPUTS_LIMIT {
+        return Err(Reason::IdentityChanged);
+    }
+    retained.file.rewind().map_err(|_| Reason::FileLocked)?;
+    let mut bytes = Vec::new();
+    (&mut retained.file)
+        .take(ACTIVATION_INPUTS_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Reason::FileLocked)?;
+    let named = platform::open_file(&retained.path).map_err(|_| Reason::IdentityChanged)?;
+    if bytes.len() as u64 != size
+        || retained
+            .file
+            .metadata()
+            .map_err(|_| Reason::FileLocked)?
+            .len()
+            != size
+        || !single_file(&retained.file)?
+        || !single_file(&named)?
+        || platform::identity(&retained.file).map_err(|_| Reason::IdentityChanged)? != expected
+        || platform::identity(&named).map_err(|_| Reason::IdentityChanged)? != expected
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)?;
+    Ok(bytes)
+}
+
+/// Absent input records preserve every earlier payload recovery state. Only a
+/// present, complete self-bound record requires the payload's published ACK.
+fn activation_inputs_snapshot(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    complete: Option<&PayloadRecordImage>,
+    names: &BTreeSet<String>,
+    allowed: &mut BTreeSet<String>,
+    end: Instant,
+) -> Result<Option<ReinstallPreparationStage>, Reason> {
+    let pending = format!("{ACTIVATION_INPUTS}.pending");
+    let published = format!("{ACTIVATION_INPUTS}.json");
+    let (name, stage) = match (names.contains(&pending), names.contains(&published)) {
+        (false, false) => {
+            if retained.activation_inputs.borrow().is_some() {
+                return Err(Reason::IdentityChanged);
+            }
+            return Ok(None);
+        }
+        (true, false) => (pending, ReinstallPreparationStage::Pending),
+        (false, true) => (published, ReinstallPreparationStage::Published),
+        _ => return Err(Reason::IdentityChanged),
+    };
+    let (complete, complete_stage) = complete.ok_or(Reason::IdentityChanged)?;
+    if *complete_stage != ReinstallPreparationStage::Published {
+        return Err(Reason::IdentityChanged);
+    }
+    let path = retained.roots.prefix.join(PAYLOAD_DIRECTORY).join(&name);
+    let mut slot = retained.activation_inputs.borrow_mut();
+    if slot.is_none() {
+        let file = open_activation_inputs(&path, false)?;
+        let identity = platform::identity(&file).map_err(|_| Reason::IdentityChanged)?;
+        *slot = Some(RetainedActivationInputs {
+            file,
+            path: path.clone(),
+            identity: Some(identity),
+            record: None,
+            stage,
+        });
+    }
+    let held = slot.as_mut().ok_or(Reason::IdentityChanged)?;
+    if held.path != path || held.stage != stage {
+        return Err(Reason::IdentityChanged);
+    }
+    let bytes = activation_inputs_bytes(held, end)?;
+    let record: ActivationInputsRecord =
+        serde_json::from_slice(&bytes).map_err(|_| Reason::IdentityChanged)?;
+    if record.identity != held.identity.ok_or(Reason::IdentityChanged)?
+        || record != activation_inputs_record(retained, plan, complete, record.identity)?
+        || bytes != record_bytes(&record)?
+        || held.record.as_ref().is_some_and(|bound| *bound != record)
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    held.record = Some(record);
+    allowed.insert(name);
+    time(end)?;
+    Ok(Some(stage))
+}
+
+fn publish_bound_activation_inputs(
+    retained: &KeepDataRetention,
+    end: Instant,
+) -> Result<(), Reason> {
+    let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+    let pending = root.join(format!("{ACTIVATION_INPUTS}.pending"));
+    let published = root.join(format!("{ACTIVATION_INPUTS}.json"));
+    let mut slot = retained.activation_inputs.borrow_mut();
+    let held = slot.as_mut().ok_or(Reason::IdentityChanged)?;
+    let bytes = record_bytes(held.record.as_ref().ok_or(Reason::IdentityChanged)?)?;
+    if activation_inputs_bytes(held, end)? != bytes {
+        return Err(Reason::IdentityChanged);
+    }
+    if held.stage == ReinstallPreparationStage::Published {
+        if held.path != published || present(&pending)? {
+            return Err(Reason::IdentityChanged);
+        }
+        return Ok(());
+    }
+    if held.path != pending || present(&published)? {
+        return Err(Reason::IdentityChanged);
+    }
+    held.file.sync_all().map_err(|_| Reason::FileLocked)?;
+    #[cfg(test)]
+    observe(
+        HandoffEvent::BeforeActivationInputsMove(pending.clone()),
+        end,
+    )?;
+    if activation_inputs_bytes(held, end)? != bytes {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)?;
+    platform::move_new(&pending, &published).map_err(|_| Reason::FileLocked)?;
+    held.path = published;
+    held.stage = ReinstallPreparationStage::Published;
+    #[cfg(test)]
+    fault(Fault::ActivationInputsMoved)?;
+    if activation_inputs_bytes(held, end)? != bytes {
+        return Err(Reason::IdentityChanged);
+    }
+    held.file.sync_all().map_err(|_| Reason::FileLocked)?;
+    time(end)?;
+    // Final acknowledgement: every original-handle check precedes this sync.
+    platform::sync_directory(&root).map_err(|_| Reason::FileLocked)
 }
 
 fn observed_payload(
@@ -959,6 +1197,13 @@ fn retain_payload_snapshot(
         )?;
     }
     for entry in directory_members(&root, end)? {
+        if entry == format!("{ACTIVATION_INPUTS}.json") {
+            // The typed snapshot already retained the original self-bound pin.
+            if retained.activation_inputs.borrow().is_none() {
+                return Err(Reason::IdentityChanged);
+            }
+            continue;
+        }
         if entry.ends_with(".json") {
             let path = root.join(entry);
             let file = platform::open_file(&path).map_err(|_| Reason::FileLocked)?;
@@ -1015,6 +1260,75 @@ fn sync_payload_prefix(
 }
 
 impl KeepAcknowledged {
+    /// Consume on failure: the unconfirmed adapter owner retains all accepted
+    /// handles through process exit. No reusable or normally installed owner
+    /// escapes an uncertain input publication.
+    fn publish_activation_inputs(mut self) -> Result<Self, Reason> {
+        {
+            let phase = self.payload_phase()?;
+            let retained = phase.view.retained;
+            let end = phase.view.end;
+            let plan = phase.plan.as_ref().ok_or(Reason::IdentityChanged)?;
+            let snapshot = phase.snapshot.as_ref().ok_or(Reason::IdentityChanged)?;
+            if snapshot.complete_stage != Some(ReinstallPreparationStage::Published)
+                || snapshot.boundary != plan.directories.len() + plan.members.len()
+            {
+                return Err(Reason::IdentityChanged);
+            }
+            if snapshot.activation_inputs.is_none() {
+                let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+                let pending = root.join(format!("{ACTIVATION_INPUTS}.pending"));
+                #[cfg(test)]
+                observe(
+                    HandoffEvent::BeforeActivationInputsRead(root.join("complete.json")),
+                    end,
+                )?;
+                let complete = read_record(&root.join("complete.json"), RECORD_LIMIT, end)?;
+                if snapshot.complete_sha256.as_deref() != Some(digest(&complete).as_str()) {
+                    return Err(Reason::IdentityChanged);
+                }
+                time(end)?;
+                let file = open_activation_inputs(&pending, true)?;
+                let mut slot = retained.activation_inputs.borrow_mut();
+                *slot = Some(RetainedActivationInputs {
+                    file,
+                    path: pending,
+                    identity: None,
+                    record: None,
+                    stage: ReinstallPreparationStage::Pending,
+                });
+                let held = slot.as_mut().ok_or(Reason::IdentityChanged)?;
+                let identity =
+                    platform::identity(&held.file).map_err(|_| Reason::IdentityChanged)?;
+                held.identity = Some(identity);
+                if !single_file(&held.file)? {
+                    return Err(Reason::IdentityChanged);
+                }
+                held.record = Some(activation_inputs_record(
+                    retained, plan, &complete, identity,
+                )?);
+                let bytes = record_bytes(held.record.as_ref().ok_or(Reason::IdentityChanged)?)?;
+                if bytes.len() as u64 > ACTIVATION_INPUTS_LIMIT {
+                    return Err(Reason::IdentityChanged);
+                }
+                time(end)?;
+                held.file
+                    .write_all(&bytes)
+                    .map_err(|_| Reason::FileLocked)?;
+                held.file.sync_all().map_err(|_| Reason::FileLocked)?;
+                if activation_inputs_bytes(held, end)? != bytes {
+                    return Err(Reason::IdentityChanged);
+                }
+                time(end)?;
+                platform::sync_directory(&root).map_err(|_| Reason::FileLocked)?;
+                #[cfg(test)]
+                fault(Fault::ActivationInputsPending)?;
+            }
+            publish_bound_activation_inputs(retained, end)?;
+        }
+        Ok(self)
+    }
+
     #[cfg(test)]
     fn payload_pass(&mut self) -> Result<(), Reason> {
         self.payload_phase().map(drop)
@@ -1926,17 +2240,20 @@ pub(super) fn intercept(args: &[OsString]) -> Option<i32> {
         .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
         let handoff =
             prepare_incoming_handoff(Path::new(prefix), Path::new(catalog), incoming, end)?;
-        let mut completed = handoff.finish()?;
-        if let IncomingCompletion::KeepData(acknowledged) = &mut completed {
-            acknowledged.publish_payloads()?;
-        }
+        let completed = match handoff.finish()? {
+            IncomingCompletion::KeepData(mut acknowledged) => {
+                acknowledged.publish_payloads()?;
+                IncomingCompletion::KeepData(Box::new((*acknowledged).publish_activation_inputs()?))
+            }
+            completed => completed,
+        };
         Ok::<_, KeepHandoffError>(completed)
     })();
     match _checkpoint {
         Ok(IncomingCompletion::NamespaceConsumed) => {}
         Ok(IncomingCompletion::KeepData(completed)) => {
-            // The same ACK owner holds the new payload and all guards until
-            // private CLI exit. Pointer/receipt and activation remain pending.
+            // The same ACK owner holds payload and bound activation inputs until
+            // private CLI exit. Installed pointer/receipt remain pending.
             drop(completed.owner);
         }
         Err(KeepHandoffError::Refused(reason)) => {
@@ -3078,6 +3395,9 @@ fn prepare_incoming_handoff(
         .map_err(Into::into);
     }
     incoming_current(&roots, &incoming, &records.seal.policy, end)?;
+    let incoming_activation = incoming
+        .activation_metadata(end)
+        .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
     let locks = existing_lock_files(&roots, &records.seal.policy, end)?;
     let parent_exit = exit_lock(
         &roots.journal,
@@ -3108,12 +3428,14 @@ fn prepare_incoming_handoff(
         parent_exit,
         runner_exit,
         incoming,
+        incoming_activation,
         roots,
         locks,
         namespace_dirs: RefCell::new(Vec::new()),
         sibling_pins: RefCell::new(Vec::new()),
         payload: RefCell::new(None),
         payload_pins: RefCell::new(Vec::new()),
+        activation_inputs: RefCell::new(None),
         active,
         records,
     };
@@ -4527,6 +4849,8 @@ enum Fault {
     PayloadEntry(usize),
     PayloadMoved(usize),
     PayloadCompletePending,
+    ActivationInputsPending,
+    ActivationInputsMoved,
 }
 
 #[cfg(test)]
@@ -4539,6 +4863,8 @@ enum HandoffEvent {
     BeforeMove(usize),
     Moved(usize),
     BeforeConsumed,
+    BeforeActivationInputsMove(PathBuf),
+    BeforeActivationInputsRead(PathBuf),
 }
 
 #[cfg(test)]
@@ -5125,6 +5451,20 @@ mod tests {
         (manifest, checksums, root.join(dir).join(app))
     }
 
+    enum FixtureDirectory {
+        Owned(tempfile::TempDir),
+        ParentOwned(PathBuf),
+    }
+
+    impl FixtureDirectory {
+        fn path(&self) -> &Path {
+            match self {
+                Self::Owned(temp) => temp.path(),
+                Self::ParentOwned(path) => path,
+            }
+        }
+    }
+
     struct Fixture {
         prefix: PathBuf,
         data: PathBuf,
@@ -5136,7 +5476,7 @@ mod tests {
         old_owner: Owner,
         // Every production handle is local to preparation or a coordinator
         // call, and drops before this directory on Windows.
-        _temp: tempfile::TempDir,
+        _temp: FixtureDirectory,
     }
 
     impl Fixture {
@@ -5379,7 +5719,7 @@ mod tests {
                 checksums,
                 image,
                 old_owner,
-                _temp: temp,
+                _temp: FixtureDirectory::Owned(temp),
             }
         }
 
@@ -5786,6 +6126,477 @@ mod tests {
         assert!(!fixture.prefix.join("uninstall/helper/runner.exe").exists());
         assert!(!fixture.prefix.join("uninstall/helper/runner").exists());
         assert!(!fixture.prefix.join("uninstall/helper/tail.ps1").exists());
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ActivationInputsChildRequest {
+        base: PathBuf,
+        manifest: PathBuf,
+        checksums: PathBuf,
+        image: PathBuf,
+        old_owner: Owner,
+        mode: String,
+    }
+
+    struct ExpectedActivationUnwind;
+
+    fn expected_activation_unwind(payload: &(dyn std::any::Any + Send), reached: usize) -> bool {
+        reached == 1 && payload.is::<ExpectedActivationUnwind>()
+    }
+
+    #[test]
+    fn activation_unwind_classifier_refuses_other_panics_or_unreached_hooks() {
+        assert!(expected_activation_unwind(&ExpectedActivationUnwind, 1));
+        assert!(!expected_activation_unwind(&ExpectedActivationUnwind, 0));
+        assert!(!expected_activation_unwind(&ExpectedActivationUnwind, 2));
+        assert!(!expected_activation_unwind(&"unrelated panic", 1));
+        let unrelated = std::panic::catch_unwind(|| std::panic::panic_any("different failure"))
+            .expect_err("negative control must actually panic");
+        assert!(!expected_activation_unwind(unrelated.as_ref(), 1));
+    }
+
+    #[test]
+    fn activation_inputs_process_helper() {
+        if std::env::var_os("ASG_TEST_PENDING_PATH_RUNNER").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() <= 16 * 1024);
+        let request: ActivationInputsChildRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request.base.canonicalize().unwrap(), request.base);
+        let fixture = Fixture {
+            prefix: request.base.join("old-package"),
+            data: request.base.join("data"),
+            catalog: request.base.join("data/catalog.db"),
+            source: request.base.join("incoming"),
+            manifest: request.manifest,
+            checksums: request.checksums,
+            image: request.image,
+            old_owner: request.old_owner,
+            _temp: FixtureDirectory::ParentOwned(request.base),
+        };
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        owner.publish_payloads().unwrap();
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        let pending = root.join(format!("{ACTIVATION_INPUTS}.pending"));
+        let published = root.join(format!("{ACTIVATION_INPUTS}.json"));
+        match request.mode.as_str() {
+            "pending" | "moved" => {
+                let fault = if request.mode == "pending" {
+                    Fault::ActivationInputsPending
+                } else {
+                    Fault::ActivationInputsMoved
+                };
+                let result = stop_at_consumed(fault, || owner.publish_activation_inputs());
+                assert!(matches!(result, Err(Reason::Deadline)));
+            }
+            "changed-complete" => {
+                let observed = Rc::new(Cell::new(false));
+                let observed_by_hook = observed.clone();
+                let result = with_observer(
+                    move |event, _| {
+                        if let HandoffEvent::BeforeActivationInputsRead(path) = event {
+                            observed_by_hook.set(true);
+                            let original = file_identity(&path);
+                            let mut record: PayloadComplete =
+                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                            record.entries_sha256 = "0".repeat(64);
+                            fs::write(&path, record_bytes(&record).unwrap()).unwrap();
+                            assert_eq!(file_identity(&path), original);
+                        }
+                        Ok(())
+                    },
+                    || owner.publish_activation_inputs(),
+                );
+                assert!(
+                    observed.get(),
+                    "actual completed-phase mutation was not reached"
+                );
+                assert!(
+                    matches!(result, Err(Reason::IdentityChanged)),
+                    "changed validated completion must refuse before new input records"
+                );
+                assert!(!pending.exists() && !published.exists());
+            }
+            "replaced" => {
+                let displaced = fixture._temp.path().join("retained-original-inputs");
+                let observed = Rc::new(Cell::new(false));
+                let observed_by_hook = observed.clone();
+                let result = with_observer(
+                    move |event, _| {
+                        if let HandoffEvent::BeforeActivationInputsMove(path) = event {
+                            observed_by_hook.set(true);
+                            let bytes = fs::read(&path).unwrap();
+                            let original = file_identity(&path);
+                            fs::rename(&path, &displaced).unwrap();
+                            update_state::write_new(&path, &bytes).unwrap();
+                            assert_ne!(file_identity(&path), original);
+                        }
+                        Ok(())
+                    },
+                    || owner.publish_activation_inputs(),
+                );
+                assert!(observed.get());
+                assert!(matches!(result, Err(Reason::IdentityChanged)));
+                assert!(!published.exists());
+            }
+            "unwind" => {
+                let original_hook = std::sync::Arc::new(std::panic::take_hook());
+                let report_unexpected = original_hook.clone();
+                std::panic::set_hook(Box::new(move |information| {
+                    if !information.payload().is::<ExpectedActivationUnwind>() {
+                        report_unexpected(information);
+                    }
+                }));
+                let reached = Rc::new(Cell::new(0usize));
+                let hook_reached = reached.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_observer(
+                        move |event, _| {
+                            if matches!(event, HandoffEvent::BeforeActivationInputsMove(_)) {
+                                hook_reached.set(hook_reached.get() + 1);
+                                std::panic::panic_any(ExpectedActivationUnwind);
+                            }
+                            Ok(())
+                        },
+                        || owner.publish_activation_inputs(),
+                    )
+                }));
+                drop(std::panic::take_hook());
+                std::panic::set_hook(
+                    std::sync::Arc::try_unwrap(original_hook)
+                        .unwrap_or_else(|_| panic!("original panic hook still borrowed")),
+                );
+                let payload = match result {
+                    Err(payload) => payload,
+                    Ok(_) => panic!("expected activation unwind did not occur"),
+                };
+                assert!(
+                    expected_activation_unwind(payload.as_ref(), reached.get()),
+                    "unexpected panic cannot prove activation unwind retention"
+                );
+                assert!(pending.exists() && !published.exists());
+            }
+            "expired" => {
+                owner.end = Instant::now();
+                assert!(matches!(
+                    owner.publish_activation_inputs(),
+                    Err(Reason::Deadline)
+                ));
+                assert!(!pending.exists() && !published.exists());
+            }
+            _ => panic!("unknown activation input test mode"),
+        }
+        // These are separate native lock opens, not control-row observations.
+        // The failed consuming operation no longer owns a reusable Rust value.
+        contenders.assert_excluded();
+        #[cfg(windows)]
+        if matches!(request.mode.as_str(), "pending" | "moved" | "unwind") {
+            let path = if published.exists() {
+                &published
+            } else {
+                &pending
+            };
+            match fs::OpenOptions::new().write(true).open(path) {
+                Ok(_) => panic!("failed publication released its original input pin"),
+                Err(error) => assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}"),
+            }
+        }
+        println!("\nasg.activation-inputs-retained/v1");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    fn keep_activation_inputs_changed_complete_refuses_before_creation() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let request = ActivationInputsChildRequest {
+            base: fixture._temp.path().canonicalize().unwrap(),
+            manifest: fixture.manifest.clone(),
+            checksums: fixture.checksums.clone(),
+            image: fixture.image.clone(),
+            old_owner: fixture.old_owner.clone(),
+            mode: "changed-complete".into(),
+        };
+        super::super::tests::call_activation_inputs_child(
+            fixture._temp.path(),
+            serde_json::to_vec(&request).unwrap(),
+            Instant::now() + Duration::from_secs(60),
+        );
+        contenders.assert_available_except(None);
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        assert!(!root.join(format!("{ACTIVATION_INPUTS}.pending")).exists());
+        assert!(!root.join(format!("{ACTIVATION_INPUTS}.json")).exists());
+    }
+
+    #[test]
+    fn keep_activation_inputs_failures_and_unwind_retain_until_actual_child_exit() {
+        for mode in ["pending", "moved", "replaced", "unwind", "expired"] {
+            let fixture = Fixture::new(true);
+            let contenders = NativeContenders::new(&fixture);
+            let request = ActivationInputsChildRequest {
+                base: fixture._temp.path().canonicalize().unwrap(),
+                manifest: fixture.manifest.clone(),
+                checksums: fixture.checksums.clone(),
+                image: fixture.image.clone(),
+                old_owner: fixture.old_owner.clone(),
+                mode: mode.into(),
+            };
+            let process_end = Instant::now() + Duration::from_secs(60);
+            super::super::tests::call_activation_inputs_child(
+                fixture._temp.path(),
+                serde_json::to_vec(&request).unwrap(),
+                process_end,
+            );
+            contenders.assert_available_except(None);
+            let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+            let pending = root.join(format!("{ACTIVATION_INPUTS}.pending"));
+            let published = root.join(format!("{ACTIVATION_INPUTS}.json"));
+            let observed = match mode {
+                "pending" | "unwind" => {
+                    assert!(pending.is_file() && !published.exists(), "mode={mode}");
+                    Some((file_identity(&pending), fs::read(&pending).unwrap()))
+                }
+                "moved" => {
+                    assert!(published.is_file() && !pending.exists());
+                    Some((file_identity(&published), fs::read(&published).unwrap()))
+                }
+                "expired" => {
+                    assert!(!pending.exists() && !published.exists());
+                    None
+                }
+                "replaced" => {
+                    let displaced = fixture._temp.path().join("retained-original-inputs");
+                    assert!(pending.is_file() && !published.exists() && displaced.is_file());
+                    let bytes = fs::read(&displaced).unwrap();
+                    let record: ActivationInputsRecord = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(record.identity, file_identity(&displaced));
+                    assert_ne!(record.identity, file_identity(&pending));
+                    assert_eq!(fs::read(&pending).unwrap(), bytes);
+                    None
+                }
+                _ => unreachable!(),
+            };
+            if mode == "replaced" {
+                let before = snapshot_with_lock_bytes(&fixture, false);
+                assert!(matches!(
+                    fixture.incoming_handoff(end()),
+                    Err(KeepHandoffError::Refused(_))
+                ));
+                assert_eq!(snapshot_with_lock_bytes(&fixture, false), before);
+                continue;
+            }
+            let mut resumed = payload_owner(&fixture);
+            publish_payload(&mut resumed);
+            let mut resumed = resumed
+                .publish_activation_inputs()
+                .unwrap_or_else(|reason| {
+                    panic!("post-exit recovery refused: mode={mode} reason={reason:?}");
+                });
+            if let Some((identity, bytes)) = observed {
+                assert_eq!(file_identity(&published), identity);
+                assert_eq!(fs::read(&published).unwrap(), bytes);
+            }
+            assert!(!pending.exists());
+            assert_payload_partial(&fixture, &mut resumed);
+            drop(resumed.owner.close().unwrap().into_resources());
+            contenders.assert_available_except(None);
+        }
+    }
+
+    #[test]
+    fn keep_activation_inputs_bind_original_metadata_and_repeat_without_new_effects() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        publish_payload(&mut owner);
+        let before = snapshot_with_lock_bytes(&fixture, false);
+        let mut owner = owner.publish_activation_inputs().unwrap_or_else(|reason| {
+            panic!("activation input publication refused: {reason:?}");
+        });
+        assert_payload_partial(&fixture, &mut owner);
+        contenders.assert_excluded();
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        let path = root.join(format!("{ACTIVATION_INPUTS}.json"));
+        let bytes = fs::read(&path).unwrap();
+        let record: ActivationInputsRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            record.current,
+            fs::read(fixture.source.join("current.json")).unwrap()
+        );
+        assert_eq!(record.identity, file_identity(&path));
+        assert!(!root.join(format!("{ACTIVATION_INPUTS}.pending")).exists());
+        let receipt: serde_json::Value = serde_json::from_slice(&record.receipt).unwrap();
+        assert_eq!(receipt["schema"], "asg.package-install/v1");
+        assert_eq!(receipt.as_object().unwrap().len(), 9);
+        assert!(record.receipt.ends_with(b"}\n"));
+        assert_eq!(
+            record.payload_complete_sha256,
+            digest(&fs::read(root.join("complete.json")).unwrap())
+        );
+        assert_eq!(
+            record.payload_plan_sha256,
+            digest(&fs::read(root.join("plan.json")).unwrap())
+        );
+        assert_eq!(
+            record.intent_sha256,
+            digest(&record_bytes(&owner.intent).unwrap())
+        );
+        assert_eq!(record.prep_sha256, digest(&owner.prep.encode().unwrap()));
+        assert_eq!(
+            record.ack_sha256,
+            digest(&owner.ack.encode(&owner.prep).unwrap())
+        );
+        let published = snapshot_with_lock_bytes(&fixture, false);
+        for (name, entry) in before {
+            assert_eq!(published.get(&name), Some(&entry), "{name}");
+        }
+        let owner = owner.publish_activation_inputs().unwrap_or_else(|reason| {
+            panic!("same-owner repeat refused: {reason:?}");
+        });
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), published);
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+        let mut resumed = payload_owner(&fixture);
+        publish_payload(&mut resumed);
+        let mut resumed = resumed
+            .publish_activation_inputs()
+            .unwrap_or_else(|reason| {
+                panic!("separate-owner repeat refused: {reason:?}");
+            });
+        assert_payload_partial(&fixture, &mut resumed);
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), published);
+        contenders.assert_excluded();
+        drop(resumed.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_activation_inputs_complete_pending_recovers_its_original_inode() {
+        let fixture = Fixture::new(true);
+        let mut owner = payload_owner(&fixture);
+        publish_payload(&mut owner);
+        let owner = owner.publish_activation_inputs().unwrap_or_else(|reason| {
+            panic!("input preparation refused: {reason:?}");
+        });
+        drop(owner.owner.close().unwrap().into_resources());
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        let final_path = root.join(format!("{ACTIVATION_INPUTS}.json"));
+        let pending = root.join(format!("{ACTIVATION_INPUTS}.pending"));
+        let expected = file_identity(&final_path);
+        let bytes = fs::read(&final_path).unwrap();
+        fs::rename(&final_path, &pending).unwrap();
+        let mut resumed = payload_owner(&fixture);
+        {
+            let view = resumed.owner.acknowledgement_publication().unwrap();
+            let slot = view.retained.activation_inputs.borrow();
+            let pin = slot.as_ref().unwrap();
+            assert_eq!(pin.identity, Some(expected));
+            assert!(pin.stage == ReinstallPreparationStage::Pending);
+            assert_eq!(platform::identity(&pin.file).unwrap(), expected);
+        }
+        let mut resumed = resumed
+            .publish_activation_inputs()
+            .unwrap_or_else(|reason| {
+                panic!("complete pending recovery refused: {reason:?}");
+            });
+        assert_eq!(file_identity(&final_path), expected);
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert!(!pending.exists());
+        assert_payload_partial(&fixture, &mut resumed);
+        drop(resumed.owner.close().unwrap().into_resources());
+    }
+
+    #[test]
+    fn keep_activation_inputs_invalid_layouts_refuse_before_sql_or_new_effects() {
+        for case in 0..8 {
+            let fixture = Fixture::new(true);
+            let contenders = NativeContenders::new(&fixture);
+            let mut owner = payload_owner(&fixture);
+            publish_payload(&mut owner);
+            let owner = owner.publish_activation_inputs().unwrap_or_else(|reason| {
+                panic!("input fixture refused: {reason:?}");
+            });
+            drop(owner.owner.close().unwrap().into_resources());
+            let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+            let final_path = root.join(format!("{ACTIVATION_INPUTS}.json"));
+            let bytes = fs::read(&final_path).unwrap();
+            match case {
+                0 => update_state::write_new(
+                    &root.join(format!("{ACTIVATION_INPUTS}.pending")),
+                    &bytes,
+                )
+                .unwrap(),
+                1 => fs::write(&final_path, &bytes[..bytes.len() / 2]).unwrap(),
+                2 => {
+                    let displaced = fixture.source.parent().unwrap().join("displaced-inputs");
+                    fs::rename(&final_path, &displaced).unwrap();
+                    update_state::write_new(&final_path, &bytes).unwrap();
+                    assert_ne!(file_identity(&final_path), file_identity(&displaced));
+                }
+                3 => {
+                    fs::rename(root.join("complete.json"), root.join("complete.pending")).unwrap();
+                }
+                4 => update_state::write_new(&root.join("unbound-inputs.json"), b"{}").unwrap(),
+                5..=7 => {
+                    let mut record: ActivationInputsRecord =
+                        serde_json::from_slice(&bytes).unwrap();
+                    match case {
+                        5 => record.intent_sha256 = "0".repeat(64),
+                        6 => record.current.push(b'\n'),
+                        _ => record.payload_complete_sha256 = "0".repeat(64),
+                    }
+                    fs::write(&final_path, record_bytes(&record).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = snapshot_with_lock_bytes(&fixture, false);
+            match fixture.incoming_handoff(end()) {
+                Err(KeepHandoffError::Refused(_)) => {}
+                Err(KeepHandoffError::Owned(_)) => {
+                    panic!("invalid inputs reached SQL: case={case}")
+                }
+                Ok(_) => panic!("invalid inputs admitted: case={case}"),
+            }
+            assert_eq!(
+                snapshot_with_lock_bytes(&fixture, false),
+                before,
+                "case={case}"
+            );
+            contenders.assert_available_except(None);
+        }
+    }
+
+    #[test]
+    fn keep_activation_inputs_absence_keeps_old_pending_payload_recovery() {
+        let fixture = Fixture::new(true);
+        let mut owner = payload_owner(&fixture);
+        assert_eq!(
+            stop_at_consumed(Fault::PayloadCompletePending, || owner.publish_payloads()),
+            Err(Reason::Deadline)
+        );
+        drop(owner.owner.close().unwrap().into_resources());
+        let mut resumed = payload_owner(&fixture);
+        {
+            let phase = resumed.payload_phase().unwrap();
+            let snapshot = phase.snapshot.unwrap();
+            assert!(snapshot.complete_stage == Some(ReinstallPreparationStage::Pending));
+            assert!(snapshot.activation_inputs.is_none());
+        }
+        publish_payload(&mut resumed);
+        let mut resumed = resumed
+            .publish_activation_inputs()
+            .unwrap_or_else(|reason| {
+                panic!("old pending payload recovery refused: {reason:?}");
+            });
+        assert_payload_partial(&fixture, &mut resumed);
+        drop(resumed.owner.close().unwrap().into_resources());
     }
 
     #[test]

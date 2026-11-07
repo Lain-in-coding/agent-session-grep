@@ -1467,6 +1467,7 @@ const RUNNER_JOB_CONTROL_ACK: &str = "asg.runner-job-empty-control/v1";
 #[derive(Clone, Copy, Debug)]
 enum RunnerGateSubject {
     PendingPath,
+    ActivationInputs,
     #[cfg(windows)]
     EmptyControl,
 }
@@ -1475,6 +1476,9 @@ impl RunnerGateSubject {
     fn entry(self) -> &'static str {
         match self {
             Self::PendingPath => RUNNER_GATE_ENTRY,
+            Self::ActivationInputs => {
+                "uninstall_command::managed_uninstall_cleanup::managed_reinstall_handoff::tests::activation_inputs_process_helper"
+            }
             #[cfg(windows)]
             Self::EmptyControl => RUNNER_JOB_CONTROL_ENTRY,
         }
@@ -1483,6 +1487,7 @@ impl RunnerGateSubject {
     fn ack(self) -> &'static str {
         match self {
             Self::PendingPath => RUNNER_GATE_ACK,
+            Self::ActivationInputs => "asg.activation-inputs-retained/v1",
             #[cfg(windows)]
             Self::EmptyControl => RUNNER_JOB_CONTROL_ACK,
         }
@@ -1986,6 +1991,21 @@ fn call_pending_path_runner(runner: &Path, request: &RunnerGateRequest, end: Ins
     );
 }
 
+pub(super) fn call_activation_inputs_child(directory: &Path, input: Vec<u8>, end: Instant) {
+    let tick = monotonic_ms()
+        .unwrap()
+        .checked_add(end.saturating_duration_since(Instant::now()).as_millis() as u64)
+        .unwrap();
+    call_runner_gate_child(
+        &std::env::current_exe().unwrap(),
+        directory,
+        input,
+        tick,
+        end,
+        RunnerGateSubject::ActivationInputs,
+    );
+}
+
 fn call_runner_gate_child(
     runner: &Path,
     directory: &Path,
@@ -2122,6 +2142,7 @@ fn call_runner_gate_child(
                         && value.end_observed
                         && value.within_end
                 }),
+                RunnerGateSubject::ActivationInputs => result_line.is_none(),
                 #[cfg(windows)]
                 RunnerGateSubject::EmptyControl => result_line.is_none(),
             };
@@ -2143,12 +2164,14 @@ fn call_runner_gate_child(
                  io_ok={io_ok} ack={ack} selected={selected} result={result:?} \
                  extra_result={extra_result} stdout_bytes={} stderr_bytes={} \
                  stdout_overflow={stdout_overflow} stderr_overflow={stderr_overflow} \
-                 stderr_panic={} stderr_test_spawn={}",
+                 stderr_panic={} stderr_test_spawn={} complete_binding_counterexample={}",
                 status.code(),
                 stdout.len(),
                 stderr.len(),
                 error_text.is_some_and(|text| text.contains("panicked at")),
                 error_text.is_some_and(|text| text.contains("Failed to spawn")),
+                error_text.is_some_and(|text| text
+                    .contains("changed validated completion must refuse before new input records")),
             );
         }
         assert!(io_ok, "runner pipe I/O failed");

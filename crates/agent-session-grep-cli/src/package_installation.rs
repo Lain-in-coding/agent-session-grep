@@ -346,7 +346,7 @@ impl ImagePin {
         Ok(())
     }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
     schema: String,
@@ -358,11 +358,11 @@ struct InstallReceipt {
     manifest_sha256: String,
     archive_sha256: String,
     package_files_sha256: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     current_sha256: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     current_generation: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     launcher_sha256: Option<String>,
 }
 pub(crate) struct Member {
@@ -548,6 +548,7 @@ pub(crate) struct IncomingPackageIdentity {
 pub(crate) struct VerifiedIncomingPackage {
     _package: PackageContents,
     identity: IncomingPackageIdentity,
+    receipt: InstallReceipt,
     source: PathBuf,
     directory: File,
     directory_identity: (u64, u64),
@@ -556,6 +557,12 @@ pub(crate) struct VerifiedIncomingPackage {
     manifest: PathBuf,
     checksums: PathBuf,
     end: Instant,
+}
+
+/// Exact incoming metadata bytes, not publication or lifecycle authority.
+pub(crate) struct IncomingActivationMetadata {
+    pub(crate) current: Vec<u8>,
+    pub(crate) receipt: Vec<u8>,
 }
 
 /// Immutable incoming bytes, without pointer/receipt or lifecycle authority.
@@ -613,6 +620,53 @@ impl VerifiedIncomingPackage {
             return Err(invalid_install("incoming root changed"));
         }
         reads.tick()
+    }
+
+    /// Read the original pointer and encode the already verified v1 receipt.
+    /// The caller must separately authorize and bind any later publication.
+    pub(crate) fn activation_metadata(
+        &self,
+        end: Instant,
+    ) -> Result<IncomingActivationMetadata, CliError> {
+        let reads = PackageReadEnd::incoming(end.min(self.end));
+        reads.tick()?;
+        let end = reads.0.ok_or_else(|| invalid_install("incoming end"))?;
+        self.recheck(end)?;
+        let path = self.source.join("current.json");
+        let mut pointers = self.inputs.iter().filter(|input| input.path == path);
+        let input = pointers
+            .next()
+            .ok_or_else(|| invalid_install("unbound incoming pointer"))?;
+        if pointers.next().is_some() || input.sha256 != self.identity.current_pointer_sha256 {
+            return Err(invalid_install("unbound incoming pointer"));
+        }
+        let current = input.bound_bytes(reads, 8192)?;
+        let receipt = &self.receipt;
+        if receipt.schema != "asg.package-install/v1"
+            || receipt.product != "agent-session-grep"
+            || receipt.launcher_protocol != 1
+            || receipt.version != self.identity.version
+            || receipt.target != self.identity.target
+            || receipt.source_commit != self.identity.source_commit
+            || receipt.manifest_sha256 != self.identity.release_manifest_sha256
+            || receipt.archive_sha256 != self.identity.archive_sha256
+            || receipt.package_files_sha256 != self.identity.package_inventory_sha256
+            || receipt.current_sha256.is_some()
+            || receipt.current_generation.is_some()
+            || receipt.launcher_sha256.is_some()
+        {
+            return Err(invalid_install("incoming activation receipt"));
+        }
+        let mut receipt = serde_json::to_vec_pretty(receipt).map_err(invalid_install)?;
+        receipt.push(b'\n');
+        if receipt.len() > 8192 {
+            return Err(invalid_install("incoming activation receipt size"));
+        }
+        #[cfg(test)]
+        tests::after_activation_metadata_read()?;
+        self.recheck(end)?;
+        reads.tick()?;
+        Ok(IncomingActivationMetadata { current, receipt })
     }
 
     /// The coordinator publishes these only under its acknowledged, held owner.
@@ -952,6 +1006,27 @@ impl IncomingFilePin {
         }
         reads.tick()
     }
+
+    /// Read through the retained inode. The caller also rechecks the full
+    /// incoming namespace before and after this same-object observation.
+    fn bound_bytes(&self, reads: PackageReadEnd, limit: u64) -> Result<Vec<u8>, CliError> {
+        reads.tick()?;
+        incoming_single_link(&self.file)?;
+        if ImageStamp::read(&self.file)? != self.stamp {
+            return Err(invalid_install("incoming input changed"));
+        }
+        let mut file = self.file.try_clone().map_err(invalid_install)?;
+        let value = reads.bytes(&mut file, limit)?;
+        if value.len() as u64 != self.stamp.len
+            || format!("{:x}", Sha256::digest(&value)) != self.sha256
+            || ImageStamp::read(&self.file)? != self.stamp
+        {
+            return Err(invalid_install("incoming input changed"));
+        }
+        incoming_single_link(&self.file)?;
+        reads.tick()?;
+        Ok(value)
+    }
 }
 
 fn relative_member(path: &Path) -> Result<String, CliError> {
@@ -1156,6 +1231,7 @@ pub(crate) fn verify_incoming_for_handoff(
     let verified = VerifiedIncomingPackage {
         _package: package,
         identity,
+        receipt,
         source,
         directory,
         directory_identity,
@@ -2307,6 +2383,430 @@ mod tests {
         fs::rename(source.join(STAGE_CHECKSUMS), &checksums).unwrap();
         let running = source.join(version_dir()).join(metadata::APP_NAME);
         (source, manifest, checksums, running, members)
+    }
+
+    thread_local! {
+        static ACTIVATION_METADATA_EXTRA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_activation_metadata_read() -> Result<(), CliError> {
+        if let Some(path) =
+            ACTIVATION_METADATA_EXTRA_DIRECTORY.with(|slot| slot.borrow_mut().take())
+        {
+            fs::create_dir(path).map_err(invalid_install)?;
+        }
+        Ok(())
+    }
+
+    struct ResetActivationMetadataObservation;
+
+    impl Drop for ResetActivationMetadataObservation {
+        fn drop(&mut self) {
+            ACTIVATION_METADATA_EXTRA_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Rebind the synthetic manifest/checksums before admission, so raw pointer
+    /// whitespace is a valid input rather than a tampering refusal.
+    fn reformat_incoming_pointer(source: &Path, manifest: &Path, checksums: &Path) -> Vec<u8> {
+        let original = fs::read(source.join("current.json")).unwrap();
+        let pointer = [b" \n".as_slice(), &original, b"\n\n"].concat();
+        CurrentPointer::parse(&pointer).unwrap();
+        fs::write(source.join("current.json"), &pointer).unwrap();
+        let pointer_sha = digest(&pointer);
+        let old_tsv = fs::read_to_string(source.join("PACKAGE-MANIFEST.tsv")).unwrap();
+        let mut replaced = 0;
+        let mut tsv = String::new();
+        for line in old_tsv.lines() {
+            if line.ends_with("\tcurrent.json") {
+                replaced += 1;
+                tsv.push_str(&format!(
+                    "file\t{pointer_sha}\t0644\t{}\tcurrent.json\n",
+                    pointer.len()
+                ));
+            } else {
+                tsv.push_str(line);
+                tsv.push('\n');
+            }
+        }
+        assert_eq!(replaced, 1);
+        fs::write(source.join("PACKAGE-MANIFEST.tsv"), &tsv).unwrap();
+        let tsv_sha = digest(tsv.as_bytes());
+        let mut release: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        let mut rebound = 0;
+        for file in release["archive"]["files"].as_array_mut().unwrap() {
+            let name = file["name"].as_str().unwrap();
+            let binding = if name.ends_with("/current.json") {
+                Some((&pointer_sha, pointer.len()))
+            } else if name.ends_with("/PACKAGE-MANIFEST.tsv") {
+                Some((&tsv_sha, tsv.len()))
+            } else {
+                None
+            };
+            if let Some((sha, size)) = binding {
+                file["sha256"] = json!(sha);
+                file["size_bytes"] = json!(size);
+                rebound += 1;
+            }
+        }
+        assert_eq!(rebound, 2);
+        release["install_manifest_sha256"] = json!(tsv_sha);
+        let release_bytes = serde_json::to_vec(&release).unwrap();
+        fs::write(manifest, &release_bytes).unwrap();
+        let release_sha = digest(&release_bytes);
+        let old_checksums = fs::read_to_string(checksums).unwrap();
+        let mut sums = String::new();
+        let mut replaced = 0;
+        for line in old_checksums.lines() {
+            let (_, name) = line.split_once("  ").unwrap();
+            if name.ends_with(".manifest.json") {
+                sums.push_str(&format!("{release_sha}  {name}\n"));
+                replaced += 1;
+            } else {
+                sums.push_str(line);
+                sums.push('\n');
+            }
+        }
+        assert_eq!(replaced, 1);
+        fs::write(checksums, sums).unwrap();
+        pointer
+    }
+
+    #[test]
+    fn incoming_activation_metadata_preserves_raw_pointer_and_installer_receipt() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let pointer = reformat_incoming_pointer(&source, &manifest, &checksums);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let before: BTreeMap<_, _> = verified
+            .inputs
+            .iter()
+            .map(|input| (input.path.clone(), fs::read(&input.path).unwrap()))
+            .collect();
+        let inventory = stage_inventory(&source).unwrap();
+        // Independent wire oracle: the actual installer's literal here-doc,
+        // with synthetic admitted values, not the production receipt serializer.
+        let installer =
+            include_str!("../../../scripts/install/package-install.sh").replace("\r\n", "\n");
+        let template = installer
+            .split_once("cat > \"$receipt\" <<EOF\n")
+            .unwrap()
+            .1
+            .split_once("\nEOF\n")
+            .unwrap()
+            .0;
+        let mut expected = format!("{template}\n");
+        for (name, value) in [
+            ("$version", env!("CARGO_PKG_VERSION").to_owned()),
+            ("$target", target().to_owned()),
+            ("$commit", "a".repeat(40)),
+            ("$manifest_hash", digest(&fs::read(&manifest).unwrap())),
+            ("$archive_hash", "d".repeat(64)),
+            (
+                "$files_hash",
+                digest(&fs::read(source.join("PACKAGE-MANIFEST.tsv")).unwrap()),
+            ),
+        ] {
+            expected = expected.replace(name, &value);
+        }
+        assert!(!expected.contains('$'));
+        for _ in 0..2 {
+            let metadata = verified.activation_metadata(end).unwrap();
+            assert_eq!(metadata.current, pointer);
+            assert_eq!(metadata.receipt, expected.as_bytes());
+            let receipt: Value = serde_json::from_slice(&metadata.receipt).unwrap();
+            assert_eq!(receipt.as_object().unwrap().len(), 9);
+            assert!(!metadata.receipt.contains(&b'\r'));
+            assert!(metadata.receipt.ends_with(b"}\n"));
+        }
+        assert_eq!(stage_inventory(&source).unwrap(), inventory);
+        for (path, bytes) in before {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(!source.join("package-install.json").exists());
+        assert!(installation_for_staged(&source).is_err());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_requires_one_exact_pointer_pin() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let mut verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let pointer = source.join("current.json");
+        let index = verified
+            .inputs
+            .iter()
+            .position(|pin| pin.path == pointer)
+            .unwrap();
+        let removed = verified.inputs.remove(index);
+        assert!(matches!(
+            verified.activation_metadata(end),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        verified.inputs.insert(index, removed);
+        let original = verified.identity.current_pointer_sha256.clone();
+        verified.identity.current_pointer_sha256 = "0".repeat(64);
+        assert!(matches!(
+            verified.activation_metadata(end),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        verified.identity.current_pointer_sha256 = original.clone();
+        verified
+            .inputs
+            .push(IncomingFilePin::open(pointer, original, PackageReadEnd::incoming(end)).unwrap());
+        assert!(matches!(
+            verified.activation_metadata(end),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        verified.inputs.pop().unwrap();
+        verified.activation_metadata(end).unwrap();
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_bound_reader_checks_buffer_limit_stamp_and_links() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let content = b"actual retained metadata\n";
+        write(&root, "metadata", content, "0644");
+        let reads = PackageReadEnd::incoming(Instant::now() + std::time::Duration::from_secs(30));
+        let mut pin = IncomingFilePin::open(root.join("metadata"), digest(content), reads).unwrap();
+        assert_eq!(
+            pin.bound_bytes(reads, content.len() as u64).unwrap(),
+            content.as_slice()
+        );
+        assert!(pin.bound_bytes(reads, content.len() as u64 - 1).is_err());
+        // No surrounding recheck can catch this: the returned-buffer check
+        // itself must reject the wrong expected digest.
+        pin.sha256 = digest(b"different metadata\n");
+        assert!(matches!(
+            pin.bound_bytes(reads, 8192),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        pin.sha256 = digest(content);
+        pin.stamp.len += 1;
+        assert!(pin.bound_bytes(reads, 8192).is_err());
+        pin.stamp.len -= 1;
+        let large = vec![b'x'; 8193];
+        write(&root, "large", &large, "0644");
+        let oversized = IncomingFilePin::open(root.join("large"), digest(&large), reads).unwrap();
+        assert!(oversized.bound_bytes(reads, 8192).is_err());
+        #[cfg(unix)]
+        {
+            fs::hard_link(root.join("metadata"), root.join("alias")).unwrap();
+            assert!(pin.bound_bytes(reads, 8192).is_err());
+        }
+    }
+
+    #[test]
+    fn incoming_activation_metadata_rejects_receipt_overrides_and_binding_changes() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let mut verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let original = verified.receipt.clone();
+        for case in [
+            "schema",
+            "product",
+            "version",
+            "target",
+            "source_commit",
+            "launcher_protocol",
+            "manifest",
+            "archive",
+            "files",
+            "current_sha256",
+            "current_generation",
+            "launcher_sha256",
+        ] {
+            verified.receipt = original.clone();
+            match case {
+                "schema" => verified.receipt.schema = "asg.package-install/v2".into(),
+                "product" => verified.receipt.product = "another-product".into(),
+                "version" => verified.receipt.version = "0.0.0-other".into(),
+                "target" => verified.receipt.target = "another-target".into(),
+                "source_commit" => verified.receipt.source_commit = "b".repeat(40),
+                "launcher_protocol" => verified.receipt.launcher_protocol = 2,
+                "manifest" => verified.receipt.manifest_sha256 = "0".repeat(64),
+                "archive" => verified.receipt.archive_sha256 = "0".repeat(64),
+                "files" => verified.receipt.package_files_sha256 = "0".repeat(64),
+                "current_sha256" => {
+                    verified.receipt.current_sha256 =
+                        Some(verified.identity.current_pointer_sha256.clone());
+                }
+                "current_generation" => verified.receipt.current_generation = Some(1),
+                "launcher_sha256" => verified.receipt.launcher_sha256 = Some("b".repeat(64)),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    verified.activation_metadata(end),
+                    Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+                ),
+                "case={case}"
+            );
+        }
+        verified.receipt = original;
+        verified.activation_metadata(end).unwrap();
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_keeps_expired_caller_and_saved_ends() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let mut verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        assert!(matches!(
+            verified.activation_metadata(expired),
+            Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
+        ));
+        verified.end = expired;
+        assert!(matches!(
+            verified.activation_metadata(end),
+            Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
+        ));
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_observes_an_expired_earlier_outer_end() {
+        use agent_session_grep_ports::control::{ControlId, DesiredUpdates};
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let control = crate::retry_fixture_busy(|| {
+            SqliteControlStore::create(
+                &root.join("deadline-control"),
+                &ControlId::parse("activation-metadata-deadline").unwrap(),
+                DesiredUpdates::Paused,
+            )
+        });
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let probe = end + std::time::Duration::from_secs(30);
+        let previous = SqliteControlStore::effective_runtime_deadline(probe);
+        let outer = Instant::now() + std::time::Duration::from_secs(1);
+        let mut called = false;
+        let result = control.with_runtime_deadline(outer, || {
+            assert_eq!(SqliteControlStore::effective_runtime_deadline(probe), outer);
+            std::thread::sleep(outer.saturating_duration_since(Instant::now()));
+            called = true;
+            assert!(matches!(
+                verified.activation_metadata(probe),
+                Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
+            ));
+            Ok(())
+        });
+        assert!(called, "accessor must run inside the expired outer scope");
+        assert!(matches!(
+            result,
+            Err(agent_session_grep_ports::PortError::WriterBusy(_))
+        ));
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(probe),
+            previous
+        );
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_rechecks_non_pointer_bytes() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let readme = source.join("README.md");
+        let original = fs::read(&readme).unwrap();
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        match fs::write(&readme, changed) {
+            Ok(()) => assert!(verified.activation_metadata(end).is_err()),
+            #[cfg(windows)]
+            Err(error) => {
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+                assert_eq!(fs::read(readme).unwrap(), original);
+                verified.activation_metadata(end).unwrap();
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("{error}"),
+        }
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_rejects_unknown_members_and_replaced_inodes() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let extra = source.join("unowned-empty");
+        fs::create_dir(&extra).unwrap();
+        assert!(verified.activation_metadata(end).is_err());
+        fs::remove_dir(extra).unwrap();
+        let pointer = source.join("current.json");
+        let original = fs::read(&pointer).unwrap();
+        let displaced = root.join("original-pointer");
+        match fs::rename(&pointer, &displaced) {
+            Ok(()) => {
+                write(&source, "current.json", &original, "0644");
+                assert_eq!(fs::read(pointer).unwrap(), original);
+                assert!(verified.activation_metadata(end).is_err());
+            }
+            #[cfg(windows)]
+            Err(error) => {
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+                assert_eq!(fs::read(pointer).unwrap(), original);
+                assert!(!displaced.exists());
+                verified.activation_metadata(end).unwrap();
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("{error}"),
+        }
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_activation_metadata_rechecks_after_read_before_returning() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let verified =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let extra = source.join("late-unowned-empty");
+        ACTIVATION_METADATA_EXTRA_DIRECTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(extra.clone());
+        });
+        let _reset = ResetActivationMetadataObservation;
+        assert!(matches!(
+            verified.activation_metadata(end),
+            Err(CliError(error)) if error.code == CanonicalCode::SchemaIncompatible
+        ));
+        ACTIVATION_METADATA_EXTRA_DIRECTORY.with(|slot| assert!(slot.borrow().is_none()));
+        assert!(
+            extra.is_dir(),
+            "the actual post-read mutation must be reached"
+        );
+        assert!(!source.join("package-install.json").exists());
     }
 
     #[test]
