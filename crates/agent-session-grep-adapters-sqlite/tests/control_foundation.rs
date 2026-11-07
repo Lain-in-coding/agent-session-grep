@@ -1891,7 +1891,13 @@ fn barrier_admitted_during_live_advisory_is_served_by_the_next_owned_cycle() {
             store.heartbeat_worker(current(&store), &worker, UpdateState::Running, None, 163)
         })
         .unwrap();
-        assert_eq!(store.barrier(&barrier.id).unwrap(), barrier);
+        // This assertion checks barrier identity, not the default read deadline.
+        // Keep one bounded read; the earlier outer end and SQL busy cap remain.
+        let read_end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let retained = store
+            .with_runtime_deadline(read_end, || store.barrier(&barrier.id))
+            .unwrap();
+        assert_eq!(retained, barrier);
         let cycle = retry_expected_success(|| {
             store.start_cycle(current(&store), &worker, barrier.required_cycle_seq, 164)
         })
@@ -1924,7 +1930,10 @@ fn barrier_admitted_during_live_advisory_is_served_by_the_next_owned_cycle() {
             )
         })
         .unwrap();
-        let served = store.persisted_barrier(&barrier.id).unwrap();
+        let read_end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let served = store
+            .with_runtime_deadline(read_end, || store.persisted_barrier(&barrier.id))
+            .unwrap();
         assert_eq!(served.state, BarrierState::AwaitingCatalog);
         assert_eq!(served.completed_cycle_seq, Some(cycle.token.cycle_seq));
         assert_eq!(served.error, None);
