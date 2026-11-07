@@ -828,8 +828,32 @@ fn late_pause_or_disabled_intent_blocks_launch_and_reports_actual_intent() {
                 Ok(response)
             },
         );
+        let returned_at = Instant::now();
         let observed = observation.finish();
-        assert!(rechecked);
+        assert!(
+            rechecked,
+            "phase=late_intent branch={} native_calls={} last_native_call={} installation_consumed={} deadline={observed:?} elapsed={:?} remaining={:?} overrun={:?} summary={}",
+            if paused { "pause" } else { "disable_intent" },
+            f.calls.borrow().len(),
+            f.calls.borrow().last().map_or("none", |args| {
+                [
+                    "daemon-reload",
+                    "enable",
+                    "LoadUnit",
+                    "NeedDaemonReload",
+                    "ExecStart",
+                    "start",
+                ]
+                .into_iter()
+                .find(|label| args.iter().any(|arg| arg == *label))
+                .unwrap_or("other")
+            }),
+            installation.is_none(),
+            returned_at.saturating_duration_since(end - BUDGET),
+            end.saturating_duration_since(returned_at),
+            returned_at.saturating_duration_since(end),
+            serde_json::to_string(&result).unwrap()
+        );
         assert_eq!(f.installations.get(), 1);
         assert!(
             f.calls
