@@ -1405,6 +1405,10 @@ fn live_authority_holds_both_database_lifetimes_and_rechecks_current_intent() {
 fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manual_running() {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::*;
+    // This case verifies native ownership and independent settings, not
+    // throughput. Each action retains one end; default-budget and expired
+    // admission tests separately exercise the unchanged production limit.
+    const SUCCESS_BUDGET: Duration = Duration::from_secs(30);
     let f = Fixture::new(DesiredUpdates::Paused);
     let mut enable_installation = Some(f.installation(true));
     let mut disable_installation = Some(f.installation(true));
@@ -1471,7 +1475,7 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     let location = NativeLocation::WindowsRun {
         subkey: registry.subkey.clone(),
     };
-    let enable_end = Instant::now() + Duration::from_secs(3);
+    let enable_end = Instant::now() + SUCCESS_BUDGET;
     let observation = ObserveDeadline::start(enable_end);
     let enabled = execute(
         f.catalog.to_str().unwrap(),
@@ -1487,7 +1491,8 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     let observed = observation.finish();
     assert!(
         observed.checks > 0 && observed.rejections == 0,
-        "{observed:?}"
+        "action=enable deadline={observed:?} summary={}",
+        serde_json::to_string(&enabled).unwrap()
     );
     assert!(enable_installation.is_none());
     assert_eq!(f.installations.get(), preparations);
@@ -1501,7 +1506,7 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
         })
         .unwrap();
     drop(writable);
-    let disable_end = Instant::now() + Duration::from_secs(3);
+    let disable_end = Instant::now() + SUCCESS_BUDGET;
     let observation = ObserveDeadline::start(disable_end);
     let disabled = execute(
         f.catalog.to_str().unwrap(),
@@ -1517,7 +1522,8 @@ fn windows_enable_disable_only_changes_exact_owned_run_value_and_preserves_manua
     let observed = observation.finish();
     assert!(
         observed.checks > 0 && observed.rejections == 0,
-        "{observed:?}"
+        "action=disable deadline={observed:?} summary={}",
+        serde_json::to_string(&disabled).unwrap()
     );
     assert!(disable_installation.is_none());
     assert_eq!(f.installations.get(), preparations);
