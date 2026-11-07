@@ -198,6 +198,20 @@ fn file_source_single_read_stays_within_fixed_chunk_even_for_large_caller_buffer
 
 #[test]
 fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal() {
+    fn error_code(error: &PortError) -> &'static str {
+        match error {
+            PortError::WriterBusy(_) => "writer_busy",
+            PortError::DeadlineExceeded(_) => "deadline_exceeded",
+            PortError::SnapshotChanged(_) => "snapshot_changed",
+            PortError::InvalidRequest(_) => "invalid_request",
+            PortError::GenerationMismatch(_) => "generation_mismatch",
+            PortError::SourceIo(_) => "source_io",
+            PortError::Backend(_) => "backend",
+            PortError::SchemaIncompatible(_) => "schema_incompatible",
+            PortError::NotFound(_) => "not_found",
+        }
+    }
+
     let temp = agent_session_grep_testkit::tempdir().unwrap();
     let path = temp.path().join("live.db");
     let writer = Connection::open(&path).unwrap();
@@ -242,37 +256,85 @@ fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal(
     let call_finished = Instant::now();
     assert!(
         matches!(&result, Err(PortError::SnapshotChanged(_))),
-        "phase=verify_after_wal_insert actual={:?} \
+        "phase=verify_after_wal_insert calls=1 error={:?} \
          original_end_expired_before={expired_before} \
          original_end_expired_after={} call_elapsed={:?}",
-        result.as_ref().map(|_| ()),
+        result.as_ref().err().map(error_code),
         call_finished >= deadline,
         call_finished.duration_since(call_started),
     );
-    let next = capture_with_deadline(&path, SQLITE_256_MIB, deadline).unwrap();
-    writer
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .unwrap();
+    let capture_started = Instant::now();
+    let next = capture_with_deadline(&path, SQLITE_256_MIB, deadline);
+    let capture_finished = Instant::now();
+    eprintln!(
+        "phase=capture_after_wal_insert calls=1 error={:?} original_end_expired_before={} \
+         original_end_expired_after={} original_remaining_before={:?} \
+         original_remaining_after={:?} call_elapsed={:?}",
+        next.as_ref().err().map(error_code),
+        capture_started >= deadline,
+        capture_finished >= deadline,
+        deadline.saturating_duration_since(capture_started),
+        deadline.saturating_duration_since(capture_finished),
+        capture_finished.duration_since(capture_started),
+    );
+    let next = next.unwrap_or_else(|_| panic!("phase=capture_after_wal_insert failed"));
+    let checkpoint_started = Instant::now();
+    let remaining = deadline.saturating_duration_since(checkpoint_started);
+    assert!(
+        !remaining.is_zero(),
+        "phase=checkpoint calls=0 original_end_expired_before=true"
+    );
+    // The fixture writer shares the original end; SQLite's default busy timeout
+    // must not grant this one checkpoint another five seconds.
+    let timeout = writer.busy_timeout(Duration::from_secs(5).min(remaining));
+    assert!(
+        timeout.is_ok(),
+        "phase=checkpoint_busy_timeout sqlite_error_code={:?}",
+        timeout
+            .as_ref()
+            .err()
+            .and_then(rusqlite::Error::sqlite_error_code),
+    );
+    assert!(
+        Instant::now() < deadline,
+        "phase=checkpoint calls=0 original_end_expired_before=true after_timeout_setup=true"
+    );
+    // execute_batch discards PRAGMA result rows, including a busy checkpoint.
+    let checkpoint: rusqlite::Result<(i64, i64, i64)> =
+        writer.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
+    let checkpoint_finished = Instant::now();
+    eprintln!(
+        "phase=checkpoint calls=1 result={:?} sqlite_error_code={:?} \
+         original_end_expired_before={} original_end_expired_after={} \
+         original_remaining_before={:?} original_remaining_after={:?} call_elapsed={:?}",
+        checkpoint.as_ref().ok(),
+        checkpoint
+            .as_ref()
+            .err()
+            .and_then(rusqlite::Error::sqlite_error_code),
+        checkpoint_started >= deadline,
+        checkpoint_finished >= deadline,
+        remaining,
+        deadline.saturating_duration_since(checkpoint_finished),
+        checkpoint_finished.duration_since(checkpoint_started),
+    );
+    let checkpoint = checkpoint.unwrap_or_else(|_| panic!("phase=checkpoint failed"));
+    assert_eq!(checkpoint, (0, 0, 0), "phase=checkpoint incomplete");
     let final_started = Instant::now();
     let result = verify_snapshot_with_deadline(&path, &next, SQLITE_256_MIB, deadline);
     let final_finished = Instant::now();
     assert!(
         result.is_ok(),
         "phase=verify_after_checkpoint calls=1 error={:?} original_end_expired_before={} \
-         original_end_expired_after={} call_elapsed={:?}",
-        result.as_ref().err().map(|error| match error {
-            PortError::WriterBusy(_) => "writer_busy",
-            PortError::DeadlineExceeded(_) => "deadline_exceeded",
-            PortError::SnapshotChanged(_) => "snapshot_changed",
-            PortError::InvalidRequest(_) => "invalid_request",
-            PortError::GenerationMismatch(_) => "generation_mismatch",
-            PortError::SourceIo(_) => "source_io",
-            PortError::Backend(_) => "backend",
-            PortError::SchemaIncompatible(_) => "schema_incompatible",
-            PortError::NotFound(_) => "not_found",
-        }),
+         original_end_expired_after={} original_remaining_before={:?} \
+         original_remaining_after={:?} call_elapsed={:?}",
+        result.as_ref().err().map(error_code),
         final_started >= deadline,
         final_finished >= deadline,
+        deadline.saturating_duration_since(final_started),
+        deadline.saturating_duration_since(final_finished),
         final_finished.duration_since(final_started),
     );
 }
