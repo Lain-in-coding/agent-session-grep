@@ -1,13 +1,14 @@
-//! Completed-only namespace consumption and fixed keep-data preparation.
-//! No payload publication, fence adoption, marker removal or activation.
+//! Completed-only namespace consumption and fixed keep-data transfer.
+//! Recovering/catalog acknowledgement does not publish payloads or activate.
 use super::*;
 use crate::package_installation::{IncomingPackageIdentity, VerifiedIncomingPackage};
 use agent_session_grep_adapters_sqlite::control::{
-    ReinstallCleanupBinding, ReinstallConnectionError, ReinstallContext, ReinstallControlOwner,
-    ReinstallDigest, ReinstallExpectedControl, ReinstallFileBinding, ReinstallFiles,
-    ReinstallImageMatch, ReinstallInspection, ReinstallInspectionGuards, ReinstallOwnedGuards,
-    ReinstallOwnedInput, ReinstallOwnedPins, ReinstallPrep, ReinstallPreparationStage,
-    ReinstallRoots, ReinstallShmBinding,
+    ReinstallAck, ReinstallCleanupBinding, ReinstallConnectionError, ReinstallContext,
+    ReinstallControlOwner, ReinstallDigest, ReinstallExpectedControl, ReinstallFileBinding,
+    ReinstallFiles, ReinstallImageMatch, ReinstallInspection, ReinstallInspectionGuards,
+    ReinstallOwnedGuards, ReinstallOwnedInput, ReinstallOwnedPins, ReinstallPrep,
+    ReinstallPreparationStage, ReinstallPublication, ReinstallQueryOnlyCatalog, ReinstallRoots,
+    ReinstallShmBinding,
 };
 use std::cell::RefCell;
 
@@ -18,6 +19,7 @@ const READY_SCHEMA: &str = "asg.reinstall-ready/v1";
 const CONSUMED_SCHEMA: &str = "asg.reinstall-consumed/v1";
 const RECORD_LIMIT: u64 = 4 * 1024 * 1024;
 const KEEP_PREP: &str = "keep-transfer-prep";
+const KEEP_ACK: &str = "keep-transfer-ack";
 const KEEP_RECORD_LIMIT: u64 = 8192;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -128,7 +130,7 @@ enum HandoffCheckpoint {
 }
 
 /// The live continuation is returned without closing or releasing its bundle.
-/// The private CLI entry exits at this milestone until adoption is wired.
+/// Preparation and adoption consume the same real resource bundle.
 enum IncomingHandoff {
     NamespaceConsumed,
     KeepData(Box<KeepPreparation>),
@@ -139,7 +141,39 @@ struct KeepPreparation {
     intent: FixedHandoffIntent,
     prep: ReinstallPrep,
     layout: Option<ReinstallPreparationStage>,
+    acknowledgement: Option<AckLayout>,
     end: Instant,
+}
+
+struct AckLayout {
+    record: ReinstallAck,
+    stage: ReinstallPreparationStage,
+}
+
+struct KeepAdopted {
+    owner: ReinstallQueryOnlyCatalog<KeepDataRetention>,
+    intent: FixedHandoffIntent,
+    prep: ReinstallPrep,
+    acknowledgement: Option<AckLayout>,
+    end: Instant,
+}
+
+struct KeepAcknowledged {
+    owner: ReinstallQueryOnlyCatalog<KeepDataRetention>,
+}
+
+struct KeepAcknowledgement {
+    owner: ReinstallQueryOnlyCatalog<KeepDataRetention>,
+    intent: FixedHandoffIntent,
+    prep: ReinstallPrep,
+    ack: ReinstallAck,
+    layout: Option<AckLayout>,
+    end: Instant,
+}
+
+enum IncomingCompletion {
+    NamespaceConsumed,
+    KeepData(KeepAcknowledged),
 }
 
 impl IncomingHandoff {
@@ -149,16 +183,111 @@ impl IncomingHandoff {
             Self::KeepData(preparation) => preparation.publish(),
         }
     }
+
+    fn finish(mut self) -> Result<IncomingCompletion, KeepHandoffError> {
+        // ACK-specific validation occurs before catalog re-entry below.
+        // Never feed ACK extras back through the Prep-only layout.
+        if !matches!(&self, Self::KeepData(preparation) if preparation.acknowledgement.is_some()) {
+            self.publish()?;
+        }
+        match self {
+            Self::NamespaceConsumed => Ok(IncomingCompletion::NamespaceConsumed),
+            Self::KeepData(preparation) => {
+                let mut acknowledgement = (*preparation).adopt()?.prepare_acknowledgement()?;
+                acknowledgement.publish()?;
+                Ok(IncomingCompletion::KeepData(KeepAcknowledged {
+                    owner: acknowledgement.owner,
+                }))
+            }
+        }
+    }
 }
 
 impl KeepPreparation {
     fn publish(&mut self) -> Result<(), Reason> {
+        if self.acknowledgement.is_some() {
+            return Err(Reason::IdentityChanged);
+        }
         self.end = SqliteControlStore::effective_runtime_deadline(self.end);
         publish_preparation(
             &mut self.owner,
             &self.intent,
             &self.prep,
             self.layout,
+            self.end,
+        )?;
+        self.layout = Some(ReinstallPreparationStage::Published);
+        Ok(())
+    }
+
+    fn adopt(mut self) -> Result<KeepAdopted, KeepHandoffError> {
+        self.end = SqliteControlStore::effective_runtime_deadline(self.end);
+        if self.layout != Some(ReinstallPreparationStage::Published) {
+            return Err(Reason::IdentityChanged.into());
+        }
+        let (mut owner, _) = self
+            .owner
+            .compare_preparation(&self.prep, ReinstallPreparationStage::Published)?;
+        if let Some(ack) = &self.acknowledgement {
+            let mut view = owner
+                .preparation_publication()
+                .map_err(|error| journal_control_error(error, self.end, Instant::now()))?;
+            acknowledgement_evidence(&mut view, &self.intent, &self.prep, Some(ack))?;
+            sync_transfer_evidence(view.retained, &self.intent, self.prep.context(), view.end)?;
+            acknowledgement_evidence(&mut view, &self.intent, &self.prep, Some(ack))?;
+        } else {
+            preparation_pass(&mut owner, &self.intent, &self.prep, self.layout, self.end)?;
+        }
+        let owner = owner.adopt_prepared()?;
+        let owner = owner.open_query_only_catalog(
+            ControlId::parse(&self.intent.operation).map_err(|_| Reason::IdentityChanged)?,
+        )?;
+        Ok(KeepAdopted {
+            owner,
+            intent: self.intent,
+            prep: self.prep,
+            acknowledgement: self.acknowledgement,
+            end: self.end,
+        })
+    }
+}
+
+impl KeepAdopted {
+    fn prepare_acknowledgement(self) -> Result<KeepAcknowledgement, KeepHandoffError> {
+        let Self {
+            owner,
+            intent,
+            prep,
+            acknowledgement,
+            end,
+        } = self;
+        let (owner, ack) = owner.prepare_acknowledgement()?;
+        if acknowledgement
+            .as_ref()
+            .is_some_and(|record| record.record != ack)
+        {
+            return Err(Reason::IdentityChanged.into());
+        }
+        Ok(KeepAcknowledgement {
+            owner,
+            intent,
+            prep,
+            ack,
+            layout: acknowledgement,
+            end,
+        })
+    }
+}
+
+impl KeepAcknowledgement {
+    fn publish(&mut self) -> Result<(), Reason> {
+        self.end = SqliteControlStore::effective_runtime_deadline(self.end);
+        publish_acknowledgement(
+            &mut self.owner,
+            &self.intent,
+            &self.prep,
+            &self.ack,
+            self.layout.as_ref(),
             self.end,
         )
     }
@@ -727,17 +856,16 @@ pub(super) fn intercept(args: &[OsString]) -> Option<i32> {
             end,
         )
         .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
-        let mut handoff =
+        let handoff =
             prepare_incoming_handoff(Path::new(prefix), Path::new(catalog), incoming, end)?;
-        handoff.publish()?;
-        Ok::<_, KeepHandoffError>(handoff)
+        handoff.finish()
     })();
     match _checkpoint {
-        Ok(IncomingHandoff::NamespaceConsumed) => {}
-        Ok(IncomingHandoff::KeepData(preparation)) => {
-            // The next tranche consumes this same owner. For this milestone,
-            // its complete bundle remains held until run_cli exits below.
-            drop(preparation);
+        Ok(IncomingCompletion::NamespaceConsumed) => {}
+        Ok(IncomingCompletion::KeepData(completed)) => {
+            // The acknowledged Recovering catalog remains held until the
+            // private CLI exits. Payload/lifecycle activation is still pending.
+            drop(completed.owner);
         }
         Err(KeepHandoffError::Refused(reason)) => {
             let _ = reason;
@@ -869,6 +997,7 @@ fn validate_existing_lock_files(locks: &[ExistingLockFile], end: Instant) -> Res
 struct TransferLayout {
     prep: ReinstallPrep,
     stage: ReinstallPreparationStage,
+    acknowledgement: Option<AckLayout>,
 }
 
 fn observed_keep_transfer(
@@ -884,15 +1013,18 @@ fn observed_keep_transfer(
     let published = format!("{KEEP_PREP}.json");
     let has_pending = names.contains(&pending);
     let has_published = names.contains(&published);
-    if names.contains("keep-transfer-ack.pending") || names.contains("keep-transfer-ack.json") {
-        // ACK continuation belongs to the next tranche; never fall back to the
-        // old namespace mover or overwrite an acknowledgement.
-        return Err(Reason::AfterExitCleanupPending);
-    }
+    let ack_pending = names.contains("keep-transfer-ack.pending");
+    let ack_published = names.contains("keep-transfer-ack.json");
     if !has_pending && !has_published {
+        if ack_pending || ack_published {
+            return Err(Reason::AfterExitCleanupPending);
+        }
         return Ok(None);
     }
-    if has_pending == has_published {
+    if has_pending == has_published
+        || (ack_pending && ack_published)
+        || (has_pending && (ack_pending || ack_published))
+    {
         return Err(Reason::IdentityChanged);
     }
     let (name, stage) = if has_pending {
@@ -900,20 +1032,45 @@ fn observed_keep_transfer(
     } else {
         (published, ReinstallPreparationStage::Published)
     };
-    exact_members(
-        &sidecar,
-        &[
-            "intent.json",
-            "ready.json",
-            "consumed.json",
-            "evidence",
-            &name,
-        ],
-        end,
-    )?;
-    let prep = ReinstallPrep::decode(&read_record(&sidecar.join(name), KEEP_RECORD_LIMIT, end)?)
+    let mut expected = vec![
+        "intent.json",
+        "ready.json",
+        "consumed.json",
+        "evidence",
+        &name,
+    ];
+    let ack_name = if ack_pending {
+        Some((
+            "keep-transfer-ack.pending",
+            ReinstallPreparationStage::Pending,
+        ))
+    } else if ack_published {
+        Some((
+            "keep-transfer-ack.json",
+            ReinstallPreparationStage::Published,
+        ))
+    } else {
+        None
+    };
+    if let Some((name, _)) = ack_name {
+        expected.push(name);
+    }
+    exact_members(&sidecar, &expected, end)?;
+    let prep = ReinstallPrep::decode(&read_record(&sidecar.join(&name), KEEP_RECORD_LIMIT, end)?)
         .map_err(|_| Reason::IdentityChanged)?;
-    Ok(Some(TransferLayout { prep, stage }))
+    let acknowledgement = ack_name
+        .map(|(name, stage)| {
+            let bytes = read_record(&sidecar.join(name), KEEP_RECORD_LIMIT, end)?;
+            let record =
+                ReinstallAck::decode(&bytes, &prep).map_err(|_| Reason::IdentityChanged)?;
+            Ok::<_, Reason>(AckLayout { record, stage })
+        })
+        .transpose()?;
+    Ok(Some(TransferLayout {
+        prep,
+        stage,
+        acknowledgement,
+    }))
 }
 
 fn keep_guards<'a>(
@@ -1602,6 +1759,108 @@ fn publish_preparation(
     Ok(())
 }
 
+fn acknowledgement_evidence(
+    view: &mut ReinstallPublication<'_, KeepDataRetention>,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    acknowledgement: Option<&AckLayout>,
+) -> Result<(), Reason> {
+    let retained = view.retained;
+    let end = view.end;
+    let mut guards = keep_guards(retained, &mut view.guards);
+    let writer = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
+    validate_existing_lock_files(&retained.locks, end)?;
+    if keep_context(retained, intent, end)? != *prep.context() {
+        return Err(Reason::IdentityChanged);
+    }
+    validate_preparation_files(intent, prep.files())?;
+    let sidecar = retained.roots.sidecar();
+    let mut names = vec![
+        "intent.json",
+        "ready.json",
+        "consumed.json",
+        "evidence",
+        "keep-transfer-prep.json",
+    ];
+    if read_record(
+        &sidecar.join("keep-transfer-prep.json"),
+        KEEP_RECORD_LIMIT,
+        end,
+    )? != prep.encode().map_err(|_| Reason::IdentityChanged)?
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    if let Some(ack) = acknowledgement {
+        let name = match ack.stage {
+            ReinstallPreparationStage::Pending => "keep-transfer-ack.pending",
+            ReinstallPreparationStage::Published => "keep-transfer-ack.json",
+        };
+        names.push(name);
+        if read_record(&sidecar.join(name), KEEP_RECORD_LIMIT, end)?
+            != ack
+                .record
+                .encode(prep)
+                .map_err(|_| Reason::IdentityChanged)?
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    exact_members(&sidecar, &names, end)?;
+    transfer_inventory(
+        retained,
+        intent,
+        prep,
+        &writer,
+        ReinstallPreparationStage::Published,
+        end,
+    )?;
+    let after = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
+    if writer.identity != after.identity
+        || writer.size != after.size
+        || writer.digest != after.digest
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)
+}
+
+fn publish_acknowledgement(
+    owner: &mut ReinstallQueryOnlyCatalog<KeepDataRetention>,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    ack: &ReinstallAck,
+    layout: Option<&AckLayout>,
+    end: Instant,
+) -> Result<(), Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    {
+        let mut view = owner
+            .acknowledgement_publication()
+            .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+        acknowledgement_evidence(&mut view, intent, prep, layout)?;
+        sync_transfer_evidence(view.retained, intent, prep.context(), view.end)?;
+    }
+    let mut view = owner
+        .acknowledgement_publication()
+        .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+    acknowledgement_evidence(&mut view, intent, prep, layout)?;
+    let sidecar = view.retained.roots.sidecar();
+    let bytes = ack.encode(prep).map_err(|_| Reason::IdentityChanged)?;
+    if layout.is_none() {
+        time(view.end)?;
+        update_state::write_new(&sidecar.join(format!("{KEEP_ACK}.pending")), &bytes)
+            .map_err(|_| Reason::FileLocked)?;
+        #[cfg(test)]
+        fault(Fault::KeepAckPending)?;
+    }
+    publish_record(&sidecar, KEEP_ACK, &bytes, view.end)?;
+    time(view.end)?;
+    platform::sync_directory(&view.retained.roots.prefix).map_err(|_| Reason::FileLocked)?;
+    // Durable ACK is the final fallible effect. The complete live owner returns
+    // without closing, reopening, activating, or emitting a later refusal.
+    Ok(())
+}
+
 fn resume_preparation(
     owner: ReinstallControlOwner<KeepDataRetention>,
     intent: FixedHandoffIntent,
@@ -1614,6 +1873,7 @@ fn resume_preparation(
         intent,
         prep: layout.prep,
         layout: Some(layout.stage),
+        acknowledgement: layout.acknowledgement,
         end,
     })))
 }
@@ -1720,6 +1980,19 @@ fn prepare_incoming_handoff(
         end,
     )?;
     let mut owner = match &transfer {
+        Some(layout) if layout.acknowledgement.is_some() => {
+            ReinstallControlOwner::open_acknowledged_read_only(
+                input,
+                layout.prep.clone(),
+                layout
+                    .acknowledgement
+                    .as_ref()
+                    .ok_or(Reason::IdentityChanged)?
+                    .record
+                    .clone(),
+                end,
+            )?
+        }
         Some(layout) => ReinstallControlOwner::open_prepared_read_only(
             input,
             layout.prep.clone(),
@@ -1803,6 +2076,7 @@ fn prepare_incoming_handoff(
         intent,
         prep,
         layout: None,
+        acknowledgement: None,
         end,
     })))
 }
@@ -3062,6 +3336,7 @@ enum Fault {
     AfterMove(usize),
     ConsumedPending,
     KeepPrepPending,
+    KeepAckPending,
 }
 
 #[cfg(test)]
@@ -3657,6 +3932,205 @@ mod tests {
             {
                 assert_eq!(after.get(name), Some(entry), "{name}");
             }
+        }
+    }
+
+    fn assert_transfer_preserves_old_files(fixture: &Fixture, before: &Snapshot) {
+        let after = snapshot_with_lock_bytes(fixture, false);
+        for (name, entry) in before {
+            if name == "data/control.db-wal" || name.ends_with("-shm") {
+                assert_eq!(after[name].identity, entry.identity);
+                assert_eq!(after[name].single_link, entry.single_link);
+            } else {
+                assert_eq!(after.get(name), Some(entry), "{name}");
+            }
+        }
+    }
+
+    fn adopted(prepared: KeepPreparation) -> KeepAdopted {
+        match prepared.adopt() {
+            Ok(adopted) => adopted,
+            Err(KeepHandoffError::Refused(reason)) => panic!("adoption refused: {reason:?}"),
+            Err(KeepHandoffError::Owned(error)) => panic!("owned adoption refused: {error:?}"),
+        }
+    }
+
+    fn acknowledgement(adopted: KeepAdopted) -> KeepAcknowledgement {
+        match adopted.prepare_acknowledgement() {
+            Ok(ack) => ack,
+            Err(KeepHandoffError::Refused(reason)) => panic!("acknowledgement refused: {reason:?}"),
+            Err(KeepHandoffError::Owned(error)) => {
+                panic!("owned acknowledgement refused: {error:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn keep_transfer_real_caller_adopts_once_and_returns_query_only_catalog_ack() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let until = end();
+        let mut prepared = prepared_handoff(&fixture, until);
+        prepared.publish().unwrap();
+        let prep = prepared.prep.clone();
+        let fixed = snapshot_with_lock_bytes(&fixture, false);
+        let adopted = adopted(prepared);
+        assert_eq!(
+            adopted.owner.identity().installation.as_str(),
+            fixture.old_owner.installation_id
+        );
+        assert_eq!(
+            adopted.owner.identity().incarnation.as_str(),
+            prep.context().incarnation
+        );
+        contenders.assert_excluded();
+        let mut ack = acknowledgement(adopted);
+        assert_eq!(
+            ack.ack.catalog_identity().generation,
+            ack.owner.identity().generation
+        );
+        ack.publish().unwrap();
+        let sidecar = fixture.prefix.join(SIDECAR);
+        let bytes = fs::read(sidecar.join("keep-transfer-ack.json")).unwrap();
+        assert_eq!(bytes, ack.ack.encode(&prep).unwrap());
+        assert!(ReinstallAck::decode(&bytes, &prep).is_ok());
+        assert!(!sidecar.join("keep-transfer-ack.pending").exists());
+        assert!(!fixture.prefix.join("current.json").exists());
+        assert_transfer_preserves_old_files(&fixture, &fixed);
+        contenders.assert_excluded();
+        drop(ack.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+        // The real entry reopens from the durable ACK. No extra adoption or
+        // control-WAL byte change is permitted by its acknowledged binding.
+        let before = snapshot_with_lock_bytes(&fixture, false);
+        let result = fixture
+            .incoming_handoff(end())
+            .and_then(IncomingHandoff::finish);
+        let completed = match result {
+            Ok(IncomingCompletion::KeepData(completed)) => completed,
+            Ok(_) => panic!("keep-data continuation bypassed"),
+            Err(KeepHandoffError::Refused(reason)) => panic!("ACK re-entry refused: {reason:?}"),
+            Err(KeepHandoffError::Owned(error)) => panic!("owned ACK re-entry refused: {error:?}"),
+        };
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), before);
+        contenders.assert_excluded();
+        drop(completed.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_transfer_q_plus_one_and_complete_ack_pending_resume_without_replay() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut prepared = prepared_handoff(&fixture, end());
+        prepared.publish().unwrap();
+        let prep = prepared.prep.clone();
+        let fixed = snapshot_with_lock_bytes(&fixture, false);
+        let transferred = adopted(prepared);
+        // q+1 exists, but no ACK was written. Confirmed close releases this test
+        // invocation; the next real entry must compare After and never adopt.
+        drop(transferred.owner.close().unwrap().into_resources());
+        let sidecar = fixture.prefix.join(SIDECAR);
+        assert!(!sidecar.join("keep-transfer-ack.json").exists());
+        let post_adoption = snapshot_with_lock_bytes(&fixture, false);
+        let mut resumed = prepared_handoff(&fixture, end());
+        let (owner, matched) = resumed
+            .owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        resumed.owner = owner;
+        assert_eq!(matched, ReinstallImageMatch::After);
+        let (owner, status) = resumed.owner.read_bound_status().unwrap();
+        resumed.owner = owner;
+        assert_eq!(
+            status.policy.control_seq.get(),
+            prep.context().old_control_seq + 1
+        );
+        assert_eq!(
+            status.policy.maintenance.owner.as_ref().unwrap().as_str(),
+            prep.context().operation
+        );
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let capture = Rc::clone(&events);
+        let mut ack = with_observer(
+            move |event, _| {
+                capture.borrow_mut().push(event);
+                Ok(())
+            },
+            || {
+                resumed.publish().unwrap();
+                acknowledgement(adopted(resumed))
+            },
+        );
+        assert!(events.borrow().iter().all(|event| !matches!(
+            event,
+            HandoffEvent::BeforeMove(_) | HandoffEvent::Moved(_) | HandoffEvent::BeforeConsumed
+        )));
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), post_adoption);
+        let bytes = ack.ack.encode(&prep).unwrap();
+        assert_eq!(
+            stop_at(Fault::KeepAckPending, || ack.publish()),
+            Err(Reason::Deadline)
+        );
+        assert_eq!(
+            fs::read(sidecar.join("keep-transfer-ack.pending")).unwrap(),
+            bytes
+        );
+        assert!(!sidecar.join("keep-transfer-ack.json").exists());
+        contenders.assert_excluded();
+        drop(ack.owner.close().unwrap().into_resources());
+
+        let resumed = prepared_handoff(&fixture, end());
+        assert!(
+            resumed.acknowledgement.as_ref().unwrap().stage == ReinstallPreparationStage::Pending
+        );
+        let mut ack = acknowledgement(adopted(resumed));
+        ack.publish().unwrap();
+        assert_eq!(
+            fs::read(sidecar.join("keep-transfer-ack.json")).unwrap(),
+            bytes
+        );
+        assert!(!sidecar.join("keep-transfer-ack.pending").exists());
+        assert_transfer_preserves_old_files(&fixture, &fixed);
+        contenders.assert_excluded();
+        drop(ack.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_transfer_torn_and_both_ack_records_refuse_without_new_effects() {
+        for both in [false, true] {
+            let fixture = Fixture::new(true);
+            let contenders = NativeContenders::new(&fixture);
+            let mut prepared = prepared_handoff(&fixture, end());
+            prepared.publish().unwrap();
+            let mut ack = acknowledgement(adopted(prepared));
+            ack.publish().unwrap();
+            let bytes = ack.ack.encode(&ack.prep).unwrap();
+            drop(ack.owner.close().unwrap().into_resources());
+            let sidecar = fixture.prefix.join(SIDECAR);
+            if !both {
+                fs::remove_file(sidecar.join("keep-transfer-ack.json")).unwrap();
+            }
+            update_state::write_new(
+                &sidecar.join("keep-transfer-ack.pending"),
+                if both {
+                    &bytes
+                } else {
+                    &bytes[..bytes.len() / 2]
+                },
+            )
+            .unwrap();
+            let before = snapshot(&fixture);
+            match fixture.incoming_handoff(end()) {
+                Err(KeepHandoffError::Refused(reason)) => {
+                    assert_eq!(reason, Reason::IdentityChanged)
+                }
+                Err(KeepHandoffError::Owned(_)) => panic!("invalid ACK reached SQLite"),
+                Ok(_) => panic!("invalid ACK admitted"),
+            }
+            assert_eq!(snapshot(&fixture), before);
+            contenders.assert_available_except(None);
         }
     }
 

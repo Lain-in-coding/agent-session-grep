@@ -403,12 +403,26 @@ struct ObservedShm {
     identity: (u64, u64),
 }
 
+/// This proof never leaves its owning bundle. Comparison modes cannot construct
+/// it: the fixed published record and its enclosing namespace must exist.
+struct PublishedPreparation {
+    directories: [fs::File; 4],
+    records: [PreparationRecordPin; 4],
+    durability_confirmed: bool,
+}
+
+struct PreparationRecordPin {
+    file: fs::File,
+    binding: ReinstallFileBinding,
+}
+
 struct ClosedPins {
     _rendezvous: Option<ReinstallHandlesPin>,
     _control_wal: Option<ObservedWal>,
     _catalog_wal: Option<ObservedWal>,
     _control_shm: Option<ObservedShm>,
     _catalog_shm: Option<ObservedShm>,
+    _published_preparation: Option<PublishedPreparation>,
 }
 
 struct Bundle<R: 'static> {
@@ -423,6 +437,9 @@ struct Bundle<R: 'static> {
     control_shm: Option<ObservedShm>,
     catalog_shm: Option<ObservedShm>,
     preparation: Option<PreparedRead>,
+    published_preparation: Option<PublishedPreparation>,
+    acknowledgement: Option<ReinstallAck>,
+    adoption_attempted: bool,
     #[cfg(test)]
     outstanding: Option<tests::OutstandingStatement>,
 }
@@ -441,6 +458,9 @@ impl<R: 'static> Bundle<R> {
             control_shm: None,
             catalog_shm: None,
             preparation: None,
+            published_preparation: None,
+            acknowledgement: None,
+            adoption_attempted: false,
             #[cfg(test)]
             outstanding: None,
         }
@@ -528,6 +548,13 @@ impl<R: 'static> Bundle<R> {
             if prepared.prep.files() != &input.files {
                 return Err(invalid());
             }
+        }
+        if let Some(ack) = &self.acknowledgement {
+            let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+            if prepared.stage != ReinstallPreparationStage::Published {
+                return Err(invalid());
+            }
+            ack.encode(&prepared.prep)?;
         }
         private_directory(&input.root, false)?;
         reject_links(&input.prefix)?;
@@ -619,7 +646,54 @@ impl<R: 'static> Bundle<R> {
                 Ok(_) => return Err(corrupt()),
             }
         }
+        if let Some(ack) = &self.acknowledgement {
+            let expected = ack.files();
+            let current = self.observed_files()?;
+            if current.control_main != expected.control_main
+                || current.control_wal != expected.control_wal
+                || current.catalog_main != expected.catalog_main
+                || current.catalog_wal != expected.catalog_wal
+                || current.control_shm.as_ref().map(|shm| shm.identity)
+                    != expected.control_shm.as_ref().map(|shm| shm.identity)
+                || current.catalog_shm.as_ref().map(|shm| shm.identity)
+                    != expected.catalog_shm.as_ref().map(|shm| shm.identity)
+            {
+                return Err(conflict());
+            }
+        }
         Ok(())
+    }
+
+    /// Hash only actual retained file handles, without refreshing original Prep
+    /// expectations. SHM has identity/size observations and no content authority.
+    fn observed_files(&mut self) -> PortResult<ReinstallFiles> {
+        self.tick()?;
+        let control = SqliteControlStore::path(&self.input.root);
+        let mut files = self.input.files.clone();
+        for (path, original, observed, binding) in [
+            (
+                sidecar(&control, "-wal"),
+                &mut self.input.pins.control_wal,
+                &mut self.control_wal,
+                &mut files.control_wal,
+            ),
+            (
+                sidecar(&self.input.catalog, "-wal"),
+                &mut self.input.pins.catalog_wal,
+                &mut self.catalog_wal,
+                &mut files.catalog_wal,
+            ),
+        ] {
+            *binding = match (original, observed) {
+                (Some(pin), _) => Some(observe_reinstall_file(&path, pin, self.end)?),
+                (None, Some(wal)) => Some(observe_reinstall_file(&path, &mut wal.file, self.end)?),
+                (None, None) => None,
+            };
+        }
+        files.control_shm = self.control_shm.as_ref().map(observe_shm).transpose()?;
+        files.catalog_shm = self.catalog_shm.as_ref().map(observe_shm).transpose()?;
+        self.tick()?;
+        Ok(files)
     }
 
     fn validate_receipt(&mut self, status: &ControlStatus) -> PortResult<()> {
@@ -726,7 +800,93 @@ impl<R: 'static> Bundle<R> {
         {
             return Err(conflict());
         }
+        if self.acknowledgement.is_some() && matched != ReinstallImageMatch::After {
+            return Err(conflict());
+        }
         Ok(matched)
+    }
+
+    fn adopt_prepared(&mut self) -> PortResult<()> {
+        self.read_control()?;
+        self.require_published_preparation()?;
+        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+        if self.compare_prepared()? == ReinstallImageMatch::After {
+            // A recorded q+1 is recovery of this fixed transition, never q+2.
+            return Ok(());
+        }
+        if self.adoption_attempted || self.acknowledgement.is_some() {
+            return Err(invalid());
+        }
+        let context = prepared.prep.context().clone();
+        if self.store()?.writable {
+            return Err(invalid());
+        }
+        self.close_control()?;
+        self.open_control(true)?;
+        if self.compare_prepared()? != ReinstallImageMatch::Before {
+            return Err(conflict());
+        }
+        self.require_published_preparation()?;
+        self.tick()?;
+        self.adoption_attempted = true;
+        let fixed_owner = ControlId::parse(&context.operation)?;
+        let old_owner = ControlId::parse(&context.old_owner)?;
+        let store = self.store()?;
+        let policy = store.bind_control_root(&self.input.guards.policy_owner)?;
+        let installation = self.installation();
+        store.recover_maintenance(
+            ControlSeq::new(context.old_control_seq)?,
+            &fixed_owner,
+            &policy,
+            &installation,
+            &old_owner,
+            MaintenanceFence {
+                state: MaintenanceState::Recovering,
+                owner: Some(fixed_owner.clone()),
+                phase: Some(MaintenancePhase::Reconciling),
+            },
+        )?;
+        #[cfg(test)]
+        tests::after_adoption()?;
+        self.read_control()?;
+        if self.compare_prepared()? != ReinstallImageMatch::After {
+            return Err(conflict());
+        }
+        self.tick()
+    }
+
+    fn require_published_preparation(&mut self) -> PortResult<()> {
+        self.tick()?;
+        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+        if prepared.stage != ReinstallPreparationStage::Published {
+            return Err(invalid());
+        }
+        self.input
+            .guards
+            .validate(&self.input.root, &self.input.prefix)?;
+        self.input.expected.validate_preparation(&prepared.prep)?;
+        if self.published_preparation.is_none() {
+            self.published_preparation = Some(PublishedPreparation::open(
+                &self.input,
+                &prepared.prep,
+                self.acknowledgement.as_ref(),
+                self.end,
+            )?);
+        }
+        self.published_preparation
+            .as_mut()
+            .ok_or_else(invalid)?
+            .make_durable(
+                &self.input,
+                &prepared.prep,
+                self.acknowledgement.as_ref(),
+                self.end,
+            )?;
+        self.input
+            .guards
+            .prefix
+            .validate_current(&self.input.prefix)?;
+        self.tick()
     }
 
     fn prepare(&mut self, context: &ReinstallContext) -> PortResult<ReinstallPrep> {
@@ -819,13 +979,10 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn open_control(&mut self, writable: bool) -> PortResult<()> {
-        if writable
-            && self
-                .preparation
-                .as_ref()
-                .is_some_and(|prepared| prepared.stage != ReinstallPreparationStage::Published)
-        {
-            return Err(invalid());
+        if writable && self.preparation.is_some() {
+            // Also covers an explicit close followed by reopen_writable.
+            // A public Published comparison never substitutes for these pins.
+            self.require_published_preparation()?;
         }
         self.validate_inputs(false)?;
         if self
@@ -850,6 +1007,8 @@ impl<R: 'static> Bundle<R> {
         }
         self.rendezvous.as_ref().ok_or_else(invalid)?.validate()?;
         let path = SqliteControlStore::path(&self.input.root);
+        #[cfg(test)]
+        tests::observe_control_open(writable);
         let conn = raw_reinstall_connection(&path, writable)?;
         // No fallible call between successful open and owned containment.
         self.control = Some(ControlSlot::captured(conn));
@@ -963,6 +1122,87 @@ impl<R: 'static> Bundle<R> {
             return Err(conflict());
         }
         Ok(after)
+    }
+
+    fn validate_catalog(&mut self, expected: &CatalogIdentity) -> PortResult<()> {
+        self.read_control()?;
+        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+        if prepared.stage != ReinstallPreparationStage::Published
+            || self.compare_prepared()? != ReinstallImageMatch::After
+        {
+            return Err(invalid());
+        }
+        let conn = self.catalog.as_ref().ok_or_else(invalid)?.get()?;
+        require_close_policy(conn)?;
+        verify_reinstall_connection(
+            conn,
+            &self.input.catalog,
+            self.input.files.catalog_main.identity,
+        )?;
+        let current = crate::managed_maintenance::read_reinstall_catalog_identity(
+            conn,
+            self.input.expected.installation(),
+            self.input.expected.incarnation()?,
+            self.end,
+        )?;
+        if &current != expected {
+            return Err(conflict());
+        }
+        self.validate_files(true)?;
+        self.tick()
+    }
+
+    fn prepare_acknowledgement(&mut self, identity: &CatalogIdentity) -> PortResult<ReinstallAck> {
+        self.validate_catalog(identity)?;
+        let ack = match &self.acknowledgement {
+            Some(ack) => ack.clone(),
+            None => {
+                let files = self.observed_files()?;
+                let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+                ReinstallAck::from_observations(
+                    &prepared.prep,
+                    ReinstallCatalogIdentity {
+                        installation: identity.installation.as_str().into(),
+                        incarnation: identity.incarnation.as_str().into(),
+                        schema: identity.schema,
+                        generation: identity.generation,
+                    },
+                    files,
+                )?
+            }
+        };
+        let catalog = ack.catalog_identity();
+        if catalog.installation != identity.installation.as_str()
+            || catalog.incarnation != identity.incarnation.as_str()
+            || catalog.schema != identity.schema
+            || catalog.generation != identity.generation
+        {
+            return Err(conflict());
+        }
+        self.acknowledgement = Some(ack.clone());
+        self.validate_catalog(identity)?;
+        Ok(ack)
+    }
+
+    fn publication(&mut self) -> ReinstallPublication<'_, R> {
+        let guards = &mut self.input.guards;
+        ReinstallPublication {
+            retained: &self.input.retained,
+            guards: ReinstallInspectionGuards {
+                prefix: &guards.prefix,
+                policy_owner: &guards.policy_owner,
+                emission: &guards.emission,
+                supervisor: &guards.supervisor,
+                background: &guards.background,
+                purge: &guards.purge,
+                history_readers: &guards.history_readers,
+                catalog_handles: &guards.catalog_handles,
+                writer: ReinstallWriterRead {
+                    lease: &mut guards.writer,
+                },
+            },
+            end: self.end,
+        }
     }
 
     fn close_all(&mut self) -> PortResult<()> {
@@ -1144,6 +1384,38 @@ impl<R: 'static> ReinstallControlOwner<R> {
         }
     }
 
+    /// ACK recovery fixes both the original Prep and its acknowledged physical
+    /// observations BEFORE opening the first connection. Only recorded After is
+    /// acceptable and no adoption is authorized by this input.
+    pub fn open_acknowledged_read_only(
+        input: ReinstallOwnedInput<R>,
+        prep: ReinstallPrep,
+        ack: ReinstallAck,
+        end: Instant,
+    ) -> Result<Self, Box<ReinstallConnectionError<R>>> {
+        let mut owned = OwnedBundle::new(input, end);
+        owned.bundle_mut().preparation = Some(PreparedRead {
+            prep,
+            stage: ReinstallPreparationStage::Published,
+        });
+        owned.bundle_mut().acknowledgement = Some(ack);
+        match owned.scoped(|bundle| bundle.open_control(false)) {
+            Ok(()) => Ok(Self { owned }),
+            Err(error) => Err(owned.failed(error)),
+        }
+    }
+
+    /// Consume the owner for the one fixed adoption. Failure retains the whole
+    /// bundle and requires request termination; it cannot be retried in place.
+    /// The owner privately binds the exact published Prep under its held prefix
+    /// guard and original end. Selecting Published for comparison grants no write.
+    pub fn adopt_prepared(mut self) -> Result<Self, Box<ReinstallConnectionError<R>>> {
+        match self.owned.scoped(Bundle::adopt_prepared) {
+            Ok(()) => Ok(self),
+            Err(error) => Err(self.owned.failed(error)),
+        }
+    }
+
     /// Only the existing cleanup inspector may borrow the readonly store view.
     /// There is no general store getter, mutable retention payload, raw handle
     /// or callback. Any failure leaves this owner retaining the entire bundle.
@@ -1207,25 +1479,7 @@ impl<R: 'static> ReinstallControlOwner<R> {
             }
             bundle.read_control().map(|_| ())
         })?;
-        let bundle = self.owned.bundle_mut();
-        let guards = &mut bundle.input.guards;
-        Ok(ReinstallPublication {
-            retained: &bundle.input.retained,
-            guards: ReinstallInspectionGuards {
-                prefix: &guards.prefix,
-                policy_owner: &guards.policy_owner,
-                emission: &guards.emission,
-                supervisor: &guards.supervisor,
-                background: &guards.background,
-                purge: &guards.purge,
-                history_readers: &guards.history_readers,
-                catalog_handles: &guards.catalog_handles,
-                writer: ReinstallWriterRead {
-                    lease: &mut guards.writer,
-                },
-            },
-            end: bundle.end,
-        })
+        Ok(self.owned.bundle_mut().publication())
     }
 
     pub fn compare_preparation(
@@ -1302,6 +1556,28 @@ impl<R: 'static> ReinstallQueryOnlyCatalog<R> {
         &self.identity
     }
 
+    pub fn prepare_acknowledgement(
+        mut self,
+    ) -> Result<(Self, ReinstallAck), Box<ReinstallConnectionError<R>>> {
+        match self
+            .owned
+            .scoped(|bundle| bundle.prepare_acknowledgement(&self.identity))
+        {
+            Ok(ack) => Ok((self, ack)),
+            Err(error) => Err(self.owned.failed(error)),
+        }
+    }
+
+    pub fn acknowledgement_publication(&mut self) -> PortResult<ReinstallPublication<'_, R>> {
+        self.owned.scoped(|bundle| {
+            if bundle.acknowledgement.is_none() {
+                return Err(invalid());
+            }
+            bundle.validate_catalog(&self.identity)
+        })?;
+        Ok(self.owned.bundle_mut().publication())
+    }
+
     pub fn close(mut self) -> Result<ReinstallClosed<R>, Box<ReinstallConnectionError<R>>> {
         match self.owned.scoped(Bundle::close_all) {
             Ok(()) => Ok(ReinstallClosed { owned: self.owned }),
@@ -1339,9 +1615,374 @@ impl<R: 'static> ReinstallClosed<R> {
                 _catalog_wal: bundle.catalog_wal,
                 _control_shm: bundle.control_shm,
                 _catalog_shm: bundle.catalog_shm,
+                _published_preparation: bundle.published_preparation,
             },
         }
     }
+}
+
+const PREPARATION_DIRECTORY: &str = ".asg-reinstall";
+const PREPARATION_FILE: &str = "keep-transfer-prep.json";
+const PREPARATION_RECORD_LIMIT: u64 = 8192;
+const HANDOFF_RECORD_LIMIT: u64 = 4 * 1024 * 1024;
+
+fn preparation_tick(end: Instant) -> PortResult<()> {
+    runtime_tick()?;
+    if Instant::now() >= end {
+        return Err(PortError::WriterBusy(
+            "control runtime deadline reached".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only the existing, exact published layout can be observed here. In particular,
+/// a caller-supplied Published enum never promotes a pending or missing record.
+fn published_preparation_layout(
+    sidecar: &Path,
+    has_acknowledgement: bool,
+    end: Instant,
+) -> PortResult<Option<&'static str>> {
+    preparation_tick(end)?;
+    private_directory(sidecar, false)?;
+    let mut members = 0u8;
+    for (ordinal, entry) in fs::read_dir(sidecar).map_err(io_error)?.enumerate() {
+        preparation_tick(end)?;
+        if ordinal >= 6 {
+            return Err(invalid());
+        }
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let bit = match name.to_str().ok_or_else(invalid)? {
+            "intent.json" => 1,
+            "ready.json" => 2,
+            "consumed.json" => 4,
+            "evidence" => 8,
+            PREPARATION_FILE => 16,
+            "keep-transfer-ack.pending" if has_acknowledgement => 32,
+            "keep-transfer-ack.json" if has_acknowledgement => 64,
+            _ => return Err(invalid()),
+        };
+        if members & bit != 0 {
+            return Err(invalid());
+        }
+        members |= bit;
+    }
+    preparation_tick(end)?;
+    match (members, has_acknowledgement) {
+        (31, false) => Ok(None),
+        (63, true) => Ok(Some("keep-transfer-ack.pending")),
+        (95, true) => Ok(Some("keep-transfer-ack.json")),
+        _ => Err(invalid()),
+    }
+}
+
+impl PreparationRecordPin {
+    fn open(
+        path: &Path,
+        sha256: ReinstallDigest,
+        limit: u64,
+        exact_size: Option<u64>,
+        end: Instant,
+    ) -> PortResult<Self> {
+        preparation_tick(end)?;
+        let file = open_reinstall_pin(path)?;
+        let size = file.metadata().map_err(io_error)?.len();
+        if size == 0 || size > limit || exact_size.is_some_and(|expected| size != expected) {
+            return Err(invalid());
+        }
+        let binding = ReinstallFileBinding {
+            identity: reinstall_file_identity(&file)?,
+            size,
+            sha256,
+        };
+        let mut pin = Self { file, binding };
+        pin.validate(path, end)?;
+        Ok(pin)
+    }
+
+    fn validate(&mut self, path: &Path, end: Instant) -> PortResult<()> {
+        verify_reinstall_file_bytes(path, &mut self.file, &self.binding, end)
+    }
+
+    fn sync(&mut self, sidecar: &Path, name: &'static str, end: Instant) -> PortResult<()> {
+        let path = sidecar.join(name);
+        self.validate(&path, end)?;
+        // FlushFileBuffers requires a writable handle. It is opened without
+        // create/truncate, checked against the already retained exact inode and
+        // bytes, and never used to write or replace content.
+        let mut file = open_preparation_sync_pin(&path)?;
+        verify_reinstall_file_bytes(&path, &mut file, &self.binding, end)?;
+        preparation_tick(end)?;
+        #[cfg(test)]
+        tests::before_preparation_sync(tests::PreparationSync::Record(name), end)?;
+        file.sync_all().map_err(io_error)?;
+        #[cfg(test)]
+        tests::after_preparation_sync(tests::PreparationSync::Record(name), end);
+        // This is admission to a later write, not a completed SQL ACK. A flush
+        // admitted before E but completing at/after E cannot authorize that write.
+        preparation_tick(end)?;
+        self.validate(&path, end)
+    }
+}
+
+impl PublishedPreparation {
+    fn open<R: 'static>(
+        input: &ReinstallOwnedInput<R>,
+        prep: &ReinstallPrep,
+        ack: Option<&ReinstallAck>,
+        end: Instant,
+    ) -> PortResult<Self> {
+        preparation_tick(end)?;
+        let sidecar = input.prefix.join(PREPARATION_DIRECTORY);
+        let _ = published_preparation_layout(&sidecar, ack.is_some(), end)?;
+        let context = prep.context();
+        private_directory(&sidecar.join("evidence"), false)?;
+        let directories = [
+            open_preparation_directory(&input.prefix)?,
+            open_preparation_directory(&input.root)?,
+            open_preparation_directory(&sidecar)?,
+            open_preparation_directory(&sidecar.join("evidence"))?,
+        ];
+        let bytes = prep.encode()?;
+        let records = [
+            PreparationRecordPin::open(
+                &sidecar.join("intent.json"),
+                context.intent_sha256,
+                HANDOFF_RECORD_LIMIT,
+                None,
+                end,
+            )?,
+            PreparationRecordPin::open(
+                &sidecar.join("ready.json"),
+                context.ready_sha256,
+                HANDOFF_RECORD_LIMIT,
+                None,
+                end,
+            )?,
+            PreparationRecordPin::open(
+                &sidecar.join("consumed.json"),
+                context.consumed_sha256,
+                HANDOFF_RECORD_LIMIT,
+                None,
+                end,
+            )?,
+            PreparationRecordPin::open(
+                &sidecar.join(PREPARATION_FILE),
+                ReinstallDigest::of_bytes(&bytes),
+                PREPARATION_RECORD_LIMIT,
+                Some(bytes.len() as u64),
+                end,
+            )?,
+        ];
+        let mut proof = Self {
+            directories,
+            records,
+            durability_confirmed: false,
+        };
+        proof.validate(input, prep, ack, end)?;
+        Ok(proof)
+    }
+
+    fn make_durable<R: 'static>(
+        &mut self,
+        input: &ReinstallOwnedInput<R>,
+        prep: &ReinstallPrep,
+        ack: Option<&ReinstallAck>,
+        end: Instant,
+    ) -> PortResult<()> {
+        self.validate(input, prep, ack, end)?;
+        if self.durability_confirmed {
+            return Ok(());
+        }
+        let sidecar = input.prefix.join(PREPARATION_DIRECTORY);
+        for (name, record) in [
+            "intent.json",
+            "ready.json",
+            "consumed.json",
+            PREPARATION_FILE,
+        ]
+        .into_iter()
+        .zip(&mut self.records)
+        {
+            record.sync(&sidecar, name, end)?;
+        }
+        // As in the existing CLI publish_record final-name recovery, Windows
+        // flushes the exact file via FlushFileBuffers; it has no general
+        // unprivileged directory fsync. Never rename/replay a published record
+        // or count a no-op directory helper as a durability barrier.
+        #[cfg(unix)]
+        for (name, ordinal) in [("evidence", 3), ("sidecar", 2), ("prefix", 0)] {
+            preparation_tick(end)?;
+            #[cfg(test)]
+            tests::before_preparation_sync(tests::PreparationSync::Directory(name), end)?;
+            self.directories[ordinal].sync_all().map_err(io_error)?;
+            #[cfg(test)]
+            tests::after_preparation_sync(tests::PreparationSync::Directory(name), end);
+            #[cfg(not(test))]
+            let _ = name;
+            preparation_tick(end)?;
+        }
+        self.validate(input, prep, ack, end)?;
+        // Only the real successful barriers and the original-end revalidation
+        // set this private state. It remains attached to these exact held pins.
+        self.durability_confirmed = true;
+        Ok(())
+    }
+
+    fn validate<R: 'static>(
+        &mut self,
+        input: &ReinstallOwnedInput<R>,
+        prep: &ReinstallPrep,
+        ack: Option<&ReinstallAck>,
+        end: Instant,
+    ) -> PortResult<()> {
+        preparation_tick(end)?;
+        input.guards.prefix.validate_current(&input.prefix)?;
+        input.guards.policy_owner.validate_current(&input.root)?;
+        input.expected.validate_preparation(prep)?;
+        let context = prep.context();
+        let sidecar = input.prefix.join(PREPARATION_DIRECTORY);
+        let acknowledgement = published_preparation_layout(&sidecar, ack.is_some(), end)?;
+        private_directory(&sidecar.join("evidence"), false)?;
+        for ((path, expected), held) in [
+            (&input.prefix, context.roots.prefix),
+            (&input.root, context.roots.data),
+            (&sidecar, context.sidecar_identity),
+            (&sidecar.join("evidence"), context.evidence_identity),
+        ]
+        .into_iter()
+        .zip(&self.directories)
+        {
+            preparation_tick(end)?;
+            let named = open_preparation_directory(path)?;
+            if !held.metadata().map_err(io_error)?.is_dir()
+                || reinstall_file_identity(held)? != expected
+                || reinstall_file_identity(&named)? != expected
+            {
+                return Err(conflict());
+            }
+        }
+        for (name, pin) in [
+            "intent.json",
+            "ready.json",
+            "consumed.json",
+            PREPARATION_FILE,
+        ]
+        .into_iter()
+        .zip(&mut self.records)
+        {
+            pin.validate(&sidecar.join(name), end)?;
+        }
+        match (acknowledgement, ack) {
+            (Some(name), Some(ack)) => {
+                let bytes = ack.encode(prep)?;
+                // ACK.pending must remain publishable by its existing CLI
+                // owner. Validate it here, but retain only immutable Prep pins.
+                PreparationRecordPin::open(
+                    &sidecar.join(name),
+                    ReinstallDigest::of_bytes(&bytes),
+                    PREPARATION_RECORD_LIMIT,
+                    Some(bytes.len() as u64),
+                    end,
+                )?;
+            }
+            (None, None) => {}
+            _ => return Err(invalid()),
+        }
+        if self.records[3].binding.sha256 != prep.sha256()? {
+            return Err(conflict());
+        }
+        input.guards.prefix.validate_current(&input.prefix)?;
+        preparation_tick(end)
+    }
+}
+
+#[cfg(any(
+    windows,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+fn open_preparation_directory(path: &Path) -> PortResult<fs::File> {
+    reject_links(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            crate::managed_locks::platform::NOFOLLOW
+                | crate::managed_locks::platform::NONBLOCK
+                | crate::managed_locks::platform::CLOEXEC
+                | crate::managed_locks::platform::DIRECTORY,
+        );
+    }
+    let file = options.open(path).map_err(io_error)?;
+    if !file.metadata().map_err(io_error)?.is_dir() {
+        return Err(invalid());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(
+    windows,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+)))]
+fn open_preparation_directory(_: &Path) -> PortResult<fs::File> {
+    Err(invalid())
+}
+
+fn open_preparation_sync_pin(path: &Path) -> PortResult<fs::File> {
+    private_file(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            crate::managed_locks::platform::NOFOLLOW
+                | crate::managed_locks::platform::NONBLOCK
+                | crate::managed_locks::platform::CLOEXEC,
+        );
+    }
+    let file = options.open(path).map_err(io_error)?;
+    #[cfg(windows)]
+    windows_private::validate_private_read(path, &file)?;
+    #[cfg(not(windows))]
+    verify_private(path, &file.metadata().map_err(io_error)?)?;
+    Ok(file)
 }
 
 fn raw_reinstall_connection(path: &Path, writable: bool) -> PortResult<Connection> {
@@ -1638,6 +2279,70 @@ fn verify_reinstall_connection(
     runtime_tick()
 }
 
+fn observe_reinstall_file(
+    path: &Path,
+    file: &mut fs::File,
+    end: Instant,
+) -> PortResult<ReinstallFileBinding> {
+    runtime_tick()?;
+    if Instant::now() >= end {
+        return Err(PortError::WriterBusy(
+            "control runtime deadline reached".into(),
+        ));
+    }
+    private_file(path)?;
+    let identity = reinstall_file_identity(file)?;
+    let size = file.metadata().map_err(io_error)?.len();
+    if size > 16 * 1024 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let mut hash = Sha256::new();
+    let mut bytes = [0; 65536];
+    let mut read = 0u64;
+    loop {
+        runtime_tick()?;
+        if Instant::now() >= end {
+            return Err(PortError::WriterBusy(
+                "control runtime deadline reached".into(),
+            ));
+        }
+        let count = file.read(&mut bytes).map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        read = read.checked_add(count as u64).ok_or_else(invalid)?;
+        if read > size {
+            return Err(conflict());
+        }
+        hash.update(&bytes[..count]);
+    }
+    if read != size {
+        return Err(conflict());
+    }
+    let binding = ReinstallFileBinding {
+        identity,
+        size,
+        sha256: ReinstallDigest(hash.finalize().into()),
+    };
+    verify_reinstall_file_bytes(path, file, &binding, end)?;
+    Ok(binding)
+}
+
+fn observe_shm(pin: &ObservedShm) -> PortResult<ReinstallShmBinding> {
+    let size = pin.file.metadata().map_err(io_error)?.len();
+    if reinstall_file_identity(&pin.file)? != pin.identity
+        || size > 64 * 1024 * 1024
+        || !size.is_multiple_of(32768)
+    {
+        return Err(conflict());
+    }
+    Ok(ReinstallShmBinding {
+        identity: pin.identity,
+        size,
+    })
+}
+
 fn verify_reinstall_file_bytes(
     path: &Path,
     file: &mut fs::File,
@@ -1740,9 +2445,105 @@ mod tests {
         WritableCatalog,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum PreparationSync {
+        Record(&'static str),
+        #[cfg(unix)]
+        Directory(&'static str),
+    }
+
+    #[derive(Clone, Copy)]
+    enum SyncFault {
+        Failure(PreparationSync),
+        ExpireAfter(PreparationSync),
+    }
+
+    struct PreparationSyncObservation {
+        previous_fault: Option<SyncFault>,
+        previous_events: Vec<PreparationSync>,
+    }
+
+    impl PreparationSyncObservation {
+        fn start(fault: Option<SyncFault>) -> Self {
+            Self {
+                previous_fault: PREPARATION_SYNC_FAULT.with(|slot| slot.replace(fault)),
+                previous_events: PREPARATION_SYNCS
+                    .with(|slot| std::mem::take(&mut *slot.borrow_mut())),
+            }
+        }
+    }
+
+    impl Drop for PreparationSyncObservation {
+        fn drop(&mut self) {
+            PREPARATION_SYNC_FAULT.with(|slot| slot.set(self.previous_fault));
+            PREPARATION_SYNCS.with(|slot| {
+                *slot.borrow_mut() = std::mem::take(&mut self.previous_events);
+            });
+        }
+    }
+
     thread_local! {
         static PANIC_AFTER_OPEN: Cell<Option<OpenKind>> = const { Cell::new(None) };
         static PANIC_AFTER_TAKE: Cell<bool> = const { Cell::new(false) };
+        static FAIL_AFTER_ADOPTION: Cell<bool> = const { Cell::new(false) };
+        static ADOPTION_COMMITS: Cell<usize> = const { Cell::new(0) };
+        static WRITABLE_CONTROL_OPENS: Cell<usize> = const { Cell::new(0) };
+        static PREPARATION_SYNC_FAULT: Cell<Option<SyncFault>> = const { Cell::new(None) };
+        static PREPARATION_SYNCS: RefCell<Vec<PreparationSync>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn before_preparation_sync(
+        boundary: PreparationSync,
+        end: Instant,
+    ) -> PortResult<()> {
+        preparation_tick(end)?;
+        if PREPARATION_SYNC_FAULT.with(|slot| {
+            if matches!(slot.get(), Some(SyncFault::Failure(expected)) if expected == boundary) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err(io_error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn after_preparation_sync(boundary: PreparationSync, end: Instant) {
+        PREPARATION_SYNCS.with(|slot| slot.borrow_mut().push(boundary));
+        if PREPARATION_SYNC_FAULT.with(|slot| {
+            if matches!(slot.get(), Some(SyncFault::ExpireAfter(expected)) if expected == boundary)
+            {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            // Model a successfully completed, nonpreemptible fsync that consumed
+            // the remaining call budget. Neither the recorded end nor TLS time
+            // is changed; only this isolated test waits for the existing E.
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    pub(super) fn observe_control_open(writable: bool) {
+        if writable {
+            WRITABLE_CONTROL_OPENS.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    pub(super) fn after_adoption() -> PortResult<()> {
+        ADOPTION_COMMITS.with(|count| count.set(count.get() + 1));
+        if FAIL_AFTER_ADOPTION.with(|flag| flag.replace(false)) {
+            return Err(PortError::Backend(
+                "synthetic adoption acknowledgement failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn after_containment(kind: OpenKind) {
@@ -2068,6 +2869,17 @@ mod tests {
             panic!("fixture expects exact status");
         };
         let data = reinstall_file_identity(&input.retained._data_root).unwrap();
+        let sidecar = input.prefix.join(PREPARATION_DIRECTORY);
+        let evidence = sidecar.join("evidence");
+        private_directory(&sidecar, true).unwrap();
+        private_directory(&evidence, true).unwrap();
+        for (name, bytes) in [
+            ("intent.json", b"synthetic fixed intent".as_slice()),
+            ("ready.json", b"synthetic ready record"),
+            ("consumed.json", b"synthetic consumed record"),
+        ] {
+            write_preparation_fixture_record(&sidecar.join(name), bytes);
+        }
         ReinstallContext {
             operation: "close-fixed-owner".into(),
             intent_sha256: ReinstallDigest::of_bytes(b"synthetic fixed intent"),
@@ -2080,8 +2892,8 @@ mod tests {
                 journal: data,
                 helper: data,
             },
-            sidecar_identity: data,
-            evidence_identity: data,
+            sidecar_identity: reinstall_file_identity(&directory_pin(&sidecar)).unwrap(),
+            evidence_identity: reinstall_file_identity(&directory_pin(&evidence)).unwrap(),
             old_owner: "close-old-owner".into(),
             installation: status.policy.installation_id.as_str().into(),
             incarnation: status.catalog_incarnation.as_ref().unwrap().as_str().into(),
@@ -2091,6 +2903,66 @@ mod tests {
             user_version: VERSION as u32,
             schema_sha256: ReinstallContext::current_schema_digest(),
             sqlite_policy: "no-close-checkpoint/v1".into(),
+        }
+    }
+
+    fn create_preparation_fixture_record(path: &Path, bytes: &[u8]) -> fs::File {
+        #[cfg(windows)]
+        let mut file = windows_private::create_file(path).unwrap();
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap()
+        };
+        file.write_all(bytes).unwrap();
+        file
+    }
+
+    fn write_preparation_fixture_record(path: &Path, bytes: &[u8]) {
+        let file = create_preparation_fixture_record(path, bytes);
+        file.sync_all().unwrap();
+    }
+
+    fn publish_preparation_fixture<R: 'static>(
+        owner: &ReinstallControlOwner<R>,
+        prep: &ReinstallPrep,
+    ) {
+        let sidecar = owner
+            .owned
+            .bundle()
+            .input
+            .prefix
+            .join(PREPARATION_DIRECTORY);
+        let pending = sidecar.join("keep-transfer-prep.pending");
+        let published = sidecar.join(PREPARATION_FILE);
+        write_preparation_fixture_record(&pending, &prep.encode().unwrap());
+        assert!(!published.exists());
+        #[cfg(unix)]
+        {
+            fs::hard_link(&pending, &published).unwrap();
+            fs::remove_file(&pending).unwrap();
+            directory_pin(&sidecar).sync_all().unwrap();
+            directory_pin(&owner.owned.bundle().input.prefix)
+                .sync_all()
+                .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+            let from: Vec<_> = pending.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<_> = published.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: live, terminated names; no REPLACE_EXISTING flag. This
+            // fixture uses the same write-through publication as the real CLI.
+            assert_ne!(
+                unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) },
+                0
+            );
         }
     }
 
@@ -2206,33 +3078,37 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(30);
         let owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
         let (owner, prep) = owner.prepare(&context).unwrap();
+        publish_preparation_fixture(&owner, &prep);
         let (owner, matched) = owner
             .compare_preparation(&prep, ReinstallPreparationStage::Published)
             .unwrap();
         assert_eq!(matched, ReinstallImageMatch::Before);
-        let mut owner = owner.close().unwrap().reopen_writable().unwrap();
-        owner
-            .owned
-            .scoped(|bundle| {
-                let store = bundle.store()?;
-                let policy = store.bind_control_root(&bundle.input.guards.policy_owner)?;
-                let installation = bundle.installation();
-                let changed = store.recover_maintenance(
-                    seq(context.old_control_seq)?,
-                    &cid(&context.operation),
-                    &policy,
-                    &installation,
-                    &cid(&context.old_owner),
-                    MaintenanceFence {
-                        state: MaintenanceState::Recovering,
-                        owner: Some(cid(&context.operation)),
-                        phase: Some(MaintenancePhase::Reconciling),
-                    },
-                )?;
-                assert_eq!(changed.control_seq.get(), context.old_control_seq + 1);
-                Ok(())
-            })
-            .unwrap();
+        let _syncs = PreparationSyncObservation::start(None);
+        let committed = ADOPTION_COMMITS.with(Cell::get);
+        let writable_opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        let owner = owner.adopt_prepared().unwrap();
+        assert_eq!(ADOPTION_COMMITS.with(Cell::get), committed + 1);
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), writable_opens + 1);
+        let expected_syncs = vec![
+            PreparationSync::Record("intent.json"),
+            PreparationSync::Record("ready.json"),
+            PreparationSync::Record("consumed.json"),
+            PreparationSync::Record(PREPARATION_FILE),
+        ];
+        #[cfg(unix)]
+        let expected_syncs = {
+            let mut expected = expected_syncs;
+            expected.extend([
+                PreparationSync::Directory("evidence"),
+                PreparationSync::Directory("sidecar"),
+                PreparationSync::Directory("prefix"),
+            ]);
+            expected
+        };
+        assert_eq!(
+            PREPARATION_SYNCS.with(|slot| slot.borrow().clone()),
+            expected_syncs
+        );
         let (owner, matched) = owner
             .compare_preparation(&prep, ReinstallPreparationStage::Published)
             .unwrap();
@@ -2271,6 +3147,9 @@ mod tests {
             .compare_preparation(&prep, ReinstallPreparationStage::Published)
             .unwrap();
         assert_eq!(matched, ReinstallImageMatch::After);
+        let recovered = recovered.adopt_prepared().unwrap();
+        assert_eq!(ADOPTION_COMMITS.with(Cell::get), committed + 1);
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), writable_opens + 1);
         let (recovered, status) = recovered.read_bound_status().unwrap();
         assert_eq!(status.policy.control_seq.get(), context.old_control_seq + 1);
         drop(recovered.close().unwrap().into_resources());
@@ -2432,7 +3311,14 @@ mod tests {
             assert_eq!(step, CleanupStep::Abort);
             abort_unconfirmed_child_cleanup();
         }
-        let input = fixture(&base, mode != "inspection-writer", true);
+        let input = fixture(
+            &base,
+            mode != "inspection-writer" && !mode.starts_with("adoption-"),
+            true,
+        );
+        let adoption_context = mode
+            .starts_with("adoption-")
+            .then(|| preparation_context(&input));
         let before = durable_snapshot(&input.root);
         let root = input.root.clone();
         let until = Instant::now() + Duration::from_secs(30);
@@ -2476,6 +3362,228 @@ mod tests {
         } else {
             let mut owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
             match mode.as_str() {
+                "adoption-pending" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Pending)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    let error = match prepared.adopt_prepared() {
+                        Ok(_) => panic!("unpublished preparation allowed adoption"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert!(!error.close_attempted());
+                    assert!(matches!(error.error(), PortError::InvalidRequest(_)));
+                    assert_eq!(ADOPTION_COMMITS.with(Cell::get), 0);
+                    drop(error);
+                }
+                "adoption-published-absent"
+                | "adoption-published-pending"
+                | "adoption-published-both"
+                | "adoption-published-changed"
+                | "adoption-published-unknown" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    let sidecar = prepared
+                        .owned
+                        .bundle()
+                        .input
+                        .prefix
+                        .join(PREPARATION_DIRECTORY);
+                    if mode != "adoption-published-absent" {
+                        let bytes = prep.encode().unwrap();
+                        let pending = sidecar.join("keep-transfer-prep.pending");
+                        match mode.as_str() {
+                            "adoption-published-pending" => {
+                                write_preparation_fixture_record(&pending, &bytes);
+                            }
+                            "adoption-published-both" => {
+                                publish_preparation_fixture(&prepared, &prep);
+                                write_preparation_fixture_record(&pending, &bytes);
+                            }
+                            "adoption-published-changed" => {
+                                write_preparation_fixture_record(
+                                    &sidecar.join(PREPARATION_FILE),
+                                    b"{}",
+                                );
+                            }
+                            "adoption-published-unknown" => {
+                                publish_preparation_fixture(&prepared, &prep);
+                                write_preparation_fixture_record(
+                                    &sidecar.join("foreign-record"),
+                                    b"unowned",
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let record_snapshot = || {
+                        fs::read_dir(&sidecar)
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .filter(|entry| entry.file_type().unwrap().is_file())
+                            .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                            .collect::<BTreeMap<_, _>>()
+                    };
+                    let fixed_records = record_snapshot();
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    let error = match prepared.adopt_prepared() {
+                        Ok(_) => panic!("a comparison mode authorized unpublished adoption"),
+                        Err(error) => error,
+                    };
+                    assert!(matches!(error.error(), PortError::InvalidRequest(_)));
+                    assert!(error.requires_process_exit());
+                    assert!(!error.close_attempted());
+                    assert!(!error.owned.bundle().store().unwrap().writable);
+                    assert!(!error.owned.bundle().adoption_attempted);
+                    assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), 0);
+                    assert_eq!(ADOPTION_COMMITS.with(Cell::get), 0);
+                    assert_eq!(
+                        error
+                            .owned
+                            .bundle()
+                            .store()
+                            .unwrap()
+                            .conn
+                            .borrow()
+                            .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                    assert_eq!(record_snapshot(), fixed_records);
+                    drop(error);
+                }
+                "adoption-prep-sync-failure" | "adoption-prep-sync-expired" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    let sidecar = prepared
+                        .owned
+                        .bundle()
+                        .input
+                        .prefix
+                        .join(PREPARATION_DIRECTORY);
+                    let published = sidecar.join(PREPARATION_FILE);
+                    let bytes = prep.encode().unwrap();
+                    // Deliberately visible final bytes without any sync. This
+                    // is the reviewed pre-barrier crash/failure window.
+                    drop(create_preparation_fixture_record(&published, &bytes));
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    let expired = mode == "adoption-prep-sync-expired";
+                    let boundary = PreparationSync::Record(PREPARATION_FILE);
+                    let _syncs = PreparationSyncObservation::start(Some(if expired {
+                        SyncFault::ExpireAfter(boundary)
+                    } else {
+                        SyncFault::Failure(boundary)
+                    }));
+                    let original_end = if expired {
+                        until.min(Instant::now() + Duration::from_secs(5))
+                    } else {
+                        until
+                    };
+                    let busy = Duration::from_millis(37);
+                    let outer = RuntimeDeadlineScope::enter_with_busy(original_end, busy).unwrap();
+                    let error = match prepared.adopt_prepared() {
+                        Ok(_) => {
+                            panic!("visible Prep admitted adoption without successful barriers")
+                        }
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert!(!error.close_attempted());
+                    assert!(!error.owned.bundle().store().unwrap().writable);
+                    assert!(!error.owned.bundle().adoption_attempted);
+                    let proof = error.owned.bundle().published_preparation.as_ref().unwrap();
+                    assert!(!proof.durability_confirmed);
+                    assert_eq!(error.owned.bundle().end, original_end);
+                    assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), 0);
+                    assert_eq!(ADOPTION_COMMITS.with(Cell::get), 0);
+                    assert!(PREPARATION_SYNC_FAULT.with(|slot| slot.get().is_none()));
+                    assert_eq!(
+                        PREPARATION_SYNCS.with(|slot| slot.borrow().contains(&boundary)),
+                        expired
+                    );
+                    if expired {
+                        assert!(matches!(error.error(), PortError::WriterBusy(_)));
+                        assert!(Instant::now() >= original_end);
+                    } else {
+                        assert!(matches!(error.error(), PortError::Backend(_)));
+                    }
+                    assert_eq!(runtime_deadline(), Some(original_end));
+                    assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), busy);
+                    assert_eq!(fs::read(&published).unwrap(), bytes);
+                    drop(outer);
+                    drop(error);
+                }
+                #[cfg(unix)]
+                "adoption-directory-sync-failure" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    publish_preparation_fixture(&prepared, &prep);
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    let _syncs = PreparationSyncObservation::start(Some(SyncFault::Failure(
+                        PreparationSync::Directory("prefix"),
+                    )));
+                    let error = match prepared.adopt_prepared() {
+                        Ok(_) => panic!("failed directory barrier allowed writable admission"),
+                        Err(error) => error,
+                    };
+                    assert!(matches!(error.error(), PortError::Backend(_)));
+                    assert!(error.requires_process_exit());
+                    assert!(!error.close_attempted());
+                    assert!(!error.owned.bundle().store().unwrap().writable);
+                    assert!(
+                        !error
+                            .owned
+                            .bundle()
+                            .published_preparation
+                            .as_ref()
+                            .unwrap()
+                            .durability_confirmed
+                    );
+                    assert!(PREPARATION_SYNC_FAULT.with(|slot| slot.get().is_none()));
+                    assert!(PREPARATION_SYNCS.with(|slot| {
+                        slot.borrow()
+                            .contains(&PreparationSync::Directory("sidecar"))
+                    }));
+                    assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), 0);
+                    assert_eq!(ADOPTION_COMMITS.with(Cell::get), 0);
+                    drop(error);
+                }
+                "adoption-lost-ack" => {
+                    let context = adoption_context.as_ref().unwrap();
+                    let (prepared, prep) = owner.prepare(context).unwrap();
+                    publish_preparation_fixture(&prepared, &prep);
+                    let (prepared, matched) = prepared
+                        .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                        .unwrap();
+                    assert_eq!(matched, ReinstallImageMatch::Before);
+                    FAIL_AFTER_ADOPTION.with(|flag| flag.set(true));
+                    let mut error = match prepared.adopt_prepared() {
+                        Ok(_) => panic!("synthetic lost acknowledgement was not reached"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert!(matches!(error.error(), PortError::Backend(_)));
+                    assert_eq!(ADOPTION_COMMITS.with(Cell::get), 1);
+                    let status = error.owned.scoped(Bundle::read_control).unwrap();
+                    assert_eq!(status.policy.control_seq.get(), context.old_control_seq + 1);
+                    assert_eq!(
+                        status.policy.maintenance.owner.as_ref(),
+                        Some(&cid(&context.operation))
+                    );
+                    drop(error);
+                }
                 "inspection-writer" => {
                     {
                         let mut view = owner.inspection().unwrap();
@@ -2622,7 +3730,17 @@ mod tests {
                 _ => panic!("unknown isolated close test mode"),
             }
         }
-        assert_eq!(durable_snapshot(&root), before);
+        let current = durable_snapshot(&root);
+        if mode == "adoption-lost-ack" {
+            assert_ne!(current.get("control.db-wal"), before.get("control.db-wal"));
+            for (name, bytes) in &before {
+                if name != "control.db-wal" {
+                    assert_eq!(current.get(name), Some(bytes), "{name}");
+                }
+            }
+        } else {
+            assert_eq!(current, before);
+        }
         assert!(!base.join("retained-dropped").exists());
         assert_eq!(runtime_deadline(), None);
         assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
@@ -3410,6 +4528,98 @@ mod tests {
     #[test]
     fn reinstall_control_busy_after_catalog_close_retains_the_complete_bundle() {
         retained_case("control-busy-after-catalog");
+    }
+
+    #[test]
+    fn reinstall_adoption_lost_ack_retains_committed_owner_until_process_exit() {
+        retained_case("adoption-lost-ack");
+    }
+
+    #[test]
+    fn reinstall_unpublished_preparation_refuses_adoption_and_retains_resources() {
+        retained_case("adoption-pending");
+    }
+
+    #[test]
+    fn reinstall_published_comparison_without_prep_never_opens_writable_or_adopts() {
+        retained_case("adoption-published-absent");
+    }
+
+    #[test]
+    fn reinstall_published_comparison_with_only_pending_never_opens_writable_or_adopts() {
+        retained_case("adoption-published-pending");
+    }
+
+    #[test]
+    fn reinstall_visible_prep_sync_failure_retains_owner_without_writable_open() {
+        retained_case("adoption-prep-sync-failure");
+    }
+
+    #[test]
+    fn reinstall_prep_sync_reaching_original_end_refuses_before_writable_open() {
+        retained_case("adoption-prep-sync-expired");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_prep_directory_sync_failure_refuses_before_writable_open() {
+        retained_case("adoption-directory-sync-failure");
+    }
+
+    #[test]
+    fn reinstall_published_comparison_cannot_bypass_admission_through_closed_owner() {
+        for only_pending in [false, true] {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let input = fixture(temp.path(), false, true);
+            let context = preparation_context(&input);
+            let root = input.root.clone();
+            let until = Instant::now() + Duration::from_secs(30);
+            let owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+            let (owner, prep) = owner.prepare(&context).unwrap();
+            if only_pending {
+                write_preparation_fixture_record(
+                    &owner
+                        .owned
+                        .bundle()
+                        .input
+                        .prefix
+                        .join(PREPARATION_DIRECTORY)
+                        .join("keep-transfer-prep.pending"),
+                    &prep.encode().unwrap(),
+                );
+            }
+            let (owner, matched) = owner
+                .compare_preparation(&prep, ReinstallPreparationStage::Published)
+                .unwrap();
+            assert_eq!(matched, ReinstallImageMatch::Before);
+            let closed = owner.close().unwrap();
+            let before = durable_snapshot(&root);
+            let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+            let commits = ADOPTION_COMMITS.with(Cell::get);
+            let error = match closed.reopen_writable() {
+                Ok(_) => panic!("confirmed close converted comparison into publication authority"),
+                Err(error) => error,
+            };
+            assert!(matches!(error.error(), PortError::InvalidRequest(_)));
+            assert!(!error.requires_process_exit());
+            assert_eq!(error.owned.bundle().end, until);
+            assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+            assert_eq!(ADOPTION_COMMITS.with(Cell::get), commits);
+            assert_eq!(durable_snapshot(&root), before);
+            drop(error);
+            contenders(temp.path(), false);
+        }
+    }
+
+    #[test]
+    fn reinstall_published_comparison_refuses_both_changed_and_unknown_layouts() {
+        for mode in [
+            "adoption-published-both",
+            "adoption-published-changed",
+            "adoption-published-unknown",
+        ] {
+            retained_case(mode);
+        }
     }
 
     #[test]
