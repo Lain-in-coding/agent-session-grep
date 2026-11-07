@@ -2282,9 +2282,11 @@ impl Fixture {
         let guard = lock(&self.root, LockKind::Background);
         let worker = self
             .control
-            .bind_worker(&guard, id("private-boot"))
+            .with_runtime_deadline(self.prepare_end, || {
+                self.control.bind_worker(&guard, id("private-boot"))
+            })
             .unwrap();
-        let store = ManagedStore::open_for_write(&self.db, &self.control).unwrap();
+        let store = self.prepare_control(|control| ManagedStore::open_for_write(&self.db, control));
         let session = entity(IdKind::Session, "00000000-0000-4000-8000-00000000c0de");
         let document = entity(IdKind::Document, "00000000-0000-4000-8000-00000000d0c5");
         let mut observation = self.observation.clone();
@@ -2353,9 +2355,7 @@ impl Fixture {
             batch.placements.push(placement);
             messages.push(message);
         }
-        store
-            .commit_source(&self.control, &worker, &batch, &observation)
-            .unwrap();
+        self.prepare_control(|control| store.commit_source(control, &worker, &batch, &observation));
         Replay {
             session,
             document,
