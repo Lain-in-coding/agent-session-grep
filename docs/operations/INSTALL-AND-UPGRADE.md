@@ -773,6 +773,15 @@ Managed default/keep-data uninstall is implemented with bounded pending cleanup;
 actual native completion/recovery remains an acceptance gate. The historical
 source uninstaller below does not implement that managed policy.
 
+Reinstalling into a completed managed-uninstall prefix is still under
+implementation. Current package installers accept a new absent prefix or verify
+an existing installation of the identical package. Do not remove retained
+uninstall evidence or manually clear the maintenance state to make a prefix
+look new. The internal keep-data receiver has an exact final control transition,
+but automatic activation, old setup/PATH ownership retirement, the empty-data
+creation path and the full repeated uninstall/install drill remain required
+before this becomes a supported installer flow.
+
 ## Existing source installation
 
 The remainder of this guide describes the unchanged source-only installation

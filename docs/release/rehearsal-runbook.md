@@ -514,6 +514,17 @@ Repeat the selected §1 installation path. Verify the second install behaves
 identically for that path. The rehearsal db is
 untouched (install must not delete user data).
 
+For a managed candidate, also run completed uninstall followed by ordinary
+installation at the same physical prefix and data path, separately for
+`--keep-data` and default removal. Keep-data preserves selected scopes,
+pause/stop intent, installation identity and exact original evidence. Default
+creates a new empty lifecycle without old grants. Exercise interruption and
+lost acknowledgement at activation, then perform a second uninstall with its
+new owner. Old helpers and receipts must not become active again. Both package
+installers must reach this flow without a private command or manual record
+removal. These gates are currently open; a storage receiver test or identical
+package repeat-install success does not satisfy them.
+
 **Run id**: `reinstall-<platform>-<date>`.
 
 ---
