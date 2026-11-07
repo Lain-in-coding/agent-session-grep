@@ -11,19 +11,28 @@ pub(super) enum BorrowedKeepDataCheck {
     Catalog,
 }
 type BorrowedKeepDataHook = Box<dyn FnMut(BorrowedKeepDataCheck) -> Result<(), PortError>>;
-type CompletionPassHook = Box<dyn FnMut()>;
+type CompletionPassHook = Box<dyn FnMut(&mut Instant)>;
 thread_local! {
     static BORROWED_KEEP_DATA_HOOK: RefCell<Option<BorrowedKeepDataHook>> = const { RefCell::new(None) };
     static COMPLETION_PASS_HOOK: RefCell<Option<CompletionPassHook>> = const { RefCell::new(None) };
 }
-pub(super) fn between_completion_passes() {
+pub(super) fn between_completion_passes(original: Instant) -> Instant {
+    let mut end = original;
     COMPLETION_PASS_HOOK.with_borrow_mut(|slot| {
         if let Some(hook) = slot {
-            hook();
+            hook(&mut end);
         }
     });
+    assert!(
+        end <= original,
+        "completion fault cannot extend the original end"
+    );
+    end
 }
-fn with_completion_pass_hook<T>(hook: impl FnMut() + 'static, operation: impl FnOnce() -> T) -> T {
+fn with_completion_pass_hook<T>(
+    hook: impl FnMut(&mut Instant) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
     struct Restore(Option<CompletionPassHook>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -3497,7 +3506,7 @@ fn completed_inspection_requires_contiguous_exact_history_and_two_equal_passes()
         let changed = [bytes.as_slice(), b"\n"].concat();
         let expected = changed.clone();
         with_completion_pass_hook(
-            move || fs::write(&path, &changed).unwrap(),
+            move |_| fs::write(&path, &changed).unwrap(),
             || {
                 assert!(matches!(
                     inspect_completed_uninstall(journal, guards, mode, deadline()),
@@ -3536,7 +3545,7 @@ fn completed_inspection_checks_live_proof_again_and_keeps_the_original_end() {
         let control = fixture.control.as_ref().unwrap();
         let result = control.with_runtime_deadline(end, || {
             with_completion_pass_hook(
-                move || {
+                move |_| {
                     std::thread::sleep(
                         end.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
                     )
@@ -3860,7 +3869,7 @@ fn unix_package_cleanup_completes_in_process_without_a_tail_helper() {
         let calls = Rc::new(Cell::new(0));
         let observed = Rc::clone(&calls);
         let result = with_completion_pass_hook(
-            move || {
+            move |_| {
                 observed.set(observed.get() + 1);
                 let state = load_state(&receipt_root, &owner, deadline())
                     .unwrap()
@@ -3925,14 +3934,10 @@ fn run_unix_fixture_finalize(
 }
 
 #[cfg(unix)]
-fn assert_unix_finalize_stays_pending(journal: &Journal) {
+fn assert_unix_pending_receipts(journal: &Journal) -> DeferredCleanup {
     let persisted = load_state(&journal.root, &journal.state.owner, deadline())
         .unwrap()
         .unwrap();
-    assert_eq!(
-        serde_json::to_vec(&persisted).unwrap(),
-        serde_json::to_vec(&journal.state).unwrap()
-    );
     for sequence in 1..=persisted.sequence {
         let bytes = fs::read(journal.root.join(format!("state-{sequence:06}.json"))).unwrap();
         let state: DeferredCleanup = serde_json::from_slice(&bytes).unwrap();
@@ -3944,6 +3949,16 @@ fn assert_unix_finalize_stays_pending(journal: &Journal) {
         assert_eq!(state.report.status, "pending_cleanup");
         assert!(matches!(state.report.outcome(), Outcome::Partial));
     }
+    persisted
+}
+
+#[cfg(unix)]
+fn assert_unix_finalize_stays_pending(journal: &Journal) {
+    let persisted = assert_unix_pending_receipts(journal);
+    assert_eq!(
+        serde_json::to_vec(&persisted).unwrap(),
+        serde_json::to_vec(&journal.state).unwrap()
+    );
     // The actual Unix caller removed the runner before reaching preflight.
     assert!(!journal.root.join("helper/runner").exists());
 }
@@ -3959,7 +3974,7 @@ fn unix_finalize_precompletion_refusal_preserves_durable_pending_in_both_modes()
         let observed = Rc::new(RefCell::new(None));
         let snapshot = Rc::clone(&observed);
         let result = with_completion_pass_hook(
-            move || {
+            move |_| {
                 // Preserve valid JSON and logical history, but change the exact
                 // evidence between the two real preflight passes.
                 let mut bytes = fs::read(&first).unwrap();
@@ -3980,16 +3995,17 @@ fn unix_finalize_precompletion_refusal_preserves_durable_pending_in_both_modes()
 
 #[cfg(unix)]
 #[test]
-fn unix_finalize_precompletion_expiry_preserves_durable_pending_in_both_modes() {
+fn unix_finalize_original_end_preserves_durable_pending_in_both_modes() {
     for keep in [true, false] {
         let (fixture, mut journal) = package_fixture_for_finalize(keep);
         let prefix = fixture.prefix.clone();
         let data = fixture.root.clone();
         let observed = Rc::new(RefCell::new(None));
         let snapshot = Rc::clone(&observed);
-        let end = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let end = started + Duration::from_secs(2);
         let result = with_completion_pass_hook(
-            move || {
+            move |_| {
                 *snapshot.borrow_mut() = Some(cleanup_inventory(&prefix, &data));
                 std::thread::sleep(
                     end.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
@@ -3997,18 +4013,77 @@ fn unix_finalize_precompletion_expiry_preserves_durable_pending_in_both_modes() 
             },
             || run_unix_fixture_finalize(&fixture, &mut journal, end),
         );
-        assert!(matches!(result, Err(Reason::Deadline)), "{result:?}");
-        assert!(Instant::now() >= end);
-        assert_unix_finalize_stays_pending(&journal);
-        assert_eq!(
-            borrowed_keep_data_inventory(&fixture),
-            *observed.borrow().as_ref().expect("real preflight reached")
+        let returned = Instant::now();
+        assert!(
+            matches!(result, Err(Reason::Deadline)),
+            "mode {keep}, result {result:?}, elapsed {:?}",
+            returned.duration_since(started)
         );
+        assert!(Instant::now() >= end);
+        assert_unix_pending_receipts(&journal);
+        assert!(journal.state.report.cleanup_pending);
+        assert!(journal.state.report.after_exit_cleanup_pending);
+        let after = borrowed_keep_data_inventory(&fixture);
+        if let Some(at_preflight) = observed.borrow().as_ref() {
+            assert_unix_finalize_stays_pending(&journal);
+            assert_eq!(&after, at_preflight);
+        }
+        // Expiry may precede preflight on a loaded machine. Preserve that exact
+        // partial inventory for recovery. Neither case permits completed
+        // receipts or another effect under this same exhausted request end.
+        assert_eq!(
+            run_unix_fixture_finalize(&fixture, &mut journal, end),
+            Err(Reason::Deadline)
+        );
+        assert_eq!(borrowed_keep_data_inventory(&fixture), after);
         // The production failure path cannot save beyond the old end; its
         // diagnostic only changes memory, while the pending receipt survives.
         let receipt = fs::read(journal.receipt_path()).unwrap();
         journal.state.report.pending(Reason::Deadline);
         journal.save_before_deadline(end).unwrap();
+        assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt);
+        assert!(matches!(journal.state.report.outcome(), Outcome::Partial));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_finalize_precompletion_expiry_preserves_durable_pending_in_both_modes() {
+    use std::cell::Cell;
+
+    for keep in [true, false] {
+        let (fixture, mut journal) = package_fixture_for_finalize(keep);
+        let prefix = fixture.prefix.clone();
+        let data = fixture.root.clone();
+        let observed = Rc::new(RefCell::new(None));
+        let snapshot = Rc::clone(&observed);
+        let shortened = Rc::new(Cell::new(None));
+        let injected = Rc::clone(&shortened);
+        let requested = deadline();
+        let result = with_completion_pass_hook(
+            move |end| {
+                assert_eq!(*end, requested);
+                assert!(injected.get().is_none(), "preflight must be reached once");
+                *snapshot.borrow_mut() = Some(cleanup_inventory(&prefix, &data));
+                // Shorten the real local end only after the actual first
+                // preflight pass. The production next-pass check must refuse.
+                // This proves the boundary, not a wall-clock performance limit.
+                *end = (*end).min(Instant::now());
+                injected.set(Some(*end));
+            },
+            || run_unix_fixture_finalize(&fixture, &mut journal, requested),
+        );
+        let expired = shortened.get().expect("real preflight must be reached");
+        assert!(expired <= requested && Instant::now() >= expired);
+        assert_eq!(result, Err(Reason::Deadline), "mode {keep}");
+        assert_unix_finalize_stays_pending(&journal);
+        assert_eq!(
+            borrowed_keep_data_inventory(&fixture),
+            *observed.borrow().as_ref().expect("preflight inventory")
+        );
+        let receipt = fs::read(journal.receipt_path()).unwrap();
+        journal.state.report.pending(Reason::Deadline);
+        journal.save_before_deadline(expired).unwrap();
         assert_eq!(fs::read(journal.receipt_path()).unwrap(), receipt);
         assert!(matches!(journal.state.report.outcome(), Outcome::Partial));
     }

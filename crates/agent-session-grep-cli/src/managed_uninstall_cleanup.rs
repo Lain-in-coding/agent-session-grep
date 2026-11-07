@@ -1262,7 +1262,7 @@ fn inspect_completed_uninstall<'a, 'guards, 'mode, 'held>(
             end,
         )?;
         #[cfg(test)]
-        tests::between_completion_passes();
+        let end = tests::between_completion_passes(end);
         if completion_pass(
             journal,
             guards,
@@ -1303,7 +1303,7 @@ fn preflight_uninstall_completion(
             end,
         )?;
         #[cfg(test)]
-        tests::between_completion_passes();
+        let end = tests::between_completion_passes(end);
         if completion_pass(
             journal,
             guards,
