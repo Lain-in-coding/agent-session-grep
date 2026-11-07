@@ -792,38 +792,109 @@ mod registry {
         let registry = Fixture::new();
         registry.set("original", REG_SZ);
         let old = f.root.with_file_name("old root");
+        let replacement = f.root.with_file_name("prepared replacement");
+        let mut installation = Some(f.installation());
+        let replacement_control = crate::retry_fixture_busy(|| {
+            SqliteControlStore::create(
+                &replacement,
+                &ControlId::parse("replacement-path").unwrap(),
+                DesiredUpdates::Stopped,
+            )
+        });
+        drop(
+            ManagedStore::create(
+                &replacement.join("catalog.db"),
+                &replacement_control,
+                ControlId::parse("replacement-catalog").unwrap(),
+                1,
+            )
+            .unwrap(),
+        );
+        drop(replacement_control);
+        let original_identity = RootIdentity::read(&f.root).unwrap();
+        let replacement_identity = RootIdentity::read(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let started = Instant::now();
+        let end = started + Duration::from_secs(3);
+        let mut phases = [None; 3];
+        let mut verifier_calls = 0;
         let report = perform(
             &f.catalog,
             Options {
                 action: Action::Install,
                 prefix: Some(f.prefix.clone()),
             },
-            Instant::now() + Duration::from_secs(3),
+            end,
             &mut |_| {
-                let install = f.installation();
+                verifier_calls += 1;
+                phases[0] = Some(Instant::now().saturating_duration_since(started));
                 fs::rename(&f.root, &old).unwrap();
-                let control = crate::retry_fixture_busy(|| {
-                    SqliteControlStore::create(
-                        &f.root,
-                        &ControlId::parse("replacement-path").unwrap(),
-                        DesiredUpdates::Stopped,
-                    )
-                });
-                drop(
-                    ManagedStore::create(
-                        &f.catalog,
-                        &control,
-                        ControlId::parse("replacement-catalog").unwrap(),
-                        1,
-                    )
-                    .unwrap(),
-                );
-                Ok(install)
+                phases[1] = Some(Instant::now().saturating_duration_since(started));
+                fs::rename(&replacement, &f.root).unwrap();
+                phases[2] = Some(Instant::now().saturating_duration_since(started));
+                Ok(installation.take().unwrap())
             },
             &mut || panic!("replacement root must be rejected before environment"),
-            &mut |_| Ok(()),
+            &mut |_| panic!("replacement root must be rejected before PATH mutation"),
         );
-        assert_eq!(report.reason, Some(PathReason::IdentityChanged));
+        let returned_at = Instant::now();
+        assert_eq!(
+            report.reason,
+            Some(PathReason::IdentityChanged),
+            "phase=root_replacement stages={phases:?} elapsed={:?} remaining={:?} overrun={:?} report={}",
+            returned_at.saturating_duration_since(started),
+            end.saturating_duration_since(returned_at),
+            returned_at.saturating_duration_since(end),
+            serde_json::to_string(&report).unwrap(),
+        );
+        assert_eq!(verifier_calls, 1);
+        assert!(installation.is_none());
+        assert_eq!(RootIdentity::read(&old).unwrap(), original_identity);
+        assert_eq!(RootIdentity::read(&f.root).unwrap(), replacement_identity);
+        assert_eq!(
+            raw_path(&windows::read(&registry.subkey).unwrap())
+                .unwrap()
+                .0,
+            "original"
+        );
+        assert!(!f.root.join("user-path").exists());
+    }
+
+    #[test]
+    fn verifier_crossing_original_deadline_refuses_before_environment_or_path() {
+        let f = super::Fixture::new();
+        let registry = Fixture::new();
+        registry.set("original", REG_SZ);
+        let mut installation = Some(f.installation());
+        let original_identity = RootIdentity::read(&f.root).unwrap();
+        let started = Instant::now();
+        let end = started + Duration::from_secs(3);
+        let mut verifier_calls = 0;
+        let report = perform(
+            &f.catalog,
+            Options {
+                action: Action::Install,
+                prefix: Some(f.prefix.clone()),
+            },
+            end,
+            &mut |_| {
+                verifier_calls += 1;
+                assert!(
+                    Instant::now() < end,
+                    "verifier must enter before the original end"
+                );
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                assert!(Instant::now() >= end);
+                Ok(installation.take().unwrap())
+            },
+            &mut || panic!("expired verifier must not inspect environment"),
+            &mut |_| panic!("expired verifier must not mutate PATH"),
+        );
+        assert_eq!(verifier_calls, 1);
+        assert!(installation.is_none());
+        assert_eq!(report.reason, Some(PathReason::Timeout));
+        assert!(!report.changed && !report.private_receipt_recorded);
+        assert_eq!(RootIdentity::read(&f.root).unwrap(), original_identity);
         assert_eq!(
             raw_path(&windows::read(&registry.subkey).unwrap())
                 .unwrap()
