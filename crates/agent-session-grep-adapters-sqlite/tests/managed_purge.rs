@@ -1490,10 +1490,19 @@ fn writer_lease_and_sqlite_writer_block_purge_with_no_partial_content_commit() {
     let f = Fixture::new();
     let job = f.revoke();
     let guard = acquire(&f.root, purge_lock_kind().unwrap());
+    let prepare_end = deadline();
+    let scope_probe = prepare_end + Duration::from_secs(1);
+    let previous_scope = SqliteControlStore::effective_runtime_deadline(scope_probe);
     let owner = f
         .control
-        .bind_purge_owner(&guard, id("blocked-writer"))
+        .with_runtime_deadline(prepare_end, || {
+            f.control.bind_purge_owner(&guard, id("blocked-writer"))
+        })
         .unwrap();
+    assert_eq!(
+        SqliteControlStore::effective_runtime_deadline(scope_probe),
+        previous_scope
+    );
     let lease = agent_session_grep_adapters_sqlite::WriterLease::try_acquire(&f.root).unwrap();
     match run(
         &f.control,

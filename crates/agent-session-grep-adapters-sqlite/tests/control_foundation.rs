@@ -96,6 +96,17 @@ fn retry_expected_success<T>(
     }
 }
 
+fn observe_control_once<T>(
+    store: &SqliteControlStore,
+    observation: impl FnOnce() -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    // These semantic assertions read exactly once under the suite's existing
+    // eight-second observation bound. Admission/mutation deadlines and their
+    // negative controls remain at the production limits.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    store.with_runtime_deadline(end, observation)
+}
+
 #[test]
 fn read_open_missing_creates_nothing() {
     let temp = agent_session_grep_testkit::tempdir().unwrap();
@@ -849,9 +860,10 @@ fn persisted_selection_exclusion_intent_and_purge_decoders_validate_all_fields()
         retry_expected_success(|| store.revoke_selection(s.control_seq, &s.value.id, None, 20))
             .unwrap();
         raw(&root).execute_batch(sql).unwrap();
+        let observed = observe_control_once(&store, || store.status());
         assert!(
-            matches!(store.status(), Err(PortError::SchemaIncompatible(_))),
-            "{sql}"
+            matches!(observed, Err(PortError::SchemaIncompatible(_))),
+            "{sql}: {observed:?}"
         );
     }
 }
@@ -2069,7 +2081,10 @@ fn latest_admission_terminal_status_wins_over_a_live_advisory_heartbeat() {
             advise(&store, &worker, state, 151);
             retry_expected_success(|| store.set_desired_updates(current(&store), desired)).unwrap();
             assert_eq!(
-                store.background_status().unwrap().worker.state,
+                observe_control_once(&store, || store.background_status())
+                    .unwrap()
+                    .worker
+                    .state,
                 state,
                 "the advisory heartbeat survives {desired:?}"
             );
@@ -2093,7 +2108,13 @@ fn latest_admission_terminal_status_wins_over_a_live_advisory_heartbeat() {
             )
         })
         .unwrap();
-        assert_eq!(store.background_status().unwrap().worker.state, state);
+        assert_eq!(
+            observe_control_once(&store, || store.background_status())
+                .unwrap()
+                .worker
+                .state,
+            state
+        );
         assert_eq!(
             admit_once(&root, &store, &s, 153, "maintenance fence"),
             LatestAdmission::Blocked(BackgroundFailure::Upgrading)
@@ -3192,7 +3213,10 @@ fn worker_binding_accepts_independent_store_handle_on_the_same_physical_root() {
         .stop_worker(current(&reopened), &authority, 102)
         .unwrap();
     assert_eq!(
-        store.background_status().unwrap().worker.state,
+        observe_control_once(&store, || store.background_status())
+            .unwrap()
+            .worker
+            .state,
         UpdateState::Offline
     );
 }

@@ -297,20 +297,35 @@ fn v1_read_is_unchanged_and_write_upgrade_preserves_policy_and_old_tokens() {
     );
     let conn = raw(&f.root);
     make_v1(&conn);
-    let read = SqliteControlStore::open_current_read_only_with_deadline(
-        &f.root,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
+    let read_started = Instant::now();
+    let read_end = read_started + Duration::from_secs(2);
+    let read_result = SqliteControlStore::open_current_read_only_with_deadline(&f.root, read_end);
+    let read_returned = Instant::now();
+    let read = read_result.unwrap_or_else(|error| {
+        panic!(
+            "phase=v1_read_open calls=1 error={error:?} elapsed={:?} expired_after={}",
+            read_returned.duration_since(read_started),
+            read_returned >= read_end
+        )
+    });
     assert_eq!(bounded(&read, || read.status()), before);
     assert_eq!(version(&conn), 1);
     assert!(indexes(&conn).is_empty());
-    let write = SqliteControlStore::open_existing_writable_with_deadline(
+    let write_started = Instant::now();
+    let write_end = write_started + Duration::from_secs(2);
+    let write_result = SqliteControlStore::open_existing_writable_with_deadline(
         &f.root,
         &id("synthetic-installation"),
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
+        write_end,
+    );
+    let write_returned = Instant::now();
+    let write = write_result.unwrap_or_else(|error| {
+        panic!(
+            "phase=v1_write_open calls=1 error={error:?} elapsed={:?} expired_after={}",
+            write_returned.duration_since(write_started),
+            write_returned >= write_end
+        )
+    });
     assert_eq!(version(&conn), CONTROL_SCHEMA_VERSION);
     assert_eq!(indexes(&conn).len(), 3);
     assert_eq!(bounded(&write, || write.status()), before);
