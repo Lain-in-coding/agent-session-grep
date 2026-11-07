@@ -1,7 +1,15 @@
-//! Completed-only namespace consumption. No package publication, setup, fence
-//! transfer, marker removal, process launch or new lifecycle is admitted here.
+//! Completed-only namespace consumption and fixed keep-data preparation.
+//! No payload publication, fence adoption, marker removal or activation.
 use super::*;
 use crate::package_installation::{IncomingPackageIdentity, VerifiedIncomingPackage};
+use agent_session_grep_adapters_sqlite::control::{
+    ReinstallCleanupBinding, ReinstallConnectionError, ReinstallContext, ReinstallControlOwner,
+    ReinstallDigest, ReinstallExpectedControl, ReinstallFileBinding, ReinstallFiles,
+    ReinstallImageMatch, ReinstallInspection, ReinstallInspectionGuards, ReinstallOwnedGuards,
+    ReinstallOwnedInput, ReinstallOwnedPins, ReinstallPrep, ReinstallPreparationStage,
+    ReinstallRoots, ReinstallShmBinding,
+};
+use std::cell::RefCell;
 
 const ENTRY: &str = "__managed-reinstall-handoff";
 const SIDECAR: &str = ".asg-reinstall";
@@ -9,6 +17,8 @@ const INTENT_SCHEMA: &str = "asg.reinstall-handoff/v1";
 const READY_SCHEMA: &str = "asg.reinstall-ready/v1";
 const CONSUMED_SCHEMA: &str = "asg.reinstall-consumed/v1";
 const RECORD_LIMIT: u64 = 4 * 1024 * 1024;
+const KEEP_PREP: &str = "keep-transfer-prep";
+const KEEP_RECORD_LIMIT: u64 = 8192;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,10 +127,78 @@ enum HandoffCheckpoint {
     NamespaceConsumed,
 }
 
+/// The live continuation is returned without closing or releasing its bundle.
+/// The private CLI entry exits at this milestone until adoption is wired.
+enum IncomingHandoff {
+    NamespaceConsumed,
+    KeepData(Box<KeepPreparation>),
+}
+
+struct KeepPreparation {
+    owner: ReinstallControlOwner<KeepDataRetention>,
+    intent: FixedHandoffIntent,
+    prep: ReinstallPrep,
+    layout: Option<ReinstallPreparationStage>,
+    end: Instant,
+}
+
+impl IncomingHandoff {
+    fn publish(&mut self) -> Result<(), Reason> {
+        match self {
+            Self::NamespaceConsumed => Ok(()),
+            Self::KeepData(preparation) => preparation.publish(),
+        }
+    }
+}
+
+impl KeepPreparation {
+    fn publish(&mut self) -> Result<(), Reason> {
+        self.end = SqliteControlStore::effective_runtime_deadline(self.end);
+        publish_preparation(
+            &mut self.owner,
+            &self.intent,
+            &self.prep,
+            self.layout,
+            self.end,
+        )
+    }
+}
+
 struct HandoffRequest<'a> {
     prefix: &'a Path,
     catalog: &'a Path,
     incoming: &'a VerifiedIncomingPackage,
+}
+
+/// The adapter owns this payload before the first control connection opens.
+/// Only this private CLI module can use its package/image/root/exit resources.
+struct KeepDataRetention {
+    parent_exit: ExitGuard,
+    runner_exit: ExitGuard,
+    incoming: VerifiedIncomingPackage,
+    roots: PinnedRoots,
+    locks: Vec<ExistingLockFile>,
+    namespace_dirs: RefCell<Vec<File>>,
+    sibling_pins: RefCell<Vec<ExistingLockFile>>,
+    active: Option<Journal>,
+    records: ResolvedRecords,
+}
+
+enum KeepHandoffError {
+    Refused(Reason),
+    Owned(Box<ReinstallConnectionError<KeepDataRetention>>),
+}
+
+impl From<Reason> for KeepHandoffError {
+    fn from(reason: Reason) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<Box<ReinstallConnectionError<KeepDataRetention>>> for KeepHandoffError {
+    fn from(error: Box<ReinstallConnectionError<KeepDataRetention>>) -> Self {
+        Self::Owned(error)
+    }
 }
 
 struct PinnedRoots {
@@ -472,6 +550,25 @@ fn resolved_records(
     intent: &FixedHandoffIntent,
     end: Instant,
 ) -> Result<ResolvedRecords, Reason> {
+    let records = resolved_history(roots, intent, end)?;
+    completed_payload_at(
+        &roots.prefix,
+        &roots.catalog,
+        &roots.journal,
+        &records.state,
+        &records.seal,
+        end,
+    )?;
+    Ok(records)
+}
+
+/// Decode only immutable archived history. Transfer recovery performs its own
+/// retained-file checks and never routes q+1 through old Uninstalling/WAL rules.
+fn resolved_history(
+    roots: &PinnedRoots,
+    intent: &FixedHandoffIntent,
+    end: Instant,
+) -> Result<ResolvedRecords, Reason> {
     let read = |name: &str, limit| -> Result<Vec<u8>, Reason> {
         let path = intent.resolve(roots, name, end)?;
         let bytes = read_record(&path, limit, end)?;
@@ -586,14 +683,6 @@ fn resolved_records(
         }
     }
     completed_receipt_records(&state, &seal, end, tail)?;
-    completed_payload_at(
-        &roots.prefix,
-        &roots.catalog,
-        &roots.journal,
-        &state,
-        &seal,
-        end,
-    )?;
     Ok(ResolvedRecords { state, seal })
 }
 
@@ -637,17 +726,38 @@ pub(super) fn intercept(args: &[OsString]) -> Option<i32> {
             &running,
             end,
         )
-        .map_err(|_| Reason::IdentityChanged)?;
-        retire_cleanup_namespace(
-            HandoffRequest {
-                prefix: Path::new(prefix),
-                catalog: Path::new(catalog),
-                incoming: &incoming,
-            },
-            end,
-        )
+        .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
+        let mut handoff =
+            prepare_incoming_handoff(Path::new(prefix), Path::new(catalog), incoming, end)?;
+        handoff.publish()?;
+        Ok::<_, KeepHandoffError>(handoff)
     })();
+    match _checkpoint {
+        Ok(IncomingHandoff::NamespaceConsumed) => {}
+        Ok(IncomingHandoff::KeepData(preparation)) => {
+            // The next tranche consumes this same owner. For this milestone,
+            // its complete bundle remains held until run_cli exits below.
+            drop(preparation);
+        }
+        Err(KeepHandoffError::Refused(reason)) => {
+            let _ = reason;
+        }
+        Err(KeepHandoffError::Owned(error)) => {
+            // Dropping an unconfirmed owner keeps every capability until
+            // run_cli immediately terminates this private entry with 10.
+            // No retry, ordinary cleanup or service continuation follows.
+            drop(error);
+        }
+    }
     Some(10)
+}
+
+fn incoming_package_error(error: CliError, end: Instant, now: Instant) -> Reason {
+    match error.0.code {
+        CanonicalCode::WriterBusy if now >= end => Reason::Deadline,
+        CanonicalCode::DeadlineExceeded => Reason::Deadline,
+        _ => Reason::IdentityChanged,
+    }
 }
 
 fn incoming_current(
@@ -656,8 +766,11 @@ fn incoming_current(
     policy: &TerminalPolicy,
     end: Instant,
 ) -> Result<(), Reason> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
     time(end)?;
-    incoming.recheck(end).map_err(|_| Reason::IdentityChanged)?;
+    incoming
+        .recheck(end)
+        .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
     let source = incoming.source_root();
     for target in [&roots.prefix, &roots.data] {
         if source.starts_with(target) || target.starts_with(source) || policy.overlaps(target)? {
@@ -751,6 +864,947 @@ fn validate_existing_lock_files(locks: &[ExistingLockFile], end: Instant) -> Res
         }
     }
     time(end)
+}
+
+struct TransferLayout {
+    prep: ReinstallPrep,
+    stage: ReinstallPreparationStage,
+}
+
+fn observed_keep_transfer(
+    roots: &PinnedRoots,
+    end: Instant,
+) -> Result<Option<TransferLayout>, Reason> {
+    let sidecar = roots.sidecar();
+    if !present(&sidecar)? {
+        return Ok(None);
+    }
+    let names = directory_members(&sidecar, end)?;
+    let pending = format!("{KEEP_PREP}.pending");
+    let published = format!("{KEEP_PREP}.json");
+    let has_pending = names.contains(&pending);
+    let has_published = names.contains(&published);
+    if names.contains("keep-transfer-ack.pending") || names.contains("keep-transfer-ack.json") {
+        // ACK continuation belongs to the next tranche; never fall back to the
+        // old namespace mover or overwrite an acknowledgement.
+        return Err(Reason::AfterExitCleanupPending);
+    }
+    if !has_pending && !has_published {
+        return Ok(None);
+    }
+    if has_pending == has_published {
+        return Err(Reason::IdentityChanged);
+    }
+    let (name, stage) = if has_pending {
+        (pending, ReinstallPreparationStage::Pending)
+    } else {
+        (published, ReinstallPreparationStage::Published)
+    };
+    exact_members(
+        &sidecar,
+        &[
+            "intent.json",
+            "ready.json",
+            "consumed.json",
+            "evidence",
+            &name,
+        ],
+        end,
+    )?;
+    let prep = ReinstallPrep::decode(&read_record(&sidecar.join(name), KEEP_RECORD_LIMIT, end)?)
+        .map_err(|_| Reason::IdentityChanged)?;
+    Ok(Some(TransferLayout { prep, stage }))
+}
+
+fn keep_guards<'a>(
+    retained: &'a KeepDataRetention,
+    guards: &'a mut ReinstallInspectionGuards<'_>,
+) -> CompletionGuards<'a> {
+    CompletionGuards {
+        parent_exit: &retained.parent_exit,
+        runner_exit: &retained.runner_exit,
+        prefix: guards.prefix,
+        drains: RetirementDrainGuards {
+            policy_owner: guards.policy_owner,
+            emission: guards.emission,
+            catalog_handles: guards.catalog_handles,
+            background: guards.background,
+            supervisor: guards.supervisor,
+            purge: guards.purge,
+        },
+        writer: &mut guards.writer,
+        history: guards.history_readers,
+    }
+}
+
+fn keep_file_pin(
+    roots: &PinnedRoots,
+    name: &str,
+    policy: &TerminalPolicy,
+    expected: Option<&ReinstallFileBinding>,
+    end: Instant,
+) -> Result<(File, ReinstallFileBinding), Reason> {
+    let observed = private_proof(&roots.data, name, policy, end)?;
+    let binding = ReinstallFileBinding {
+        identity: observed.identity,
+        size: observed.size,
+        sha256: ReinstallDigest::from_hex(&observed.digest).map_err(|_| Reason::IdentityChanged)?,
+    };
+    if expected.is_some_and(|expected| expected != &binding) {
+        return Err(Reason::IdentityChanged);
+    }
+    let path = roots.data.join(name);
+    let file = platform::open_file(&path).map_err(|_| Reason::FileLocked)?;
+    if !single_file(&file)?
+        || platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != binding.identity
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)?;
+    Ok((file, binding))
+}
+
+fn keep_optional_pin(
+    roots: &PinnedRoots,
+    name: &str,
+    policy: &TerminalPolicy,
+    end: Instant,
+) -> Result<(Option<File>, Option<ReinstallFileBinding>), Reason> {
+    if !present(&roots.data.join(name))? {
+        return Ok((None, None));
+    }
+    let (pin, binding) = keep_file_pin(roots, name, policy, None, end)?;
+    Ok((Some(pin), Some(binding)))
+}
+
+fn keep_shm(
+    roots: &PinnedRoots,
+    name: &str,
+    pins: &mut Vec<ExistingLockFile>,
+    end: Instant,
+) -> Result<Option<ReinstallShmBinding>, Reason> {
+    time(end)?;
+    let path = roots.data.join(name);
+    if !present(&path)? {
+        return Ok(None);
+    }
+    let file = platform::open_file(&path).map_err(|_| Reason::IdentityChanged)?;
+    let size = file.metadata().map_err(|_| Reason::IdentityChanged)?.len();
+    if !single_file(&file)? || size > 64 * 1024 * 1024 || !size.is_multiple_of(32768) {
+        return Err(Reason::IdentityChanged);
+    }
+    let identity = platform::identity(&file).map_err(|_| Reason::IdentityChanged)?;
+    pins.push((path, file, identity));
+    Ok(Some(ReinstallShmBinding { identity, size }))
+}
+
+fn keep_owned_input(
+    mut retained: KeepDataRetention,
+    prefix: ExclusiveGuard,
+    owners: CleanupGuards,
+    history: ExclusiveGuard,
+    prep: Option<&ReinstallPrep>,
+    end: Instant,
+) -> Result<ReinstallOwnedInput<KeepDataRetention>, Reason> {
+    let roots = &retained.roots;
+    let records = &retained.records;
+    let policy = &records.seal.policy;
+    let (control_main, control_binding) = keep_file_pin(
+        roots,
+        "control.db",
+        policy,
+        prep.map(|prep| &prep.files().control_main),
+        end,
+    )?;
+    let (catalog_main, catalog_binding) = keep_file_pin(
+        roots,
+        &records.state.owner.catalog_name,
+        policy,
+        prep.map(|prep| &prep.files().catalog_main),
+        end,
+    )?;
+    if control_binding.identity != policy.control_file_identity
+        || catalog_binding.identity != records.state.catalog_file_identity
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    let (mut control_wal, observed_control_wal) =
+        keep_optional_pin(roots, "control.db-wal", policy, end)?;
+    let (mut catalog_wal, observed_catalog_wal) = keep_optional_pin(
+        roots,
+        &format!("{}-wal", records.state.owner.catalog_name),
+        policy,
+        end,
+    )?;
+    let receipt = records
+        .seal
+        .metadata
+        .retained
+        .iter()
+        .find(|proof| proof.relative == "installation-prefix.json")
+        .ok_or(Reason::IdentityChanged)?;
+    let expected_receipt = ReinstallFileBinding {
+        identity: receipt.identity,
+        size: receipt.size,
+        sha256: ReinstallDigest::from_hex(&receipt.digest).map_err(|_| Reason::IdentityChanged)?,
+    };
+    let (prefix_binding_pin, prefix_binding) = keep_file_pin(
+        roots,
+        "installation-prefix.json",
+        policy,
+        Some(&expected_receipt),
+        end,
+    )?;
+    let mut sibling_pins = Vec::new();
+    let observed = ReinstallFiles {
+        control_main: control_binding,
+        control_wal: observed_control_wal,
+        control_shm: keep_shm(roots, "control.db-shm", &mut sibling_pins, end)?,
+        catalog_main: catalog_binding,
+        catalog_wal: observed_catalog_wal,
+        catalog_shm: keep_shm(
+            roots,
+            &format!("{}-shm", records.state.owner.catalog_name),
+            &mut sibling_pins,
+            end,
+        )?,
+    };
+    // Original bindings come from the durable Prep. Observation never refreshes
+    // expected bytes when resuming an uncertain control WAL write.
+    let files = prep.map_or(observed.clone(), |prep| prep.files().clone());
+    if let Some(prep) = prep {
+        for (expected, actual) in [
+            (&prep.files().control_wal, &observed.control_wal),
+            (&prep.files().catalog_wal, &observed.catalog_wal),
+        ] {
+            if expected.as_ref().is_some_and(|expected| {
+                actual
+                    .as_ref()
+                    .is_none_or(|actual| actual.identity != expected.identity)
+            }) {
+                return Err(Reason::IdentityChanged);
+            }
+        }
+        // Originally absent siblings may exist on re-entry. Keep these first
+        // observed handles in the opaque CLI payload while the adapter pins and
+        // verifies the same names; never discard an observed inode to reopen it.
+        for (name, expected, pin, observed) in [
+            (
+                "control.db-wal".to_owned(),
+                &prep.files().control_wal,
+                &mut control_wal,
+                &observed.control_wal,
+            ),
+            (
+                format!("{}-wal", records.state.owner.catalog_name),
+                &prep.files().catalog_wal,
+                &mut catalog_wal,
+                &observed.catalog_wal,
+            ),
+        ] {
+            if expected.is_none()
+                && let Some(file) = pin.take()
+            {
+                sibling_pins.push((
+                    roots.data.join(name),
+                    file,
+                    observed.as_ref().ok_or(Reason::IdentityChanged)?.identity,
+                ));
+            }
+        }
+    }
+    let expected = ReinstallExpectedControl::Cleanup(ReinstallCleanupBinding {
+        installation: ControlId::parse(&records.state.owner.installation_id)
+            .map_err(|_| Reason::IdentityChanged)?,
+        incarnation: ControlId::parse(&records.state.catalog_incarnation)
+            .map_err(|_| Reason::IdentityChanged)?,
+        owner: ControlId::parse(&records.state.owner.nonce).map_err(|_| Reason::IdentityChanged)?,
+        control_seq: ControlSeq::new(policy.control_seq).map_err(|_| Reason::IdentityChanged)?,
+        policy_epoch: PolicyEpoch::new(policy.policy_epoch).map_err(|_| Reason::IdentityChanged)?,
+    });
+    let input_root = roots.data.clone();
+    let input_prefix = roots.prefix.clone();
+    let input_catalog = roots.catalog.clone();
+    retained.sibling_pins.get_mut().extend(sibling_pins);
+    Ok(ReinstallOwnedInput {
+        root: input_root,
+        prefix: input_prefix,
+        catalog: input_catalog,
+        expected,
+        files,
+        prefix_binding,
+        guards: ReinstallOwnedGuards {
+            prefix,
+            policy_owner: owners.policy_owner,
+            emission: owners.emission,
+            supervisor: owners.supervisor,
+            background: owners.background,
+            purge: owners.purge,
+            history_readers: history,
+            catalog_handles: owners.catalog_handles,
+            writer: owners._writer,
+        },
+        pins: ReinstallOwnedPins {
+            control_main,
+            control_wal,
+            catalog_main,
+            catalog_wal,
+            prefix_binding: prefix_binding_pin,
+        },
+        retained,
+    })
+}
+
+/// Rebuild only immutable comparison context from the already consumed old
+/// namespace. No control/catalog open, owner adoption or archive replay occurs.
+fn keep_context(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    end: Instant,
+) -> Result<ReinstallContext, Reason> {
+    let roots = &retained.roots;
+    intent.validate(roots, &retained.incoming, end)?;
+    if !intent.owner.keep_data || partition_boundary(roots, intent, end)? != intent.leaves.len() {
+        return Err(Reason::IdentityChanged);
+    }
+    let sidecar = roots.sidecar();
+    let intent_bytes = record_bytes(intent)?;
+    let ready = expected_ready(roots, intent)?;
+    let ready_bytes = record_bytes(&ready)?;
+    let consumed = ConsumedRecord {
+        schema: CONSUMED_SCHEMA.into(),
+        intent_sha256: digest(&intent_bytes),
+        ready_sha256: digest(&ready_bytes),
+        leaf_count: intent.leaves.len(),
+        inventory_sha256: digest(&record_bytes(&intent.inventory)?),
+    };
+    let consumed_bytes = record_bytes(&consumed)?;
+    for (name, expected) in [
+        ("intent.json", &intent_bytes),
+        ("ready.json", &ready_bytes),
+        ("consumed.json", &consumed_bytes),
+    ] {
+        if read_record(&sidecar.join(name), RECORD_LIMIT, end)? != *expected {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    platform::validate_private(&sidecar).map_err(|_| Reason::IdentityChanged)?;
+    platform::validate_private(&sidecar.join("evidence")).map_err(|_| Reason::IdentityChanged)?;
+    let ordinals: BTreeSet<_> = (0..intent.leaves.len())
+        .map(|n| format!("{n:06}"))
+        .collect();
+    if directory_members(&sidecar.join("evidence"), end)? != ordinals {
+        return Err(Reason::IdentityChanged);
+    }
+    let current = resolved_history(roots, intent, end)?;
+    if record_bytes(&current.state)? != record_bytes(&retained.records.state)?
+        || record_bytes(&current.seal)? != record_bytes(&retained.records.seal)?
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    completed_payload_absence_at(
+        &roots.prefix,
+        &roots.catalog,
+        &roots.journal,
+        &current.state,
+        &current.seal,
+        end,
+    )?;
+    incoming_current(roots, &retained.incoming, &current.seal.policy, end)?;
+    Ok(ReinstallContext {
+        operation: intent.operation.clone(),
+        intent_sha256: ReinstallDigest::of_bytes(&intent_bytes),
+        ready_sha256: ReinstallDigest::of_bytes(&ready_bytes),
+        consumed_sha256: ReinstallDigest::of_bytes(&consumed_bytes),
+        incoming_sha256: ReinstallDigest::of_bytes(&record_bytes(retained.incoming.identity())?),
+        roots: ReinstallRoots {
+            prefix: roots.roots.prefix,
+            data: roots.roots.data,
+            journal: roots.roots.journal,
+            helper: roots.roots.helper,
+        },
+        sidecar_identity: intent.sidecar_identity,
+        evidence_identity: ready.evidence_identity,
+        old_owner: intent.owner.nonce.clone(),
+        installation: intent.owner.installation_id.clone(),
+        incarnation: intent.catalog_incarnation.clone(),
+        old_control_seq: current.seal.policy.control_seq,
+        policy_epoch: current.seal.policy.policy_epoch,
+        application_id: 0x4153_4331,
+        user_version: 2,
+        schema_sha256: ReinstallContext::current_schema_digest(),
+        sqlite_policy: "no-close-checkpoint/v1".into(),
+    })
+}
+
+fn validate_preparation_files(
+    intent: &FixedHandoffIntent,
+    files: &ReinstallFiles,
+) -> Result<(), Reason> {
+    let node = |name: &str| {
+        intent
+            .inventory
+            .iter()
+            .find(|entry| entry.scope == Scope::Data && entry.relative == name)
+            .map(|entry| &entry.node)
+    };
+    for (name, binding) in [
+        ("control.db".to_owned(), Some(&files.control_main)),
+        ("control.db-wal".to_owned(), files.control_wal.as_ref()),
+        (intent.owner.catalog_name.clone(), Some(&files.catalog_main)),
+        (
+            format!("{}-wal", intent.owner.catalog_name),
+            files.catalog_wal.as_ref(),
+        ),
+    ] {
+        match (node(&name), binding) {
+            (None | Some(Node::Absent), None) => {}
+            (
+                Some(Node::File {
+                    identity,
+                    size,
+                    sha256: Some(sha256),
+                }),
+                Some(binding),
+            ) if binding.identity == *identity
+                && binding.size == *size
+                && binding.sha256.to_hex() == *sha256 => {}
+            _ => return Err(Reason::IdentityChanged),
+        }
+    }
+    for (name, binding) in [
+        ("control.db-shm".to_owned(), files.control_shm.as_ref()),
+        (
+            format!("{}-shm", intent.owner.catalog_name),
+            files.catalog_shm.as_ref(),
+        ),
+    ] {
+        match (node(&name), binding) {
+            (None | Some(Node::Absent), None) => {}
+            (
+                Some(Node::File {
+                    identity,
+                    size,
+                    sha256: None,
+                }),
+                Some(binding),
+            ) if binding.identity == *identity && binding.size == *size => {}
+            _ => return Err(Reason::IdentityChanged),
+        }
+    }
+    Ok(())
+}
+
+fn pin_transfer_directories(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    context: &ReinstallContext,
+    end: Instant,
+) -> Result<(), Reason> {
+    let roots = &retained.roots;
+    let mut pins = retained.namespace_dirs.borrow_mut();
+    for (path, expected) in [
+        (roots.sidecar(), intent.sidecar_identity),
+        (roots.sidecar().join("evidence"), context.evidence_identity),
+    ]
+    .into_iter()
+    .chain(
+        intent
+            .inventory
+            .iter()
+            .filter_map(|entry| match entry.node {
+                Node::Directory { identity } => {
+                    Some((roots.base(entry.scope).join(&entry.relative), identity))
+                }
+                _ => None,
+            }),
+    ) {
+        time(end)?;
+        let file = platform::directory(&path).map_err(|_| Reason::IdentityChanged)?;
+        if platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != expected {
+            return Err(Reason::IdentityChanged);
+        }
+        pins.push(file);
+    }
+    time(end)
+}
+
+/// The transfer mode has exactly four SQLite sibling allowances. All other
+/// files/directories retain the immutable intent's identity, bytes and absence.
+/// The adapter checks the original full images on this same live connection.
+fn transfer_inventory(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    writer: &OwnedFile,
+    stage: ReinstallPreparationStage,
+    end: Instant,
+) -> Result<(), Reason> {
+    let roots = &retained.roots;
+    let siblings = [
+        "control.db-wal".to_owned(),
+        format!("{}-wal", intent.owner.catalog_name),
+        "control.db-shm".to_owned(),
+        format!("{}-shm", intent.owner.catalog_name),
+    ];
+    let mut expected: BTreeMap<Scope, BTreeSet<String>> = [Scope::Prefix, Scope::Data]
+        .into_iter()
+        .map(|scope| (scope, BTreeSet::new()))
+        .collect();
+    for entry in &intent.inventory {
+        time(end)?;
+        let path = roots.base(entry.scope).join(&entry.relative);
+        if entry.scope == Scope::Prefix && intent.leaves.contains(&entry.relative) {
+            if present(&path)? {
+                return Err(Reason::IdentityChanged);
+            }
+            continue;
+        }
+        if entry.scope == Scope::Data && siblings.contains(&entry.relative) {
+            continue;
+        }
+        if !matches!(entry.node, Node::Absent) {
+            expected
+                .get_mut(&entry.scope)
+                .ok_or(Reason::IdentityChanged)?
+                .insert(entry.relative.clone());
+        }
+        match &entry.node {
+            Node::Absent if !present(&path)? => {}
+            Node::Directory { identity: expected } if identity(&path)? == *expected => {}
+            Node::File {
+                identity,
+                size,
+                sha256,
+            } if entry.scope == Scope::Data && entry.relative == "writer.lock" => {
+                if *identity != writer.identity || *size != 0 || sha256.is_some() {
+                    return Err(Reason::IdentityChanged);
+                }
+            }
+            Node::File { .. } => archive_proof(&path, entry, &retained.records.seal.policy, end)?,
+            _ => return Err(Reason::IdentityChanged),
+        }
+    }
+    for (index, name) in siblings.iter().enumerate() {
+        time(end)?;
+        let path = roots.data.join(name);
+        let original_identity = match index {
+            0 => prep.files().control_wal.as_ref().map(|v| v.identity),
+            1 => prep.files().catalog_wal.as_ref().map(|v| v.identity),
+            2 => prep.files().control_shm.as_ref().map(|v| v.identity),
+            _ => prep.files().catalog_shm.as_ref().map(|v| v.identity),
+        };
+        if !present(&path)? {
+            if original_identity.is_some()
+                || retained
+                    .sibling_pins
+                    .borrow()
+                    .iter()
+                    .any(|(p, _, _)| *p == path)
+            {
+                return Err(Reason::IdentityChanged);
+            }
+            continue;
+        }
+        package_installation::ordinary(&path).map_err(|_| Reason::IdentityChanged)?;
+        // The same owner's bound read validates private file ownership/ACLs
+        // and its held WAL/SHM pins before and after this inventory pass.
+        // platform::validate_private accepts directories only, not siblings.
+        if retained.records.seal.policy.overlaps(&path)? {
+            return Err(Reason::SourceOverlap);
+        }
+        let pin = platform::open_file(&path).map_err(|_| Reason::IdentityChanged)?;
+        let observed = platform::identity(&pin).map_err(|_| Reason::IdentityChanged)?;
+        let size = pin.metadata().map_err(|_| Reason::IdentityChanged)?.len();
+        if !single_file(&pin)?
+            || original_identity.is_some_and(|identity| identity != observed)
+            || size > MAX_FILE
+            || (index >= 2 && (size > 64 * 1024 * 1024 || !size.is_multiple_of(32768)))
+            || (index == 1
+                && original_identity.is_none()
+                && (stage != ReinstallPreparationStage::Published || size != 0))
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        if index == 1
+            && let Some(binding) = &prep.files().catalog_wal
+        {
+            let actual = private_proof(&roots.data, name, &retained.records.seal.policy, end)?;
+            if actual.identity != binding.identity
+                || actual.size != binding.size
+                || actual.digest != binding.sha256.to_hex()
+            {
+                return Err(Reason::IdentityChanged);
+            }
+        }
+        let mut pins = retained.sibling_pins.borrow_mut();
+        if let Some((_, held, expected)) = pins.iter().find(|(p, _, _)| *p == path) {
+            if *expected != observed
+                || platform::identity(held).map_err(|_| Reason::IdentityChanged)? != observed
+                || !single_file(held)?
+            {
+                return Err(Reason::IdentityChanged);
+            }
+        } else {
+            pins.push((path, pin, observed));
+        }
+        expected
+            .get_mut(&Scope::Data)
+            .ok_or(Reason::IdentityChanged)?
+            .insert(name.clone());
+    }
+    for scope in [Scope::Prefix, Scope::Data] {
+        let mut actual = BTreeSet::new();
+        let mut pending = vec![String::new()];
+        while let Some(relative) = pending.pop() {
+            for name in directory_members(&roots.base(scope).join(&relative), end)? {
+                let name = if relative.is_empty() {
+                    name
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if scope == Scope::Prefix && name == SIDECAR {
+                    continue;
+                }
+                if actual.len() >= MAX_ENTRIES || !expected[&scope].contains(&name) {
+                    return Err(Reason::UnclassifiedOwnedArtifact);
+                }
+                if intent.inventory.iter().any(|entry| {
+                    entry.scope == scope
+                        && entry.relative == name
+                        && matches!(entry.node, Node::Directory { .. })
+                }) {
+                    pending.push(name.clone());
+                }
+                actual.insert(name);
+            }
+        }
+        if actual != expected[&scope] {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    time(end)
+}
+
+fn sync_transfer_evidence(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    context: &ReinstallContext,
+    end: Instant,
+) -> Result<(), Reason> {
+    let roots = &retained.roots;
+    let sidecar = roots.sidecar();
+    for name in ["intent.json", "ready.json", "consumed.json"] {
+        let path = sidecar.join(name);
+        sync_record(&path, &read_record(&path, RECORD_LIMIT, end)?, end)?;
+    }
+    let mut parents = BTreeMap::new();
+    for name in &intent.leaves {
+        let parent = name.rsplit_once('/').ok_or(Reason::IdentityChanged)?.0;
+        let Node::Directory { identity } = intent.entry(Scope::Prefix, parent)?.node else {
+            return Err(Reason::IdentityChanged);
+        };
+        parents.insert(parent, identity);
+    }
+    for (parent, expected) in parents {
+        sync_bound_directory(&roots.prefix.join(parent), expected, end)?;
+    }
+    sync_bound_directory(&sidecar.join("evidence"), context.evidence_identity, end)?;
+    sync_bound_directory(&sidecar, context.sidecar_identity, end)?;
+    sync_bound_directory(&roots.prefix, context.roots.prefix, end)
+}
+
+fn preparation_pass(
+    owner: &mut ReinstallControlOwner<KeepDataRetention>,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    layout: Option<ReinstallPreparationStage>,
+    end: Instant,
+) -> Result<(), Reason> {
+    let mut view = owner
+        .preparation_publication()
+        .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+    let retained = view.retained;
+    let end = view.end;
+    let mut guards = keep_guards(retained, &mut view.guards);
+    let writer = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
+    validate_existing_lock_files(&retained.locks, end)?;
+    if keep_context(retained, intent, end)? != *prep.context() {
+        return Err(Reason::IdentityChanged);
+    }
+    validate_preparation_files(intent, prep.files())?;
+    let name = match layout {
+        None => None,
+        Some(ReinstallPreparationStage::Pending) => Some(format!("{KEEP_PREP}.pending")),
+        Some(ReinstallPreparationStage::Published) => Some(format!("{KEEP_PREP}.json")),
+    };
+    let mut names = vec!["intent.json", "ready.json", "consumed.json", "evidence"];
+    if let Some(name) = &name {
+        names.push(name);
+        if read_record(&retained.roots.sidecar().join(name), KEEP_RECORD_LIMIT, end)?
+            != prep.encode().map_err(|_| Reason::IdentityChanged)?
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    exact_members(&retained.roots.sidecar(), &names, end)?;
+    transfer_inventory(
+        retained,
+        intent,
+        prep,
+        &writer,
+        layout.unwrap_or(ReinstallPreparationStage::Pending),
+        end,
+    )?;
+    let after = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
+    if writer.identity != after.identity
+        || writer.size != after.size
+        || writer.digest != after.digest
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    time(end)
+}
+
+fn publish_preparation(
+    owner: &mut ReinstallControlOwner<KeepDataRetention>,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    layout: Option<ReinstallPreparationStage>,
+    end: Instant,
+) -> Result<(), Reason> {
+    preparation_pass(owner, intent, prep, layout, end)?;
+    {
+        let view = owner
+            .preparation_publication()
+            .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+        sync_transfer_evidence(view.retained, intent, prep.context(), view.end)?;
+    }
+    // Revalidation brackets all lost-ACK barriers before a new record effect.
+    preparation_pass(owner, intent, prep, layout, end)?;
+    let view = owner
+        .preparation_publication()
+        .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+    let sidecar = view.retained.roots.sidecar();
+    let bytes = prep.encode().map_err(|_| Reason::IdentityChanged)?;
+    if layout.is_none() {
+        time(view.end)?;
+        update_state::write_new(&sidecar.join(format!("{KEEP_PREP}.pending")), &bytes)
+            .map_err(|_| Reason::FileLocked)?;
+        #[cfg(test)]
+        fault(Fault::KeepPrepPending)?;
+    }
+    publish_record(&sidecar, KEEP_PREP, &bytes, view.end)?;
+    time(view.end)?;
+    platform::sync_directory(&view.retained.roots.prefix).map_err(|_| Reason::FileLocked)?;
+    // This final parent barrier acknowledges the whole Prep publication.
+    // No fallible check follows a successful, possibly nonpreemptible sync.
+    Ok(())
+}
+
+fn resume_preparation(
+    owner: ReinstallControlOwner<KeepDataRetention>,
+    intent: FixedHandoffIntent,
+    layout: TransferLayout,
+    end: Instant,
+) -> Result<IncomingHandoff, KeepHandoffError> {
+    let (owner, _) = owner.compare_preparation(&layout.prep, layout.stage)?;
+    Ok(IncomingHandoff::KeepData(Box::new(KeepPreparation {
+        owner,
+        intent,
+        prep: layout.prep,
+        layout: Some(layout.stage),
+        end,
+    })))
+}
+
+fn prepare_incoming_handoff(
+    prefix_path: &Path,
+    catalog_path: &Path,
+    incoming: VerifiedIncomingPackage,
+    end: Instant,
+) -> Result<IncomingHandoff, KeepHandoffError> {
+    let end = SqliteControlStore::effective_runtime_deadline(end);
+    time(end)?;
+    let roots = PinnedRoots::open(prefix_path, catalog_path, end)?;
+    let resumed = observed_intent(&roots, end)?;
+    let transfer = observed_keep_transfer(&roots, end)?;
+    let active = if resumed.is_none() {
+        Some(roots.active_journal(end)?)
+    } else {
+        None
+    };
+    let records = match (&active, &resumed) {
+        (Some(journal), None) if transfer.is_none() => ResolvedRecords {
+            state: journal.state.clone(),
+            seal: read_seal(journal, end)?,
+        },
+        (None, Some(intent)) => {
+            intent.validate(&roots, &incoming, end)?;
+            if transfer.is_some() {
+                resolved_history(&roots, intent, end)?
+            } else {
+                resolved_records(&roots, intent, end)?
+            }
+        }
+        _ => return Err(Reason::IdentityChanged.into()),
+    };
+    if !records.state.owner.keep_data {
+        if transfer.is_some() {
+            return Err(Reason::IdentityChanged.into());
+        }
+        return retire_cleanup_namespace(
+            HandoffRequest {
+                prefix: prefix_path,
+                catalog: catalog_path,
+                incoming: &incoming,
+            },
+            end,
+        )
+        .map(|_| IncomingHandoff::NamespaceConsumed)
+        .map_err(Into::into);
+    }
+    incoming_current(&roots, &incoming, &records.seal.policy, end)?;
+    let locks = existing_lock_files(&roots, &records.seal.policy, end)?;
+    let parent_exit = exit_lock(
+        &roots.journal,
+        &records.seal.parent_exit,
+        &records.seal.policy,
+        end,
+        true,
+    )?;
+    let runner_exit = exit_lock(
+        &roots.journal,
+        &records.seal.runner_exit,
+        &records.seal.policy,
+        end,
+        true,
+    )?;
+    let prefix = update_state::acquire_installation_lock(&roots.prefix, end)
+        .map_err(|_| Reason::AfterExitCleanupPending)?;
+    roots.validate(end)?;
+    let owners = acquire_completion_drains(&roots.data, roots.data_identity, end, |_| Ok(()))?;
+    let history = acquire(
+        &roots.data,
+        LockKind::HistoryReaders,
+        end,
+        Reason::PrivateMetadataCleanupPending,
+    )?;
+    validate_existing_lock_files(&locks, end)?;
+    let retained = KeepDataRetention {
+        parent_exit,
+        runner_exit,
+        incoming,
+        roots,
+        locks,
+        namespace_dirs: RefCell::new(Vec::new()),
+        sibling_pins: RefCell::new(Vec::new()),
+        active,
+        records,
+    };
+    if let (Some(intent), Some(layout)) = (&resumed, &transfer) {
+        // Select and validate transfer recovery BEFORE the first control open.
+        // No old-mode byte read or old Uninstalling check precedes this route.
+        if keep_context(&retained, intent, end)? != *layout.prep.context() {
+            return Err(Reason::IdentityChanged.into());
+        }
+        validate_preparation_files(intent, layout.prep.files())?;
+        pin_transfer_directories(&retained, intent, layout.prep.context(), end)?;
+    }
+    let input = keep_owned_input(
+        retained,
+        prefix,
+        owners,
+        history,
+        transfer.as_ref().map(|layout| &layout.prep),
+        end,
+    )?;
+    let mut owner = match &transfer {
+        Some(layout) => ReinstallControlOwner::open_prepared_read_only(
+            input,
+            layout.prep.clone(),
+            layout.stage,
+            end,
+        )?,
+        None => ReinstallControlOwner::open_read_only(input, end)?,
+    };
+    let intent = if let Some(layout) = transfer {
+        let intent = resumed.ok_or(Reason::IdentityChanged)?;
+        return resume_preparation(owner, intent, layout, end);
+    } else {
+        let view = owner
+            .inspection()
+            .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+        let ReinstallInspection {
+            control,
+            installation,
+            mut guards,
+            retained,
+            end,
+            ..
+        } = view;
+        let mut guards = keep_guards(retained, &mut guards);
+        let mode = CompletionMode::KeepData {
+            control,
+            installation: &installation,
+        };
+        validate_existing_lock_files(&retained.locks, end)?;
+        let intent = match (retained.active.as_ref(), resumed) {
+            (Some(journal), None) => {
+                let inventory = {
+                    let mut completed =
+                        inspect_completed_uninstall(journal, &mut guards, &mode, end)?;
+                    completed.validate_current()?;
+                    let inventory = capture_inventory(
+                        &retained.roots,
+                        &retained.records,
+                        &completed.evidence,
+                        end,
+                    )?;
+                    completed.validate_current()?;
+                    inventory
+                };
+                prepare_fixed_intent(
+                    &retained.roots,
+                    &retained.incoming,
+                    &retained.records,
+                    inventory,
+                    end,
+                )?
+            }
+            (None, Some(intent)) => intent,
+            _ => return Err(Reason::IdentityChanged.into()),
+        };
+        let mut pins = retained.namespace_dirs.borrow_mut();
+        reconcile_retirement_retaining(
+            &retained.roots,
+            &retained.incoming,
+            &intent,
+            &mut guards,
+            &mode,
+            end,
+            &mut pins,
+        )?;
+        intent
+    };
+    let context = {
+        let view = owner
+            .inspection()
+            .map_err(|error| journal_control_error(error, end, Instant::now()))?;
+        keep_context(view.retained, &intent, view.end)?
+    };
+    let (owner, prep) = owner.prepare(&context)?;
+    let (owner, matched) = owner.compare_preparation(&prep, ReinstallPreparationStage::Pending)?;
+    if matched != ReinstallImageMatch::Before {
+        return Err(Reason::IdentityChanged.into());
+    }
+    Ok(IncomingHandoff::KeepData(Box::new(KeepPreparation {
+        owner,
+        intent,
+        prep,
+        layout: None,
+        end,
+    })))
 }
 
 fn retire_cleanup_namespace(
@@ -1895,6 +2949,27 @@ fn reconcile_retirement(
     mode: &CompletionMode<'_, '_>,
     end: Instant,
 ) -> Result<HandoffCheckpoint, Reason> {
+    let mut directory_pins = Vec::new();
+    reconcile_retirement_retaining(
+        roots,
+        incoming,
+        intent,
+        guards,
+        mode,
+        end,
+        &mut directory_pins,
+    )
+}
+
+fn reconcile_retirement_retaining(
+    roots: &PinnedRoots,
+    incoming: &VerifiedIncomingPackage,
+    intent: &FixedHandoffIntent,
+    guards: &mut CompletionGuards<'_>,
+    mode: &CompletionMode<'_, '_>,
+    end: Instant,
+    directory_pins: &mut Vec<File>,
+) -> Result<HandoffCheckpoint, Reason> {
     let sidecar = roots.sidecar();
     let sidecar_pin = platform::directory(&sidecar).map_err(|_| Reason::IdentityChanged)?;
     if platform::identity(&sidecar_pin).map_err(|_| Reason::IdentityChanged)?
@@ -1904,7 +2979,7 @@ fn reconcile_retirement(
     }
     // Keep directories in place and pinned, especially on Windows where held
     // directories cannot be renamed. No directory is a movable evidence leaf.
-    let mut directory_pins = vec![sidecar_pin];
+    directory_pins.push(sidecar_pin);
     for entry in &intent.inventory {
         if let Node::Directory { identity: expected } = entry.node {
             let pin = platform::directory(&roots.base(entry.scope).join(&entry.relative))
@@ -1986,6 +3061,7 @@ enum Fault {
     BeforeMove(usize),
     AfterMove(usize),
     ConsumedPending,
+    KeepPrepPending,
 }
 
 #[cfg(test)]
@@ -2541,6 +3617,356 @@ mod tests {
             };
             fs::read(path).unwrap()
         }
+
+        fn incoming_handoff(&self, until: Instant) -> Result<IncomingHandoff, KeepHandoffError> {
+            let until = SqliteControlStore::effective_runtime_deadline(until);
+            let incoming = package_installation::verify_incoming_for_handoff(
+                &self.source,
+                &self.manifest,
+                &self.checksums,
+                &self.image,
+                until,
+            )
+            .map_err(|error| incoming_package_error(error, until, Instant::now()))?;
+            prepare_incoming_handoff(&self.prefix, &self.catalog, incoming, until)
+        }
+    }
+
+    fn prepared_handoff(fixture: &Fixture, until: Instant) -> KeepPreparation {
+        match fixture.incoming_handoff(until) {
+            Ok(IncomingHandoff::KeepData(preparation)) => *preparation,
+            Ok(IncomingHandoff::NamespaceConsumed) => panic!("keep-data preparation was bypassed"),
+            Err(KeepHandoffError::Refused(reason)) => panic!("preparation refused: {reason:?}"),
+            Err(KeepHandoffError::Owned(error)) => panic!("owned preparation refused: {error:?}"),
+        }
+    }
+
+    fn close_preparation(preparation: KeepPreparation) {
+        // The tests consume a healthy owner through its real explicit close.
+        // Production errors still terminate the private entry with the bundle
+        // retained; no test extracts its Connection or repairs a close error.
+        let KeepPreparation { owner, .. } = preparation;
+        drop(owner.close().unwrap().into_resources());
+    }
+
+    fn assert_fixed_old_evidence(fixture: &Fixture, expected: &Snapshot) {
+        let after = snapshot_with_lock_bytes(fixture, false);
+        for (name, entry) in expected {
+            if !name.ends_with("keep-transfer-prep.pending")
+                && !name.ends_with("keep-transfer-prep.json")
+            {
+                assert_eq!(after.get(name), Some(entry), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn keep_prep_real_caller_publishes_fixed_streams_under_owned_guards() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let until = end();
+        let mut prepared = prepared_handoff(&fixture, until);
+        let fixed = snapshot_with_lock_bytes(&fixture, false);
+        let sequence = prepared.prep.context().old_control_seq;
+        let bytes = prepared.prep.encode().unwrap();
+        assert!(bytes.len() <= KEEP_RECORD_LIMIT as usize);
+        assert_eq!(prepared.prep.before().table_rows(0), Some(1));
+        assert_ne!(
+            prepared.prep.before().sha256(),
+            prepared.prep.after().sha256()
+        );
+        assert!(prepared.layout.is_none());
+        let siblings = [
+            "control.db-wal".to_owned(),
+            "control.db-shm".to_owned(),
+            format!("{}-wal", fixture.old_owner.catalog_name),
+            format!("{}-shm", fixture.old_owner.catalog_name),
+        ];
+        assert!(
+            siblings.iter().any(|name| {
+                fs::symlink_metadata(fixture.data.join(name))
+                    .is_ok_and(|metadata| metadata.is_file())
+            }),
+            "publication must exercise a real SQLite sibling file"
+        );
+        contenders.assert_excluded();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let capture = Rc::clone(&observed);
+        with_observer(
+            move |event, actual_end| {
+                assert_eq!(actual_end, until);
+                capture.borrow_mut().push(event);
+                Ok(())
+            },
+            || prepared.publish(),
+        )
+        .unwrap();
+        assert!(observed.borrow().iter().all(|event| !matches!(
+            event,
+            HandoffEvent::BeforeMove(_) | HandoffEvent::Moved(_) | HandoffEvent::BeforeConsumed
+        )));
+        let sidecar = fixture.prefix.join(SIDECAR);
+        exact_members(
+            &sidecar,
+            &[
+                "intent.json",
+                "ready.json",
+                "consumed.json",
+                "evidence",
+                "keep-transfer-prep.json",
+            ],
+            until,
+        )
+        .unwrap();
+        assert_eq!(
+            read_record(
+                &sidecar.join("keep-transfer-prep.json"),
+                KEEP_RECORD_LIMIT,
+                until
+            )
+            .unwrap(),
+            bytes
+        );
+        let view = prepared.owner.inspection().unwrap();
+        let status = view
+            .control
+            .with_runtime_deadline(view.end, || view.control.lifecycle_status())
+            .unwrap();
+        assert_eq!(status.policy.control_seq.get(), sequence);
+        assert_eq!(
+            status.policy.maintenance.state,
+            MaintenanceState::Uninstalling
+        );
+        assert_eq!(
+            status.policy.maintenance.owner.as_ref().unwrap().as_str(),
+            fixture.old_owner.nonce
+        );
+        assert_fixed_old_evidence(&fixture, &fixed);
+        contenders.assert_excluded();
+        close_preparation(prepared);
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_prep_complete_pending_and_published_reentry_do_not_replay_namespace() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut prepared = prepared_handoff(&fixture, end());
+        let bytes = prepared.prep.encode().unwrap();
+        let fixed = snapshot_with_lock_bytes(&fixture, false);
+        assert_eq!(
+            stop_at(Fault::KeepPrepPending, || prepared.publish()),
+            Err(Reason::Deadline)
+        );
+        contenders.assert_excluded();
+        let sidecar = fixture.prefix.join(SIDECAR);
+        assert_eq!(
+            fs::read(sidecar.join("keep-transfer-prep.pending")).unwrap(),
+            bytes
+        );
+        assert!(!sidecar.join("keep-transfer-prep.json").exists());
+        assert_fixed_old_evidence(&fixture, &fixed);
+        close_preparation(prepared);
+        contenders.assert_available_except(None);
+
+        for stage in [
+            ReinstallPreparationStage::Pending,
+            ReinstallPreparationStage::Published,
+        ] {
+            let until = end();
+            let mut resumed = prepared_handoff(&fixture, until);
+            assert!(resumed.layout == Some(stage));
+            assert_eq!(resumed.prep.encode().unwrap(), bytes);
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let capture = Rc::clone(&events);
+            with_observer(
+                move |event, actual_end| {
+                    assert_eq!(actual_end, until);
+                    capture.borrow_mut().push(event);
+                    Ok(())
+                },
+                || resumed.publish(),
+            )
+            .unwrap();
+            let events = events.borrow();
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                HandoffEvent::BeforeMove(_) | HandoffEvent::Moved(_) | HandoffEvent::BeforeConsumed
+            )));
+            for parent in resumed
+                .intent
+                .leaves
+                .iter()
+                .map(|name| fixture.prefix.join(name).parent().unwrap().to_path_buf())
+                .chain([sidecar.join("evidence")])
+                .collect::<BTreeSet<_>>()
+            {
+                assert!(events.contains(&HandoffEvent::DirectorySynced(parent)));
+            }
+            assert_eq!(
+                fs::read(sidecar.join("keep-transfer-prep.json")).unwrap(),
+                bytes
+            );
+            assert!(!sidecar.join("keep-transfer-prep.pending").exists());
+            assert_fixed_old_evidence(&fixture, &fixed);
+            contenders.assert_excluded();
+            close_preparation(resumed);
+            contenders.assert_available_except(None);
+        }
+    }
+
+    #[test]
+    fn keep_prep_torn_both_unknown_and_ack_without_prep_preserve_input() {
+        for damage in ["torn", "both", "unknown", "ack-only"] {
+            let fixture = Fixture::new(true);
+            let contenders = NativeContenders::new(&fixture);
+            let mut prepared = prepared_handoff(&fixture, end());
+            prepared.publish().unwrap();
+            let bytes = prepared.prep.encode().unwrap();
+            close_preparation(prepared);
+            let sidecar = fixture.prefix.join(SIDECAR);
+            match damage {
+                "torn" => {
+                    fs::remove_file(sidecar.join("keep-transfer-prep.json")).unwrap();
+                    update_state::write_new(
+                        &sidecar.join("keep-transfer-prep.pending"),
+                        &bytes[..bytes.len() / 2],
+                    )
+                    .unwrap();
+                }
+                "both" => {
+                    update_state::write_new(&sidecar.join("keep-transfer-prep.pending"), &bytes)
+                        .unwrap()
+                }
+                "unknown" => {
+                    update_state::write_new(&sidecar.join("unrecognized-record"), b"x").unwrap()
+                }
+                "ack-only" => {
+                    fs::remove_file(sidecar.join("keep-transfer-prep.json")).unwrap();
+                    update_state::write_new(&sidecar.join("keep-transfer-ack.pending"), b"{}")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let damaged = snapshot(&fixture);
+            let expected = match damage {
+                "unknown" => Reason::UnclassifiedOwnedArtifact,
+                "ack-only" => Reason::AfterExitCleanupPending,
+                _ => Reason::IdentityChanged,
+            };
+            match fixture.incoming_handoff(end()) {
+                Err(KeepHandoffError::Refused(reason)) => assert_eq!(reason, expected),
+                Err(KeepHandoffError::Owned(_)) => panic!("invalid layout reached SQLite"),
+                Ok(_) => panic!("invalid transfer layout was accepted"),
+            }
+            assert_eq!(snapshot(&fixture), damaged);
+            contenders.assert_available_except(None);
+        }
+    }
+
+    #[test]
+    fn keep_prep_replaced_receipt_and_expired_entry_refuse_before_open() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut prepared = prepared_handoff(&fixture, end());
+        prepared.publish().unwrap();
+        close_preparation(prepared);
+        let fixed = snapshot(&fixture);
+        match fixture.incoming_handoff(Instant::now()) {
+            Err(KeepHandoffError::Refused(reason)) => assert_eq!(reason, Reason::Deadline),
+            _ => panic!("expired entry did not refuse before open"),
+        }
+        assert_eq!(snapshot(&fixture), fixed);
+        let receipt = fixture.data.join("installation-prefix.json");
+        let old = fixture
+            ._temp
+            .path()
+            .join("retained-original-prefix-binding");
+        let bytes = fs::read(&receipt).unwrap();
+        let original = file_identity(&receipt);
+        fs::rename(&receipt, &old).unwrap();
+        update_state::write_new(&receipt, &bytes).unwrap();
+        assert_ne!(file_identity(&receipt), original);
+        assert_eq!(fs::read(&old).unwrap(), bytes);
+        let damaged = snapshot(&fixture);
+        match fixture.incoming_handoff(end()) {
+            Err(KeepHandoffError::Refused(reason)) => assert_eq!(reason, Reason::IdentityChanged),
+            Err(KeepHandoffError::Owned(_)) => panic!("changed receipt reached SQLite"),
+            Ok(_) => panic!("changed receipt was accepted"),
+        }
+        assert_eq!(snapshot(&fixture), damaged);
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_prep_package_deadline_mapping_preserves_identity_failures() {
+        let now = Instant::now();
+        let before = now - Duration::from_millis(1);
+        let after = now + Duration::from_millis(1);
+        let error = |code| CliError(ProtocolError::new(code, "synthetic package refusal"));
+        assert_eq!(
+            incoming_package_error(error(CanonicalCode::WriterBusy), now, now),
+            Reason::Deadline
+        );
+        assert_eq!(
+            incoming_package_error(error(CanonicalCode::WriterBusy), after, now),
+            Reason::IdentityChanged
+        );
+        for code in [CanonicalCode::SchemaIncompatible, CanonicalCode::SourceIo] {
+            assert_eq!(
+                incoming_package_error(error(code), before, now),
+                Reason::IdentityChanged
+            );
+        }
+        assert_eq!(
+            incoming_package_error(error(CanonicalCode::DeadlineExceeded), after, now),
+            Reason::Deadline
+        );
+    }
+
+    #[test]
+    fn keep_prep_earlier_outer_end_reaches_publication_and_restores_scope() {
+        let fixture = Fixture::new(true);
+        let scope_fixture = agent_session_grep_testkit::tempdir().unwrap();
+        let scope_control = SqliteControlStore::create_with_deadline(
+            &scope_fixture.path().join("control"),
+            &id("prep-scope"),
+            DesiredUpdates::Paused,
+            end(),
+        )
+        .unwrap();
+        let outer_end = end();
+        let requested = outer_end + BUDGET;
+        let observed = Rc::new(Cell::new(0));
+        let capture = Rc::clone(&observed);
+        let mut prepared = None;
+        scope_control
+            .with_runtime_deadline(outer_end, || {
+                assert_eq!(
+                    SqliteControlStore::effective_runtime_deadline(requested),
+                    outer_end
+                );
+                let mut handoff = prepared_handoff(&fixture, requested);
+                assert_eq!(handoff.end, outer_end);
+                with_observer(
+                    move |_, actual| {
+                        assert_eq!(actual, outer_end);
+                        capture.set(capture.get() + 1);
+                        Ok(())
+                    },
+                    || handoff.publish(),
+                )
+                .unwrap();
+                prepared = Some(handoff);
+                Ok(())
+            })
+            .unwrap();
+        assert!(observed.get() > 0);
+        assert_eq!(
+            SqliteControlStore::effective_runtime_deadline(requested),
+            requested
+        );
+        close_preparation(prepared.unwrap());
     }
 
     fn stop_at<T>(point: Fault, operation: impl FnOnce() -> T) -> T {
@@ -2797,6 +4223,10 @@ mod tests {
     type Snapshot = BTreeMap<String, SnapshotEntry>;
 
     fn snapshot(fixture: &Fixture) -> Snapshot {
+        snapshot_with_lock_bytes(fixture, true)
+    }
+
+    fn snapshot_with_lock_bytes(fixture: &Fixture, read_lock_bytes: bool) -> Snapshot {
         let mut result = BTreeMap::new();
         for (scope, root) in [("prefix", &fixture.prefix), ("data", &fixture.data)] {
             let mut pending = vec![root.to_path_buf()];
@@ -2849,7 +4279,10 @@ mod tests {
                         let file = File::open(&path).unwrap();
                         // Writer diagnostics change at lawful reacquisition;
                         // SHM bytes are SQLite bookkeeping. Their inode remains.
-                        let bytes = if relative == "writer.lock" || relative.ends_with("-shm") {
+                        let bytes = if relative == "writer.lock"
+                            || relative.ends_with("-shm")
+                            || (!read_lock_bytes && relative.ends_with(".lock"))
+                        {
                             vec![]
                         } else {
                             fs::read(&path).unwrap()

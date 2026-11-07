@@ -62,6 +62,82 @@ pub struct ReinstallOwnedPins {
     pub prefix_binding: fs::File,
 }
 
+/// Recorded terminal coordinates, checked by the sealed connection read.
+/// The CLI still verifies regions, completed history and namespace evidence.
+pub struct ReinstallCleanupBinding {
+    pub installation: ControlId,
+    pub incarnation: ControlId,
+    pub owner: ControlId,
+    pub control_seq: ControlSeq,
+    pub policy_epoch: PolicyEpoch,
+}
+
+pub enum ReinstallExpectedControl {
+    Exact(Box<ControlStatus>),
+    Cleanup(ReinstallCleanupBinding),
+}
+
+impl ReinstallExpectedControl {
+    fn installation(&self) -> &ControlId {
+        match self {
+            Self::Exact(status) => &status.policy.installation_id,
+            Self::Cleanup(binding) => &binding.installation,
+        }
+    }
+
+    fn incarnation(&self) -> PortResult<&ControlId> {
+        match self {
+            Self::Exact(status) => status.catalog_incarnation.as_ref().ok_or_else(invalid),
+            Self::Cleanup(binding) => Ok(&binding.incarnation),
+        }
+    }
+
+    fn validate(&self, status: &ControlStatus) -> PortResult<()> {
+        let matches = match self {
+            Self::Exact(expected) => status == expected.as_ref(),
+            Self::Cleanup(expected) => {
+                status.policy.installation_id == expected.installation
+                    && status.catalog_incarnation.as_ref() == Some(&expected.incarnation)
+                    && status.policy.control_seq == expected.control_seq
+                    && status.policy.policy_epoch == expected.policy_epoch
+                    && status.policy.maintenance.state == MaintenanceState::Uninstalling
+                    && status.policy.maintenance.phase == Some(MaintenancePhase::Quiescing)
+                    && status.policy.maintenance.owner.as_ref() == Some(&expected.owner)
+            }
+        };
+        if !matches {
+            return Err(conflict());
+        }
+        status.policy.maintenance.validate()
+    }
+
+    fn validate_preparation(&self, prep: &ReinstallPrep) -> PortResult<()> {
+        let context = prep.context();
+        let (sequence, epoch, owner) = match self {
+            Self::Exact(status) => (
+                status.policy.control_seq,
+                status.policy.policy_epoch,
+                status
+                    .policy
+                    .maintenance
+                    .owner
+                    .as_ref()
+                    .ok_or_else(invalid)?,
+            ),
+            Self::Cleanup(binding) => (binding.control_seq, binding.policy_epoch, &binding.owner),
+        };
+        if context.installation != self.installation().as_str()
+            || context.incarnation != self.incarnation()?.as_str()
+            || context.old_control_seq != sequence.get()
+            || context.policy_epoch != epoch.get()
+            || context.old_owner != owner.as_str()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// Comparison inputs plus actual owned resources. `retained` is never inspected
 /// or invoked: the CLI moves its real exit guards, package/image and root pins
 /// into it. `'static` forbids borrowing those resources from an outer scope.
@@ -70,7 +146,7 @@ pub struct ReinstallOwnedInput<R: 'static> {
     pub root: PathBuf,
     pub prefix: PathBuf,
     pub catalog: PathBuf,
-    pub expected: ControlStatus,
+    pub expected: ReinstallExpectedControl,
     pub files: ReinstallFiles,
     pub prefix_binding: ReinstallFileBinding,
     pub guards: ReinstallOwnedGuards,
@@ -82,6 +158,94 @@ pub struct ReinstallOwnedInput<R: 'static> {
 /// There is no raw connection, arbitrary SQL or callback interface.
 pub struct ReinstallControlOwner<R: 'static> {
     owned: OwnedBundle<R>,
+}
+
+/// A short borrow of the actual readonly store and retained CLI resources.
+/// Construction requires both writable=false and SQLite query_only=1. Keeping
+/// this value borrowed prevents close/reopen/adoption of its owning bundle.
+#[non_exhaustive]
+pub struct ReinstallInspection<'a, R: 'static> {
+    pub control: &'a SqliteControlStore,
+    pub installation: InstallationLockAuthority<'a>,
+    pub guards: ReinstallInspectionGuards<'a>,
+    pub retained: &'a R,
+    pub end: Instant,
+}
+
+pub struct ReinstallInspectionGuards<'a> {
+    pub prefix: &'a ExclusiveGuard,
+    pub policy_owner: &'a ExclusiveGuard,
+    pub emission: &'a ExclusiveGuard,
+    pub supervisor: &'a ExclusiveGuard,
+    pub background: &'a ExclusiveGuard,
+    pub purge: &'a ExclusiveGuard,
+    pub history_readers: &'a ExclusiveGuard,
+    pub catalog_handles: &'a ExclusiveGuard,
+    /// Reading diagnostics cannot move or replace the bundle's actual lease.
+    pub writer: ReinstallWriterRead<'a>,
+}
+
+/// A nonextractable borrow of the writer owned by the connection bundle.
+/// Only record reads and identity validation are exposed; dropping this view
+/// leaves the original lease in its owner.
+///
+/// A caller cannot replace and drop the original lease:
+/// ```compile_fail
+/// use agent_session_grep_adapters_sqlite::{
+///     WriterLease, control::ReinstallInspectionGuards,
+/// };
+/// fn take_writer(mut guards: ReinstallInspectionGuards<'_>, replacement: WriterLease) {
+///     let original = std::mem::replace(&mut *guards.writer, replacement);
+///     drop(original);
+/// }
+/// ```
+///
+/// The underlying mutable borrow is private:
+/// ```compile_fail
+/// use agent_session_grep_adapters_sqlite::{
+///     WriterLease, control::ReinstallWriterRead,
+/// };
+/// fn extract<'a>(view: ReinstallWriterRead<'a>) -> &'a mut WriterLease {
+///     view.lease
+/// }
+/// ```
+pub struct ReinstallWriterRead<'a> {
+    lease: &'a mut WriterLease,
+}
+
+impl ReinstallWriterRead<'_> {
+    pub fn path(&self) -> &Path {
+        self.lease.path()
+    }
+
+    pub fn validate_current(&self, root: &Path) -> PortResult<()> {
+        self.lease.validate_current(root)
+    }
+
+    pub fn validate_proof_file(&self, candidate: &fs::File) -> PortResult<()> {
+        self.lease.validate_proof_file(candidate)
+    }
+
+    pub fn read_record(&mut self) -> PortResult<String> {
+        self.lease.read_record()
+    }
+}
+
+/// Bound filesystem publication view. It deliberately contains no store:
+/// recorded After may be inspected for a prep/ACK without exporting a writable
+/// SQL surface. All borrowed resources stay inside the consuming owner.
+pub struct ReinstallPublication<'a, R: 'static> {
+    pub retained: &'a R,
+    pub guards: ReinstallInspectionGuards<'a>,
+    pub end: Instant,
+}
+
+/// Comparison mode, not publication authority. The private coordinator verifies
+/// the exact durable prep layout before selecting either readonly entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReinstallPreparationStage {
+    Pending,
+    Published,
 }
 
 /// The catalog remains query-only even though SQLite opened it READ_WRITE.
@@ -155,6 +319,41 @@ struct ConnectionSlot {
     close_code: Option<i32>,
 }
 
+struct ControlSlot {
+    store: Option<SqliteControlStore>,
+    close: ConnectionSlot,
+}
+
+impl ControlSlot {
+    fn captured(conn: Connection) -> Self {
+        Self {
+            store: None,
+            close: ConnectionSlot::new(conn),
+        }
+    }
+
+    fn from_store(store: SqliteControlStore) -> Self {
+        Self {
+            store: Some(store),
+            close: ConnectionSlot {
+                conn: None,
+                close_confirmed: false,
+                close_attempted: false,
+                close_code: None,
+            },
+        }
+    }
+
+    fn store(&self) -> PortResult<&SqliteControlStore> {
+        self.store.as_ref().ok_or_else(invalid)
+    }
+}
+
+struct PreparedRead {
+    prep: ReinstallPrep,
+    stage: ReinstallPreparationStage,
+}
+
 impl ConnectionSlot {
     fn new(conn: Connection) -> Self {
         Self {
@@ -215,7 +414,7 @@ struct ClosedPins {
 struct Bundle<R: 'static> {
     input: ReinstallOwnedInput<R>,
     end: Instant,
-    control: Option<ConnectionSlot>,
+    control: Option<ControlSlot>,
     catalog: Option<ConnectionSlot>,
     handle_lease: Option<ControlHandleLease>,
     rendezvous: Option<ReinstallHandlesPin>,
@@ -223,6 +422,7 @@ struct Bundle<R: 'static> {
     catalog_wal: Option<ObservedWal>,
     control_shm: Option<ObservedShm>,
     catalog_shm: Option<ObservedShm>,
+    preparation: Option<PreparedRead>,
     #[cfg(test)]
     outstanding: Option<tests::OutstandingStatement>,
 }
@@ -240,13 +440,40 @@ impl<R: 'static> Bundle<R> {
             catalog_wal: None,
             control_shm: None,
             catalog_shm: None,
+            preparation: None,
             #[cfg(test)]
             outstanding: None,
         }
     }
 
     fn connections(&self) -> impl Iterator<Item = &ConnectionSlot> {
-        self.control.iter().chain(self.catalog.iter())
+        self.control
+            .iter()
+            .map(|slot| &slot.close)
+            .chain(self.catalog.iter())
+    }
+
+    fn store(&self) -> PortResult<&SqliteControlStore> {
+        self.control.as_ref().ok_or_else(invalid)?.store()
+    }
+
+    fn control_handle_lease(&self) -> PortResult<&ControlHandleLease> {
+        self.control
+            .as_ref()
+            .and_then(|slot| slot.store.as_ref())
+            .map(|store| &store.handle_lease)
+            .or(self.handle_lease.as_ref())
+            .ok_or_else(invalid)
+    }
+
+    fn installation(&self) -> InstallationLockAuthority<'_> {
+        InstallationLockAuthority {
+            guard: &self.input.guards.prefix,
+            prefix: self.input.prefix.clone(),
+            identity: self.input.guards.prefix.root_identity(),
+            installation: self.input.expected.installation().clone(),
+            control_root: self.input.guards.policy_owner.root_identity(),
+        }
     }
 
     fn unconfirmed(&self) -> bool {
@@ -267,28 +494,40 @@ impl<R: 'static> Bundle<R> {
         self.tick()?;
         let input = &self.input;
         input.files.validate()?;
-        input.expected.policy.maintenance.validate()?;
         if !input.root.is_absolute()
             || !input.prefix.is_absolute()
             || input.catalog.parent() != Some(input.root.as_path())
-            || input.expected.catalog_incarnation.is_none()
-            || input.expected.policy.maintenance.owner.is_none()
-            || !matches!(
-                (
-                    input.expected.policy.maintenance.state,
-                    input.expected.policy.maintenance.phase
-                ),
-                (
-                    MaintenanceState::Uninstalling,
-                    Some(MaintenancePhase::Quiescing)
-                ) | (
-                    MaintenanceState::Recovering,
-                    Some(MaintenancePhase::Reconciling)
-                )
-            )
             || input.prefix_binding.size > MAX_PREFIX_BINDING_BYTES
         {
             return Err(invalid());
+        }
+        input.expected.incarnation()?;
+        if let ReinstallExpectedControl::Exact(status) = &input.expected {
+            status.policy.maintenance.validate()?;
+            if status.policy.maintenance.owner.is_none()
+                || !matches!(
+                    (
+                        status.policy.maintenance.state,
+                        status.policy.maintenance.phase
+                    ),
+                    (
+                        MaintenanceState::Uninstalling,
+                        Some(MaintenancePhase::Quiescing)
+                    ) | (
+                        MaintenanceState::Recovering,
+                        Some(MaintenancePhase::Reconciling)
+                    )
+                )
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(prepared) = &self.preparation {
+            prepared.prep.validate()?;
+            input.expected.validate_preparation(&prepared.prep)?;
+            if prepared.prep.files() != &input.files {
+                return Err(invalid());
+            }
         }
         private_directory(&input.root, false)?;
         reject_links(&input.prefix)?;
@@ -305,6 +544,12 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn validate_files(&mut self, allow_empty_wal: bool) -> PortResult<()> {
+        let catalog_allow_empty = self
+            .preparation
+            .as_ref()
+            .map_or(allow_empty_wal, |prepared| {
+                prepared.stage == ReinstallPreparationStage::Published
+            });
         let input = &mut self.input;
         let control_path = SqliteControlStore::path(&input.root);
         let prefix_path = input.root.join(PREFIX_BINDING_FILE);
@@ -327,20 +572,33 @@ impl<R: 'static> Bundle<R> {
         ] {
             verify_reinstall_file_bytes(path, pin, binding, self.end)?;
         }
-        verify_wal(
-            &control_path,
-            &mut input.pins.control_wal,
-            input.files.control_wal.as_ref(),
-            &mut self.control_wal,
-            allow_empty_wal,
-            self.end,
-        )?;
+        if self.preparation.is_some() {
+            // The selected prep mode precedes the first open on re-entry.
+            // Only this WAL's bytes may differ; the actual read must still
+            // match recorded Before (pending) or Before/After (published).
+            verify_logical_control_wal(
+                &control_path,
+                &mut input.pins.control_wal,
+                input.files.control_wal.as_ref(),
+                &mut self.control_wal,
+                self.end,
+            )?;
+        } else {
+            verify_wal(
+                &control_path,
+                &mut input.pins.control_wal,
+                input.files.control_wal.as_ref(),
+                &mut self.control_wal,
+                allow_empty_wal,
+                self.end,
+            )?;
+        }
         verify_wal(
             &input.catalog,
             &mut input.pins.catalog_wal,
             input.files.catalog_wal.as_ref(),
             &mut self.catalog_wal,
-            allow_empty_wal,
+            catalog_allow_empty,
             self.end,
         )?;
         verify_shm(
@@ -396,40 +654,51 @@ impl<R: 'static> Bundle<R> {
 
     fn read_control(&mut self) -> PortResult<ControlStatus> {
         self.validate_inputs(true)?;
-        self.handle_lease
-            .as_ref()
-            .ok_or_else(invalid)?
+        self.control_handle_lease()?
             .validate_admission(&self.input.root)?;
         if self.rendezvous.is_none() {
             self.rendezvous = Some(ReinstallHandlesPin::open(&self.input.root)?);
         }
         self.rendezvous.as_ref().ok_or_else(invalid)?.validate()?;
-        let path = SqliteControlStore::path(&self.input.root);
-        let conn = self.control.as_ref().ok_or_else(invalid)?.get()?;
-        require_close_policy(conn)?;
-        verify_reinstall_connection(conn, &path, self.input.files.control_main.identity)?;
         let status = {
-            let tx = conn.unchecked_transaction().map_err(sql_error)?;
-            validate_schema(&tx)?;
-            let version: i64 = tx
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .map_err(sql_error)?;
-            let mode: String = tx
-                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                .map_err(sql_error)?;
-            if version != VERSION || mode != "wal" {
-                return Err(corrupt());
+            let store = self.store()?;
+            {
+                let conn = store.conn.borrow();
+                require_close_policy(&conn)?;
+                verify_reinstall_connection(
+                    &conn,
+                    &SqliteControlStore::path(&self.input.root),
+                    self.input.files.control_main.identity,
+                )?;
+                let tx = conn.unchecked_transaction().map_err(sql_error)?;
+                validate_schema(&tx)?;
+                let version: i64 = tx
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(sql_error)?;
+                let mode: String = tx
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .map_err(sql_error)?;
+                if version != VERSION || mode != "wal" {
+                    return Err(corrupt());
+                }
+                tx.commit().map_err(sql_error)?;
             }
-            validate_policy_admission_capacity(&tx)?;
-            let status = load_status_core(&tx)?;
-            if status != self.input.expected {
-                return Err(conflict());
+            let installation = self.installation();
+            let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
+            let status = store.read_bound_to_sealed_with_deadline(
+                self.input.guards.policy_owner.root_identity(),
+                &owner,
+                &installation,
+                SealedControlFile::from_recorded(self.input.files.control_main.identity),
+                self.end,
+            )?;
+            if self.preparation.is_some() {
+                self.compare_prepared()?;
+            } else {
+                self.input.expected.validate(&status)?;
             }
-            runtime_tick()?;
-            tx.commit().map_err(sql_error)?;
             status
         };
-        verify_reinstall_connection(conn, &path, self.input.files.control_main.identity)?;
         self.validate_receipt(&status)?;
         self.validate_files(true)?;
         self.rendezvous.as_ref().ok_or_else(invalid)?.validate()?;
@@ -437,12 +706,132 @@ impl<R: 'static> Bundle<R> {
         Ok(status)
     }
 
+    fn compare_prepared(&self) -> PortResult<ReinstallImageMatch> {
+        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+        let store = self.store()?;
+        let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
+        let installation = self.installation();
+        let matched = store.compare_reinstall_commitment_with_deadline(
+            ReinstallSnapshotBinding {
+                control_root: self.input.guards.policy_owner.root_identity(),
+                owner: &owner,
+                installation: &installation,
+                sealed: SealedControlFile::from_recorded(self.input.files.control_main.identity),
+            },
+            &prepared.prep,
+            self.end,
+        )?;
+        if prepared.stage == ReinstallPreparationStage::Pending
+            && matched != ReinstallImageMatch::Before
+        {
+            return Err(conflict());
+        }
+        Ok(matched)
+    }
+
+    fn prepare(&mut self, context: &ReinstallContext) -> PortResult<ReinstallPrep> {
+        self.read_control()?;
+        self.require_readonly_inspection()?;
+        if self.preparation.is_some() {
+            return Err(invalid());
+        }
+        // The initial readonly open may have created empty WAL/SHM siblings.
+        // Fix their already-held observations into the first Prep, matching the
+        // coordinator's post-open inventory. Never refresh a published binding.
+        for (original, binding, observed) in [
+            (
+                &mut self.input.pins.control_wal,
+                &mut self.input.files.control_wal,
+                &mut self.control_wal,
+            ),
+            (
+                &mut self.input.pins.catalog_wal,
+                &mut self.input.files.catalog_wal,
+                &mut self.catalog_wal,
+            ),
+        ] {
+            if original.is_none()
+                && binding.is_none()
+                && let Some(wal) = observed.take()
+            {
+                *original = Some(wal.file);
+                *binding = Some(wal.binding);
+            }
+        }
+        for (binding, observed) in [
+            (&mut self.input.files.control_shm, &self.control_shm),
+            (&mut self.input.files.catalog_shm, &self.catalog_shm),
+        ] {
+            if let Some(shm) = observed {
+                *binding = Some(ReinstallShmBinding {
+                    identity: shm.identity,
+                    size: shm.file.metadata().map_err(io_error)?.len(),
+                });
+            }
+        }
+        let store = self.store()?;
+        let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
+        let installation = self.installation();
+        let prep = store
+            .prepare_reinstall_commitments_with_deadline(
+                ReinstallPreparationRead {
+                    binding: ReinstallSnapshotBinding {
+                        control_root: self.input.guards.policy_owner.root_identity(),
+                        owner: &owner,
+                        installation: &installation,
+                        sealed: SealedControlFile::from_recorded(
+                            self.input.files.control_main.identity,
+                        ),
+                    },
+                    context,
+                    files: &self.input.files,
+                },
+                self.end,
+            )?
+            .into_preparation();
+        self.validate_files(true)?;
+        self.tick()?;
+        Ok(prep)
+    }
+
+    fn require_readonly_inspection(&self) -> PortResult<()> {
+        let store = self.store()?;
+        if let ReinstallExpectedControl::Exact(status) = &self.input.expected
+            && (status.policy.maintenance.state != MaintenanceState::Uninstalling
+                || status.policy.maintenance.phase != Some(MaintenancePhase::Quiescing))
+        {
+            return Err(invalid());
+        }
+        if store.writable
+            || store
+                .conn
+                .borrow()
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .map_err(sql_error)?
+                != 1
+        {
+            return Err(invalid());
+        }
+        if self.preparation.is_some() && self.compare_prepared()? != ReinstallImageMatch::Before {
+            return Err(invalid());
+        }
+        self.tick()
+    }
+
     fn open_control(&mut self, writable: bool) -> PortResult<()> {
+        if writable
+            && self
+                .preparation
+                .as_ref()
+                .is_some_and(|prepared| prepared.stage != ReinstallPreparationStage::Published)
+        {
+            return Err(invalid());
+        }
         self.validate_inputs(false)?;
         if self
             .control
             .as_ref()
-            .is_some_and(|slot| !slot.close_confirmed)
+            .is_some_and(|slot| !slot.close.close_confirmed)
         {
             return Err(invalid());
         }
@@ -463,21 +852,47 @@ impl<R: 'static> Bundle<R> {
         let path = SqliteControlStore::path(&self.input.root);
         let conn = raw_reinstall_connection(&path, writable)?;
         // No fallible call between successful open and owned containment.
-        self.control = Some(ConnectionSlot::new(conn));
+        self.control = Some(ControlSlot::captured(conn));
         #[cfg(test)]
         tests::after_containment(tests::OpenKind::Control);
-        let conn = self.control.as_ref().ok_or_else(invalid)?.get()?;
+        let conn = self.control.as_ref().ok_or_else(invalid)?.close.get()?;
         install_reinstall_close_policy(conn)?;
         verify_reinstall_connection(conn, &path, self.input.files.control_main.identity)?;
         configure_query_only(conn)?;
+        let private_root = self.input.root.clone();
+        let conn = self
+            .control
+            .as_mut()
+            .ok_or_else(invalid)?
+            .close
+            .conn
+            .take()
+            .ok_or_else(invalid)?;
+        let store = SqliteControlStore {
+            conn: RefCell::new(conn),
+            handle_lease: self
+                .handle_lease
+                .take()
+                .expect("retained control lease before open"),
+            writable: false,
+            root_identity: self.input.guards.policy_owner.root_identity(),
+            private_root,
+        };
+        self.control.as_mut().expect("contained control slot").store = Some(store);
         self.read_control()?;
         if writable {
-            self.control
-                .as_ref()
-                .ok_or_else(invalid)?
-                .get()?
+            self.store()?
+                .conn
+                .borrow()
                 .execute_batch("PRAGMA query_only=OFF;")
                 .map_err(sql_error)?;
+            self.control
+                .as_mut()
+                .ok_or_else(invalid)?
+                .store
+                .as_mut()
+                .ok_or_else(invalid)?
+                .writable = true;
         }
         self.tick()
     }
@@ -510,12 +925,8 @@ impl<R: 'static> Bundle<R> {
         configure_query_only(conn)?;
         let identity = crate::managed_maintenance::read_reinstall_catalog_identity(
             conn,
-            &self.input.expected.policy.installation_id,
-            self.input
-                .expected
-                .catalog_incarnation
-                .as_ref()
-                .ok_or_else(invalid)?,
+            self.input.expected.installation(),
+            self.input.expected.incarnation()?,
             self.end,
         )?;
         verify_reinstall_connection(
@@ -530,6 +941,12 @@ impl<R: 'static> Bundle<R> {
 
     fn catalog_transition(&mut self, owner: &ControlId) -> PortResult<CatalogIdentity> {
         let status = self.read_control()?;
+        if let Some(prepared) = &self.preparation
+            && (prepared.stage != ReinstallPreparationStage::Published
+                || self.compare_prepared()? != ReinstallImageMatch::After)
+        {
+            return Err(invalid());
+        }
         if status.policy.maintenance.state != MaintenanceState::Recovering
             || status.policy.maintenance.phase != Some(MaintenancePhase::Reconciling)
             || status.policy.maintenance.owner.as_ref() != Some(owner)
@@ -564,7 +981,28 @@ impl<R: 'static> Bundle<R> {
         if let Some(slot) = &mut self.catalog {
             slot.close_once()?;
         }
-        self.control.as_mut().ok_or_else(invalid)?.close_once()
+        self.close_control()
+    }
+
+    fn close_control(&mut self) -> PortResult<()> {
+        self.tick()?;
+        let slot = self.control.as_mut().ok_or_else(invalid)?;
+        if slot.close.close_attempted || slot.close.close_confirmed {
+            return Err(invalid());
+        }
+        if slot.store.is_some() && self.handle_lease.is_some() {
+            return Err(invalid());
+        }
+        if let Some(store) = slot.store.take() {
+            let SqliteControlStore {
+                conn, handle_lease, ..
+            } = store;
+            // Move the actual lease into the full bundle BEFORE consuming conn.
+            // store=None is never evidence of close: close_confirmed stays false.
+            self.handle_lease = Some(handle_lease);
+            slot.close.conn = Some(conn.into_inner());
+        }
+        slot.close.close_once()
     }
 }
 
@@ -637,6 +1075,14 @@ struct ConnectionScope<'a, R: 'static> {
 
 impl<R: 'static> ConnectionScope<'_, R> {
     fn configure(&self) -> PortResult<()> {
+        if let Some(store) = self
+            .bundle
+            .control
+            .as_ref()
+            .and_then(|slot| slot.store.as_ref())
+        {
+            configure_runtime_deadline(&store.conn.borrow())?;
+        }
         for slot in self.bundle.connections() {
             if let Some(conn) = &slot.conn {
                 configure_runtime_deadline(conn)?;
@@ -682,6 +1128,135 @@ impl<R: 'static> ReinstallControlOwner<R> {
         }
     }
 
+    /// The exact prep mode is selected before opening SQLite. This never applies
+    /// the old byte-exact control-WAL check before the recorded image comparison.
+    pub fn open_prepared_read_only(
+        input: ReinstallOwnedInput<R>,
+        prep: ReinstallPrep,
+        stage: ReinstallPreparationStage,
+        end: Instant,
+    ) -> Result<Self, Box<ReinstallConnectionError<R>>> {
+        let mut owned = OwnedBundle::new(input, end);
+        owned.bundle_mut().preparation = Some(PreparedRead { prep, stage });
+        match owned.scoped(|bundle| bundle.open_control(false)) {
+            Ok(()) => Ok(Self { owned }),
+            Err(error) => Err(owned.failed(error)),
+        }
+    }
+
+    /// Only the existing cleanup inspector may borrow the readonly store view.
+    /// There is no general store getter, mutable retention payload, raw handle
+    /// or callback. Any failure leaves this owner retaining the entire bundle.
+    pub fn inspection(&mut self) -> PortResult<ReinstallInspection<'_, R>> {
+        self.owned.scoped(|bundle| {
+            bundle.read_control()?;
+            bundle.require_readonly_inspection()
+        })?;
+        let bundle = self.owned.bundle_mut();
+        let ReinstallOwnedGuards {
+            prefix,
+            policy_owner,
+            emission,
+            supervisor,
+            background,
+            purge,
+            history_readers,
+            catalog_handles,
+            writer,
+        } = &mut bundle.input.guards;
+        let installation = InstallationLockAuthority {
+            guard: &*prefix,
+            prefix: bundle.input.prefix.clone(),
+            identity: prefix.root_identity(),
+            installation: bundle.input.expected.installation().clone(),
+            control_root: policy_owner.root_identity(),
+        };
+        Ok(ReinstallInspection {
+            control: bundle.control.as_ref().ok_or_else(invalid)?.store()?,
+            installation,
+            guards: ReinstallInspectionGuards {
+                prefix,
+                policy_owner,
+                emission,
+                supervisor,
+                background,
+                purge,
+                history_readers,
+                catalog_handles,
+                writer: ReinstallWriterRead { lease: writer },
+            },
+            retained: &bundle.input.retained,
+            end: bundle.end,
+        })
+    }
+
+    pub fn prepare(
+        mut self,
+        context: &ReinstallContext,
+    ) -> Result<(Self, ReinstallPrep), Box<ReinstallConnectionError<R>>> {
+        match self.owned.scoped(|bundle| bundle.prepare(context)) {
+            Ok(prep) => Ok((self, prep)),
+            Err(error) => Err(self.owned.failed(error)),
+        }
+    }
+
+    pub fn preparation_publication(&mut self) -> PortResult<ReinstallPublication<'_, R>> {
+        self.owned.scoped(|bundle| {
+            if bundle.preparation.is_none() {
+                return Err(invalid());
+            }
+            bundle.read_control().map(|_| ())
+        })?;
+        let bundle = self.owned.bundle_mut();
+        let guards = &mut bundle.input.guards;
+        Ok(ReinstallPublication {
+            retained: &bundle.input.retained,
+            guards: ReinstallInspectionGuards {
+                prefix: &guards.prefix,
+                policy_owner: &guards.policy_owner,
+                emission: &guards.emission,
+                supervisor: &guards.supervisor,
+                background: &guards.background,
+                purge: &guards.purge,
+                history_readers: &guards.history_readers,
+                catalog_handles: &guards.catalog_handles,
+                writer: ReinstallWriterRead {
+                    lease: &mut guards.writer,
+                },
+            },
+            end: bundle.end,
+        })
+    }
+
+    pub fn compare_preparation(
+        mut self,
+        prep: &ReinstallPrep,
+        stage: ReinstallPreparationStage,
+    ) -> Result<(Self, ReinstallImageMatch), Box<ReinstallConnectionError<R>>> {
+        match self.owned.scoped(|bundle| {
+            prep.validate()?;
+            if prep.files() != &bundle.input.files {
+                return Err(invalid());
+            }
+            if let Some(prior) = &bundle.preparation
+                && (prior.prep != *prep
+                    || (prior.stage == ReinstallPreparationStage::Published
+                        && stage == ReinstallPreparationStage::Pending))
+            {
+                return Err(invalid());
+            }
+            bundle.preparation = Some(PreparedRead {
+                prep: prep.clone(),
+                stage,
+            });
+            bundle.read_control()?;
+            bundle.compare_prepared()
+        }) {
+            Ok(matched) => Ok((self, matched)),
+            Err(error) => Err(self.owned.failed(error)),
+        }
+    }
+
     pub fn open_query_only_catalog(
         mut self,
         owner: ControlId,
@@ -716,12 +1291,8 @@ impl SqliteControlStore {
         end: Instant,
     ) -> ReinstallControlOwner<R> {
         let mut owned = OwnedBundle::new(input, end);
-        let Self {
-            conn, handle_lease, ..
-        } = self;
         let bundle = owned.bundle_mut();
-        bundle.control = Some(ConnectionSlot::new(conn.into_inner()));
-        bundle.handle_lease = Some(handle_lease);
+        bundle.control = Some(ControlSlot::from_store(self));
         ReinstallControlOwner { owned }
     }
 }
@@ -847,6 +1418,57 @@ fn verify_wal(
         }
         _ => Err(invalid()),
     }
+}
+
+/// Physical identity admission for the one WAL whose bytes are checked through
+/// the full recorded logical image. Main/catalog/receipt checks stay byte-exact.
+fn verify_logical_control_wal(
+    main: &Path,
+    original: &mut Option<fs::File>,
+    expected: Option<&ReinstallFileBinding>,
+    observed: &mut Option<ObservedWal>,
+    end: Instant,
+) -> PortResult<()> {
+    runtime_tick()?;
+    if Instant::now() >= end {
+        return Err(PortError::WriterBusy(
+            "control runtime deadline reached".into(),
+        ));
+    }
+    let path = sidecar(main, "-wal");
+    let (pin, identity) = match (original, expected) {
+        (Some(file), Some(binding)) => (&*file, binding.identity),
+        (None, None) => {
+            if observed.is_none() {
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(io_error(error)),
+                    Ok(_) => {}
+                }
+                let file = open_reinstall_pin(&path)?;
+                *observed = Some(ObservedWal {
+                    binding: ReinstallFileBinding {
+                        identity: reinstall_file_identity(&file)?,
+                        size: 0,
+                        sha256: ReinstallDigest::of_bytes(&[]),
+                    },
+                    file,
+                });
+            }
+            let wal = observed.as_ref().ok_or_else(invalid)?;
+            (&wal.file, wal.binding.identity)
+        }
+        _ => return Err(invalid()),
+    };
+    private_file(&path)?;
+    let named = open_reinstall_pin(&path)?;
+    if reinstall_file_identity(pin)? != identity
+        || reinstall_file_identity(&named)? != identity
+        || pin.metadata().map_err(io_error)?.len() > 16 * 1024 * 1024 * 1024
+    {
+        return Err(conflict());
+    }
+    runtime_tick()
 }
 
 fn verify_shm(
@@ -1411,7 +2033,7 @@ mod tests {
             root,
             prefix,
             catalog,
-            expected,
+            expected: ReinstallExpectedControl::Exact(Box::new(expected)),
             files,
             prefix_binding,
             guards,
@@ -1441,14 +2063,228 @@ mod tests {
             .collect()
     }
 
-    fn arm_busy<R: 'static>(bundle: &mut Bundle<R>, catalog: bool) {
-        let slot = if catalog {
-            bundle.catalog.as_ref()
-        } else {
-            bundle.control.as_ref()
+    fn preparation_context(input: &ReinstallOwnedInput<Retained>) -> ReinstallContext {
+        let ReinstallExpectedControl::Exact(status) = &input.expected else {
+            panic!("fixture expects exact status");
+        };
+        let data = reinstall_file_identity(&input.retained._data_root).unwrap();
+        ReinstallContext {
+            operation: "close-fixed-owner".into(),
+            intent_sha256: ReinstallDigest::of_bytes(b"synthetic fixed intent"),
+            ready_sha256: ReinstallDigest::of_bytes(b"synthetic ready record"),
+            consumed_sha256: ReinstallDigest::of_bytes(b"synthetic consumed record"),
+            incoming_sha256: ReinstallDigest::of_bytes(b"synthetic package identity"),
+            roots: ReinstallRoots {
+                prefix: reinstall_file_identity(&input.retained._prefix_root).unwrap(),
+                data,
+                journal: data,
+                helper: data,
+            },
+            sidecar_identity: data,
+            evidence_identity: data,
+            old_owner: "close-old-owner".into(),
+            installation: status.policy.installation_id.as_str().into(),
+            incarnation: status.catalog_incarnation.as_ref().unwrap().as_str().into(),
+            old_control_seq: status.policy.control_seq.get(),
+            policy_epoch: status.policy.policy_epoch.get(),
+            application_id: APPLICATION_ID as u32,
+            user_version: VERSION as u32,
+            schema_sha256: ReinstallContext::current_schema_digest(),
+            sqlite_policy: "no-close-checkpoint/v1".into(),
         }
+    }
+
+    #[test]
+    fn owned_readonly_inspection_streams_fixed_prep_on_the_same_connection() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let root = input.root.clone();
+        let before = durable_snapshot(&root);
+        let context = preparation_context(&input);
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+        let (original, retained) = {
+            let mut view = owner.inspection().unwrap();
+            assert!(!view.control.writable);
+            assert_eq!(view.end, until);
+            view.guards.writer.read_record().unwrap();
+            view.guards.writer.validate_current(&root).unwrap();
+            let contender = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(view.guards.writer.path())
+                .unwrap();
+            view.guards.writer.validate_proof_file(&contender).unwrap();
+            assert!(!contender.try_lock_exclusive().unwrap());
+            let conn = view.control.conn.borrow();
+            assert_eq!(
+                conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.execute_batch("CREATE TEMP TABLE forbidden_inspection_write(n INTEGER)")
+                    .unwrap_err()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ReadOnly)
+            );
+            // SAFETY: observation only; this test never closes or exports it.
+            (
+                unsafe { conn.handle() as usize },
+                view.retained as *const Retained,
+            )
+        };
+        let (owner, prep) = owner.prepare(&context).unwrap();
+        assert_eq!(prep.context().old_control_seq, context.old_control_seq);
+        assert!(prep.before().sha256() != prep.after().sha256());
+        let (mut owner, matched) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Pending)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::Before);
+        {
+            let view = owner.inspection().unwrap();
+            // SAFETY: same live store, no native handle ownership change.
+            assert_eq!(
+                unsafe { view.control.conn.borrow().handle() as usize },
+                original
+            );
+            assert!(std::ptr::eq(view.retained, retained));
+        }
+        let resources = owner.close().unwrap().into_resources();
+        assert_eq!(durable_snapshot(&root), before);
+        assert!(!temp.path().join("retained-dropped").exists());
+        drop(resources);
+        contenders(temp.path(), false);
+    }
+
+    #[test]
+    fn owned_inspection_refuses_a_writable_store_or_disabled_query_only() {
+        for writable in [false, true] {
+            let temp = agent_session_grep_testkit::tempdir().unwrap();
+            let input = fixture(temp.path(), false, false);
+            let until = Instant::now() + Duration::from_secs(30);
+            let mut owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+            if writable {
+                owner = owner.close().unwrap().reopen_writable().unwrap();
+            } else {
+                owner
+                    .owned
+                    .bundle()
+                    .store()
+                    .unwrap()
+                    .conn
+                    .borrow()
+                    .execute_batch("PRAGMA query_only=OFF;")
+                    .unwrap();
+            }
+            assert!(matches!(
+                owner.inspection(),
+                Err(PortError::InvalidRequest(_))
+            ));
+            // Restore only the deliberate test configuration; no production
+            // failure path reopens or silently repairs a refused inspection.
+            owner
+                .owned
+                .bundle()
+                .store()
+                .unwrap()
+                .conn
+                .borrow()
+                .execute_batch("PRAGMA query_only=ON;")
+                .unwrap();
+            drop(owner.close().unwrap().into_resources());
+        }
+    }
+
+    #[test]
+    fn prepared_owner_compares_recorded_after_without_rechecking_old_wal_bytes() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let context = preparation_context(&input);
+        let root = input.root.clone();
+        let before = durable_snapshot(&root);
+        let until = Instant::now() + Duration::from_secs(30);
+        let owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+        let (owner, prep) = owner.prepare(&context).unwrap();
+        let (owner, matched) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::Before);
+        let mut owner = owner.close().unwrap().reopen_writable().unwrap();
+        owner
+            .owned
+            .scoped(|bundle| {
+                let store = bundle.store()?;
+                let policy = store.bind_control_root(&bundle.input.guards.policy_owner)?;
+                let installation = bundle.installation();
+                let changed = store.recover_maintenance(
+                    seq(context.old_control_seq)?,
+                    &cid(&context.operation),
+                    &policy,
+                    &installation,
+                    &cid(&context.old_owner),
+                    MaintenanceFence {
+                        state: MaintenanceState::Recovering,
+                        owner: Some(cid(&context.operation)),
+                        phase: Some(MaintenancePhase::Reconciling),
+                    },
+                )?;
+                assert_eq!(changed.control_seq.get(), context.old_control_seq + 1);
+                Ok(())
+            })
+            .unwrap();
+        let (owner, matched) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::After);
+        let (owner, status) = owner.read_bound_status().unwrap();
+        assert_eq!(status.policy.control_seq.get(), context.old_control_seq + 1);
+        assert_eq!(
+            status.policy.maintenance.owner.as_ref(),
+            Some(&cid(&context.operation))
+        );
+        let resources = owner.close().unwrap().into_resources();
+        let after = durable_snapshot(&root);
+        for (name, bytes) in &before {
+            if name != "control.db-wal" {
+                assert_eq!(after.get(name), Some(bytes), "{name}");
+            }
+        }
+        assert_ne!(after.get("control.db-wal"), before.get("control.db-wal"));
+        // A later readonly entry selects Published before its first open.
+        // Releasing only the already-confirmed connection's handle lease models
+        // reacquisition on a new request; every required input guard is retained.
+        let ReinstallClosedResources {
+            input,
+            control_handles,
+            _observed,
+        } = resources;
+        drop(control_handles);
+        let recovered = ReinstallControlOwner::open_prepared_read_only(
+            input,
+            prep.clone(),
+            ReinstallPreparationStage::Published,
+            until,
+        )
         .unwrap();
-        let statement = OutstandingStatement::prepare(slot.get().unwrap());
+        let (recovered, matched) = recovered
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::After);
+        let (recovered, status) = recovered.read_bound_status().unwrap();
+        assert_eq!(status.policy.control_seq.get(), context.old_control_seq + 1);
+        drop(recovered.close().unwrap().into_resources());
+        drop(_observed);
+        assert_eq!(durable_snapshot(&root), after);
+        contenders(temp.path(), false);
+    }
+
+    fn arm_busy<R: 'static>(bundle: &mut Bundle<R>, catalog: bool) {
+        let statement = if catalog {
+            OutstandingStatement::prepare(bundle.catalog.as_ref().unwrap().get().unwrap())
+        } else {
+            OutstandingStatement::prepare(&bundle.store().unwrap().conn.borrow())
+        };
         assert!(bundle.outstanding.replace(statement).is_none());
     }
 
@@ -1573,7 +2409,7 @@ mod tests {
         let Ok(mode) = std::env::var(CHILD_MODE) else {
             return;
         };
-        let requests = ChildRequests::new(mode == "normal");
+        let requests = ChildRequests::new(mode == "normal" || mode == "inspection-writer");
         let base = PathBuf::from(std::env::var_os(CHILD_ROOT).unwrap());
         if matches!(mode.as_str(), "cleanup-no-exit" | "cleanup-live-reader") {
             struct CleanupSentinel(PathBuf);
@@ -1596,7 +2432,7 @@ mod tests {
             assert_eq!(step, CleanupStep::Abort);
             abort_unconfirmed_child_cleanup();
         }
-        let input = fixture(&base, true, true);
+        let input = fixture(&base, mode != "inspection-writer", true);
         let before = durable_snapshot(&input.root);
         let root = input.root.clone();
         let until = Instant::now() + Duration::from_secs(30);
@@ -1616,7 +2452,12 @@ mod tests {
                     policy_owner: &input.guards.policy_owner,
                     prefix_guard: &input.guards.prefix,
                     sealed: SealedControlFile::from_recorded(input.files.control_main.identity),
-                    expected: &input.expected,
+                    expected: match &input.expected {
+                        ReinstallExpectedControl::Exact(status) => status,
+                        ReinstallExpectedControl::Cleanup(_) => {
+                            panic!("fixture expects exact status")
+                        }
+                    },
                 },
                 until,
             )
@@ -1635,6 +2476,30 @@ mod tests {
         } else {
             let mut owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
             match mode.as_str() {
+                "inspection-writer" => {
+                    {
+                        let mut view = owner.inspection().unwrap();
+                        let record = view.guards.writer.read_record().unwrap();
+                        view.guards.writer.validate_current(&root).unwrap();
+                        let proof = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(view.guards.writer.path())
+                            .unwrap();
+                        view.guards.writer.validate_proof_file(&proof).unwrap();
+                        assert!(!proof.try_lock_exclusive().unwrap());
+                        signal("inspection-writer-held");
+                        // The parent probes native locks while this restricted
+                        // view and its actual readonly store are still borrowed.
+                        requests.receive();
+                        assert_eq!(view.guards.writer.read_record().unwrap(), record);
+                        view.guards.writer.validate_current(&root).unwrap();
+                    }
+                    arm_busy(owner.owned.bundle_mut(), false);
+                    let error = close_error(owner.close());
+                    assert_busy_close(&error);
+                    drop(error);
+                }
                 "owner-drop" => {
                     arm_busy(owner.owned.bundle_mut(), false);
                     drop(owner);
@@ -1696,8 +2561,10 @@ mod tests {
                     assert!(catalog.close_attempted && catalog.close_confirmed);
                     assert!(catalog.conn.is_none());
                     let control = bundle.control.as_ref().unwrap();
-                    assert!(control.close_attempted && !control.close_confirmed);
-                    assert!(control.conn.is_some());
+                    assert!(control.close.close_attempted && !control.close.close_confirmed);
+                    assert!(control.store.is_none());
+                    assert!(control.close.conn.is_some());
+                    assert!(bundle.handle_lease.is_some());
                     drop(error);
                 }
                 "probe-unwind" | "catalog-unwind" => {
@@ -1738,6 +2605,7 @@ mod tests {
                             .control
                             .as_ref()
                             .unwrap()
+                            .close
                             .close_confirmed
                     );
                     assert_eq!(durable_snapshot(&root), before);
@@ -2249,7 +3117,7 @@ mod tests {
                 stdout_eof: false,
                 stderr_eof: false,
                 cleanup_confirmed: false,
-                normal: mode == "normal",
+                normal: mode == "normal" || mode == "inspection-writer",
                 sent: 0,
             };
             // Establish exact-child RAII before any fallible pipe setup.
@@ -2545,6 +3413,26 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_inspection_writer_stays_held_through_busy_close_and_error_drop() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let mut child = IsolatedChild::start(temp.path(), "inspection-writer");
+        child.expect("inspection-writer-held");
+        child.assert_alive();
+        contenders(temp.path(), true);
+        child.assert_alive();
+        assert!(!temp.path().join("retained-dropped").exists());
+        child.send("release");
+        child.expect("unconfirmed-and-retained");
+        child.assert_alive();
+        contenders(temp.path(), true);
+        child.assert_alive();
+        assert!(!temp.path().join("retained-dropped").exists());
+        child.finish(23);
+        assert!(!temp.path().join("retained-dropped").exists());
+        contenders(temp.path(), false);
+    }
+
+    #[test]
     fn reinstall_child_cleanup_requires_exit_and_reader_confirmation_before_return() {
         let end = Instant::now();
         let before = end - PROCESS_POLL;
@@ -2638,7 +3526,7 @@ mod tests {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 owner.owned.scoped::<()>(|bundle| {
                     assert_eq!(runtime_deadline(), Some(inner_end));
-                    require_close_policy(bundle.control.as_ref().unwrap().get()?)?;
+                    require_close_policy(&bundle.store()?.conn.borrow())?;
                     if panic {
                         panic!("synthetic inner operation unwind");
                     }
@@ -2666,11 +3554,10 @@ mod tests {
             let timeout: i64 = owner
                 .owned
                 .bundle()
-                .control
-                .as_ref()
+                .store()
                 .unwrap()
-                .get()
-                .unwrap()
+                .conn
+                .borrow()
                 .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(timeout, i64::try_from(BUSY_TIMEOUT.as_millis()).unwrap());

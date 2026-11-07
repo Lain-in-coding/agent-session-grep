@@ -23,8 +23,11 @@ pub use reinstall_commitment::{
     ReinstallSnapshotBinding,
 };
 pub use reinstall_connection::{
-    ReinstallClosed, ReinstallClosedResources, ReinstallConnectionError, ReinstallControlOwner,
-    ReinstallOwnedGuards, ReinstallOwnedInput, ReinstallOwnedPins, ReinstallQueryOnlyCatalog,
+    ReinstallCleanupBinding, ReinstallClosed, ReinstallClosedResources, ReinstallConnectionError,
+    ReinstallControlOwner, ReinstallExpectedControl, ReinstallInspection,
+    ReinstallInspectionGuards, ReinstallOwnedGuards, ReinstallOwnedInput, ReinstallOwnedPins,
+    ReinstallPreparationStage, ReinstallPublication, ReinstallQueryOnlyCatalog,
+    ReinstallWriterRead,
 };
 pub use reinstall_records::{
     ReinstallAck, ReinstallCatalogIdentity, ReinstallContext, ReinstallDigest,

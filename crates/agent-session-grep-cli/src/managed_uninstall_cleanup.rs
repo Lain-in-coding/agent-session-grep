@@ -3,7 +3,7 @@
 //! child must acquire that SAME inode before changing any planned payload file.
 use super::*;
 use agent_session_grep_adapters_sqlite::{
-    control::{INSTALLATION_LOCK_KEY, SealedControlFile},
+    control::{INSTALLATION_LOCK_KEY, ReinstallWriterRead, SealedControlFile},
     managed_locks::JobLockKey,
     managed_purge::PrivateArtifactClass,
 };
@@ -1095,8 +1095,54 @@ struct CompletionGuards<'a> {
     runner_exit: &'a ExitGuard,
     prefix: &'a ExclusiveGuard,
     drains: RetirementDrainGuards<'a>,
-    writer: &'a mut WriterLease,
+    writer: &'a mut dyn CompletionWriter,
     history: &'a ExclusiveGuard,
+}
+
+/// The inspector reads a held writer without acquiring, replacing or extracting
+/// it. Reinstall supplies the adapter's nonextractable view; ordinary cleanup
+/// continues borrowing its own lease.
+trait CompletionWriter {
+    fn path(&self) -> &Path;
+    fn validate_current(&self, root: &Path) -> Result<(), PortError>;
+    fn validate_proof_file(&self, candidate: &File) -> Result<(), PortError>;
+    fn read_record(&mut self) -> Result<String, PortError>;
+}
+
+impl CompletionWriter for WriterLease {
+    fn path(&self) -> &Path {
+        WriterLease::path(self)
+    }
+
+    fn validate_current(&self, root: &Path) -> Result<(), PortError> {
+        WriterLease::validate_current(self, root)
+    }
+
+    fn validate_proof_file(&self, candidate: &File) -> Result<(), PortError> {
+        WriterLease::validate_proof_file(self, candidate)
+    }
+
+    fn read_record(&mut self) -> Result<String, PortError> {
+        WriterLease::read_record(self)
+    }
+}
+
+impl CompletionWriter for ReinstallWriterRead<'_> {
+    fn path(&self) -> &Path {
+        ReinstallWriterRead::path(self)
+    }
+
+    fn validate_current(&self, root: &Path) -> Result<(), PortError> {
+        ReinstallWriterRead::validate_current(self, root)
+    }
+
+    fn validate_proof_file(&self, candidate: &File) -> Result<(), PortError> {
+        ReinstallWriterRead::validate_proof_file(self, candidate)
+    }
+
+    fn read_record(&mut self) -> Result<String, PortError> {
+        ReinstallWriterRead::read_record(self)
+    }
 }
 
 enum CompletionMode<'a, 'held> {
@@ -1616,6 +1662,41 @@ fn completed_payload_at(
     seal: &Seal,
     end: Instant,
 ) -> Result<(), Reason> {
+    completed_payload_with_retained(prefix, catalog, journal_root, state, seal, end, |root| {
+        for proof in seal
+            .metadata
+            .preserved
+            .iter()
+            .chain(&seal.metadata.retained)
+        {
+            verify(root, proof, &seal.policy, end, false)?;
+        }
+        Ok(())
+    })
+}
+
+/// Immutable payload absences shared with transfer recovery. Retained file
+/// identity/bytes remain the caller's explicit mode-specific obligation.
+fn completed_payload_absence_at(
+    prefix: &Path,
+    catalog: &Path,
+    journal_root: &Path,
+    state: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+) -> Result<(), Reason> {
+    completed_payload_with_retained(prefix, catalog, journal_root, state, seal, end, |_| Ok(()))
+}
+
+fn completed_payload_with_retained(
+    prefix: &Path,
+    catalog: &Path,
+    journal_root: &Path,
+    state: &DeferredCleanup,
+    seal: &Seal,
+    end: Instant,
+    retained: impl FnOnce(&Path) -> Result<(), Reason>,
+) -> Result<(), Reason> {
     let root = catalog.parent().ok_or(Reason::IdentityChanged)?;
     for proof in &seal.package_files {
         require_absent(
@@ -1635,14 +1716,7 @@ fn completed_payload_at(
             end,
         )?;
     }
-    for proof in seal
-        .metadata
-        .preserved
-        .iter()
-        .chain(&seal.metadata.retained)
-    {
-        verify(root, proof, &seal.policy, end, false)?;
-    }
+    retained(root)?;
     for group in &state.groups {
         if !group.removed {
             return Err(match group.kind {
@@ -2279,7 +2353,7 @@ fn account_tree_with_writer(
 }
 fn writer_proof(
     journal: &Journal,
-    writer: &mut WriterLease,
+    writer: &mut dyn CompletionWriter,
     policy: &TerminalPolicy,
     end: Instant,
 ) -> Result<OwnedFile, Reason> {
@@ -2290,7 +2364,7 @@ fn writer_proof(
 
 fn writer_proof_with_open(
     journal: &Journal,
-    writer: &mut WriterLease,
+    writer: &mut dyn CompletionWriter,
     policy: &TerminalPolicy,
     end: Instant,
     open_file: impl FnOnce(&Path) -> Result<fs::File, Reason>,
@@ -2302,7 +2376,7 @@ fn writer_proof_with_open(
 fn writer_proof_at(
     root: &Path,
     root_identity: RootIdentity,
-    writer: &mut WriterLease,
+    writer: &mut dyn CompletionWriter,
     policy: &TerminalPolicy,
     end: Instant,
     open_file: impl FnOnce(&Path) -> Result<fs::File, Reason>,
