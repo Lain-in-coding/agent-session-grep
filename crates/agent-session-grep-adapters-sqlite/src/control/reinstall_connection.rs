@@ -7,6 +7,13 @@ use crate::managed_maintenance::CatalogIdentity;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 
+#[path = "reinstall_activation.rs"]
+mod reinstall_activation;
+use reinstall_activation::FinalRead;
+pub use reinstall_activation::{
+    ReinstallActivation, ReinstallActivationFiles, ReinstallFinalOwner, ReinstallFinalRecords,
+};
+
 /// Actual owned capabilities, moved from the drained reinstall coordinator.
 /// Serialized identities and the opaque retention payload cannot replace them.
 pub struct ReinstallOwnedGuards {
@@ -423,6 +430,7 @@ struct ClosedPins {
     _control_shm: Option<ObservedShm>,
     _catalog_shm: Option<ObservedShm>,
     _published_preparation: Option<PublishedPreparation>,
+    _final_read: Option<FinalRead>,
 }
 
 struct Bundle<R: 'static> {
@@ -439,6 +447,8 @@ struct Bundle<R: 'static> {
     preparation: Option<PreparedRead>,
     published_preparation: Option<PublishedPreparation>,
     acknowledgement: Option<ReinstallAck>,
+    final_read: Option<FinalRead>,
+    final_failed: bool,
     adoption_attempted: bool,
     #[cfg(test)]
     outstanding: Option<tests::OutstandingStatement>,
@@ -460,6 +470,8 @@ impl<R: 'static> Bundle<R> {
             preparation: None,
             published_preparation: None,
             acknowledgement: None,
+            final_read: None,
+            final_failed: false,
             adoption_attempted: false,
             #[cfg(test)]
             outstanding: None,
@@ -497,7 +509,7 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn unconfirmed(&self) -> bool {
-        self.connections().any(|slot| !slot.close_confirmed)
+        self.final_failed || self.connections().any(|slot| !slot.close_confirmed)
     }
 
     fn tick(&self) -> PortResult<()> {
@@ -556,10 +568,27 @@ impl<R: 'static> Bundle<R> {
             }
             ack.encode(&prepared.prep)?;
         }
+        if let Some(final_read) = &self.final_read {
+            final_read.records.validate()?;
+            let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
+            if final_read.records.prep != prepared.prep
+                || self.acknowledgement.as_ref() != Some(&final_read.records.ack)
+            {
+                return Err(invalid());
+            }
+        }
         private_directory(&input.root, false)?;
         reject_links(&input.prefix)?;
         crate::managed_store::validate_catalog_path(&input.catalog)?;
         input.guards.validate(&input.root, &input.prefix)?;
+        if self.final_read.is_none() {
+            match fs::symlink_metadata(input.prefix.join(PREPARATION_DIRECTORY).join("activation"))
+            {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+                Ok(_) => return Err(invalid()),
+            }
+        }
         if let Some(lease) = &self.handle_lease {
             lease.validate_admission(&input.root)?;
         }
@@ -652,7 +681,12 @@ impl<R: 'static> Bundle<R> {
             let expected = ack.files();
             let current = self.observed_files()?;
             if current.control_main != expected.control_main
-                || current.control_wal != expected.control_wal
+                || if self.final_read.is_some() {
+                    current.control_wal.as_ref().map(|wal| wal.identity)
+                        != expected.control_wal.as_ref().map(|wal| wal.identity)
+                } else {
+                    current.control_wal != expected.control_wal
+                }
                 || current.catalog_main != expected.catalog_main
                 || current.catalog_wal != expected.catalog_wal
                 || current.control_shm.as_ref().map(|shm| shm.identity)
@@ -729,6 +763,9 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn read_control(&mut self) -> PortResult<ControlStatus> {
+        if self.final_read.is_some() {
+            return self.read_final_control().map(|(status, _)| status);
+        }
         self.read_control_observed(None).map(|(status, _)| status)
     }
 
@@ -803,6 +840,9 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn compare_prepared(&self) -> PortResult<ReinstallImageMatch> {
+        if self.final_read.is_some() {
+            return Err(invalid());
+        }
         let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
         let store = self.store()?;
         let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
@@ -872,8 +912,7 @@ impl<R: 'static> Bundle<R> {
         )?;
         #[cfg(test)]
         tests::after_adoption()?;
-        self.read_control()?;
-        if self.compare_prepared()? != ReinstallImageMatch::After {
+        if self.read_control_observed(None)?.1 != Some(ReinstallImageMatch::After) {
             return Err(conflict());
         }
         self.tick()
@@ -1006,9 +1045,16 @@ impl<R: 'static> Bundle<R> {
         if writable && self.preparation.is_some() {
             // Also covers an explicit close followed by reopen_writable.
             // A public Published comparison never substitutes for these pins.
-            self.require_published_preparation()?;
+            if self.final_read.is_some() {
+                self.require_final_publication(true)?;
+            } else {
+                self.require_published_preparation()?;
+            }
         }
         self.validate_inputs(false)?;
+        if self.final_read.is_some() {
+            self.require_final_publication(false)?;
+        }
         if self
             .control
             .as_ref()
@@ -1123,10 +1169,10 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn catalog_transition(&mut self, owner: &ControlId) -> PortResult<CatalogIdentity> {
-        let status = self.read_control()?;
+        let (status, matched) = self.read_control_observed(None)?;
         if let Some(prepared) = &self.preparation
             && (prepared.stage != ReinstallPreparationStage::Published
-                || self.compare_prepared()? != ReinstallImageMatch::After)
+                || matched != Some(ReinstallImageMatch::After))
         {
             return Err(invalid());
         }
@@ -1232,6 +1278,9 @@ impl<R: 'static> Bundle<R> {
     }
 
     fn close_all(&mut self) -> PortResult<()> {
+        if self.final_read.is_some() {
+            return Err(invalid());
+        }
         self.read_control()?;
         if let Some(slot) = &self.catalog {
             let conn = slot.get()?;
@@ -1300,6 +1349,14 @@ impl<R: 'static> OwnedBundle<R> {
         &mut self,
         operation: impl FnOnce(&mut Bundle<R>) -> PortResult<T>,
     ) -> PortResult<T> {
+        if self.bundle().final_failed {
+            return Err(invalid());
+        }
+        if self.bundle().final_read.is_some() {
+            // Pessimistic before the first fallible scope/admission operation.
+            // An error or unwind leaves this sticky even with no SQL slot.
+            self.bundle_mut().final_failed = true;
+        }
         let end = SqliteControlStore::effective_runtime_deadline(self.bundle().end);
         self.bundle_mut().end = end;
         let scope = RuntimeDeadlineScope::enter(end)?;
@@ -1310,6 +1367,9 @@ impl<R: 'static> OwnedBundle<R> {
         scoped.configure()?;
         let result = operation(&mut *scoped.bundle);
         let restored = scoped.restore();
+        if scoped.bundle.final_read.is_some() || scoped.bundle.final_failed {
+            scoped.bundle.final_failed = result.is_err() || restored.is_err();
+        }
         match (result, restored) {
             (Err(error), _) => Err(error),
             (Ok(value), Ok(())) => Ok(value),
@@ -1327,8 +1387,9 @@ impl<R: 'static> Drop for OwnedBundle<R> {
         if let Some(bundle) = self.value.take()
             && bundle.unconfirmed()
         {
-            // R includes the CLI's actual exit/package/root resources. Leaking
-            // only Connection would release exclusion and is forbidden.
+            // R includes the CLI's actual exit/package/root resources. A failed
+            // final admission retains them even before any connection opens.
+            // Retaining only SQL would release exclusion and is forbidden.
             std::mem::forget(bundle);
         }
     }
@@ -1529,8 +1590,9 @@ impl<R: 'static> ReinstallControlOwner<R> {
                 prep: prep.clone(),
                 stage,
             });
-            bundle.read_control()?;
-            bundle.compare_prepared()
+            // The same complete read already compared this exact preparation.
+            // Consume its result after the unchanged final file/end checks.
+            bundle.read_control_observed(None)?.1.ok_or_else(invalid)
         }) {
             Ok(matched) => Ok((self, matched)),
             Err(error) => Err(self.owned.failed(error)),
@@ -1618,7 +1680,12 @@ impl<R: 'static> ReinstallClosed<R> {
     pub fn reopen_writable(
         mut self,
     ) -> Result<ReinstallControlOwner<R>, Box<ReinstallConnectionError<R>>> {
-        match self.owned.scoped(|bundle| bundle.open_control(true)) {
+        match self.owned.scoped(|bundle| {
+            if bundle.final_read.is_some() {
+                return Err(invalid());
+            }
+            bundle.open_control(true)
+        }) {
             Ok(()) => Ok(ReinstallControlOwner { owned: self.owned }),
             Err(error) => Err(self.owned.failed(error)),
         }
@@ -1642,6 +1709,7 @@ impl<R: 'static> ReinstallClosed<R> {
                 _control_shm: bundle.control_shm,
                 _catalog_shm: bundle.catalog_shm,
                 _published_preparation: bundle.published_preparation,
+                _final_read: bundle.final_read,
             },
         }
     }
@@ -2538,6 +2606,9 @@ mod tests {
         static PANIC_AFTER_OPEN: Cell<Option<OpenKind>> = const { Cell::new(None) };
         static PANIC_AFTER_TAKE: Cell<bool> = const { Cell::new(false) };
         static FAIL_AFTER_ADOPTION: Cell<bool> = const { Cell::new(false) };
+        static FAIL_AFTER_FINAL_COMMIT: Cell<bool> = const { Cell::new(false) };
+        static PANIC_FINAL_PUBLICATION: Cell<bool> = const { Cell::new(false) };
+        static FINAL_COMMITS: Cell<usize> = const { Cell::new(0) };
         static ADOPTION_COMMITS: Cell<usize> = const { Cell::new(0) };
         static WRITABLE_CONTROL_OPENS: Cell<usize> = const { Cell::new(0) };
         static COMMITMENT_COMPARISONS: Cell<usize> = const { Cell::new(0) };
@@ -2630,6 +2701,22 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn after_final_commit() -> PortResult<()> {
+        FINAL_COMMITS.with(|count| count.set(count.get() + 1));
+        if FAIL_AFTER_FINAL_COMMIT.with(|flag| flag.replace(false)) {
+            return Err(PortError::Backend(
+                "synthetic final acknowledgement failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn before_final_publication_return() {
+        if PANIC_FINAL_PUBLICATION.with(|flag| flag.replace(false)) {
+            panic!("synthetic unwind inside final publication validation");
+        }
     }
 
     pub(super) fn after_containment(kind: OpenKind) {
@@ -3095,10 +3182,26 @@ mod tests {
         let (owner, prep) = owner.prepare(&context).unwrap();
         assert_eq!(prep.context().old_control_seq, context.old_control_seq);
         assert!(prep.before().sha256() != prep.after().sha256());
+        let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
         let (mut owner, matched) = owner
             .compare_preparation(&prep, ReinstallPreparationStage::Pending)
             .unwrap();
         assert_eq!(matched, ReinstallImageMatch::Before);
+        assert_eq!(
+            COMMITMENT_COMPARISONS.with(Cell::get),
+            comparisons + 1,
+            "one unchanged comparison must read the complete image once"
+        );
+        let (next, matched) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Pending)
+            .unwrap();
+        owner = next;
+        assert_eq!(matched, ReinstallImageMatch::Before);
+        assert_eq!(
+            COMMITMENT_COMPARISONS.with(Cell::get),
+            comparisons + 2,
+            "a later comparison must freshly read the complete image"
+        );
         {
             let view = owner.inspection().unwrap();
             // SAFETY: same live store, no native handle ownership change.
@@ -3172,9 +3275,15 @@ mod tests {
         let _syncs = PreparationSyncObservation::start(None);
         let committed = ADOPTION_COMMITS.with(Cell::get);
         let writable_opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
         let owner = owner.adopt_prepared().unwrap();
         assert_eq!(ADOPTION_COMMITS.with(Cell::get), committed + 1);
         assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), writable_opens + 1);
+        assert_eq!(
+            COMMITMENT_COMPARISONS.with(Cell::get),
+            comparisons + 5,
+            "post-adoption read must not repeat its full image comparison"
+        );
         let expected_syncs = vec![
             PreparationSync::Record("intent.json"),
             PreparationSync::Record("ready.json"),
@@ -3259,9 +3368,15 @@ mod tests {
             .unwrap();
         assert_eq!(matched, ReinstallImageMatch::Before);
         let owner = owner.adopt_prepared().unwrap();
+        let comparisons = COMMITMENT_COMPARISONS.with(Cell::get);
         let catalog = owner
             .open_query_only_catalog(cid("close-fixed-owner"))
             .unwrap();
+        assert_eq!(
+            COMMITMENT_COMPARISONS.with(Cell::get),
+            comparisons + 2,
+            "catalog transition requires one complete entry and one exit read"
+        );
         let (mut catalog, ack) = catalog.prepare_acknowledgement().unwrap();
         assert_eq!(ack.catalog_identity().incarnation, context.incarnation);
         let before = durable_snapshot(&root);
@@ -3298,6 +3413,576 @@ mod tests {
         drop(catalog.close().unwrap().into_resources());
         assert_eq!(durable_snapshot(&root), before);
         contenders(temp.path(), false);
+    }
+
+    fn acknowledged_fixture(
+        input: ReinstallOwnedInput<Retained>,
+        until: Instant,
+    ) -> (
+        ReinstallQueryOnlyCatalog<Retained>,
+        ReinstallPrep,
+        ReinstallAck,
+    ) {
+        let context = preparation_context(&input);
+        let owner = ReinstallControlOwner::open_read_only(input, until).unwrap();
+        let (owner, prep) = owner.prepare(&context).unwrap();
+        publish_preparation_fixture(&owner, &prep);
+        let (owner, _) = owner
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        let owner = owner.adopt_prepared().unwrap();
+        let catalog = owner
+            .open_query_only_catalog(cid("close-fixed-owner"))
+            .unwrap();
+        let (catalog, ack) = catalog.prepare_acknowledgement().unwrap();
+        let sidecar = catalog
+            .owned
+            .bundle()
+            .input
+            .prefix
+            .join(PREPARATION_DIRECTORY);
+        write_preparation_fixture_record(
+            &sidecar.join("keep-transfer-ack.json"),
+            &ack.encode(&prep).unwrap(),
+        );
+        #[cfg(unix)]
+        directory_pin(&sidecar).sync_all().unwrap();
+        (catalog, prep, ack)
+    }
+
+    /// Published synthetic filesystem prerequisites with actual native bindings.
+    /// Only the CLI's later tests establish their package/retirement semantics.
+    fn final_fixture(
+        catalog: ReinstallQueryOnlyCatalog<Retained>,
+        prep: ReinstallPrep,
+        ack: ReinstallAck,
+    ) -> (ReinstallQueryOnlyCatalog<Retained>, ReinstallFinalRecords) {
+        let prefix = catalog.owned.bundle().input.prefix.clone();
+        let sidecar = prefix.join(PREPARATION_DIRECTORY);
+        let payload = prefix.join(".asg-reinstall-payload");
+        private_directory(&payload, true).unwrap();
+        let payload_bytes = b"synthetic fully published package payload";
+        let retired_bytes = b"synthetic retired setup/native/PATH inventory";
+        write_preparation_fixture_record(&payload.join("complete.json"), payload_bytes);
+        let (catalog, terminal) = catalog
+            .prepare_terminal(
+                ReinstallDigest::of_bytes(payload_bytes),
+                ReinstallDigest::of_bytes(retired_bytes),
+            )
+            .unwrap();
+        let activation_dir = sidecar.join("activation");
+        private_directory(&activation_dir, true).unwrap();
+        write_preparation_fixture_record(
+            &activation_dir.join("retired-ownership.json"),
+            retired_bytes,
+        );
+        write_preparation_fixture_record(
+            &activation_dir.join("control.json"),
+            &terminal.encode(&prep, &ack).unwrap(),
+        );
+        write_preparation_fixture_record(&prefix.join("current.json"), b"synthetic fixed pointer");
+        write_preparation_fixture_record(
+            &prefix.join("package-install.json"),
+            b"synthetic fixed installation receipt",
+        );
+        // Bind the actual create-new handle before encoding the intent. Its
+        // native identity is stable; no self-referential content hash is used.
+        let mut intent_file =
+            create_preparation_fixture_record(&activation_dir.join("intent.json"), b"");
+        let activation = ReinstallActivation::new(
+            &prep,
+            &ack,
+            &terminal,
+            ReinstallActivationFiles {
+                activation_directory: reinstall_file_identity(&directory_pin(&activation_dir))
+                    .unwrap(),
+                activation_intent: reinstall_file_identity(&intent_file).unwrap(),
+                payload_directory: reinstall_file_identity(&directory_pin(&payload)).unwrap(),
+                handoff_intent: binding(&sidecar.join("intent.json")).1,
+                handoff_ready: binding(&sidecar.join("ready.json")).1,
+                handoff_consumed: binding(&sidecar.join("consumed.json")).1,
+                preparation: binding(&sidecar.join(PREPARATION_FILE)).1,
+                acknowledgement: binding(&sidecar.join("keep-transfer-ack.json")).1,
+                terminal: binding(&activation_dir.join("control.json")).1,
+                payload_complete: binding(&payload.join("complete.json")).1,
+                retired_ownership: binding(&activation_dir.join("retired-ownership.json")).1,
+                current: binding(&prefix.join("current.json")).1,
+                package_receipt: binding(&prefix.join("package-install.json")).1,
+            },
+        )
+        .unwrap();
+        let encoded = activation.encode(&prep, &ack, &terminal).unwrap();
+        intent_file.write_all(&encoded).unwrap();
+        intent_file.sync_all().unwrap();
+        drop(intent_file);
+        assert!(
+            ReinstallActivation::decode(&encoded, &prep, &ack, &terminal).unwrap() == activation
+        );
+        #[cfg(unix)]
+        for path in [&payload, &activation_dir, &sidecar, &prefix] {
+            directory_pin(path).sync_all().unwrap();
+        }
+        (
+            catalog,
+            ReinstallFinalRecords {
+                prep,
+                ack,
+                terminal,
+                activation,
+            },
+        )
+    }
+
+    #[test]
+    fn reinstall_final_owner_commits_once_and_retains_original_policy_and_catalog() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let root = input.root.clone();
+        let end = Instant::now() + Duration::from_secs(30);
+        let (catalog, prep, ack) = acknowledged_fixture(input, end);
+        let before = durable_snapshot(&root);
+        let original_retained = &catalog.owned.bundle().input.retained as *const Retained;
+        let original_catalog = {
+            // SAFETY: read-only address observation, never transfer or close it.
+            unsafe {
+                catalog
+                    .owned
+                    .bundle()
+                    .catalog
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .handle()
+            }
+        };
+        let (mut catalog, records) = final_fixture(catalog, prep, ack);
+        assert!(catalog.acknowledgement_publication().is_err());
+        let owner = catalog
+            .into_final_owner(records.terminal.clone(), records.activation.clone())
+            .unwrap();
+        let (owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+        let (owner, result) = owner.commit().unwrap();
+        assert_eq!(result, ReinstallTerminalCommit::Committed);
+        let (mut owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        let final_bytes = durable_snapshot(&root);
+        assert_ne!(final_bytes["control.db-wal"], before["control.db-wal"]);
+        for (name, bytes) in &before {
+            if name != "control.db-wal" {
+                assert_eq!(final_bytes.get(name), Some(bytes), "{name}");
+            }
+        }
+        {
+            let view = owner.publication().unwrap();
+            assert!(std::ptr::eq(view.retained, original_retained));
+            assert_eq!(view.end, end);
+            view.guards.writer.validate_current(&root).unwrap();
+        }
+        let store = owner.owned.bundle().store().unwrap();
+        let status = store
+            .with_runtime_deadline(end, || store.lifecycle_status())
+            .unwrap();
+        assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+        assert_eq!(status.policy.maintenance.state, MaintenanceState::Idle);
+        assert_eq!(
+            status.policy.control_seq.get(),
+            records.prep.context().old_control_seq + 2
+        );
+        let conn = owner
+            .owned
+            .bundle()
+            .catalog
+            .as_ref()
+            .unwrap()
+            .get()
+            .unwrap();
+        // SAFETY: same live connection address as before final-owner transfer.
+        assert_eq!(unsafe { conn.handle() }, original_catalog);
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute_batch("CREATE TEMP TABLE forbidden_final_write(n INTEGER)")
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ReadOnly)
+        );
+        let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        for _ in 0..2 {
+            let (next, result) = owner.commit().unwrap();
+            assert_eq!(result, ReinstallTerminalCommit::AlreadyCommitted);
+            owner = next;
+        }
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+        assert_eq!(durable_snapshot(&root), final_bytes);
+        let resources = owner.close().unwrap().into_resources();
+        assert_eq!(durable_snapshot(&root), final_bytes);
+        assert!(!temp.path().join("retained-dropped").exists());
+        contenders(temp.path(), true);
+        drop(resources);
+        contenders(temp.path(), false);
+    }
+
+    #[test]
+    fn reinstall_final_owner_selects_reentry_before_open_and_reuses_same_resources() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let root = input.root.clone();
+        let end = Instant::now() + Duration::from_secs(30);
+        let (catalog, prep, ack) = acknowledged_fixture(input, end);
+        let (catalog, records) = final_fixture(catalog, prep, ack);
+        let owner = catalog
+            .into_final_owner(records.terminal.clone(), records.activation.clone())
+            .unwrap();
+        let closed = owner.close().unwrap();
+        let ReinstallClosedResources {
+            input,
+            control_handles,
+            _observed,
+        } = closed.into_resources();
+        drop(control_handles);
+        let owner = ReinstallFinalOwner::open_read_only(input, records.clone(), end).unwrap();
+        let (owner, result) = owner.commit().unwrap();
+        assert_eq!(result, ReinstallTerminalCommit::Committed);
+        let resources = owner.close().unwrap().into_resources();
+        // All original guards are carried forward. Only confirmed-close
+        // ControlHandles is released before the separate read-only admission.
+        let ReinstallClosedResources {
+            input,
+            control_handles,
+            _observed: current_observed,
+        } = resources;
+        drop(control_handles);
+        let before = durable_snapshot(&root);
+        let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        let owner = ReinstallFinalOwner::open_read_only(input, records.clone(), end).unwrap();
+        let (owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        let (mut owner, result) = owner.commit().unwrap();
+        assert_eq!(result, ReinstallTerminalCommit::AlreadyCommitted);
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+        assert!(!owner.owned.bundle().store().unwrap().writable);
+        let view = owner.publication().unwrap();
+        assert_eq!(view.retained.dropped, temp.path().join("retained-dropped"));
+        assert!(!temp.path().join("retained-dropped").exists());
+        let activation = temp.path().join("prefix/.asg-reinstall/activation");
+        let pending = activation.join("ack.pending");
+        let ack_path = activation.join("ack.json");
+        write_preparation_fixture_record(&pending, &records.acknowledgement_bytes().unwrap());
+        let (owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        let pending_identity = binding(&pending).1.identity;
+        fs::rename(&pending, &ack_path).expect("held pending ACK must remain publishable");
+        assert_eq!(binding(&ack_path).1.identity, pending_identity);
+        let (owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        let resources = owner.close().unwrap().into_resources();
+        assert_eq!(durable_snapshot(&root), before);
+        drop((resources, _observed, current_observed));
+        contenders(temp.path(), false);
+    }
+
+    #[test]
+    fn reinstall_final_owner_refuses_same_bytes_on_replaced_published_input() {
+        for mode in ["final-replaced-pointer", "final-replaced-intent"] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_pending_ack_replacement_does_not_replace_its_pin() {
+        retained_case("final-replaced-pending-ack");
+    }
+
+    #[test]
+    fn reinstall_final_owner_q_plus_two_without_intent_refuses_before_first_open() {
+        retained_case_with_control("final-preopen-missing", false);
+    }
+
+    fn final_child(
+        mode: &str,
+        base: &Path,
+        input: ReinstallOwnedInput<Retained>,
+        requests: ChildRequests,
+        until: Instant,
+    ) -> ! {
+        let root = input.root.clone();
+        let prefix = input.prefix.clone();
+        let (catalog, prep, ack) = acknowledged_fixture(input, until);
+        let (catalog, records) = final_fixture(catalog, prep, ack);
+        let before = durable_snapshot(&root);
+        if matches!(mode, "final-replaced-pointer" | "final-replaced-intent") {
+            let relative = if mode == "final-replaced-pointer" {
+                "current.json"
+            } else {
+                ".asg-reinstall/activation/intent.json"
+            };
+            let path = prefix.join(relative);
+            let parked = base.join("original-input");
+            let bytes = fs::read(&path).unwrap();
+            let original = binding(&path).1;
+            fs::rename(&path, &parked).unwrap();
+            write_preparation_fixture_record(&path, &bytes);
+            assert!(binding(&path).1 != original);
+            let error = match catalog
+                .into_final_owner(records.terminal.clone(), records.activation.clone())
+            {
+                Ok(_) => panic!("replacement inode was admitted"),
+                Err(error) => error,
+            };
+            assert!(error.requires_process_exit());
+            assert!(matches!(error.error(), PortError::GenerationMismatch(_)));
+            assert!(error.owned.bundle().final_failed);
+            assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+            assert_eq!(durable_snapshot(&root), before);
+            drop(error);
+        } else if matches!(
+            mode,
+            "final-missing-intent" | "final-wrong-record" | "final-early-ack"
+        ) {
+            let activation = prefix.join(".asg-reinstall/activation");
+            match mode {
+                "final-missing-intent" => {
+                    fs::remove_file(activation.join("intent.json")).unwrap();
+                }
+                "final-wrong-record" => {
+                    let path = activation.join("retired-ownership.json");
+                    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+                    file.write_all(b"X").unwrap();
+                }
+                "final-early-ack" => write_preparation_fixture_record(
+                    &activation.join("ack.json"),
+                    &records.acknowledgement_bytes().unwrap(),
+                ),
+                _ => unreachable!(),
+            }
+            let error = match catalog
+                .into_final_owner(records.terminal.clone(), records.activation.clone())
+            {
+                Ok(_) => panic!("incomplete final publication was admitted"),
+                Err(error) => error,
+            };
+            assert!(error.requires_process_exit());
+            assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+            assert_eq!(durable_snapshot(&root), before);
+            drop(error);
+        } else {
+            let owner = catalog
+                .into_final_owner(records.terminal.clone(), records.activation.clone())
+                .unwrap();
+            match mode {
+                "final-replaced-pending-ack" => {
+                    let (owner, _) = owner.commit().unwrap();
+                    let path = prefix.join(".asg-reinstall/activation/ack.pending");
+                    let parked = base.join("original-ack");
+                    let bytes = records.acknowledgement_bytes().unwrap();
+                    write_preparation_fixture_record(&path, &bytes);
+                    let (owner, _) = owner.readback().unwrap();
+                    let original = binding(&path).1;
+                    fs::rename(&path, &parked).unwrap();
+                    write_preparation_fixture_record(&path, &bytes);
+                    assert!(binding(&path).1 != original);
+                    let error = match owner.readback() {
+                        Ok(_) => panic!("same-byte replacement changed the held ACK identity"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert!(error.owned.bundle().final_failed);
+                    #[cfg(windows)]
+                    assert!(matches!(error.error(), PortError::Backend(_)));
+                    #[cfg(not(windows))]
+                    assert!(matches!(error.error(), PortError::GenerationMismatch(_)));
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                    drop(error);
+                }
+                "final-publication-refused" | "final-publication-unwind" => {
+                    let (mut owner, _) = owner.commit().unwrap();
+                    let committed = durable_snapshot(&root);
+                    if mode == "final-publication-refused" {
+                        let path = prefix.join(".asg-reinstall-payload/complete.json");
+                        let original = fs::read(&path).unwrap();
+                        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        file.write_all(b"X").unwrap();
+                        drop(file);
+                        assert!(owner.publication().is_err());
+                        fs::write(&path, &original).unwrap();
+                    } else {
+                        PANIC_FINAL_PUBLICATION.with(|flag| flag.set(true));
+                        assert!(
+                            catch_unwind(AssertUnwindSafe(|| {
+                                let _ = owner.publication();
+                            }))
+                            .is_err()
+                        );
+                    }
+                    assert!(
+                        owner.publication().is_err(),
+                        "a failed final publication must never be reauthorized"
+                    );
+                    let error = close_error(owner.close());
+                    assert!(error.requires_process_exit());
+                    assert!(!error.close_attempted());
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                    assert_eq!(durable_snapshot(&root), committed);
+                    drop(error);
+                }
+                "final-preopen-missing" | "final-preopen-expired" => {
+                    let (owner, _) = owner.commit().unwrap();
+                    let ReinstallClosedResources {
+                        input,
+                        control_handles,
+                        _observed,
+                    } = owner.close().unwrap().into_resources();
+                    drop((control_handles, _observed));
+                    let committed = durable_snapshot(&root);
+                    let request_end = if mode == "final-preopen-missing" {
+                        fs::remove_file(prefix.join(".asg-reinstall/activation/intent.json"))
+                            .unwrap();
+                        until
+                    } else {
+                        Instant::now()
+                    };
+                    let error = match ReinstallFinalOwner::open_read_only(
+                        input,
+                        records.clone(),
+                        request_end,
+                    ) {
+                        Ok(_) => panic!("invalid final entry was admitted"),
+                        Err(error) => error,
+                    };
+                    assert!(error.owned.bundle().control.is_none());
+                    assert!(error.owned.bundle().catalog.is_none());
+                    assert!(error.owned.bundle().handle_lease.is_none());
+                    assert!(
+                        error.requires_process_exit(),
+                        "accepted final resources must survive failure before SQL open"
+                    );
+                    assert!(!error.close_attempted());
+                    assert_eq!(durable_snapshot(&root), committed);
+                    drop(error);
+                }
+                "final-lost-ack" => {
+                    FAIL_AFTER_FINAL_COMMIT.with(|flag| flag.set(true));
+                    let error = match owner.commit() {
+                        Ok(_) => panic!("lost acknowledgement fault did not run"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert!(matches!(error.error(), PortError::Backend(_)));
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                    let store = error.owned.bundle().store().unwrap();
+                    let status = store
+                        .with_runtime_deadline(until, || store.lifecycle_status())
+                        .unwrap();
+                    assert_eq!(status.policy.maintenance.state, MaintenanceState::Idle);
+                    assert_eq!(status.desired_updates, DesiredUpdates::Paused);
+                    drop(error);
+                }
+                "final-catalog-busy" | "final-control-busy" => {
+                    let (mut owner, result) = owner.commit().unwrap();
+                    assert_eq!(result, ReinstallTerminalCommit::Committed);
+                    arm_busy(owner.owned.bundle_mut(), mode == "final-catalog-busy");
+                    let error = close_error(owner.close());
+                    assert_busy_close(&error);
+                    if mode == "final-control-busy" {
+                        assert!(
+                            error
+                                .owned
+                                .bundle()
+                                .catalog
+                                .as_ref()
+                                .unwrap()
+                                .close_confirmed
+                        );
+                    }
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                    drop(error);
+                }
+                "final-record-changed-after" => {
+                    let (owner, _) = owner.commit().unwrap();
+                    let path = prefix.join(".asg-reinstall-payload/complete.json");
+                    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+                    file.write_all(b"X").unwrap();
+                    drop(file);
+                    let error = match owner.readback() {
+                        Ok(_) => panic!("changed completion record was accepted"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                    drop(error);
+                }
+                "final-q1-wal-changed" => {
+                    let wal = root.join("control.db-wal");
+                    let mut file = fs::OpenOptions::new().append(true).open(&wal).unwrap();
+                    file.write_all(b"uncommitted-tail").unwrap();
+                    file.sync_all().unwrap();
+                    drop(file);
+                    let changed = fs::read(&wal).unwrap();
+                    let error = match owner.commit() {
+                        Ok(_) => panic!("q+1 changed WAL bytes allowed terminal commit"),
+                        Err(error) => error,
+                    };
+                    assert!(error.requires_process_exit());
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                    assert_eq!(fs::read(&wal).unwrap(), changed);
+                    let store = error.owned.bundle().store().unwrap();
+                    let status = store
+                        .with_runtime_deadline(until, || store.lifecycle_status())
+                        .unwrap();
+                    assert_eq!(
+                        status.policy.maintenance.state,
+                        MaintenanceState::Recovering
+                    );
+                    assert_eq!(
+                        status.policy.control_seq.get(),
+                        records.prep.context().old_control_seq + 1
+                    );
+                    drop(error);
+                }
+                "final-expired" => {
+                    let expired = until.min(Instant::now() + Duration::from_millis(50));
+                    let outer =
+                        RuntimeDeadlineScope::enter_with_busy(expired, Duration::from_millis(7))
+                            .unwrap();
+                    std::thread::sleep(expired.saturating_duration_since(Instant::now()));
+                    let error = match owner.commit() {
+                        Ok(_) => panic!("expired final write was admitted"),
+                        Err(error) => error,
+                    };
+                    assert!(matches!(error.error(), PortError::WriterBusy(_)));
+                    assert!(error.requires_process_exit());
+                    assert_eq!(error.owned.bundle().end, expired);
+                    assert_eq!(runtime_deadline(), Some(expired));
+                    assert_eq!(
+                        RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                        Duration::from_millis(7)
+                    );
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                    assert_eq!(durable_snapshot(&root), before);
+                    drop(outer);
+                    drop(error);
+                }
+                _ => panic!("unknown final owner child mode"),
+            }
+        }
+        let current = durable_snapshot(&root);
+        for (name, bytes) in before {
+            if name != "control.db-wal" {
+                assert_eq!(current.get(&name), Some(&bytes), "{name}");
+            }
+        }
+        assert!(!base.join("retained-dropped").exists());
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        signal("unconfirmed-and-retained");
+        requests.receive();
+        requests.finish();
+        std::process::exit(23);
     }
 
     fn arm_busy<R: 'static>(bundle: &mut Bundle<R>, catalog: bool) {
@@ -3455,7 +4140,9 @@ mod tests {
         }
         let input = fixture(
             &base,
-            mode != "inspection-writer" && !mode.starts_with("adoption-"),
+            mode != "inspection-writer"
+                && !mode.starts_with("adoption-")
+                && !mode.starts_with("final-"),
             true,
         );
         let adoption_context = mode
@@ -3464,6 +4151,9 @@ mod tests {
         let before = durable_snapshot(&input.root);
         let root = input.root.clone();
         let until = Instant::now() + Duration::from_secs(30);
+        if mode.starts_with("final-") {
+            final_child(&mode, &base, input, requests, until);
+        }
         if mode == "open-unwind" {
             PANIC_AFTER_OPEN.with(|slot| slot.set(Some(OpenKind::Control)));
             assert!(
@@ -4668,6 +5358,10 @@ mod tests {
     }
 
     fn contenders(base: &Path, held: bool) {
+        contenders_with_control(base, held, true);
+    }
+
+    fn contenders_with_control(base: &Path, held: bool, control_handles_held: bool) {
         let root = base.join("data");
         let prefix = base.join("prefix");
         for kind in [
@@ -4680,8 +5374,9 @@ mod tests {
             LockKind::HistoryReaders,
             LockKind::MaintenanceJob(JobLockKey::parse(PURGE_LOCK_KEY).unwrap()),
         ] {
+            let blocked = held && (kind != LockKind::ControlHandles || control_handles_held);
             let result = ExclusiveGuard::try_acquire(&root, kind);
-            if held {
+            if blocked {
                 assert!(matches!(result, Err(PortError::WriterBusy(_))));
             } else {
                 drop(result.unwrap());
@@ -4713,13 +5408,17 @@ mod tests {
     }
 
     fn retained_case(mode: &str) {
+        retained_case_with_control(mode, true);
+    }
+
+    fn retained_case_with_control(mode: &str, control_handles_held: bool) {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let mut child = IsolatedChild::start(temp.path(), mode);
         child.expect("unconfirmed-and-retained");
         // This process has no in-process guard registry for the child. These
         // are actual independent OS contenders, while that child is still live.
         child.assert_alive();
-        contenders(temp.path(), true);
+        contenders_with_control(temp.path(), true, control_handles_held);
         child.assert_alive();
         assert!(!temp.path().join("retained-dropped").exists());
         child.finish(23);
@@ -4731,6 +5430,41 @@ mod tests {
     fn acknowledged_publication_keeps_final_file_check_and_expiry() {
         for mode in ["adoption-catalog-expired", "adoption-catalog-receipt"] {
             retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_lost_ack_and_close_busy_hold_every_native_guard() {
+        for mode in ["final-lost-ack", "final-catalog-busy", "final-control-busy"] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_invalid_records_and_expiry_keep_exclusion() {
+        for mode in [
+            "final-missing-intent",
+            "final-wrong-record",
+            "final-early-ack",
+            "final-record-changed-after",
+            "final-q1-wal-changed",
+            "final-expired",
+        ] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_failed_publication_never_reauthorizes_the_same_owner() {
+        for mode in ["final-publication-refused", "final-publication-unwind"] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_preopen_failures_retain_every_accepted_resource() {
+        for mode in ["final-preopen-missing", "final-preopen-expired"] {
+            retained_case_with_control(mode, false);
         }
     }
 

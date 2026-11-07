@@ -528,6 +528,14 @@ impl ReinstallTerminal {
         &self.control_final
     }
 
+    pub(super) fn payload_complete(&self) -> ReinstallDigest {
+        self.payload_complete_sha256
+    }
+
+    pub(super) fn retired_ownership(&self) -> ReinstallDigest {
+        self.retired_ownership_sha256
+    }
+
     pub fn encode(&self, prep: &ReinstallPrep, ack: &ReinstallAck) -> PortResult<Vec<u8>> {
         self.validate(prep, ack)?;
         encode(self)

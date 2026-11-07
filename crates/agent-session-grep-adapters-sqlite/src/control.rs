@@ -20,11 +20,12 @@ mod reinstall_connection;
 mod reinstall_records;
 pub use reinstall_commitment::{
     ReinstallCommitmentPair, ReinstallImageMatch, ReinstallPreparationRead,
-    ReinstallSnapshotBinding, ReinstallTerminalCommit,
+    ReinstallSnapshotBinding, ReinstallTerminalCommit, ReinstallTerminalMatch,
 };
 pub use reinstall_connection::{
-    ReinstallCleanupBinding, ReinstallClosed, ReinstallClosedResources, ReinstallConnectionError,
-    ReinstallControlOwner, ReinstallExpectedControl, ReinstallInspection,
+    ReinstallActivation, ReinstallActivationFiles, ReinstallCleanupBinding, ReinstallClosed,
+    ReinstallClosedResources, ReinstallConnectionError, ReinstallControlOwner,
+    ReinstallExpectedControl, ReinstallFinalOwner, ReinstallFinalRecords, ReinstallInspection,
     ReinstallInspectionGuards, ReinstallOwnedGuards, ReinstallOwnedInput, ReinstallOwnedPins,
     ReinstallPreparationStage, ReinstallPublication, ReinstallQueryOnlyCatalog,
     ReinstallWriterRead,

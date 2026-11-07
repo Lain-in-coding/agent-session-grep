@@ -46,6 +46,12 @@ pub enum ReinstallTerminalCommit {
     AlreadyCommitted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReinstallTerminalMatch {
+    Recovering,
+    Final,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Projection {
     Current,
@@ -141,6 +147,55 @@ impl SqliteControlStore {
                 retired_ownership,
                 terminal.ok_or_else(corrupt)?,
             )
+        })
+    }
+
+    /// Read both sides of the one permitted terminal transition in the same
+    /// snapshot. Ordinary preparation readers still reject the final image.
+    pub fn compare_reinstall_terminal_with_deadline(
+        &self,
+        binding: ReinstallSnapshotBinding<'_, '_>,
+        prep: &ReinstallPrep,
+        ack: &ReinstallAck,
+        terminal: &ReinstallTerminal,
+        end: Instant,
+    ) -> PortResult<ReinstallTerminalMatch> {
+        self.with_runtime_deadline(end, || {
+            terminal.validate(prep, ack)?;
+            self.validate_reinstall_read_binding(&binding)?;
+            let handles = ReinstallHandlesPin::open(&self.private_root)?;
+            let (current, counterpart) = {
+                let mut conn = self.conn.borrow_mut();
+                configure_runtime_deadline(&conn)?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(sql_error)?;
+                let images = self.reinstall_images_in_transaction(
+                    &tx,
+                    &binding,
+                    prep.context(),
+                    prep.files(),
+                    Projection::Recovering,
+                )?;
+                runtime_tick()?;
+                tx.commit().map_err(sql_error)?;
+                images
+            };
+            let matched = if current == *prep.after()
+                && counterpart.as_ref() == Some(terminal.final_image())
+            {
+                ReinstallTerminalMatch::Recovering
+            } else if current == *terminal.final_image()
+                && counterpart.as_ref() == Some(prep.after())
+            {
+                ReinstallTerminalMatch::Final
+            } else {
+                return Err(conflict());
+            };
+            handles.validate()?;
+            self.validate_reinstall_read_binding(&binding)?;
+            runtime_tick()?;
+            Ok(matched)
         })
     }
 
