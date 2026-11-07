@@ -29,6 +29,7 @@ mod managed_receipt;
 #[cfg(test)]
 mod managed_receipt_tests;
 pub mod managed_refresh;
+pub mod managed_schema_transition;
 pub mod managed_source_context;
 pub mod managed_store;
 mod relocation;

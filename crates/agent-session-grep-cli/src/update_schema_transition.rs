@@ -4,6 +4,9 @@
 //! file, running executable, root, lock, old-directory absence or complete v2
 //! state. The internal command is deliberately an unconditional effect-free
 //! refusal until the complete transition protocol is available.
+#[path = "update_schema_transition_state.rs"]
+pub mod state;
+
 use crate::{
     protocol::CanonicalCode,
     update_state::{Checkpoint, Phase, State, VersionIdentity},

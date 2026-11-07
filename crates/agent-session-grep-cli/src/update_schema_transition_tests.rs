@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{Value, json};
 use std::fs;
 
-fn synthetic_root() -> PathBuf {
+pub(super) fn synthetic_root() -> PathBuf {
     if cfg!(windows) {
         PathBuf::from("C:/asg-transition-fixture")
     } else {
@@ -24,7 +24,7 @@ fn package(version: &str, digit: char, catalog: u32, control: u32) -> Value {
     })
 }
 
-fn admission_value(root: &Path) -> Value {
+pub(super) fn admission_value(root: &Path) -> Value {
     let prefix = root.join("install");
     let control = root.join("data");
     let incoming = root.join("incoming");
