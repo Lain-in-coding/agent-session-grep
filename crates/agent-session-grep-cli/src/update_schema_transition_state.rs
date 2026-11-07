@@ -12,6 +12,13 @@ use serde::{
 };
 use std::{collections::BTreeSet, fmt};
 
+#[path = "update_schema_transition_records.rs"]
+pub mod records;
+use records::{
+    Component, ComponentIntent, ComponentReadback, ComponentReceipt, Coverage, RollbackIntent,
+    RollbackPlan,
+};
+
 const STATE_SCHEMA: &str = "asg.update-state/v2";
 const PROOF_LIMIT: usize = 8192;
 
@@ -122,16 +129,17 @@ pub enum RecordSlot {
     ControlIntent,
     CatalogReceipt,
     ControlReceipt,
+    CatalogCommitReadback,
+    ControlCommitReadback,
     ForwardPairReadback,
     RollbackPairReadback,
     SelfCheck,
     RollbackIntent,
-    Finalizer,
+    RollbackPlan,
 }
 
 impl RecordSlot {
-    /// Fixed basename only. Finalizer is rooted at C; the other records are
-    /// rooted at the admitted U. This method supplies no filesystem authority.
+    /// Fixed basename under the admitted U. This supplies no filesystem authority.
     pub fn filename(self) -> &'static str {
         match self {
             Self::Coverage => "coverage.json",
@@ -139,11 +147,13 @@ impl RecordSlot {
             Self::ControlIntent => "control-intent.json",
             Self::CatalogReceipt => "catalog-receipt.json",
             Self::ControlReceipt => "control-receipt.json",
+            Self::CatalogCommitReadback => "catalog-commit-readback.json",
+            Self::ControlCommitReadback => "control-commit-readback.json",
             Self::ForwardPairReadback => "forward-pair-readback.json",
             Self::RollbackPairReadback => "rollback-pair-readback.json",
             Self::SelfCheck => "self-check.json",
             Self::RollbackIntent => "rollback-intent.json",
-            Self::Finalizer => "schema-transition-finalize.json",
+            Self::RollbackPlan => "rollback-plan.json",
         }
     }
 
@@ -307,6 +317,28 @@ struct ControlCheckpoint {
 }
 
 impl ControlCheckpoint {
+    fn same_restore_policy(&self, before: &Self) -> bool {
+        self.authority_blake3 == before.authority_blake3
+            && self.policy_epoch == before.policy_epoch
+            && self.desired_updates == before.desired_updates
+            && self.autostart_enabled == before.autostart_enabled
+            && self.restart_request_seq == before.restart_request_seq
+    }
+
+    /// A later observation may advance policy, but cannot reuse an older
+    /// sequence or give the same sequence contradictory policy fields.
+    fn follows_checkpoint(&self, before: &Self) -> Result<()> {
+        require(
+            self.installation_id == before.installation_id
+                && self.catalog_incarnation == before.catalog_incarnation
+                && self.control_seq >= before.control_seq
+                && self.policy_epoch >= before.policy_epoch
+                && self.next_cycle_seq >= before.next_cycle_seq
+                && self.restart_request_seq >= before.restart_request_seq
+                && (self.control_seq != before.control_seq || self.same_restore_policy(before)),
+        )
+    }
+
     fn validate(&self, admission: &AdmissionV2, schema: u32) -> Result<()> {
         require(
             self.installation_id == admission.record.installation_id
@@ -413,6 +445,14 @@ enum ImageState {
 }
 
 impl ImageState {
+    fn stamp(&self) -> Option<&FileStamp> {
+        match self {
+            Self::Complete { stamp } | Self::Adopted { stamp, .. } => Some(stamp),
+            Self::Reclaimed { stamp, .. } | Self::DeleteIntent { stamp, .. } => stamp.as_ref(),
+            _ => None,
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Registered | Self::Deleted | Self::Absent => Ok(()),
@@ -520,6 +560,18 @@ struct ImageSlot {
 }
 
 impl ImageSlot {
+    fn clean(&self) -> bool {
+        matches!(self.image, ImageState::Absent | ImageState::Deleted)
+            && matches!(self.manifest, ManifestState::Absent)
+            && [
+                &self.sidecars.wal,
+                &self.sidecars.shm,
+                &self.sidecars.journal,
+            ]
+            .into_iter()
+            .all(|slot| matches!(slot, SidecarState::Absent | SidecarState::Deleted))
+    }
+
     fn validate(&self, admission: &AdmissionV2, role: ImageRole) -> Result<()> {
         require(self.role == role && self.root_binding == admission.record.control_root.identity)?;
         id(&self.artifact_id)?;
@@ -666,10 +718,23 @@ enum ComponentProgress {
     Committed {
         intent: RecordRef,
         receipt: RecordRef,
+        readback: RecordRef,
+    },
+    NotApplied {
+        intent: RecordRef,
+        readback: RecordRef,
     },
 }
 
 impl ComponentProgress {
+    fn intent(&self) -> Option<&RecordRef> {
+        match self {
+            Self::Intent { record } => Some(record),
+            Self::Committed { intent, .. } | Self::NotApplied { intent, .. } => Some(intent),
+            Self::Unstarted => None,
+        }
+    }
+
     fn validate(&self, catalog: bool) -> Result<()> {
         let (intent_slot, receipt_slot) = if catalog {
             (RecordSlot::CatalogIntent, RecordSlot::CatalogReceipt)
@@ -679,9 +744,26 @@ impl ComponentProgress {
         match self {
             Self::Unstarted => Ok(()),
             Self::Intent { record } => record.validate(intent_slot),
-            Self::Committed { intent, receipt } => {
+            Self::Committed {
+                intent,
+                receipt,
+                readback,
+            } => {
                 intent.validate(intent_slot)?;
-                receipt.validate(receipt_slot)
+                receipt.validate(receipt_slot)?;
+                readback.validate(if catalog {
+                    RecordSlot::CatalogCommitReadback
+                } else {
+                    RecordSlot::ControlCommitReadback
+                })
+            }
+            Self::NotApplied { intent, readback } => {
+                intent.validate(intent_slot)?;
+                readback.validate(if catalog {
+                    RecordSlot::CatalogCommitReadback
+                } else {
+                    RecordSlot::ControlCommitReadback
+                })
             }
         }
     }
@@ -689,6 +771,13 @@ impl ComponentProgress {
     fn receipt(&self) -> Option<&RecordRef> {
         match self {
             Self::Committed { receipt, .. } => Some(receipt),
+            _ => None,
+        }
+    }
+
+    fn readback(&self) -> Option<&RecordRef> {
+        match self {
+            Self::Committed { readback, .. } | Self::NotApplied { readback, .. } => Some(readback),
             _ => None,
         }
     }
@@ -791,7 +880,6 @@ enum PlainPhase {
     ControlRestored,
     CleanupPending,
     CleanupComplete,
-    FinalizingOldLayout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,8 +919,6 @@ enum PhaseV2 {
     CleanupPending,
     #[serde(deserialize_with = "closed_unit")]
     CleanupComplete,
-    #[serde(deserialize_with = "closed_unit")]
-    FinalizingOldLayout,
     Attention {
         resume: PlainPhase,
         failed_seq: u64,
@@ -859,9 +945,46 @@ impl PhaseV2 {
             Self::ControlRestored => PlainPhase::ControlRestored,
             Self::CleanupPending => PlainPhase::CleanupPending,
             Self::CleanupComplete => PlainPhase::CleanupComplete,
-            Self::FinalizingOldLayout => PlainPhase::FinalizingOldLayout,
             Self::Attention { resume, .. } => *resume,
         }
+    }
+}
+
+impl PlainPhase {
+    fn next(self) -> Option<Self> {
+        Some(match self {
+            Self::Verified => Self::Quiescing,
+            Self::Quiescing => Self::BackedUp,
+            Self::BackedUp => Self::Staged,
+            Self::Staged => Self::Catalog23Control2,
+            Self::Catalog23Control2 => Self::Catalog23Control3,
+            Self::Catalog23Control3 => Self::Migrated,
+            Self::Migrated => Self::Switched,
+            Self::Switched => Self::SelfChecked,
+            Self::SelfChecked => Self::Opening,
+            Self::Opening => Self::Complete,
+            Self::ReclaimPrepared => Self::ReclaimCommitted,
+            Self::ReclaimCommitted => Self::CatalogRestored,
+            Self::CatalogRestored => Self::ControlRestored,
+            Self::ControlRestored => Self::CleanupPending,
+            Self::CleanupPending => Self::CleanupComplete,
+            Self::Complete | Self::CleanupComplete => return None,
+        })
+    }
+
+    fn pre_open(self) -> bool {
+        matches!(
+            self,
+            Self::Verified
+                | Self::Quiescing
+                | Self::BackedUp
+                | Self::Staged
+                | Self::Catalog23Control2
+                | Self::Catalog23Control3
+                | Self::Migrated
+                | Self::Switched
+                | Self::SelfChecked
+        )
     }
 }
 
@@ -940,7 +1063,10 @@ impl OwnedRecordSlot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RollbackProgress {
-    intent: RecordRef,
+    #[serde(deserialize_with = "nullable")]
+    plan: Option<RecordRef>,
+    #[serde(deserialize_with = "nullable")]
+    intent: Option<RecordRef>,
     restore_pair: RestorePair,
     #[serde(deserialize_with = "nullable")]
     recovery_incarnation: Option<String>,
@@ -964,17 +1090,67 @@ struct RollbackProgress {
 }
 
 impl RollbackProgress {
+    fn preparation_complete(&self) -> bool {
+        self.restore_pair == RestorePair::Required
+            && self.plan.is_some()
+            && [&self.catalog_side, &self.control_side]
+                .into_iter()
+                .all(|slot| {
+                    slot.as_ref().is_some_and(|image| {
+                        matches!(image.parent, ParentState::Owned { .. })
+                            && matches!(image.image, ImageState::Complete { .. })
+                            && matches!(image.manifest, ManifestState::Absent)
+                            && [
+                                &image.sidecars.wal,
+                                &image.sidecars.shm,
+                                &image.sidecars.journal,
+                            ]
+                            .into_iter()
+                            .all(|sidecar| matches!(sidecar, SidecarState::Owned { .. }))
+                    })
+                })
+            && [&self.catalog_displaced, &self.control_displaced]
+                .into_iter()
+                .all(|slot| {
+                    slot.as_ref().is_some_and(|image| {
+                        matches!(image.parent, ParentState::Owned { .. })
+                            && matches!(image.image, ImageState::Registered | ImageState::Absent)
+                            && matches!(image.manifest, ManifestState::Complete { .. })
+                            && [
+                                &image.sidecars.wal,
+                                &image.sidecars.shm,
+                                &image.sidecars.journal,
+                            ]
+                            .into_iter()
+                            .all(|sidecar| matches!(sidecar, SidecarState::Absent))
+                    })
+                })
+            && [&self.catalog_restore_journal, &self.control_restore_journal]
+                .into_iter()
+                .all(|slot| {
+                    slot.as_ref().is_some_and(|journal| {
+                        journal.state == OwnedRecordState::Complete
+                            && journal.identity.is_some()
+                            && journal.size_bytes > 0
+                            && journal.blake3.is_some()
+                    })
+                })
+    }
+
     fn validate(&self, admission: &AdmissionV2) -> Result<()> {
-        self.intent.validate(RecordSlot::RollbackIntent)?;
+        if let Some(plan) = &self.plan {
+            plan.validate(RecordSlot::RollbackPlan)?;
+        }
+        if let Some(intent) = &self.intent {
+            intent.validate(RecordSlot::RollbackIntent)?;
+        }
         self.authority_checkpoint
             .validate(admission, self.authority_checkpoint.schema)?;
         require(matches!(self.authority_checkpoint.schema, 2 | 3))?;
         if let Some(record) = &self.rollback_pair_readback {
             record.validate(RecordSlot::RollbackPairReadback)?;
         }
-        if let Some(record) = &self.finalizer {
-            record.validate(RecordSlot::Finalizer)?;
-        }
+        require(self.finalizer.is_none())?;
         let images = [
             (&self.catalog_side, ImageRole::CatalogSide),
             (&self.control_side, ImageRole::ControlSide),
@@ -984,6 +1160,8 @@ impl RollbackProgress {
         if self.restore_pair == RestorePair::NotNeeded {
             require(
                 self.recovery_incarnation.is_none()
+                    && self.plan.is_none()
+                    && self.intent.is_some()
                     && self.authority_checkpoint.schema == 2
                     && images.iter().all(|(slot, _)| slot.is_none())
                     && self.catalog_restore_journal.is_none()
@@ -991,6 +1169,7 @@ impl RollbackProgress {
             )?;
             return Ok(());
         }
+        require(self.plan.is_some())?;
         let suffix = &admission.record.update_id["update_".len()..];
         require(
             self.recovery_incarnation.as_deref()
@@ -1019,13 +1198,15 @@ enum EffectKind {
     StagePublish,
     FenceSet,
     PreimageCreate,
+    RollbackBindParent,
+    RollbackCreateEmpty,
+    RollbackWriteContent,
     ComponentCommit,
     MetadataPublish,
     MetadataRestore,
     PairRestore,
     OwnedDelete,
     FenceClear,
-    OldLayoutFinalize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1064,6 +1245,10 @@ impl PendingEffect {
             EffectKind::PreimageCreate => {
                 matches!(self.slot.as_str(), "catalog_preimage" | "control_preimage")
             }
+            EffectKind::RollbackBindParent
+            | EffectKind::RollbackCreateEmpty
+            | EffectKind::RollbackWriteContent => records::PreparationSlot::parse(&self.slot)
+                .is_some_and(|slot| slot.permits(self.kind)),
             EffectKind::ComponentCommit => matches!(self.slot.as_str(), "catalog" | "control"),
             EffectKind::MetadataPublish | EffectKind::MetadataRestore => matches!(
                 self.slot.as_str(),
@@ -1096,7 +1281,6 @@ impl PendingEffect {
                     | "catalog_restore_journal"
                     | "control_restore_journal"
             ),
-            EffectKind::OldLayoutFinalize => self.slot == "finalizer",
         };
         require(
             valid_slot
@@ -1284,11 +1468,35 @@ impl StateRecord {
         if let Some(rollback) = &self.rollback {
             require(self.requests_open_intent.is_none())?;
             rollback.validate(admission)?;
+            require(
+                rollback.intent.is_some()
+                    || (rollback.restore_pair == RestorePair::Required
+                        && self.phase.plain() == PlainPhase::ReclaimPrepared),
+            )?;
             if rollback.restore_pair == RestorePair::NotNeeded {
                 require(
                     self.catalog_component.receipt().is_none()
-                        && self.control_component.receipt().is_none(),
+                        && matches!(self.control_component, ComponentProgress::Unstarted),
                 )?;
+            } else if matches!(
+                self.phase.plain(),
+                PlainPhase::ReclaimPrepared | PlainPhase::ReclaimCommitted
+            ) {
+                for image in [&rollback.catalog_displaced, &rollback.control_displaced] {
+                    require(image.as_ref().is_some_and(|image| {
+                        matches!(image.image, ImageState::Registered | ImageState::Absent)
+                            && [
+                                &image.sidecars.wal,
+                                &image.sidecars.shm,
+                                &image.sidecars.journal,
+                            ]
+                            .into_iter()
+                            .all(|sidecar| matches!(sidecar, SidecarState::Absent))
+                    }))?;
+                }
+                if rollback.intent.is_some() {
+                    require(rollback.preparation_complete())?;
+                }
             }
         }
         if let Some(pending) = &self.pending {
@@ -1301,6 +1509,14 @@ impl StateRecord {
             require((1..=self.seq).contains(failed_seq))?;
         }
         let phase = self.phase.plain();
+        for (component, entry_phase) in [
+            (&self.catalog_component, PlainPhase::Staged),
+            (&self.control_component, PlainPhase::Catalog23Control2),
+        ] {
+            if matches!(component, ComponentProgress::NotApplied { .. }) {
+                require(self.rollback.is_some() || phase == entry_phase)?;
+            }
+        }
         let forward_rank = match phase {
             PlainPhase::Verified => Some(0),
             PlainPhase::Quiescing => Some(1),
@@ -1340,6 +1556,9 @@ impl StateRecord {
                     ComponentProgress::Unstarted
                 ))?;
             }
+            if rank < 4 {
+                require(self.catalog_component.receipt().is_none())?;
+            }
             if rank < 2 {
                 require(matches!(self.stage, StageProgress::Unstarted))?;
             }
@@ -1348,6 +1567,9 @@ impl StateRecord {
                     self.control_component,
                     ComponentProgress::Unstarted
                 ))?;
+            }
+            if rank < 5 {
+                require(self.control_component.receipt().is_none())?;
             }
             if rank < 5 {
                 require(self.forward_pair_readback.is_none())?;
@@ -1414,7 +1636,6 @@ impl StateRecord {
                 PlainPhase::ControlRestored
                     | PlainPhase::CleanupPending
                     | PlainPhase::CleanupComplete
-                    | PlainPhase::FinalizingOldLayout
             ) {
                 require(
                     self.rollback
@@ -1427,11 +1648,1187 @@ impl StateRecord {
     }
 }
 
+const METADATA_ORDER: [usize; 16] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 4];
+const METADATA_KEYS: [&str; 16] = [
+    "package_manifest",
+    "package_receipt",
+    "release_manifest",
+    "checksums",
+    "current",
+    "installer_sh",
+    "installer_powershell",
+    "install_guide",
+    "readme",
+    "changelog",
+    "license_mit",
+    "license_apache",
+    "notice",
+    "security",
+    "dependencies_json",
+    "dependencies_csv",
+];
+const IMAGE_KEYS: [&str; 6] = [
+    "catalog_preimage",
+    "control_preimage",
+    "catalog_side",
+    "control_side",
+    "catalog_displaced",
+    "control_displaced",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    Coverage,
+    Quiesced,
+    Image(usize),
+    Stage,
+    Component(Component),
+    Metadata(usize),
+    ForwardReadback,
+    SelfCheck,
+    Open,
+    Rollback,
+    RollbackIntent,
+    RollbackReadback,
+    Journal(usize),
+}
+
+impl ImageState {
+    fn follows(&self, before: &Self, phase: PlainPhase) -> Result<()> {
+        if self == before {
+            return Ok(());
+        }
+        let allowed = match (before, self) {
+            (Self::Absent, Self::Registered) => phase == PlainPhase::Quiescing,
+            (Self::Registered, Self::OwnedIncomplete { .. }) => matches!(
+                phase,
+                PlainPhase::Quiescing | PlainPhase::ReclaimPrepared | PlainPhase::ReclaimCommitted
+            ),
+            (Self::Registered, Self::Complete { .. }) => matches!(
+                phase,
+                PlainPhase::ReclaimCommitted | PlainPhase::CatalogRestored
+            ),
+            (Self::OwnedIncomplete { identity }, Self::Complete { stamp }) => {
+                identity == &stamp.identity
+                    && matches!(
+                        phase,
+                        PlainPhase::Quiescing
+                            | PlainPhase::ReclaimPrepared
+                            | PlainPhase::ReclaimCommitted
+                            | PlainPhase::CatalogRestored
+                    )
+            }
+            (Self::Complete { stamp }, Self::Adopted { stamp: next, .. }) => {
+                stamp == next && phase == PlainPhase::Catalog23Control2
+            }
+            (
+                Self::OwnedIncomplete { identity },
+                Self::Reclaimed {
+                    identity: next,
+                    stamp: None,
+                },
+            ) => identity == next && phase == PlainPhase::ReclaimPrepared,
+            (
+                Self::Complete { stamp } | Self::Adopted { stamp, .. },
+                Self::Reclaimed {
+                    identity,
+                    stamp: Some(next),
+                },
+            ) => {
+                stamp == next && identity == &stamp.identity && phase == PlainPhase::ReclaimPrepared
+            }
+            (Self::Registered, Self::Absent) => phase == PlainPhase::CleanupPending,
+            (
+                Self::OwnedIncomplete { identity },
+                Self::DeleteIntent {
+                    identity: next,
+                    stamp: None,
+                },
+            ) => identity == next && phase == PlainPhase::CleanupPending,
+            (
+                Self::Reclaimed { identity, stamp },
+                Self::DeleteIntent {
+                    identity: next,
+                    stamp: after,
+                },
+            ) => identity == next && stamp == after && phase == PlainPhase::CleanupPending,
+            (
+                Self::Complete { stamp },
+                Self::DeleteIntent {
+                    identity,
+                    stamp: Some(after),
+                },
+            ) => {
+                phase == PlainPhase::CleanupPending && stamp == after && identity == &stamp.identity
+            }
+            (
+                Self::Adopted {
+                    stamp,
+                    disposition: Disposition::Quarantined,
+                    ..
+                },
+                Self::DeleteIntent {
+                    identity,
+                    stamp: Some(after),
+                },
+            ) => {
+                stamp == after
+                    && identity == &stamp.identity
+                    && matches!(
+                        phase,
+                        PlainPhase::Migrated | PlainPhase::Switched | PlainPhase::SelfChecked
+                    )
+            }
+            (Self::DeleteIntent { .. }, Self::Deleted) => matches!(
+                phase,
+                PlainPhase::CleanupPending
+                    | PlainPhase::Migrated
+                    | PlainPhase::Switched
+                    | PlainPhase::SelfChecked
+            ),
+            // A prepared replacement becomes the installed file. Its old side
+            // name can be absent only at the recorded pair exchange boundary.
+            (Self::Complete { .. }, Self::Absent) => matches!(
+                phase,
+                PlainPhase::ReclaimCommitted | PlainPhase::CatalogRestored
+            ),
+            _ => false,
+        };
+        require(allowed)
+    }
+}
+
+impl SidecarState {
+    fn follows(&self, before: &Self, cleanup: bool) -> bool {
+        self == before
+            || match (before, self) {
+                (Self::Absent, Self::Owned { .. }) => !cleanup,
+                (Self::Owned { identity }, Self::DeleteIntent { identity: next }) => {
+                    identity == next
+                }
+                (Self::DeleteIntent { .. }, Self::Deleted) => true,
+                _ => false,
+            }
+    }
+}
+
+impl ImageSlot {
+    fn follows(&self, before: &Self, phase: PlainPhase) -> Result<()> {
+        require(
+            self.role == before.role
+                && self.artifact_id == before.artifact_id
+                && self.root_binding == before.root_binding
+                && self.relative_locator == before.relative_locator
+                && self.coverage_ref == before.coverage_ref,
+        )?;
+        let mut changes = 0;
+        if self.parent != before.parent {
+            require(
+                matches!(
+                    (&before.parent, &self.parent),
+                    (ParentState::AbsentUnderBoundRoot, ParentState::Owned { .. })
+                ) && matches!(phase, PlainPhase::Quiescing | PlainPhase::ReclaimPrepared),
+            )?;
+            changes += 1;
+        }
+        if self.image != before.image {
+            if matches!(before.image, ImageState::Registered)
+                && matches!(self.image, ImageState::Complete { .. })
+            {
+                require(matches!(
+                    (self.role, phase),
+                    (ImageRole::CatalogDisplaced, PlainPhase::ReclaimCommitted)
+                        | (ImageRole::ControlDisplaced, PlainPhase::CatalogRestored)
+                ))?;
+            }
+            if matches!(before.image, ImageState::Complete { .. })
+                && matches!(self.image, ImageState::Absent)
+            {
+                require(matches!(
+                    (self.role, phase),
+                    (ImageRole::CatalogSide, PlainPhase::ReclaimCommitted)
+                        | (ImageRole::ControlSide, PlainPhase::CatalogRestored)
+                ))?;
+            }
+            if matches!(before.image, ImageState::Complete { .. })
+                && matches!(self.image, ImageState::DeleteIntent { .. })
+            {
+                require(matches!(
+                    self.role,
+                    ImageRole::CatalogDisplaced
+                        | ImageRole::ControlDisplaced
+                        | ImageRole::CatalogSide
+                        | ImageRole::ControlSide
+                ))?;
+            }
+            self.image.follows(&before.image, phase)?;
+            changes += 1;
+        }
+        if self.manifest != before.manifest {
+            let valid = match (&before.manifest, &self.manifest) {
+                (ManifestState::Absent, ManifestState::OwnedIncomplete { .. }) => matches!(
+                    phase,
+                    PlainPhase::Quiescing
+                        | PlainPhase::ReclaimPrepared
+                        | PlainPhase::ReclaimCommitted
+                ),
+                (
+                    ManifestState::OwnedIncomplete { identity },
+                    ManifestState::Complete { stamp },
+                ) => identity == &stamp.identity,
+                (
+                    ManifestState::OwnedIncomplete { .. } | ManifestState::Complete { .. },
+                    ManifestState::Absent,
+                ) => {
+                    matches!(
+                        self.image,
+                        ImageState::DeleteIntent { .. } | ImageState::Deleted | ImageState::Absent
+                    )
+                }
+                _ => false,
+            };
+            require(valid)?;
+            changes += 1;
+        }
+        let cleanup = matches!(phase, PlainPhase::CleanupPending | PlainPhase::SelfChecked);
+        for (old, new) in [
+            (&before.sidecars.wal, &self.sidecars.wal),
+            (&before.sidecars.shm, &self.sidecars.shm),
+            (&before.sidecars.journal, &self.sidecars.journal),
+        ] {
+            if old != new {
+                require(new.follows(old, cleanup))?;
+                changes += 1;
+            }
+        }
+        require(changes == 1)
+    }
+}
+
+impl StageProgress {
+    fn follows(&self, before: &Self) -> bool {
+        match (before, self) {
+            (Self::Unstarted, Self::Intent { .. }) => true,
+            (
+                Self::Intent {
+                    inventory_sha256: a,
+                },
+                Self::Extracted {
+                    inventory_sha256: b,
+                },
+            )
+            | (
+                Self::Extracted {
+                    inventory_sha256: a,
+                },
+                Self::PublishIntent {
+                    inventory_sha256: b,
+                },
+            )
+            | (
+                Self::PublishIntent {
+                    inventory_sha256: a,
+                },
+                Self::Published {
+                    inventory_sha256: b,
+                    ..
+                },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl ComponentProgress {
+    fn follows(&self, before: &Self) -> bool {
+        match (before, self) {
+            (Self::Unstarted, Self::Intent { .. }) => true,
+            (
+                Self::Intent { record },
+                Self::Committed { intent, .. } | Self::NotApplied { intent, .. },
+            ) => record == intent,
+            _ => false,
+        }
+    }
+}
+
+impl MetadataSlot {
+    fn images(&self) -> Option<(&BeforeImage, &ImageDigest)> {
+        match self {
+            Self::Untouched => None,
+            Self::Prepared { before, after }
+            | Self::PublishIntent { before, after }
+            | Self::Applied { before, after }
+            | Self::RestoreIntent { before, after }
+            | Self::Restored { before, after } => Some((before, after)),
+        }
+    }
+
+    fn follows(&self, before: &Self, rollback: bool) -> bool {
+        let allowed = if rollback {
+            matches!(
+                (before, self),
+                (
+                    Self::Prepared { .. } | Self::PublishIntent { .. } | Self::Applied { .. },
+                    Self::RestoreIntent { .. }
+                ) | (Self::RestoreIntent { .. }, Self::Restored { .. })
+            )
+        } else {
+            matches!(
+                (before, self),
+                (Self::Untouched, Self::Prepared { .. })
+                    | (Self::Prepared { .. }, Self::PublishIntent { .. })
+                    | (Self::PublishIntent { .. }, Self::Applied { .. })
+            )
+        };
+        allowed && (before.images().is_none() || before.images() == self.images())
+    }
+}
+
+impl OwnedRecordSlot {
+    fn follows(&self, before: &Self) -> bool {
+        if self.role != before.role || self.path_kind != before.path_kind {
+            return false;
+        }
+        let same_identity = before.identity.is_none() || self.identity == before.identity;
+        let same_bytes = before.blake3.is_none()
+            || (self.blake3 == before.blake3 && self.size_bytes == before.size_bytes);
+        same_identity
+            && same_bytes
+            && matches!(
+                (before.state, self.state),
+                (
+                    OwnedRecordState::Registered,
+                    OwnedRecordState::Owned | OwnedRecordState::Absent
+                ) | (
+                    OwnedRecordState::Owned,
+                    OwnedRecordState::Complete | OwnedRecordState::DeleteIntent
+                ) | (OwnedRecordState::Complete, OwnedRecordState::DeleteIntent)
+                    | (OwnedRecordState::DeleteIntent, OwnedRecordState::Deleted)
+            )
+    }
+}
+
+impl StateRecord {
+    fn same_progress(&self, before: &Self) -> bool {
+        let mut comparable = self.clone();
+        comparable.seq = before.seq;
+        comparable.predecessor_sha256 = before.predecessor_sha256.clone();
+        comparable.phase = before.phase.clone();
+        comparable.pending = before.pending.clone();
+        comparable.last_failure = before.last_failure.clone();
+        comparable == *before
+    }
+
+    fn successor(&self, before: &Self) -> Result<()> {
+        let from = before.phase.plain();
+        let to = self.phase.plain();
+        if let PhaseV2::Attention { resume, failed_seq } = &self.phase {
+            let failure = self.last_failure.as_ref().ok_or(RecordError::Invalid)?;
+            return require(
+                *resume == from
+                    && *failed_seq == before.seq
+                    && failure.at_seq == before.seq
+                    && failure.effect == before.pending.as_ref().map(|p| p.kind)
+                    && self.same_progress(before)
+                    && self.pending == before.pending
+                    && !matches!(from, PlainPhase::Complete | PlainPhase::CleanupComplete),
+            );
+        }
+        if matches!(before.phase, PhaseV2::Attention { .. }) && to == from {
+            return require(
+                self.same_progress(before)
+                    && self.pending == before.pending
+                    && self.last_failure.is_none(),
+            );
+        }
+        let reclaim = to == PlainPhase::ReclaimPrepared && from.pre_open();
+        require(!matches!(before.phase, PhaseV2::Attention { .. }) || reclaim)?;
+        require(to == from || from.next() == Some(to) || reclaim)?;
+        require(!matches!(
+            from,
+            PlainPhase::Complete | PlainPhase::CleanupComplete
+        ))?;
+        if reclaim {
+            require(
+                before.requests_open_intent.is_none()
+                    && self.requests_open_intent.is_none()
+                    && before.rollback.is_none()
+                    && self.rollback.is_some()
+                    && before.pending.is_none(),
+            )?;
+            if let Some(rollback) = &self.rollback {
+                require(match rollback.restore_pair {
+                    RestorePair::Required => rollback.plan.is_some() && rollback.intent.is_none(),
+                    RestorePair::NotNeeded => rollback.plan.is_none() && rollback.intent.is_some(),
+                })?;
+                for image in [
+                    rollback.catalog_side.as_ref(),
+                    rollback.control_side.as_ref(),
+                    rollback.catalog_displaced.as_ref(),
+                    rollback.control_displaced.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    require(
+                        matches!(image.parent, ParentState::AbsentUnderBoundRoot)
+                            && matches!(image.image, ImageState::Registered | ImageState::Absent)
+                            && matches!(image.manifest, ManifestState::Absent)
+                            && [
+                                &image.sidecars.wal,
+                                &image.sidecars.shm,
+                                &image.sidecars.journal,
+                            ]
+                            .into_iter()
+                            .all(|state| matches!(state, SidecarState::Absent)),
+                    )?;
+                }
+                for record in [
+                    rollback.catalog_restore_journal.as_ref(),
+                    rollback.control_restore_journal.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    require(
+                        matches!(
+                            record.state,
+                            OwnedRecordState::Registered | OwnedRecordState::Absent
+                        ) && record.identity.is_none()
+                            && record.blake3.is_none()
+                            && record.size_bytes == 0,
+                    )?;
+                }
+            }
+        }
+        let changes = self.progress_changes(before)?;
+        self.check_change_phase(before, &changes)?;
+        self.check_pending(before, &changes)?;
+        let failure_changed = self.last_failure != before.last_failure;
+        if failure_changed {
+            if let Some(failure) = &self.last_failure {
+                require(
+                    failure.at_seq == before.seq
+                        && failure.effect == before.pending.as_ref().map(|p| p.kind)
+                        && self.same_progress(before)
+                        && self.pending == before.pending
+                        && to == from,
+                )?;
+            } else {
+                require(before.last_failure.is_some())?;
+            }
+        }
+        require(
+            !changes.is_empty()
+                || self.phase != before.phase
+                || self.pending != before.pending
+                || failure_changed,
+        )?;
+        if to != from {
+            self.check_phase_boundary(before, &changes)?;
+        }
+        Ok(())
+    }
+
+    fn progress_changes(&self, before: &Self) -> Result<Vec<Change>> {
+        let mut changes = Vec::new();
+        let mut comparable = self.clone();
+        comparable.seq = before.seq;
+        comparable.predecessor_sha256 = before.predecessor_sha256.clone();
+        comparable.phase = before.phase.clone();
+        comparable.pending = before.pending.clone();
+        comparable.last_failure = before.last_failure.clone();
+        if self.quiesced != before.quiesced {
+            require(before.quiesced.is_none() && self.quiesced.is_some())?;
+            comparable.quiesced = before.quiesced.clone();
+            changes.push(Change::Quiesced);
+        }
+        let mut coverage_changed = false;
+        for (index, (old, new)) in before.images().into_iter().zip(self.images()).enumerate() {
+            let (Some(old), Some(new)) = (old, new) else {
+                continue;
+            };
+            if old.coverage_ref != new.coverage_ref {
+                require(old.coverage_ref.is_none() && new.coverage_ref.is_some())?;
+                coverage_changed = true;
+            }
+            let mut without_coverage = new.clone();
+            without_coverage.coverage_ref = old.coverage_ref.clone();
+            if &without_coverage != old {
+                without_coverage.follows(old, before.phase.plain())?;
+                changes.push(Change::Image(index));
+            }
+        }
+        if coverage_changed {
+            changes.push(Change::Coverage);
+        }
+        comparable.preimages = before.preimages.clone();
+        if self.stage != before.stage {
+            require(self.stage.follows(&before.stage))?;
+            comparable.stage = before.stage.clone();
+            changes.push(Change::Stage);
+        }
+        for (component, old, new) in [
+            (
+                Component::Catalog,
+                &before.catalog_component,
+                &self.catalog_component,
+            ),
+            (
+                Component::Control,
+                &before.control_component,
+                &self.control_component,
+            ),
+        ] {
+            if old != new {
+                require(new.follows(old))?;
+                changes.push(Change::Component(component));
+            }
+        }
+        comparable.catalog_component = before.catalog_component.clone();
+        comparable.control_component = before.control_component.clone();
+        for (index, (old, new)) in before
+            .metadata
+            .slots
+            .iter()
+            .zip(&self.metadata.slots)
+            .enumerate()
+        {
+            if old != new {
+                require(new.follows(old, self.rollback.is_some()))?;
+                changes.push(Change::Metadata(index));
+            }
+        }
+        comparable.metadata = before.metadata.clone();
+        for (old, new, kind) in [
+            (
+                &before.forward_pair_readback,
+                &self.forward_pair_readback,
+                Change::ForwardReadback,
+            ),
+            (&before.self_check, &self.self_check, Change::SelfCheck),
+        ] {
+            if old != new {
+                require(old.is_none() && new.is_some())?;
+                changes.push(kind);
+            }
+        }
+        comparable.forward_pair_readback = before.forward_pair_readback.clone();
+        comparable.self_check = before.self_check.clone();
+        if self.requests_open_intent != before.requests_open_intent {
+            require(
+                before.requests_open_intent.is_none()
+                    && self
+                        .requests_open_intent
+                        .as_ref()
+                        .is_some_and(|intent| intent.seq == self.seq),
+            )?;
+            changes.push(Change::Open);
+        }
+        comparable.requests_open_intent = before.requests_open_intent.clone();
+        match (&before.rollback, &self.rollback) {
+            (None, Some(_)) => changes.push(Change::Rollback),
+            (Some(old), Some(new)) => {
+                let mut fixed = new.clone();
+                if old.intent != new.intent {
+                    require(
+                        old.intent.is_none()
+                            && new.intent.is_some()
+                            && old.restore_pair == RestorePair::Required,
+                    )?;
+                    fixed.intent = old.intent.clone();
+                    changes.push(Change::RollbackIntent);
+                }
+                fixed.catalog_side = old.catalog_side.clone();
+                fixed.control_side = old.control_side.clone();
+                fixed.catalog_displaced = old.catalog_displaced.clone();
+                fixed.control_displaced = old.control_displaced.clone();
+                for (old, new, index) in [
+                    (
+                        &old.catalog_restore_journal,
+                        &new.catalog_restore_journal,
+                        0,
+                    ),
+                    (
+                        &old.control_restore_journal,
+                        &new.control_restore_journal,
+                        1,
+                    ),
+                ] {
+                    if old != new {
+                        require(
+                            old.as_ref()
+                                .zip(new.as_ref())
+                                .is_some_and(|(a, b)| b.follows(a)),
+                        )?;
+                        changes.push(Change::Journal(index));
+                    }
+                }
+                fixed.catalog_restore_journal = old.catalog_restore_journal.clone();
+                fixed.control_restore_journal = old.control_restore_journal.clone();
+                if old.rollback_pair_readback != new.rollback_pair_readback {
+                    require(
+                        old.rollback_pair_readback.is_none()
+                            && new.rollback_pair_readback.is_some(),
+                    )?;
+                    changes.push(Change::RollbackReadback);
+                }
+                fixed.rollback_pair_readback = old.rollback_pair_readback.clone();
+                fixed.finalizer = old.finalizer.clone();
+                require(&fixed == old)?;
+                for (old, new) in before.images().into_iter().zip(self.images()).skip(2) {
+                    require(old.is_some() == new.is_some())?;
+                }
+            }
+            (Some(_), None) => return Err(RecordError::Invalid),
+            (None, None) => {}
+        }
+        comparable.rollback = before.rollback.clone();
+        require(comparable == *before)?;
+        Ok(changes)
+    }
+
+    fn check_change_phase(&self, before: &Self, changes: &[Change]) -> Result<()> {
+        let phase = before.phase.plain();
+        let adopting = changes.contains(&Change::Component(Component::Control))
+            && self.control_component.receipt().is_some();
+        let reclaiming = phase == PlainPhase::ReclaimPrepared
+            && self.phase.plain() == PlainPhase::ReclaimCommitted;
+        let pair_group = before.pending.as_ref().is_some_and(|pending| {
+            pending.kind == EffectKind::PairRestore
+                && changes.iter().all(|change| pending.targets(*change))
+        });
+        let grouped = pair_group
+            || (changes
+                .iter()
+                .all(|change| matches!(change, Change::Quiesced | Change::Coverage))
+                && changes.contains(&Change::Quiesced))
+            || ((adopting || reclaiming)
+                && changes.iter().all(|change| {
+                    matches!(
+                        change,
+                        Change::Component(Component::Control) | Change::Image(0 | 1)
+                    )
+                }));
+        require(changes.len() <= 1 || grouped)?;
+        for change in changes {
+            require(match *change {
+                Change::Quiesced | Change::Coverage => {
+                    matches!(phase, PlainPhase::Verified | PlainPhase::Quiescing)
+                }
+                Change::Stage => phase == PlainPhase::BackedUp,
+                Change::Component(Component::Catalog) => phase == PlainPhase::Staged,
+                Change::Component(Component::Control) => phase == PlainPhase::Catalog23Control2,
+                Change::Metadata(index) => {
+                    let rollback = self.rollback.is_some();
+                    let next = if rollback {
+                        METADATA_ORDER.iter().rev().copied().find(|i| {
+                            !matches!(
+                                before.metadata.slots[*i],
+                                MetadataSlot::Untouched | MetadataSlot::Restored { .. }
+                            )
+                        })
+                    } else {
+                        METADATA_ORDER.iter().copied().find(|i| {
+                            !matches!(before.metadata.slots[*i], MetadataSlot::Applied { .. })
+                        })
+                    };
+                    next == Some(index)
+                        && phase
+                            == if rollback {
+                                PlainPhase::CleanupPending
+                            } else {
+                                PlainPhase::Migrated
+                            }
+                }
+                Change::ForwardReadback => {
+                    phase == PlainPhase::Catalog23Control3
+                        && self.phase.plain() == PlainPhase::Migrated
+                }
+                Change::SelfCheck => {
+                    phase == PlainPhase::Switched && self.phase.plain() == PlainPhase::SelfChecked
+                }
+                Change::Open => {
+                    phase == PlainPhase::SelfChecked && self.phase.plain() == PlainPhase::Opening
+                }
+                Change::Rollback => phase.pre_open(),
+                Change::RollbackIntent => {
+                    phase == PlainPhase::ReclaimPrepared
+                        && self.phase.plain() == PlainPhase::ReclaimPrepared
+                        && before.pending.is_none()
+                        && self.pending.is_none()
+                        && self
+                            .rollback
+                            .as_ref()
+                            .is_some_and(RollbackProgress::preparation_complete)
+                }
+                Change::RollbackReadback => phase == PlainPhase::CatalogRestored,
+                Change::Journal(_) => matches!(
+                    phase,
+                    PlainPhase::ReclaimPrepared
+                        | PlainPhase::ReclaimCommitted
+                        | PlainPhase::CatalogRestored
+                        | PlainPhase::CleanupPending
+                ),
+                Change::Image(index) => {
+                    let new = self.images()[index].ok_or(RecordError::Invalid)?;
+                    let old = before.images()[index].ok_or(RecordError::Invalid)?;
+                    if matches!(old.image, ImageState::Registered)
+                        && matches!(new.image, ImageState::Complete { .. })
+                    {
+                        let (slot, boundary) = match new.role {
+                            ImageRole::CatalogDisplaced => ("catalog", PlainPhase::CatalogRestored),
+                            ImageRole::ControlDisplaced => ("control", PlainPhase::ControlRestored),
+                            _ => return Err(RecordError::Invalid),
+                        };
+                        require(
+                            self.phase.plain() == boundary
+                                && before.pending.as_ref().is_some_and(|p| {
+                                    p.kind == EffectKind::PairRestore && p.slot == slot
+                                }),
+                        )?;
+                    }
+                    if matches!(old.image, ImageState::Complete { .. })
+                        && matches!(new.image, ImageState::Absent)
+                    {
+                        let (slot, boundary) = match new.role {
+                            ImageRole::CatalogSide => ("catalog", PlainPhase::CatalogRestored),
+                            ImageRole::ControlSide => ("control", PlainPhase::ControlRestored),
+                            _ => return Err(RecordError::Invalid),
+                        };
+                        require(
+                            self.phase.plain() == boundary
+                                && before.pending.as_ref().is_some_and(|pending| {
+                                    pending.kind == EffectKind::PairRestore && pending.slot == slot
+                                }),
+                        )?;
+                    }
+                    if new.image == old.image {
+                        require(matches!(
+                            phase,
+                            PlainPhase::Quiescing
+                                | PlainPhase::ReclaimPrepared
+                                | PlainPhase::ReclaimCommitted
+                                | PlainPhase::CatalogRestored
+                                | PlainPhase::CleanupPending
+                                | PlainPhase::Migrated
+                                | PlainPhase::Switched
+                                | PlainPhase::SelfChecked
+                        ))?;
+                        continue;
+                    }
+                    match &new.image {
+                        ImageState::Adopted { .. } => adopting,
+                        ImageState::Reclaimed { .. } => reclaiming,
+                        _ => matches!(
+                            phase,
+                            PlainPhase::Quiescing
+                                | PlainPhase::ReclaimPrepared
+                                | PlainPhase::ReclaimCommitted
+                                | PlainPhase::CatalogRestored
+                                | PlainPhase::CleanupPending
+                                | PlainPhase::Migrated
+                                | PlainPhase::Switched
+                                | PlainPhase::SelfChecked
+                        ),
+                    }
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn check_pending(&self, before: &Self, changes: &[Change]) -> Result<()> {
+        match (&before.pending, &self.pending) {
+            (None, Some(next)) => {
+                require(next.intent_seq == self.seq && before.last_failure.is_none())?;
+                require(changes.is_empty())?;
+                self.effect_allowed(next)?;
+            }
+            (Some(old), Some(new)) => {
+                require(old == new && changes.is_empty() && self.phase == before.phase)?;
+            }
+            (Some(old), None) => {
+                before.effect_allowed(old)?;
+                require(
+                    !changes.is_empty()
+                        || match old.kind {
+                            EffectKind::FenceClear => self.phase.plain() == PlainPhase::Complete,
+                            EffectKind::PairRestore => {
+                                self.phase.plain() != before.phase.plain()
+                                    && self
+                                        .rollback
+                                        .as_ref()
+                                        .is_some_and(|r| r.restore_pair == RestorePair::NotNeeded)
+                            }
+                            _ => false,
+                        },
+                )?;
+                require(
+                    changes.iter().all(|change| old.targets(*change))
+                        && (self.phase.plain() == before.phase.plain()
+                            || before.phase.plain().next() == Some(self.phase.plain())),
+                )?;
+            }
+            (None, None) => {
+                require(changes.iter().all(|change| match *change {
+                    Change::Stage => matches!(
+                        self.stage,
+                        StageProgress::Intent { .. } | StageProgress::PublishIntent { .. }
+                    ),
+                    Change::Component(component) => matches!(
+                        if component == Component::Catalog {
+                            &self.catalog_component
+                        } else {
+                            &self.control_component
+                        },
+                        ComponentProgress::Intent { .. }
+                    ),
+                    Change::Metadata(index) => matches!(
+                        self.metadata.slots[index],
+                        MetadataSlot::Prepared { .. }
+                            | MetadataSlot::PublishIntent { .. }
+                            | MetadataSlot::RestoreIntent { .. }
+                    ),
+                    Change::Image(index) => {
+                        index < 2
+                            && self.images()[index].is_some_and(|image| {
+                                matches!(image.image, ImageState::Registered)
+                                    || (before.phase.plain() == PlainPhase::ReclaimPrepared
+                                        && self.phase.plain() == PlainPhase::ReclaimCommitted
+                                        && matches!(image.image, ImageState::Reclaimed { .. }))
+                            })
+                    }
+                    Change::Journal(_) => false,
+                    _ => true,
+                }))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn effect_allowed(&self, pending: &PendingEffect) -> Result<()> {
+        let phase = self.phase.plain();
+        require(match pending.kind {
+            EffectKind::FenceSet => phase == PlainPhase::Quiescing && self.quiesced.is_none(),
+            EffectKind::StageExtract => {
+                phase == PlainPhase::BackedUp && matches!(self.stage, StageProgress::Intent { .. })
+            }
+            EffectKind::StagePublish => {
+                phase == PlainPhase::BackedUp
+                    && matches!(self.stage, StageProgress::PublishIntent { .. })
+            }
+            EffectKind::PreimageCreate => {
+                phase == PlainPhase::Quiescing
+                    && self.quiesced.is_some()
+                    && [&self.preimages.catalog, &self.preimages.control]
+                        .into_iter()
+                        .all(|image| !matches!(image.image, ImageState::Absent))
+            }
+            EffectKind::RollbackBindParent
+            | EffectKind::RollbackCreateEmpty
+            | EffectKind::RollbackWriteContent => {
+                phase == PlainPhase::ReclaimPrepared
+                    && self.rollback.as_ref().is_some_and(|r| {
+                        r.restore_pair == RestorePair::Required
+                            && r.plan.is_some()
+                            && r.intent.is_none()
+                    })
+                    && records::PreparationSlot::parse(&pending.slot)
+                        .is_some_and(|slot| slot.permits(pending.kind))
+            }
+            EffectKind::ComponentCommit => match pending.slot.as_str() {
+                "catalog" => {
+                    phase == PlainPhase::Staged
+                        && matches!(self.catalog_component, ComponentProgress::Intent { .. })
+                }
+                "control" => {
+                    phase == PlainPhase::Catalog23Control2
+                        && matches!(self.control_component, ComponentProgress::Intent { .. })
+                }
+                _ => false,
+            },
+            EffectKind::MetadataPublish | EffectKind::MetadataRestore => {
+                let index = METADATA_KEYS
+                    .iter()
+                    .position(|key| *key == pending.slot)
+                    .ok_or(RecordError::Invalid)?;
+                match pending.kind {
+                    EffectKind::MetadataPublish => {
+                        phase == PlainPhase::Migrated
+                            && matches!(
+                                self.metadata.slots[index],
+                                MetadataSlot::PublishIntent { .. }
+                            )
+                    }
+                    _ => {
+                        phase == PlainPhase::CleanupPending
+                            && matches!(
+                                self.metadata.slots[index],
+                                MetadataSlot::RestoreIntent { .. }
+                            )
+                    }
+                }
+            }
+            EffectKind::PairRestore => {
+                self.rollback.as_ref().is_some_and(|r| r.intent.is_some())
+                    && ((phase == PlainPhase::ReclaimCommitted && pending.slot == "catalog")
+                        || (phase == PlainPhase::CatalogRestored && pending.slot == "control"))
+            }
+            EffectKind::OwnedDelete => matches!(
+                phase,
+                PlainPhase::CleanupPending
+                    | PlainPhase::Migrated
+                    | PlainPhase::Switched
+                    | PlainPhase::SelfChecked
+            ),
+            EffectKind::FenceClear => phase == PlainPhase::Opening,
+        })
+    }
+
+    fn check_phase_boundary(&self, before: &Self, changes: &[Change]) -> Result<()> {
+        let to = self.phase.plain();
+        require(match to {
+            PlainPhase::Quiescing => self
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.kind == EffectKind::FenceSet),
+            PlainPhase::BackedUp => {
+                self.pending.is_none()
+                    && self.quiesced.is_some()
+                    && [&self.preimages.catalog, &self.preimages.control]
+                        .into_iter()
+                        .all(|image| {
+                            matches!(image.image, ImageState::Complete { .. })
+                                && matches!(image.manifest, ManifestState::Complete { .. })
+                        })
+            }
+            PlainPhase::Staged => {
+                self.pending.is_none() && matches!(self.stage, StageProgress::Published { .. })
+            }
+            PlainPhase::Catalog23Control2 => {
+                self.pending.is_none()
+                    && self.catalog_component.receipt().is_some()
+                    && changes.contains(&Change::Component(Component::Catalog))
+            }
+            PlainPhase::Catalog23Control3 => {
+                self.pending.is_none()
+                    && self.control_component.receipt().is_some()
+                    && changes.contains(&Change::Component(Component::Control))
+                    && [&self.preimages.catalog, &self.preimages.control]
+                        .into_iter()
+                        .all(|image| matches!(image.image, ImageState::Adopted { .. }))
+            }
+            PlainPhase::Migrated => self.pending.is_none() && changes == [Change::ForwardReadback],
+            PlainPhase::Switched => {
+                self.pending.is_none()
+                    && self
+                        .metadata
+                        .slots
+                        .iter()
+                        .all(|slot| matches!(slot, MetadataSlot::Applied { .. }))
+            }
+            PlainPhase::SelfChecked => self.pending.is_none() && changes == [Change::SelfCheck],
+            PlainPhase::Opening => {
+                self.pending.is_none()
+                    && changes == [Change::Open]
+                    && self.images().into_iter().flatten().all(|image| {
+                        matches!(
+                            image.image,
+                            ImageState::Adopted {
+                                disposition: Disposition::Restorable,
+                                ..
+                            }
+                        ) || image.clean()
+                    })
+            }
+            PlainPhase::Complete => {
+                self.pending.is_none()
+                    && self.last_failure.is_none()
+                    && before
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.kind == EffectKind::FenceClear)
+            }
+            PlainPhase::ReclaimPrepared => changes == [Change::Rollback] && self.pending.is_none(),
+            PlainPhase::ReclaimCommitted => {
+                self.rollback.as_ref().is_some_and(|r| r.intent.is_some())
+                    && changes
+                        .iter()
+                        .all(|change| matches!(change, Change::Image(0 | 1)))
+                    && self.pending.is_none()
+                    && [&self.preimages.catalog, &self.preimages.control]
+                        .into_iter()
+                        .all(|image| {
+                            matches!(
+                                image.image,
+                                ImageState::Registered
+                                    | ImageState::Absent
+                                    | ImageState::Deleted
+                                    | ImageState::Reclaimed { .. }
+                            )
+                        })
+            }
+            PlainPhase::CatalogRestored => {
+                self.pending.is_none()
+                    && before
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.kind == EffectKind::PairRestore && p.slot == "catalog")
+                    && self.rollback.as_ref().is_some_and(|r| {
+                        r.restore_pair == RestorePair::NotNeeded
+                            || r.catalog_side
+                                .as_ref()
+                                .is_some_and(|image| matches!(image.image, ImageState::Absent))
+                    })
+            }
+            PlainPhase::ControlRestored => {
+                self.pending.is_none()
+                    && self
+                        .rollback
+                        .as_ref()
+                        .is_some_and(|r| r.rollback_pair_readback.is_some())
+                    && before
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.kind == EffectKind::PairRestore && p.slot == "control")
+                    && self.rollback.as_ref().is_some_and(|r| {
+                        r.restore_pair == RestorePair::NotNeeded
+                            || r.control_side
+                                .as_ref()
+                                .is_some_and(|image| matches!(image.image, ImageState::Absent))
+                    })
+            }
+            PlainPhase::CleanupPending => self.pending.is_none(),
+            PlainPhase::CleanupComplete => {
+                self.pending.is_none()
+                    && self.images().into_iter().flatten().all(ImageSlot::clean)
+                    && self.metadata.slots.iter().all(|slot| {
+                        matches!(
+                            slot,
+                            MetadataSlot::Untouched | MetadataSlot::Restored { .. }
+                        )
+                    })
+                    && self.rollback.as_ref().is_some_and(|r| {
+                        [
+                            r.catalog_restore_journal.as_ref(),
+                            r.control_restore_journal.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .all(|record| {
+                            matches!(
+                                record.state,
+                                OwnedRecordState::Absent | OwnedRecordState::Deleted
+                            )
+                        })
+                    })
+            }
+            PlainPhase::Verified => false,
+        })
+    }
+}
+
+impl PendingEffect {
+    fn targets(&self, change: Change) -> bool {
+        match change {
+            Change::Stage => matches!(
+                self.kind,
+                EffectKind::StageExtract | EffectKind::StagePublish
+            ),
+            Change::Component(component) => {
+                self.kind == EffectKind::ComponentCommit
+                    && self.slot
+                        == if component == Component::Catalog {
+                            "catalog"
+                        } else {
+                            "control"
+                        }
+            }
+            Change::Metadata(index) => {
+                matches!(
+                    self.kind,
+                    EffectKind::MetadataPublish | EffectKind::MetadataRestore
+                ) && self.slot == METADATA_KEYS[index]
+            }
+            Change::Image(index) => {
+                (matches!(
+                    self.kind,
+                    EffectKind::PreimageCreate | EffectKind::OwnedDelete
+                ) && self.slot == IMAGE_KEYS[index])
+                    || (matches!(
+                        self.kind,
+                        EffectKind::RollbackBindParent
+                            | EffectKind::RollbackCreateEmpty
+                            | EffectKind::RollbackWriteContent
+                    ) && records::PreparationSlot::parse(&self.slot)
+                        .is_some_and(|slot| slot.target() == Change::Image(index)))
+                    || (self.kind == EffectKind::ComponentCommit
+                        && self.slot == "control"
+                        && index < 2)
+                    || (self.kind == EffectKind::PairRestore
+                        && ((self.slot == "catalog" && matches!(index, 2 | 4))
+                            || (self.slot == "control" && matches!(index, 3 | 5))))
+            }
+            Change::Journal(index) => {
+                (matches!(
+                    self.kind,
+                    EffectKind::RollbackCreateEmpty | EffectKind::RollbackWriteContent
+                ) && records::PreparationSlot::parse(&self.slot)
+                    .is_some_and(|slot| slot.target() == Change::Journal(index)))
+                    || (self.kind == EffectKind::OwnedDelete
+                        && self.slot
+                            == if index == 0 {
+                                "catalog_restore_journal"
+                            } else {
+                                "control_restore_journal"
+                            })
+                    || (self.kind == EffectKind::PairRestore
+                        && self.slot == if index == 0 { "catalog" } else { "control" })
+            }
+            Change::Quiesced | Change::Coverage => self.kind == EffectKind::FenceSet,
+            Change::RollbackReadback => {
+                self.kind == EffectKind::PairRestore && self.slot == "control"
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A decoded state is a bounded record, never a publication/executor capability.
 #[derive(Debug)]
 pub struct StateV2 {
     record: StateRecord,
     raw: Vec<u8>,
+}
+
+/// Already decoded byte evidence. These borrowed records are not native guards.
+#[derive(Clone, Copy)]
+pub struct RecordSet<'a> {
+    pub proofs: &'a [ProofRecord],
+    pub manifests: &'a [records::PreimageManifest],
+}
+
+/// An effect ACK supplies the exact typed readback bytes named by pending.
+/// The future executor is responsible for obtaining them under retained pins.
+pub struct SuccessorEvidence<'a> {
+    pub previous: RecordSet<'a>,
+    pub current: RecordSet<'a>,
+    pub effect_readback: Option<&'a [u8]>,
+}
+
+fn find_record<'a>(
+    proofs: &'a [ProofRecord],
+    reference: &RecordRef,
+    used: &mut BTreeSet<u8>,
+) -> Result<&'a ProofRecord> {
+    let proof = proofs
+        .iter()
+        .find(|proof| reference.matches(proof))
+        .ok_or(RecordError::Invalid)?;
+    used.insert(proof.slot as u8);
+    Ok(proof)
 }
 
 impl StateV2 {
@@ -1460,8 +2857,8 @@ impl StateV2 {
         &self.raw
     }
 
-    /// The chain/open-intent guard is necessary but not a full successor or
-    /// publication admission. Native effect and substep dispatch remain gated.
+    /// Validate one closed record successor. Runtime still owes native admission
+    /// and exact effect readback; use validate_successor for retained payloads too.
     pub fn validate_chain(&self, previous: &Self, admission: &AdmissionV2) -> Result<()> {
         self.record.validate(admission)?;
         previous.record.validate(admission)?;
@@ -1487,12 +2884,17 @@ impl StateV2 {
                     && self.record.rollback.is_none(),
             )?;
         }
-        Ok(())
+        self.record.successor(&previous.record)
     }
 
     /// Check actual supplied proof bytes against the state references. This
     /// checks the acyclic readback/SelfCheck chain, not live component commits.
     pub fn validate_proofs(&self, proofs: &[ProofRecord], admission: &AdmissionV2) -> Result<()> {
+        require(proofs.len() <= 3)?;
+        self.validate_readbacks(&proofs.iter().collect::<Vec<_>>(), admission)
+    }
+
+    fn validate_readbacks(&self, proofs: &[&ProofRecord], admission: &AdmissionV2) -> Result<()> {
         self.record.validate(admission)?;
         require(proofs.len() <= 3)?;
         let mut seen = BTreeSet::new();
@@ -1503,6 +2905,7 @@ impl StateV2 {
         let find = |reference: &RecordRef| -> Result<&ProofRecord> {
             proofs
                 .iter()
+                .copied()
                 .find(|proof| reference.matches(proof))
                 .ok_or(RecordError::Invalid)
         };
@@ -1531,10 +2934,10 @@ impl StateV2 {
                     && pair.catalog_identity.generation == before.catalog.generation
                     && pair.catalog_identity.destructive_epoch == before.catalog.destructive_epoch
                     && pair.catalog.identity == before.catalog_file.identity
-                    && pair.control.identity == before.control_file.identity
-                    && pair.control_checkpoint.control_seq >= before.control.control_seq
-                    && pair.control_checkpoint.policy_epoch >= before.control.policy_epoch,
+                    && pair.control.identity == before.control_file.identity,
             )?;
+            pair.control_checkpoint
+                .follows_checkpoint(&before.control)?;
         }
         if let Some(reference) = &self.record.self_check {
             let proof = find(reference)?;
@@ -1553,11 +2956,11 @@ impl StateV2 {
                 check.forward_pair_readback_sha256 == forward.sha256
                     && check.catalog_receipt_sha256 == pair.catalog_receipt_sha256
                     && check.control_receipt_sha256 == pair.control_receipt_sha256
-                    && check.catalog_identity == pair.catalog_identity
-                    && check.control_checkpoint.control_seq >= pair.control_checkpoint.control_seq
-                    && check.control_checkpoint.policy_epoch
-                        >= pair.control_checkpoint.policy_epoch,
+                    && check.catalog_identity == pair.catalog_identity,
             )?;
+            check
+                .control_checkpoint
+                .follows_checkpoint(&pair.control_checkpoint)?;
             let StageProgress::Published {
                 inventory_sha256, ..
             } = &self.record.stage
@@ -1586,7 +2989,10 @@ impl StateV2 {
                 return Err(RecordError::Invalid);
             };
             require(
-                pair.rollback_intent_sha256 == rollback.intent.sha256
+                rollback
+                    .intent
+                    .as_ref()
+                    .is_some_and(|intent| pair.rollback_intent_sha256 == intent.sha256)
                     && pair.restore_pair == rollback.restore_pair,
             )?;
             if pair.restore_pair == RestorePair::NotNeeded {
@@ -1614,6 +3020,816 @@ impl StateV2 {
             );
         require(proofs.len() == expected)
     }
+
+    /// Validate every retained referenced payload, including preimage manifests.
+    /// Bytes establish relations only; the executor must retain actual native pins.
+    pub fn validate_records(
+        &self,
+        proofs: &[ProofRecord],
+        manifests: &[records::PreimageManifest],
+        admission: &AdmissionV2,
+    ) -> Result<()> {
+        self.record.validate(admission)?;
+        require(proofs.len() <= 12 && manifests.len() <= 2)?;
+        let mut slots = BTreeSet::new();
+        for proof in proofs {
+            require(slots.insert(proof.slot as u8))?;
+            proof.payload.validate(admission)?;
+        }
+        let mut used = BTreeSet::new();
+        let readbacks: Vec<_> = proofs
+            .iter()
+            .filter(|proof| {
+                matches!(
+                    proof.slot,
+                    RecordSlot::ForwardPairReadback
+                        | RecordSlot::RollbackPairReadback
+                        | RecordSlot::SelfCheck
+                )
+            })
+            .collect();
+        self.validate_readbacks(&readbacks, admission)?;
+        for proof in &readbacks {
+            used.insert(proof.slot as u8);
+        }
+        let mut coverage = None;
+        for image in self.record.images().into_iter().flatten() {
+            if let Some(reference) = &image.coverage_ref {
+                let proof = find_record(proofs, reference, &mut used)?;
+                let ProofPayload::Coverage(value) = &proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                if let Some(checkpoint) = &self.record.quiesced {
+                    require(
+                        reference.sha256 == checkpoint.coverage_sha256
+                            && value.source_ids.len() as u64 == checkpoint.coverage_count,
+                    )?;
+                }
+                coverage = Some(proof);
+            }
+        }
+        let mut manifest_components = BTreeSet::new();
+        for manifest in manifests {
+            require(manifest_components.insert(manifest.component as u8))?;
+            let image = match manifest.component {
+                Component::Catalog => &self.record.preimages.catalog,
+                Component::Control => &self.record.preimages.control,
+            };
+            manifest.validate_binding(
+                image,
+                coverage.ok_or(RecordError::Invalid)?,
+                self.record.quiesced.as_ref(),
+                admission,
+            )?;
+        }
+        for (component, progress) in [
+            (Component::Catalog, &self.record.catalog_component),
+            (Component::Control, &self.record.control_component),
+        ] {
+            let Some(reference) = progress.intent() else {
+                continue;
+            };
+            let proof = find_record(proofs, reference, &mut used)?;
+            let ProofPayload::ComponentIntent(intent) = &proof.payload else {
+                return Err(RecordError::Invalid);
+            };
+            require(intent.component == component && intent.intent_seq <= self.record.seq)?;
+            intent
+                .catalog_preimage
+                .matches_image(&self.record.preimages.catalog)?;
+            intent
+                .control_preimage
+                .matches_image(&self.record.preimages.control)?;
+            for (role, preimage) in [
+                (Component::Catalog, &intent.catalog_preimage),
+                (Component::Control, &intent.control_preimage),
+            ] {
+                let manifest = manifests
+                    .iter()
+                    .find(|m| m.component == role)
+                    .ok_or(RecordError::Invalid)?;
+                manifest.matches_preimage(preimage)?;
+            }
+            let quiesced = self.record.quiesced.as_ref().ok_or(RecordError::Invalid)?;
+            match &intent.before {
+                records::ComponentSnapshot::Catalog(snapshot) => {
+                    require(snapshot.identity == quiesced.catalog)?;
+                }
+                records::ComponentSnapshot::Control(snapshot) => {
+                    snapshot.checkpoint.follows_checkpoint(&quiesced.control)?;
+                    let catalog = self
+                        .record
+                        .catalog_component
+                        .receipt()
+                        .ok_or(RecordError::Invalid)?;
+                    require(
+                        intent.catalog_receipt_sha256.as_deref() == Some(catalog.sha256.as_str()),
+                    )?;
+                    let catalog_readback = find_record(
+                        proofs,
+                        self.record
+                            .catalog_component
+                            .readback()
+                            .ok_or(RecordError::Invalid)?,
+                        &mut used,
+                    )?;
+                    let ProofPayload::ComponentReadback(catalog_readback) =
+                        &catalog_readback.payload
+                    else {
+                        return Err(RecordError::Invalid);
+                    };
+                    snapshot
+                        .checkpoint
+                        .follows_checkpoint(&catalog_readback.control_checkpoint)?;
+                }
+            }
+            let readback = if let Some(reference) = progress.readback() {
+                let readback_proof = find_record(proofs, reference, &mut used)?;
+                let ProofPayload::ComponentReadback(readback) = &readback_proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                let catalog_intent_proof = find_record(
+                    proofs,
+                    self.record
+                        .catalog_component
+                        .intent()
+                        .ok_or(RecordError::Invalid)?,
+                    &mut used,
+                )?;
+                let ProofPayload::ComponentIntent(catalog_intent) = &catalog_intent_proof.payload
+                else {
+                    return Err(RecordError::Invalid);
+                };
+                let records::ComponentSnapshot::Catalog(catalog_snapshot) = &catalog_intent.before
+                else {
+                    return Err(RecordError::Invalid);
+                };
+                require(readback.pending_state.seq < self.record.seq)?;
+                readback.matches_component(
+                    intent,
+                    proof.raw_bytes(),
+                    progress,
+                    if component == Component::Catalog {
+                        progress.receipt()
+                    } else {
+                        self.record.catalog_component.receipt()
+                    },
+                    catalog_snapshot,
+                    quiesced,
+                )?;
+                Some(readback.as_ref())
+            } else {
+                None
+            };
+            if let Some(receipt) = progress.receipt() {
+                let receipt_proof = find_record(proofs, receipt, &mut used)?;
+                let ProofPayload::ComponentReceipt(value) = &receipt_proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                value.matches_intent(intent, proof.raw_bytes())?;
+                if component == Component::Control {
+                    let live = &readback.ok_or(RecordError::Invalid)?.control_checkpoint;
+                    let records::ComponentSnapshot::Control(before) = &intent.before else {
+                        return Err(RecordError::Invalid);
+                    };
+                    let old = &quiesced.control;
+                    let restorable =
+                        before.checkpoint.same_restore_policy(old) && live.same_restore_policy(old);
+                    let expected = if restorable {
+                        Disposition::Restorable
+                    } else {
+                        Disposition::Quarantined
+                    };
+                    for image in [
+                        &self.record.preimages.catalog,
+                        &self.record.preimages.control,
+                    ] {
+                        if let ImageState::Adopted {
+                            receipt_sha256,
+                            disposition,
+                            ..
+                        } = &image.image
+                        {
+                            require(receipt_sha256 == &receipt.sha256 && *disposition == expected)?;
+                        }
+                    }
+                }
+                if let Some(reference) = &self.record.forward_pair_readback {
+                    let forward = find_record(proofs, reference, &mut used)?;
+                    let ProofPayload::Forward(pair) = &forward.payload else {
+                        return Err(RecordError::Invalid);
+                    };
+                    match &intent.expected_after {
+                        records::ComponentSnapshot::Catalog(after) => {
+                            require(pair.catalog_identity == after.identity)?;
+                        }
+                        records::ComponentSnapshot::Control(after) => {
+                            pair.control_checkpoint
+                                .follows_checkpoint(&after.checkpoint)?;
+                        }
+                    }
+                    pair.control_checkpoint.follows_checkpoint(
+                        &readback.ok_or(RecordError::Invalid)?.control_checkpoint,
+                    )?;
+                }
+                if let Some(reference) = &self.record.self_check {
+                    let check = find_record(proofs, reference, &mut used)?;
+                    let ProofPayload::SelfCheck(check) = &check.payload else {
+                        return Err(RecordError::Invalid);
+                    };
+                    check.control_checkpoint.follows_checkpoint(
+                        &readback.ok_or(RecordError::Invalid)?.control_checkpoint,
+                    )?;
+                }
+            }
+        }
+        if let Some(rollback) = &self.record.rollback {
+            let plan = if let Some(reference) = &rollback.plan {
+                let proof = find_record(proofs, reference, &mut used)?;
+                let ProofPayload::RollbackPlan(plan) = &proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                require(
+                    rollback.restore_pair == RestorePair::Required
+                        && rollback.recovery_incarnation.as_deref()
+                            == Some(plan.recovery_incarnation.as_str())
+                        && rollback.authority_checkpoint == plan.compatible_control_checkpoint,
+                )?;
+                Some((plan.as_ref(), proof.raw_bytes()))
+            } else {
+                None
+            };
+            let intent = if let Some(reference) = &rollback.intent {
+                let proof = find_record(proofs, reference, &mut used)?;
+                let ProofPayload::RollbackIntent(intent) = &proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                require(
+                    intent.restore_pair == rollback.restore_pair
+                        && intent.recovery_incarnation == rollback.recovery_incarnation
+                        && intent.compatible_control_checkpoint == rollback.authority_checkpoint,
+                )?;
+                if let Some((plan, raw)) = plan {
+                    intent.matches_plan(plan, raw)?;
+                }
+                Some(intent.as_ref())
+            } else {
+                None
+            };
+            if rollback.restore_pair == RestorePair::Required {
+                let (plan, _) = plan.ok_or(RecordError::Invalid)?;
+                let quiesced = self.record.quiesced.as_ref().ok_or(RecordError::Invalid)?;
+                let catalog_receipt = self
+                    .record
+                    .catalog_component
+                    .receipt()
+                    .ok_or(RecordError::Invalid)?;
+                let catalog_proof = find_record(proofs, catalog_receipt, &mut used)?;
+                let ProofPayload::ComponentReceipt(catalog_receipt) = &catalog_proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                let live = &plan.live_pair_before;
+                let mut expected_catalog = quiesced.catalog.clone();
+                expected_catalog.schema = catalog_receipt.pair_after.catalog;
+                let control_after = if let Some(reference) = self.record.control_component.receipt()
+                {
+                    let receipt_proof = find_record(proofs, reference, &mut used)?;
+                    let ProofPayload::ComponentReceipt(receipt) = &receipt_proof.payload else {
+                        return Err(RecordError::Invalid);
+                    };
+                    let intent_proof = find_record(
+                        proofs,
+                        self.record
+                            .control_component
+                            .intent()
+                            .ok_or(RecordError::Invalid)?,
+                        &mut used,
+                    )?;
+                    let ProofPayload::ComponentIntent(control_intent) = &intent_proof.payload
+                    else {
+                        return Err(RecordError::Invalid);
+                    };
+                    let records::ComponentSnapshot::Control(after) = &control_intent.expected_after
+                    else {
+                        return Err(RecordError::Invalid);
+                    };
+                    require(live.control_checkpoint.schema == receipt.pair_after.control)?;
+                    &after.checkpoint
+                } else {
+                    require(live.control_checkpoint.schema == catalog_receipt.pair_after.control)?;
+                    &quiesced.control
+                };
+                require(
+                    live.catalog_identity == expected_catalog
+                        && live.catalog.identity == quiesced.catalog_file.identity
+                        && live.control.identity == quiesced.control_file.identity
+                        && live.control_checkpoint.catalog_incarnation
+                            == Some(expected_catalog.incarnation)
+                        && live.control_checkpoint.control_seq >= control_after.control_seq
+                        && live.control_checkpoint.policy_epoch >= control_after.policy_epoch
+                        && live.control_checkpoint.next_cycle_seq >= control_after.next_cycle_seq,
+                )?;
+                for retained in proofs {
+                    let checkpoint = match &retained.payload {
+                        ProofPayload::ComponentReadback(readback) => {
+                            Some(&readback.control_checkpoint)
+                        }
+                        ProofPayload::Forward(readback) => Some(&readback.control_checkpoint),
+                        ProofPayload::SelfCheck(check) => Some(&check.control_checkpoint),
+                        _ => None,
+                    };
+                    if let Some(checkpoint) = checkpoint {
+                        live.control_checkpoint.follows_checkpoint(checkpoint)?;
+                    }
+                }
+                require(
+                    plan.compatible_control_checkpoint.authority_blake3
+                        == quiesced.control.authority_blake3
+                        && plan.compatible_control_checkpoint.desired_updates
+                            == quiesced.control.desired_updates
+                        && plan.compatible_control_checkpoint.restart_request_seq
+                            == quiesced.control.restart_request_seq,
+                )?;
+                require(
+                    plan.compatible_control_checkpoint.policy_epoch
+                        == quiesced.control.policy_epoch
+                        && plan.compatible_control_checkpoint.autostart_enabled
+                            == quiesced.control.autostart_enabled,
+                )?;
+                plan.preimage_refs
+                    .catalog
+                    .as_ref()
+                    .ok_or(RecordError::Invalid)?
+                    .matches_image(&self.record.preimages.catalog)?;
+                plan.preimage_refs
+                    .control
+                    .as_ref()
+                    .ok_or(RecordError::Invalid)?
+                    .matches_image(&self.record.preimages.control)?;
+                for (component, descriptor) in [
+                    (Component::Catalog, plan.preimage_refs.catalog.as_ref()),
+                    (Component::Control, plan.preimage_refs.control.as_ref()),
+                ] {
+                    manifests
+                        .iter()
+                        .find(|m| m.component == component)
+                        .ok_or(RecordError::Invalid)?
+                        .matches_preimage(descriptor.ok_or(RecordError::Invalid)?)?;
+                }
+                if let Some(intent) = intent {
+                    let prepared = intent
+                        .prepared_pair_after
+                        .as_ref()
+                        .ok_or(RecordError::Invalid)?;
+                    for (image, expected) in [
+                        (&rollback.catalog_side, &prepared.catalog),
+                        (&rollback.control_side, &prepared.control),
+                        (
+                            &rollback.catalog_displaced,
+                            &intent.live_pair_before.catalog,
+                        ),
+                        (
+                            &rollback.control_displaced,
+                            &intent.live_pair_before.control,
+                        ),
+                    ] {
+                        if let Some(stamp) = image.as_ref().and_then(|image| image.image.stamp()) {
+                            require(stamp == expected)?;
+                        }
+                    }
+                } else {
+                    require(rollback.rollback_pair_readback.is_none())?;
+                }
+            } else {
+                require(plan.is_none())?;
+                let live = &intent.ok_or(RecordError::Invalid)?.live_pair_before;
+                if let Some(quiesced) = &self.record.quiesced {
+                    require(
+                        live.catalog_identity == quiesced.catalog
+                            && live.catalog.identity == quiesced.catalog_file.identity
+                            && live.control.identity == quiesced.control_file.identity,
+                    )?;
+                    live.control_checkpoint
+                        .follows_checkpoint(&quiesced.control)?;
+                }
+                if let Some(reference) = self.record.catalog_component.readback() {
+                    let proof = find_record(proofs, reference, &mut used)?;
+                    let ProofPayload::ComponentReadback(readback) = &proof.payload else {
+                        return Err(RecordError::Invalid);
+                    };
+                    require(
+                        live.catalog_identity == readback.catalog_identity
+                            && live.catalog.identity == readback.catalog_file
+                            && live.control.identity == readback.control_file,
+                    )?;
+                    live.control_checkpoint
+                        .follows_checkpoint(&readback.control_checkpoint)?;
+                }
+            }
+            if let Some(reference) = &rollback.rollback_pair_readback {
+                let intent = intent.ok_or(RecordError::Invalid)?;
+                let readback = find_record(proofs, reference, &mut used)?;
+                let ProofPayload::Rollback(pair) = &readback.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                let expected = intent
+                    .prepared_pair_after
+                    .as_ref()
+                    .unwrap_or(&intent.live_pair_before);
+                require(
+                    pair.catalog == expected.catalog
+                        && pair.control == expected.control
+                        && pair.catalog_identity == expected.catalog_identity
+                        && pair.control_checkpoint == expected.control_checkpoint
+                        && pair.owned_inventory_blake3 == intent.owned_inventory_blake3,
+                )?;
+            }
+            for descriptor in intent
+                .into_iter()
+                .flat_map(|intent| {
+                    [
+                        intent.preimage_refs.catalog.as_ref(),
+                        intent.preimage_refs.control.as_ref(),
+                    ]
+                })
+                .flatten()
+            {
+                let component = if descriptor.kind == records::PreimageKind::CatalogBackup {
+                    Component::Catalog
+                } else {
+                    Component::Control
+                };
+                manifests
+                    .iter()
+                    .find(|manifest| manifest.component == component)
+                    .ok_or(RecordError::Invalid)?
+                    .matches_preimage(descriptor)?;
+            }
+        }
+        for (component, image) in [
+            (Component::Catalog, &self.record.preimages.catalog),
+            (Component::Control, &self.record.preimages.control),
+        ] {
+            if image.image.stamp().is_some()
+                || matches!(image.manifest, ManifestState::Complete { .. })
+            {
+                require(manifest_components.contains(&(component as u8)))?;
+            }
+        }
+        require(used.len() == proofs.len())
+    }
+
+    fn effect_projection(
+        &self,
+        effect: &PendingEffect,
+        proofs: &[ProofRecord],
+    ) -> Result<Option<Vec<u8>>> {
+        fn encoded<T: Serialize>(value: &T) -> Result<Option<Vec<u8>>> {
+            Ok(Some(super::encode(value)?))
+        }
+        let raw = |reference: &RecordRef| -> Result<Option<Vec<u8>>> {
+            let proof = proofs
+                .iter()
+                .find(|proof| reference.matches(proof))
+                .ok_or(RecordError::Invalid)?;
+            Ok(Some(proof.raw_bytes().to_vec()))
+        };
+        match effect.kind {
+            EffectKind::StageExtract | EffectKind::StagePublish => encoded(&self.record.stage),
+            EffectKind::FenceSet => match &self.record.quiesced {
+                Some(checkpoint) => encoded(&checkpoint.control),
+                None => Ok(None),
+            },
+            EffectKind::FenceClear => {
+                let reference = self
+                    .record
+                    .self_check
+                    .as_ref()
+                    .ok_or(RecordError::Invalid)?;
+                let proof = proofs
+                    .iter()
+                    .find(|proof| reference.matches(proof))
+                    .ok_or(RecordError::Invalid)?;
+                let ProofPayload::SelfCheck(check) = &proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                encoded(&check.control_checkpoint)
+            }
+            EffectKind::PreimageCreate | EffectKind::OwnedDelete => {
+                if let Some(index) = IMAGE_KEYS.iter().position(|key| *key == effect.slot) {
+                    let image = self.record.images()[index].ok_or(RecordError::Invalid)?;
+                    encoded(image)
+                } else {
+                    let rollback = self.record.rollback.as_ref().ok_or(RecordError::Invalid)?;
+                    let record = if effect.slot == "catalog_restore_journal" {
+                        rollback.catalog_restore_journal.as_ref()
+                    } else {
+                        rollback.control_restore_journal.as_ref()
+                    };
+                    encoded(record.ok_or(RecordError::Invalid)?)
+                }
+            }
+            EffectKind::RollbackBindParent
+            | EffectKind::RollbackCreateEmpty
+            | EffectKind::RollbackWriteContent => {
+                let slot =
+                    records::PreparationSlot::parse(&effect.slot).ok_or(RecordError::Invalid)?;
+                match slot.target() {
+                    Change::Image(index) => {
+                        encoded(self.record.images()[index].ok_or(RecordError::Invalid)?)
+                    }
+                    Change::Journal(index) => {
+                        let r = self.record.rollback.as_ref().ok_or(RecordError::Invalid)?;
+                        encoded(
+                            if index == 0 {
+                                r.catalog_restore_journal.as_ref()
+                            } else {
+                                r.control_restore_journal.as_ref()
+                            }
+                            .ok_or(RecordError::Invalid)?,
+                        )
+                    }
+                    _ => Err(RecordError::Invalid),
+                }
+            }
+            EffectKind::ComponentCommit => {
+                let progress = if effect.slot == "catalog" {
+                    &self.record.catalog_component
+                } else {
+                    &self.record.control_component
+                };
+                raw(progress.intent().ok_or(RecordError::Invalid)?)
+            }
+            EffectKind::MetadataPublish | EffectKind::MetadataRestore => {
+                let index = METADATA_KEYS
+                    .iter()
+                    .position(|key| *key == effect.slot)
+                    .ok_or(RecordError::Invalid)?;
+                encoded(&self.record.metadata.slots[index])
+            }
+            EffectKind::PairRestore => raw(self
+                .record
+                .rollback
+                .as_ref()
+                .ok_or(RecordError::Invalid)?
+                .intent
+                .as_ref()
+                .ok_or(RecordError::Invalid)?),
+        }
+    }
+
+    fn bind_pending_effect(
+        &self,
+        previous: &Self,
+        evidence: &SuccessorEvidence<'_>,
+        admission: &AdmissionV2,
+    ) -> Result<()> {
+        let effect = previous
+            .record
+            .pending
+            .as_ref()
+            .or(self.record.pending.as_ref());
+        let Some(effect) = effect else {
+            return require(evidence.effect_readback.is_none());
+        };
+        if self.record.pending.is_some() {
+            require(evidence.effect_readback.is_none())?;
+        }
+        if matches!(
+            effect.kind,
+            EffectKind::RollbackBindParent
+                | EffectKind::RollbackCreateEmpty
+                | EffectKind::RollbackWriteContent
+        ) {
+            let plan_ref = previous
+                .record
+                .rollback
+                .as_ref()
+                .and_then(|r| r.plan.as_ref())
+                .ok_or(RecordError::Invalid)?;
+            let proof = evidence
+                .previous
+                .proofs
+                .iter()
+                .find(|p| plan_ref.matches(p))
+                .ok_or(RecordError::Invalid)?;
+            let ProofPayload::RollbackPlan(plan) = &proof.payload else {
+                return Err(RecordError::Invalid);
+            };
+            let projection = records::preparation_projection(
+                previous,
+                effect,
+                plan,
+                proof.raw_bytes(),
+                admission,
+            )?;
+            require(
+                effect.expected_after.size_bytes == projection.len() as u64
+                    && effect.expected_after.sha256 == sha256(&projection),
+            )?;
+            let owner = previous
+                .effect_projection(effect, evidence.previous.proofs)?
+                .ok_or(RecordError::Invalid)?;
+            require(
+                effect.expected_before
+                    == BeforeRecord::RecordDigest {
+                        size_bytes: owner.len() as u64,
+                        sha256: sha256(&owner),
+                    },
+            )?;
+            if previous.record.pending.is_some() && self.record.pending.is_none() {
+                return records::validate_preparation_readback(
+                    previous,
+                    self,
+                    effect,
+                    &projection,
+                    evidence.effect_readback.ok_or(RecordError::Invalid)?,
+                    admission,
+                );
+            }
+            return Ok(());
+        }
+        if effect.kind == EffectKind::ComponentCommit
+            && previous.record.pending.is_some()
+            && self.record.pending.is_none()
+        {
+            let projection = previous
+                .effect_projection(effect, evidence.previous.proofs)?
+                .ok_or(RecordError::Invalid)?;
+            require(
+                effect.expected_before
+                    == BeforeRecord::RecordDigest {
+                        size_bytes: projection.len() as u64,
+                        sha256: sha256(&projection),
+                    }
+                    && effect.expected_after.size_bytes == projection.len() as u64
+                    && effect.expected_after.sha256 == sha256(&projection),
+            )?;
+            let component = if effect.slot == "catalog" {
+                Component::Catalog
+            } else {
+                Component::Control
+            };
+            let progress = if component == Component::Catalog {
+                &self.record.catalog_component
+            } else {
+                &self.record.control_component
+            };
+            let reference = progress.readback().ok_or(RecordError::Invalid)?;
+            let proof = evidence
+                .current
+                .proofs
+                .iter()
+                .find(|p| reference.matches(p))
+                .ok_or(RecordError::Invalid)?;
+            let ProofPayload::ComponentReadback(readback) = &proof.payload else {
+                return Err(RecordError::Invalid);
+            };
+            readback.pending_state.matches(previous)?;
+            return require(
+                readback.component == component
+                    && evidence.effect_readback == Some(proof.raw_bytes()),
+            );
+        }
+        if previous.record.pending.is_none() {
+            let raw = previous.effect_projection(effect, evidence.previous.proofs)?;
+            let expected = match raw {
+                Some(raw) => BeforeRecord::RecordDigest {
+                    size_bytes: raw.len() as u64,
+                    sha256: sha256(&raw),
+                },
+                None => BeforeRecord::Absent,
+            };
+            require(effect.expected_before == expected)?;
+            if matches!(
+                effect.kind,
+                EffectKind::ComponentCommit | EffectKind::PairRestore
+            ) {
+                let raw = self
+                    .effect_projection(effect, evidence.current.proofs)?
+                    .ok_or(RecordError::Invalid)?;
+                require(
+                    effect.expected_after.size_bytes == raw.len() as u64
+                        && effect.expected_after.sha256 == sha256(&raw),
+                )?;
+            }
+        } else if self.record.pending.is_none() {
+            let raw = self
+                .effect_projection(effect, evidence.current.proofs)?
+                .ok_or(RecordError::Invalid)?;
+            let observed = evidence.effect_readback.ok_or(RecordError::Invalid)?;
+            require(
+                effect.expected_after.size_bytes == observed.len() as u64
+                    && effect.expected_after.sha256 == sha256(observed),
+            )?;
+            if effect.kind == EffectKind::FenceClear {
+                let current: ControlCheckpoint = canonical(observed)?;
+                current.validate(admission, 3)?;
+                let before: ControlCheckpoint = canonical(&raw)?;
+                require(current.maintenance.state == FenceState::Idle)?;
+                current.follows_checkpoint(&before)?;
+            } else {
+                require(observed == raw)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Full pure admission for one successor and its retained record set.
+    pub fn validate_successor(
+        &self,
+        previous: &Self,
+        evidence: SuccessorEvidence<'_>,
+        admission: &AdmissionV2,
+    ) -> Result<()> {
+        self.validate_chain(previous, admission)?;
+        previous.validate_records(
+            evidence.previous.proofs,
+            evidence.previous.manifests,
+            admission,
+        )?;
+        self.validate_records(
+            evidence.current.proofs,
+            evidence.current.manifests,
+            admission,
+        )?;
+        for (component, before, after) in [
+            (
+                Component::Catalog,
+                &previous.record.catalog_component,
+                &self.record.catalog_component,
+            ),
+            (
+                Component::Control,
+                &previous.record.control_component,
+                &self.record.control_component,
+            ),
+        ] {
+            if before.intent().is_none()
+                && let Some(reference) = after.intent()
+            {
+                let proof = evidence
+                    .current
+                    .proofs
+                    .iter()
+                    .find(|proof| reference.matches(proof))
+                    .ok_or(RecordError::Invalid)?;
+                let ProofPayload::ComponentIntent(intent) = &proof.payload else {
+                    return Err(RecordError::Invalid);
+                };
+                require(intent.component == component && intent.intent_seq == self.record.seq)?;
+            }
+        }
+        for old in evidence.previous.proofs {
+            require(
+                evidence
+                    .current
+                    .proofs
+                    .iter()
+                    .any(|new| new.slot == old.slot && new.raw == old.raw),
+            )?;
+        }
+        for old in evidence.previous.manifests {
+            require(
+                evidence.current.manifests.iter().any(|new| {
+                    new.component == old.component && new.raw_bytes() == old.raw_bytes()
+                }),
+            )?;
+        }
+        if previous
+            .record
+            .rollback
+            .as_ref()
+            .and_then(|r| r.intent.as_ref())
+            .is_none()
+            && let Some(rollback) = &self.record.rollback
+            && rollback.restore_pair == RestorePair::Required
+            && let Some(reference) = &rollback.intent
+        {
+            let proof = evidence
+                .current
+                .proofs
+                .iter()
+                .find(|p| reference.matches(p))
+                .ok_or(RecordError::Invalid)?;
+            let ProofPayload::RollbackIntent(intent) = &proof.payload else {
+                return Err(RecordError::Invalid);
+            };
+            let prepared = intent
+                .prepared_pair_after
+                .as_ref()
+                .ok_or(RecordError::Invalid)?;
+            require(
+                rollback.preparation_complete()
+                    && rollback.catalog_side.as_ref().and_then(|i| i.image.stamp())
+                        == Some(&prepared.catalog)
+                    && rollback.control_side.as_ref().and_then(|i| i.image.stamp())
+                        == Some(&prepared.control),
+            )?;
+        }
+        self.bind_pending_effect(previous, &evidence, admission)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1623,6 +3839,12 @@ struct RowCounts {
     receipts: u64,
     heads: u64,
     proofs: u64,
+}
+
+impl RowCounts {
+    fn empty(&self) -> bool {
+        [self.grants, self.receipts, self.heads, self.proofs] == [0; 4]
+    }
 }
 
 // Fields are intentionally repeated rather than flattened: deny_unknown_fields
@@ -1691,12 +3913,24 @@ enum ProofPayload {
     Forward(ForwardReadback),
     Rollback(RollbackReadback),
     SelfCheck(SelfCheckPayload),
+    ComponentIntent(Box<ComponentIntent>),
+    ComponentReceipt(Box<ComponentReceipt>),
+    ComponentReadback(Box<ComponentReadback>),
+    RollbackIntent(Box<RollbackIntent>),
+    RollbackPlan(Box<RollbackPlan>),
+    Coverage(Coverage),
 }
 
 impl ProofPayload {
     fn validate(&self, admission: &AdmissionV2) -> Result<()> {
         admission.record.validate()?;
         let (catalog, control) = match self {
+            Self::ComponentIntent(record) => return record.validate(admission),
+            Self::ComponentReceipt(record) => return record.validate(admission),
+            Self::ComponentReadback(record) => return record.validate(admission),
+            Self::RollbackIntent(record) => return record.validate(admission),
+            Self::RollbackPlan(record) => return record.validate(admission),
+            Self::Coverage(record) => return record.validate(admission),
             Self::Forward(record) => {
                 record.context(admission, "asg.schema-transition-forward-pair-readback/v1")?;
                 record.catalog.validate()?;
@@ -1780,7 +4014,24 @@ impl ProofRecord {
             RecordSlot::ForwardPairReadback => ProofPayload::Forward(canonical(bytes)?),
             RecordSlot::RollbackPairReadback => ProofPayload::Rollback(canonical(bytes)?),
             RecordSlot::SelfCheck => ProofPayload::SelfCheck(canonical(bytes)?),
-            _ => return Err(RecordError::Invalid),
+            RecordSlot::CatalogIntent | RecordSlot::ControlIntent => {
+                let record: ComponentIntent = canonical(bytes)?;
+                require(slot == record.component.intent_slot())?;
+                ProofPayload::ComponentIntent(Box::new(record))
+            }
+            RecordSlot::CatalogReceipt | RecordSlot::ControlReceipt => {
+                let record: ComponentReceipt = canonical(bytes)?;
+                require(slot == record.component.receipt_slot())?;
+                ProofPayload::ComponentReceipt(Box::new(record))
+            }
+            RecordSlot::RollbackIntent => ProofPayload::RollbackIntent(Box::new(canonical(bytes)?)),
+            RecordSlot::RollbackPlan => ProofPayload::RollbackPlan(Box::new(canonical(bytes)?)),
+            RecordSlot::CatalogCommitReadback | RecordSlot::ControlCommitReadback => {
+                let record: ComponentReadback = canonical(bytes)?;
+                require(record.component.readback_slot() == slot)?;
+                ProofPayload::ComponentReadback(Box::new(record))
+            }
+            RecordSlot::Coverage => ProofPayload::Coverage(records::canonical_list_record(bytes)?),
         };
         payload.validate(admission)?;
         Ok(Self {
