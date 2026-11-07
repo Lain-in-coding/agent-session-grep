@@ -44,6 +44,13 @@ const EMPTY_RENDEZVOUS: &[&str] = &[
     "maintenance-job-6c65676163792d6d6967726174696f6e.lock",
 ];
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerAdmissionEvent {
+    AfterImageAuthority,
+    BeforeTailConsumption,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HelperPlan {
@@ -1022,6 +1029,8 @@ fn run_child(
     let installation = update_state::acquire_installation_lock(prefix, end)
         .map_err(|_| Reason::AfterExitCleanupPending)?;
     validate_installation_guard(&journal, &installation, end)?;
+    #[cfg(test)]
+    tests::observe_runner_admission(RunnerAdmissionEvent::AfterImageAuthority, end);
     require_completed_path(&journal)?;
     if recover {
         plan.deadline_tick = Some(tick);
@@ -2723,6 +2732,8 @@ fn inspect_tail_completion(
 }
 
 fn consume_tail_result(journal: &mut Journal, seal: &Seal, end: Instant) -> Result<bool, Reason> {
+    #[cfg(test)]
+    tests::observe_runner_admission(RunnerAdmissionEvent::BeforeTailConsumption, end);
     let Some(report) = inspect_tail_completion(journal, seal, end)? else {
         return Ok(false);
     };

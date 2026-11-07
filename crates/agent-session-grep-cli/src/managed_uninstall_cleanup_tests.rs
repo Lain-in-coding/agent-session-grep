@@ -334,6 +334,13 @@ struct PackageFixture {
 }
 impl PackageFixture {
     fn new(tail: bool) -> Self {
+        Self::with_application(
+            tail,
+            b"inert synthetic native application, never executed".to_vec(),
+        )
+    }
+
+    fn with_application(tail: bool, app: Vec<u8>) -> Self {
         let temp = agent_session_grep_testkit::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let prefix = base.join("package");
@@ -391,7 +398,6 @@ impl PackageFixture {
         }
         drop(policy_owner);
         drop(installation_lock);
-        let app = b"inert synthetic native application, never executed".to_vec();
         let launcher = b"inert synthetic stable launcher".to_vec();
         let digest = format!("{:x}", Sha256::digest(&app));
         let dir = format!("versions/{}-{}", env!("CARGO_PKG_VERSION"), &digest[..12]);
@@ -1434,6 +1440,827 @@ fn pending_path_blocks_existing_helper_plan_before_prepare_or_finalize_effects()
                 Err(Reason::PathConfigurationRetained)
             );
             assert_eq!(borrowed_keep_data_inventory(&fixture), before);
+        }
+    }
+}
+
+const RUNNER_GATE_ENTRY: &str =
+    "uninstall_command::managed_uninstall_cleanup::tests::pending_path_real_runner_process_helper";
+const RUNNER_GATE_ENV: &str = "ASG_TEST_PENDING_PATH_RUNNER";
+const RUNNER_GATE_ACK: &str = "asg.pending-path-real-runner/v1";
+const RUNNER_GATE_RESULT: &str = "asg.pending-path-real-runner-result/v1 ";
+const RUNNER_GATE_IO_LIMIT: usize = 16 * 1024;
+#[cfg(windows)]
+const RUNNER_JOB_CONTROL_ENTRY: &str = "uninstall_command::managed_uninstall_cleanup::tests::pending_path_runner_job_empty_process_helper";
+#[cfg(windows)]
+const RUNNER_JOB_CONTROL_ACK: &str = "asg.runner-job-empty-control/v1";
+
+#[derive(Clone, Copy, Debug)]
+enum RunnerGateSubject {
+    PendingPath,
+    #[cfg(windows)]
+    EmptyControl,
+}
+
+impl RunnerGateSubject {
+    fn entry(self) -> &'static str {
+        match self {
+            Self::PendingPath => RUNNER_GATE_ENTRY,
+            #[cfg(windows)]
+            Self::EmptyControl => RUNNER_JOB_CONTROL_ENTRY,
+        }
+    }
+
+    fn ack(self) -> &'static str {
+        match self {
+            Self::PendingPath => RUNNER_GATE_ACK,
+            #[cfg(windows)]
+            Self::EmptyControl => RUNNER_JOB_CONTROL_ACK,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerGateRequest {
+    prefix: PathBuf,
+    catalog: PathBuf,
+    nonce: String,
+    tick: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerGateResult {
+    reason: Option<Reason>,
+    after_image_authority: usize,
+    before_tail_consumption: usize,
+    end_observed: bool,
+    within_end: bool,
+}
+
+#[derive(Default)]
+struct RunnerGateObservation {
+    end: Option<Instant>,
+    after_image_authority: usize,
+    before_tail_consumption: usize,
+}
+
+thread_local! {
+    static RUNNER_GATE_OBSERVATION: RefCell<Option<RunnerGateObservation>> = const { RefCell::new(None) };
+}
+
+pub(super) fn observe_runner_admission(event: RunnerAdmissionEvent, end: Instant) {
+    RUNNER_GATE_OBSERVATION.with_borrow_mut(|slot| {
+        let Some(observed) = slot else {
+            return;
+        };
+        if let Some(original) = observed.end {
+            assert_eq!(end, original, "runner admission renewed its end");
+        } else {
+            observed.end = Some(end);
+        }
+        match event {
+            RunnerAdmissionEvent::AfterImageAuthority => observed.after_image_authority += 1,
+            RunnerAdmissionEvent::BeforeTailConsumption => {
+                observed.before_tail_consumption += 1;
+                // Fail before a broken gate could consume a receipt or spawn a
+                // Windows tail. This assertion never substitutes a return value.
+                panic!("pending PATH reached tail consumption");
+            }
+        }
+    });
+}
+
+#[test]
+fn pending_path_real_runner_process_helper() {
+    // Normal suite discovery does not run the child body. Only the exact
+    // copied libtest image receives this marker and the bounded stdin request.
+    if std::env::var_os(RUNNER_GATE_ENV).as_deref() != Some(OsStr::new("1")) {
+        return;
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take((RUNNER_GATE_IO_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= RUNNER_GATE_IO_LIMIT);
+    let request: RunnerGateRequest = serde_json::from_slice(&bytes).unwrap();
+    let running = std::env::current_exe().unwrap();
+    let runner = request
+        .prefix
+        .join("uninstall/helper")
+        .join(if cfg!(windows) {
+            "runner.exe"
+        } else {
+            "runner"
+        });
+    assert!(
+        running.canonicalize().unwrap() == runner.canonicalize().unwrap(),
+        "child must execute the actual prepared runner"
+    );
+    assert!(monotonic_ms().unwrap() < request.tick);
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNNER_GATE_OBSERVATION.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+    RUNNER_GATE_OBSERVATION.with_borrow_mut(|slot| {
+        assert!(slot.is_none());
+        *slot = Some(RunnerGateObservation::default());
+    });
+    let restore = Restore;
+    // The caller supplies one original recovery end. PATH must refuse before
+    // recovery can even replace the historical tick in the in-memory plan.
+    let result = run_child(
+        &request.prefix,
+        &request.catalog,
+        &request.nonce,
+        request.tick,
+        true,
+    );
+    let observed = RUNNER_GATE_OBSERVATION.with_borrow_mut(|slot| slot.take().unwrap());
+    drop(restore);
+    // Only fixed enums/counts leave this child. Emit before assertions so a
+    // refusal cannot be hidden by the parent's later Job accounting assertion.
+    println!(
+        "\n{RUNNER_GATE_RESULT}{}",
+        serde_json::to_string(&RunnerGateResult {
+            reason: result.err(),
+            after_image_authority: observed.after_image_authority,
+            before_tail_consumption: observed.before_tail_consumption,
+            end_observed: observed.end.is_some(),
+            within_end: monotonic_ms().is_ok_and(|now| now < request.tick),
+        })
+        .unwrap()
+    );
+    assert_eq!(result, Err(Reason::PathConfigurationRetained));
+    assert_eq!(observed.after_image_authority, 1);
+    assert_eq!(observed.before_tail_consumption, 0);
+    assert!(observed.end.is_some());
+    assert!(monotonic_ms().unwrap() < request.tick);
+    println!("\n{RUNNER_GATE_ACK}");
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerJobControlRequest {
+    tick: u64,
+}
+
+#[cfg(windows)]
+#[test]
+fn pending_path_runner_job_empty_process_helper() {
+    if std::env::var_os(RUNNER_GATE_ENV).as_deref() != Some(OsStr::new("1")) {
+        return;
+    }
+    // This independent control has no package, journal, SQLite, run_child or
+    // tail call. The same libtest process waits for the same post-assignment
+    // stdin release, acknowledges only this empty body, then exits naturally.
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take((RUNNER_GATE_IO_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= RUNNER_GATE_IO_LIMIT);
+    let request: RunnerJobControlRequest = serde_json::from_slice(&bytes).unwrap();
+    assert!(monotonic_ms().unwrap() < request.tick);
+    println!("\n{RUNNER_JOB_CONTROL_ACK}");
+}
+
+#[cfg(windows)]
+#[test]
+fn pending_path_runner_job_empty_child_has_one_process() {
+    // Execute the same built image directly, without creating another package
+    // or copying a fixture. Its result cannot discharge the PATH test's gate.
+    let image = std::env::current_exe().unwrap();
+    let end = deadline();
+    let request = RunnerJobControlRequest {
+        tick: deadline_tick(end).unwrap(),
+    };
+    call_runner_gate_child(
+        &image,
+        image.parent().unwrap(),
+        serde_json::to_vec(&request).unwrap(),
+        request.tick,
+        end,
+        RunnerGateSubject::EmptyControl,
+    );
+}
+
+#[derive(PartialEq, Eq)]
+enum RunnerGateInput {
+    Directory((u64, u64)),
+    File {
+        identity: (u64, u64),
+        size: u64,
+        digest: Option<String>,
+    },
+}
+
+fn runner_gate_inventory(fixture: &PackageFixture) -> BTreeMap<PathBuf, RunnerGateInput> {
+    fn collect(
+        base: &Path,
+        path: &Path,
+        end: Instant,
+        entries: &mut BTreeMap<PathBuf, RunnerGateInput>,
+    ) {
+        time(end).unwrap();
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(!metadata.file_type().is_symlink());
+        let relative = path.strip_prefix(base).unwrap().to_path_buf();
+        let node = if metadata.is_dir() {
+            let identity = platform::identity(&platform::directory(path).unwrap()).unwrap();
+            for entry in fs::read_dir(path).unwrap() {
+                collect(base, &entry.unwrap().path(), end, entries);
+            }
+            RunnerGateInput::Directory(identity)
+        } else {
+            assert!(metadata.is_file());
+            let name = path.file_name().unwrap().to_str().unwrap();
+            if name.ends_with(".lock") || name.ends_with("-shm") {
+                // Lock contents and SQLite-owned SHM are not byte oracles.
+                RunnerGateInput::File {
+                    identity: platform::identity(&platform::open_file(path).unwrap()).unwrap(),
+                    size: metadata.len(),
+                    digest: None,
+                }
+            } else {
+                let name = relative.to_str().unwrap().replace('\\', "/");
+                let proof = private_proof(base, &name, &policy(), end).unwrap();
+                RunnerGateInput::File {
+                    identity: proof.identity,
+                    size: proof.size,
+                    digest: Some(proof.digest),
+                }
+            }
+        };
+        assert!(entries.insert(relative, node).is_none());
+    }
+    let end = deadline();
+    let mut entries = BTreeMap::new();
+    let base = fixture.prefix.parent().unwrap();
+    collect(base, &fixture.prefix, end, &mut entries);
+    collect(base, &fixture.root, end, &mut entries);
+    entries
+}
+
+#[cfg(windows)]
+struct RunnerGateJob(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct RunnerGateJobAccounting {
+    total: u32,
+    active: u32,
+    limit_terminated: u32,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct RunnerGateJobProbe {
+    accounting: RunnerGateJobAccounting,
+    listed: u32,
+    owned_listed: bool,
+    other_count: usize,
+    owned_in_job: bool,
+    owned_in_any_job: bool,
+}
+
+#[cfg(windows)]
+impl RunnerGateJobProbe {
+    fn empty_before_assignment(&self) -> bool {
+        self.accounting.total == 0
+            && self.accounting.active == 0
+            && self.accounting.limit_terminated == 0
+            && self.listed == 0
+            && !self.owned_listed
+            && self.other_count == 0
+            && !self.owned_in_job
+    }
+
+    fn only_owned_child(&self) -> bool {
+        self.accounting.active == 1
+            && self.accounting.limit_terminated == 0
+            && self.listed == 1
+            && self.owned_listed
+            && self.other_count == 0
+            && self.owned_in_job
+            && self.owned_in_any_job
+    }
+
+    fn empty_after_exit(&self) -> bool {
+        self.accounting.active == 0
+            && self.accounting.limit_terminated == 0
+            && self.listed == 0
+            && !self.owned_listed
+            && self.other_count == 0
+    }
+}
+
+#[cfg(windows)]
+impl RunnerGateJob {
+    fn new() -> Self {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::*;
+        // A private, noninheritable Job is kept until the directly owned child
+        // exits. Admission through stdin starts only after assignment succeeds.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null(), "runner Job creation failed");
+        let job = Self(unsafe { OwnedHandle::from_raw_handle(raw) });
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    job.0.as_raw_handle() as _,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            },
+            0,
+            "runner Job policy failed"
+        );
+        job
+    }
+
+    fn assign(&self, child: &std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        assert_ne!(
+            unsafe {
+                AssignProcessToJobObject(self.0.as_raw_handle() as _, child.as_raw_handle() as _)
+            },
+            0,
+            "runner Job assignment failed"
+        );
+    }
+
+    fn accounting(&self) -> Result<RunnerGateJobAccounting, &'static str> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::*;
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle() as _,
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("query_failed");
+        }
+        Ok(RunnerGateJobAccounting {
+            total: accounting.TotalProcesses,
+            active: accounting.ActiveProcesses,
+            limit_terminated: accounting.TotalTerminatedProcesses,
+        })
+    }
+
+    fn probe(
+        &self,
+        child: &std::process::Child,
+        end: Instant,
+    ) -> Result<RunnerGateJobProbe, &'static str> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::{
+            JobObjects::{IsProcessInJob, JobObjectBasicProcessIdList, QueryInformationJobObject},
+            Threading::GetProcessId,
+        };
+        if Instant::now() >= end {
+            return Err("probe_expired");
+        }
+        let accounting = self.accounting()?;
+        // Read this retained Job only. Fixed scratch fails closed on truncation;
+        // PID values are compared here and never stored in diagnostic output.
+        #[repr(C)]
+        struct Processes {
+            assigned: u32,
+            returned: u32,
+            ids: [usize; 8],
+        }
+        let mut processes = Processes {
+            assigned: 0,
+            returned: 0,
+            ids: [0; 8],
+        };
+        let mut bytes = 0;
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle() as _,
+                JobObjectBasicProcessIdList,
+                (&mut processes as *mut Processes).cast(),
+                std::mem::size_of_val(&processes) as u32,
+                &mut bytes,
+            )
+        } == 0
+            || processes.assigned != processes.returned
+            || processes.returned as usize > processes.ids.len()
+            || bytes as usize > std::mem::size_of_val(&processes)
+            || (bytes as usize)
+                < 2 * std::mem::size_of::<u32>()
+                    + processes.returned as usize * std::mem::size_of::<usize>()
+        {
+            return Err("pid_list_incomplete");
+        }
+        let owned_id = unsafe { GetProcessId(child.as_raw_handle() as _) };
+        if owned_id == 0 || owned_id != child.id() {
+            return Err("owned_handle_mismatch");
+        }
+        let mut owned_in_job = 0;
+        let mut owned_in_any_job = 0;
+        if unsafe {
+            IsProcessInJob(
+                child.as_raw_handle() as _,
+                self.0.as_raw_handle() as _,
+                &mut owned_in_job,
+            )
+        } == 0
+            || unsafe {
+                IsProcessInJob(
+                    child.as_raw_handle() as _,
+                    std::ptr::null_mut(),
+                    &mut owned_in_any_job,
+                )
+            } == 0
+        {
+            return Err("membership_query_failed");
+        }
+        let ids = &processes.ids[..processes.returned as usize];
+        Ok(RunnerGateJobProbe {
+            accounting,
+            listed: processes.returned,
+            owned_listed: ids.contains(&(owned_id as usize)),
+            other_count: ids.iter().filter(|id| **id != owned_id as usize).count(),
+            owned_in_job: owned_in_job != 0,
+            owned_in_any_job: owned_in_any_job != 0,
+        })
+    }
+
+    fn observe_empty(&self, end: Instant) -> Result<RunnerGateJobAccounting, &'static str> {
+        loop {
+            let accounting = self.accounting()?;
+            // TotalProcesses also counts associations refused by a Job limit.
+            // Preserve all three counters; do not infer a running descendant
+            // or relax the original total==1 oracle from that fact.
+            if accounting.active == 0 || Instant::now() >= end {
+                return Ok(accounting);
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+}
+
+struct RunnerGateChild {
+    child: std::process::Child,
+    end: Instant,
+    #[cfg(windows)]
+    job: RunnerGateJob,
+}
+
+impl Drop for RunnerGateChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        // This is the retained Child, never a PID/name search or process tree
+        // guessed from the machine. A failed test must still reap its runner.
+        let _termination = self.child.kill();
+        while Instant::now() < self.end {
+            if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+                return;
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(self.end.saturating_duration_since(Instant::now())),
+            );
+        }
+        // Never unwind into TempDir deletion while the owned runner might still
+        // be alive. Aborting this failing libtest process retains its fixture;
+        // on Windows the noninheritable Job closes and terminates its member.
+        eprintln!("pending PATH runner did not reap within its original end");
+        std::process::abort();
+    }
+}
+
+fn read_runner_gate_output(mut input: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0; 4096];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((kept, overflow));
+        }
+        let retain = count.min(RUNNER_GATE_IO_LIMIT - kept.len());
+        kept.extend_from_slice(&buffer[..retain]);
+        overflow |= retain != count;
+    }
+}
+
+fn call_pending_path_runner(runner: &Path, request: &RunnerGateRequest, end: Instant) {
+    call_runner_gate_child(
+        runner,
+        &request.prefix,
+        serde_json::to_vec(request).unwrap(),
+        request.tick,
+        end,
+        RunnerGateSubject::PendingPath,
+    );
+}
+
+fn call_runner_gate_child(
+    runner: &Path,
+    directory: &Path,
+    input: Vec<u8>,
+    tick: u64,
+    end: Instant,
+    subject: RunnerGateSubject,
+) {
+    use std::process::{Command, Stdio};
+    assert!(input.len() <= RUNNER_GATE_IO_LIMIT);
+    let mut command = Command::new(runner);
+    command
+        .args([
+            "--exact",
+            subject.entry(),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RUNNER_GATE_ENV, "1")
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW can create a hidden conhost in this Job. This
+        // pipe-only test needs no console; DETACHED_PROCESS keeps the strict
+        // one-process oracle while all standard handles remain explicit.
+        command.creation_flags(0x00000008);
+        RunnerGateJob::new()
+    };
+    let work_end = end - Duration::from_secs(2);
+    assert!(
+        Instant::now() < work_end,
+        "runner admission has no cleanup reserve"
+    );
+    std::thread::scope(|scope| {
+        let mut owned = RunnerGateChild {
+            child: command.spawn().expect("prepared runner spawn failed"),
+            end,
+            #[cfg(windows)]
+            job,
+        };
+        #[cfg(windows)]
+        let job_before = owned.job.probe(&owned.child, end);
+        #[cfg(windows)]
+        owned.job.assign(&owned.child);
+        #[cfg(windows)]
+        let job_admitted = owned.job.probe(&owned.child, end);
+        // The child is still waiting for stdin in both snapshots above.
+        let stdout = owned.child.stdout.take().unwrap();
+        let stderr = owned.child.stderr.take().unwrap();
+        let stdout = scope.spawn(move || read_runner_gate_output(stdout));
+        let stderr = scope.spawn(move || read_runner_gate_output(stderr));
+        let mut stdin = owned.child.stdin.take().unwrap();
+        let stdin = scope.spawn(move || stdin.write_all(&input));
+        let status = loop {
+            if let Some(status) = owned.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < work_end,
+                "pending PATH runner exhausted its work window"
+            );
+            std::thread::sleep(
+                Duration::from_millis(5).min(work_end.saturating_duration_since(Instant::now())),
+            );
+        };
+        #[cfg(windows)]
+        let job_accounting = owned.job.observe_empty(end);
+        #[cfg(windows)]
+        let job_after = owned.job.probe(&owned.child, end);
+        #[cfg(windows)]
+        let job_ok = job_accounting.as_ref().is_ok_and(|value| {
+            value.total == 1 && value.active == 0 && value.limit_terminated == 0
+        }) && job_before
+            .as_ref()
+            .is_ok_and(RunnerGateJobProbe::empty_before_assignment)
+            && job_admitted
+                .as_ref()
+                .is_ok_and(RunnerGateJobProbe::only_owned_child)
+            && job_after
+                .as_ref()
+                .is_ok_and(RunnerGateJobProbe::empty_after_exit);
+        #[cfg(not(windows))]
+        let (job_accounting, job_before, job_admitted, job_after, job_ok) = ((), (), (), (), true);
+        // The exact child was reaped above. Close its retained handle and Job
+        // before joining pipes, including on a failed accounting observation.
+        drop(owned);
+        while !stdin.is_finished() || !stdout.is_finished() || !stderr.is_finished() {
+            if Instant::now() >= end {
+                eprintln!(
+                    "runner output did not drain: subject={subject:?} status={:?} job={job_accounting:?} \
+                     before={job_before:?} admitted={job_admitted:?} after={job_after:?}",
+                    status.code()
+                );
+                // Do not unwind into fixture deletion or an unbounded scoped
+                // thread join while an owned pipe is still live.
+                std::process::abort();
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(end.saturating_duration_since(Instant::now())),
+            );
+        }
+        let stdin_ok = matches!(stdin.join(), Ok(Ok(())));
+        let (stdout, stdout_overflow, stdout_ok) = match stdout.join() {
+            Ok(Ok((bytes, overflow))) => (bytes, overflow, true),
+            _ => (Vec::new(), false, false),
+        };
+        let (stderr, stderr_overflow, stderr_ok) = match stderr.join() {
+            Ok(Ok((bytes, overflow))) => (bytes, overflow, true),
+            _ => (Vec::new(), false, false),
+        };
+        let text = std::str::from_utf8(&stdout).ok();
+        let ack = text.map_or(0, |text| {
+            text.lines().filter(|line| *line == subject.ack()).count()
+        });
+        let selected = text.is_some_and(|text| text.contains("1 passed; 0 failed; 0 ignored"));
+        let mut results = text
+            .into_iter()
+            .flat_map(str::lines)
+            .filter_map(|line| line.strip_prefix(RUNNER_GATE_RESULT));
+        let result_line = results.next();
+        let result =
+            result_line.and_then(|line| serde_json::from_str::<RunnerGateResult>(line).ok());
+        let extra_result = results.next().is_some();
+        let result_ok = !extra_result
+            && match subject {
+                RunnerGateSubject::PendingPath => result.as_ref().is_some_and(|value| {
+                    value.reason == Some(Reason::PathConfigurationRetained)
+                        && value.after_image_authority == 1
+                        && value.before_tail_consumption == 0
+                        && value.end_observed
+                        && value.within_end
+                }),
+                #[cfg(windows)]
+                RunnerGateSubject::EmptyControl => result_line.is_none(),
+            };
+        let io_ok = stdin_ok && stdout_ok && stderr_ok;
+        if !(job_ok
+            && io_ok
+            && status.success()
+            && ack == 1
+            && selected
+            && result_ok
+            && stderr.is_empty()
+            && !stdout_overflow
+            && !stderr_overflow)
+        {
+            let error_text = std::str::from_utf8(&stderr).ok();
+            eprintln!(
+                "runner diagnostic: subject={subject:?} status={:?} job={job_accounting:?} \
+                 before={job_before:?} admitted={job_admitted:?} after={job_after:?} \
+                 io_ok={io_ok} ack={ack} selected={selected} result={result:?} \
+                 extra_result={extra_result} stdout_bytes={} stderr_bytes={} \
+                 stdout_overflow={stdout_overflow} stderr_overflow={stderr_overflow} \
+                 stderr_panic={} stderr_test_spawn={}",
+                status.code(),
+                stdout.len(),
+                stderr.len(),
+                error_text.is_some_and(|text| text.contains("panicked at")),
+                error_text.is_some_and(|text| text.contains("Failed to spawn")),
+            );
+        }
+        assert!(io_ok, "runner pipe I/O failed");
+        assert!(job_ok, "runner Job accounting or drain failed");
+        assert!(
+            !stdout_overflow && !stderr_overflow,
+            "runner output exceeded cap"
+        );
+        assert!(status.success(), "pending PATH runner assertions failed");
+        assert!(
+            stderr.is_empty(),
+            "pending PATH runner emitted unexpected diagnostics"
+        );
+        assert_eq!(ack, 1);
+        assert!(selected, "runner helper was not selected");
+        assert!(
+            result_ok,
+            "runner admission result was missing or unexpected"
+        );
+        assert!(monotonic_ms().unwrap() < tick);
+    });
+}
+
+#[test]
+fn pending_path_real_runner_image_refuses_before_tail_consumption() {
+    for keep in [true, false] {
+        let original_image = std::env::current_exe().unwrap();
+        let mut image = Vec::new();
+        let image_limit = 512 * 1024 * 1024;
+        File::open(&original_image)
+            .unwrap()
+            .take(image_limit + 1)
+            .read_to_end(&mut image)
+            .unwrap();
+        assert!(!image.is_empty() && image.len() as u64 <= image_limit);
+        let image_sha = format!("{:x}", Sha256::digest(&image));
+        // Supporting images keep the old synthetic fixture semantics. The app
+        // and original prepare's copied runner are actual executable libtest
+        // bytes, with their real size/hash in the generated package manifest.
+        let fixture = PackageFixture::with_application(cfg!(windows), image);
+        let (install, mut journal) = fixture.journal(keep);
+        let plan = journal.state.after_exit.as_ref().unwrap();
+        assert_eq!(plan.runner.digest, image_sha);
+        let runner = journal.root.join(&plan.runner.relative);
+        let seal = read_seal(&journal, deadline()).unwrap();
+        assert!(verify(&journal.root, &plan.runner, &seal.policy, deadline(), false).unwrap());
+        drop(install);
+
+        // A synthetic historical acknowledgement tests ordering only. It does
+        // not claim actual native completion: the real runner remains present.
+        if cfg!(windows) {
+            let sequence = journal.state.sequence + 1;
+            let plan = journal.state.after_exit.as_mut().unwrap();
+            plan.deadline_tick = Some(1);
+            plan.payload_complete = true;
+            plan.tail_pending = true;
+            plan.tail_handoff_sequence = Some(sequence);
+            journal.save(deadline()).unwrap();
+            let plan = journal.state.after_exit.as_ref().unwrap();
+            let receipt = fs::read(journal.receipt_path()).unwrap();
+            let result = json!({
+                "schema": "asg.uninstall-tail-result/v1",
+                "nonce": journal.state.owner.nonce,
+                "seal_sha256": plan.seal.digest,
+                "receipt_sequence": sequence,
+                "receipt_sha256": format!("{:x}", Sha256::digest(&receipt)),
+                "deadline_tick": 1,
+                "tail_removed": true, "runner_removed": true,
+                "complete": true, "reason": "complete",
+            });
+            private_file(
+                &journal
+                    .root
+                    .join(format!("helper/tail-result-{sequence:06}.json")),
+                &serde_json::to_vec(&result).unwrap(),
+            );
+            assert_eq!(
+                validated_tail_result(&journal, &seal, sequence, deadline()).unwrap(),
+                Some(TailReceiptCompletion::Complete)
+            );
+        }
+        for complete_path_with_retained_reason in [false, true] {
+            journal.state.report.path = Some(if complete_path_with_retained_reason {
+                json!({"status":"complete","registration_present":false,"installation_bound":true})
+            } else {
+                json!({"status":"incomplete","reason":"recovery_required","installation_bound":true})
+            });
+            journal
+                .state
+                .report
+                .pending(Reason::PathConfigurationRetained);
+            journal.save(deadline()).unwrap();
+            let sequence = journal.state.sequence;
+            let before = runner_gate_inventory(&fixture);
+            // Preparation and snapshots precede this single original request
+            // end. No schedule(), renewed recovery end or nested child is used.
+            let end = deadline();
+            let request = RunnerGateRequest {
+                prefix: fixture.prefix.clone(),
+                catalog: fixture.catalog.clone(),
+                nonce: journal.state.owner.nonce.clone(),
+                tick: deadline_tick(end).unwrap(),
+            };
+            call_pending_path_runner(&runner, &request, end);
+            assert!(
+                runner_gate_inventory(&fixture) == before,
+                "pending PATH runner changed input bytes or native identities"
+            );
+            let reopened = open_journal(&fixture.prefix, &fixture.catalog, deadline()).unwrap();
+            assert_eq!(reopened.state.sequence, sequence);
+            assert!(
+                reopened
+                    .state
+                    .report
+                    .reasons
+                    .contains(&Reason::PathConfigurationRetained)
+            );
+            assert_eq!(
+                serde_json::to_vec(&reopened.state).unwrap(),
+                serde_json::to_vec(&journal.state).unwrap()
+            );
         }
     }
 }
