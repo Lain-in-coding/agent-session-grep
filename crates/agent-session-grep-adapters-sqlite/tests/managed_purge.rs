@@ -1779,24 +1779,28 @@ fn nested_purge_control_writer_uses_earlier_end_and_preserves_original_job() {
     let writer = Connection::open(SqliteControlStore::path(&f.root)).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = Instant::now();
-    let result = f
-        .control
-        .with_runtime_deadline(started + Duration::from_millis(20), || {
-            run(
-                &f.control,
-                &f.catalog,
-                &owner,
-                None,
-                20,
-                started + Duration::from_secs(1),
-            )
-        });
+    let original_end = started + Duration::from_millis(20);
+    let requested_end = started + Duration::from_secs(1);
+    let mut body_entered = None;
+    let mut body_returned = None;
+    let mut body_end = None;
+    let result = f.control.with_runtime_deadline(original_end, || {
+        body_entered = Some(started.elapsed());
+        body_end = Some(SqliteControlStore::effective_runtime_deadline(
+            requested_end,
+        ));
+        let result = run(&f.control, &f.catalog, &owner, None, 20, requested_end);
+        body_returned = Some(started.elapsed());
+        result
+    });
     let elapsed = started.elapsed();
     writer.execute_batch("ROLLBACK").unwrap();
     assert!(matches!(result, Err(PortError::WriterBusy(_))));
     assert!(
         elapsed < Duration::from_millis(150),
-        "nested control elapsed: {elapsed:?}"
+        "phase=nested_control_writer calls=1 elapsed={elapsed:?} \
+         body_entered={body_entered:?} body_returned={body_returned:?} \
+         original_end={original_end:?} body_end={body_end:?}"
     );
     let progress = f.control.purge_job_status(&job).unwrap();
     assert_eq!(progress.job.state, PurgeState::Pending);

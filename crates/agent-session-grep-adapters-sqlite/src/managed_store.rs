@@ -603,8 +603,12 @@ impl ManagedStore {
             let Some(handles) = handles.as_ref() else {
                 return Ok(());
             };
+            #[cfg(test)]
+            wal_tests::admission_enter(wal_tests::AdmissionStage::Initial, control_end);
             let admitted =
                 checkpoint_admission(control, authority, handles.root_identity(), control_end);
+            #[cfg(test)]
+            wal_tests::admission_return(wal_tests::AdmissionStage::Initial, &admitted);
             let policy = match admitted {
                 Ok(policy) => policy,
                 Err(PortError::WriterBusy(_)) => {
@@ -2310,12 +2314,17 @@ fn checkpoint_catalog(
     }
     #[cfg(test)]
     wal_tests::before_checkpoint();
-    let current = match checkpoint_admission(
+    #[cfg(test)]
+    wal_tests::admission_enter(wal_tests::AdmissionStage::Pretruncate, target.control_end);
+    let admitted = checkpoint_admission(
         control,
         authority,
         RootIdentity::read(path.parent().ok_or_else(invalid)?)?,
         target.control_end,
-    ) {
+    );
+    #[cfg(test)]
+    wal_tests::admission_return(wal_tests::AdmissionStage::Pretruncate, &admitted);
+    let current = match admitted {
         Ok(current) => current,
         Err(PortError::WriterBusy(_)) => {
             report.outcome = WalCheckpointOutcome::Deferred(WalDeferral::Fence);
@@ -3759,6 +3768,216 @@ pub(crate) mod wal_tests {
         static AFTER_CLOSE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         static PRAGMAS: RefCell<Vec<(i64, i64, i64, i64)>> = const { RefCell::new(Vec::new()) };
         static PREPARED_CHECKPOINT: RefCell<Option<PreparedCheckpoint>> = const { RefCell::new(None) };
+        static ADMISSION_DIAGNOSTIC: RefCell<Option<AdmissionDiagnostic>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum AdmissionStage {
+        Initial,
+        Pretruncate,
+    }
+
+    impl AdmissionStage {
+        fn index(self) -> usize {
+            match self {
+                Self::Initial => 0,
+                Self::Pretruncate => 1,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct AdmissionObservation {
+        requested_end: Instant,
+        effective_end: Instant,
+        entered_remaining_us: i128,
+        returned_remaining_us: Option<i128>,
+        result: Option<&'static str>,
+    }
+
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct AdmissionDiagnostic {
+        slots: [Option<AdmissionObservation>; 2],
+        physical_attempts: usize,
+        unexpected_observation: bool,
+    }
+
+    impl std::fmt::Debug for AdmissionDiagnostic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WalAdmissions")
+                .field("initial", &self.slots[0])
+                .field("pretruncate", &self.slots[1])
+                .field("physical_attempts", &self.physical_attempts)
+                .field("unexpected_observation", &self.unexpected_observation)
+                .finish()
+        }
+    }
+
+    struct ObserveAdmissions {
+        previous: Option<AdmissionDiagnostic>,
+    }
+
+    impl ObserveAdmissions {
+        fn start() -> Self {
+            Self {
+                previous: ADMISSION_DIAGNOSTIC
+                    .with(|slot| slot.replace(Some(AdmissionDiagnostic::default()))),
+            }
+        }
+
+        fn snapshot(&self) -> AdmissionDiagnostic {
+            ADMISSION_DIAGNOSTIC.with(|slot| (*slot.borrow()).unwrap())
+        }
+    }
+
+    impl Drop for ObserveAdmissions {
+        fn drop(&mut self) {
+            ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    fn remaining_us(end: Instant, now: Instant) -> i128 {
+        if end >= now {
+            end.duration_since(now).as_micros() as i128
+        } else {
+            -(now.duration_since(end).as_micros() as i128)
+        }
+    }
+
+    fn admission_result<T>(result: &PortResult<T>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(PortError::WriterBusy(message)) => match message.as_str() {
+                "control runtime deadline reached" => "deadline",
+                "control storage is busy" => "control_busy",
+                "managed control fence is active" => "active_fence",
+                _ => "other",
+            },
+            Err(_) => "other",
+        }
+    }
+
+    // Enabled only by the targeted tests and collector regressions. No TLS
+    // borrow spans admission; disabled observation samples no clocks or errors.
+    pub(super) fn admission_enter(stage: AdmissionStage, end: Instant) {
+        ADMISSION_DIAGNOSTIC.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(observed) = slot.as_mut() else {
+                return;
+            };
+            if observed.slots[stage.index()].is_some() {
+                observed.unexpected_observation = true;
+                return;
+            }
+            let effective_end = SqliteControlStore::effective_runtime_deadline(end);
+            observed.slots[stage.index()] = Some(AdmissionObservation {
+                requested_end: end,
+                effective_end,
+                entered_remaining_us: remaining_us(effective_end, Instant::now()),
+                returned_remaining_us: None,
+                result: None,
+            });
+        });
+    }
+
+    pub(super) fn admission_return<T>(stage: AdmissionStage, result: &PortResult<T>) {
+        ADMISSION_DIAGNOSTIC.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(observed) = slot.as_mut() else {
+                return;
+            };
+            let Some(entry) = observed.slots[stage.index()].as_mut() else {
+                observed.unexpected_observation = true;
+                return;
+            };
+            if entry.result.is_some() {
+                observed.unexpected_observation = true;
+                return;
+            }
+            entry.returned_remaining_us = Some(remaining_us(entry.effective_end, Instant::now()));
+            entry.result = Some(admission_result(result));
+        });
+    }
+
+    #[test]
+    fn wal_admission_diagnostic_classifies_only_exact_errors() {
+        assert_eq!(admission_result(&Ok::<_, PortError>(())), "ok");
+        for (message, expected) in [
+            ("control runtime deadline reached", "deadline"),
+            ("control storage is busy", "control_busy"),
+            ("managed control fence is active", "active_fence"),
+            ("control runtime deadline reached extra", "other"),
+            ("unclassified synthetic refusal", "other"),
+        ] {
+            let result: PortResult<()> = Err(PortError::WriterBusy(message.into()));
+            assert_eq!(admission_result(&result), expected);
+        }
+        let result: PortResult<()> = Err(PortError::Backend(
+            "control runtime deadline reached".into(),
+        ));
+        assert_eq!(admission_result(&result), "other");
+        let now = Instant::now();
+        assert_eq!(remaining_us(now, now), 0);
+        assert_eq!(remaining_us(now + Duration::from_micros(1), now), 1);
+        assert_eq!(remaining_us(now, now + Duration::from_micros(1)), -1);
+    }
+
+    #[test]
+    fn wal_admission_diagnostic_restores_nested_collectors_and_unwind() {
+        let previous = ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow());
+        {
+            let outer = ObserveAdmissions::start();
+            let end = Instant::now() + Duration::from_secs(1);
+            admission_enter(AdmissionStage::Initial, end);
+            let entered = outer.snapshot().slots[0].unwrap();
+            assert_eq!(entered.requested_end, end);
+            assert_eq!(
+                entered.effective_end,
+                SqliteControlStore::effective_runtime_deadline(end)
+            );
+            assert_eq!(entered.returned_remaining_us, None);
+            assert_eq!(entered.result, None);
+            let result: PortResult<()> = Err(PortError::WriterBusy(
+                "control runtime deadline reached".into(),
+            ));
+            admission_return(AdmissionStage::Initial, &result);
+            let retained = outer.snapshot();
+            assert_eq!(retained.slots[0].unwrap().result, Some("deadline"));
+            assert!(retained.slots[0].unwrap().returned_remaining_us.is_some());
+            {
+                let inner = ObserveAdmissions::start();
+                assert_eq!(inner.snapshot(), AdmissionDiagnostic::default());
+                admission_enter(AdmissionStage::Initial, end);
+                admission_return(AdmissionStage::Initial, &Ok::<_, PortError>(()));
+                admission_enter(AdmissionStage::Pretruncate, end);
+                admission_return(AdmissionStage::Pretruncate, &Ok::<_, PortError>(()));
+                observe_physical_attempt();
+                let observed = inner.snapshot();
+                assert_eq!(observed.slots[0].unwrap().result, Some("ok"));
+                assert_eq!(observed.slots[1].unwrap().result, Some("ok"));
+                assert_eq!(observed.physical_attempts, 1);
+                admission_enter(AdmissionStage::Initial, end + Duration::from_secs(1));
+                assert_eq!(inner.snapshot().slots, observed.slots);
+                assert!(inner.snapshot().unexpected_observation);
+            }
+            assert_eq!(outer.snapshot(), retained);
+            let unwound = std::panic::catch_unwind(|| {
+                let inner = ObserveAdmissions::start();
+                admission_enter(AdmissionStage::Initial, end);
+                let result: PortResult<()> = Err(PortError::WriterBusy(
+                    "unclassified synthetic refusal".into(),
+                ));
+                admission_return(AdmissionStage::Initial, &result);
+                assert_eq!(inner.snapshot().slots[0].unwrap().result, Some("other"));
+                assert!(!format!("{:?}", inner.snapshot()).contains("unclassified synthetic"));
+                admission_enter(AdmissionStage::Pretruncate, end);
+                assert_eq!(inner.snapshot().slots[1].unwrap().result, None);
+                panic!("synthetic admission observer unwind");
+            });
+            assert!(unwound.is_err());
+            assert_eq!(outer.snapshot(), retained);
+        }
+        assert_eq!(ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow()), previous);
     }
 
     struct PreparedCheckpoint {
@@ -3812,6 +4031,11 @@ pub(crate) mod wal_tests {
         PREPARED_CHECKPOINT.with(|slot| {
             if let Some(observed) = slot.borrow_mut().as_mut() {
                 observed.physical_attempts += 1;
+            }
+        });
+        ADMISSION_DIAGNOSTIC.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                observed.physical_attempts = observed.physical_attempts.saturating_add(1);
             }
         });
     }
@@ -4006,11 +4230,18 @@ pub(crate) mod wal_tests {
             .execute_batch("BEGIN IMMEDIATE; UPDATE wal_fixture SET proof='uncommitted';")
             .unwrap();
         PRAGMAS.with(|values| values.borrow_mut().clear());
+        let diagnostic = ObserveAdmissions::start();
         let report = fixture.checkpoint().unwrap();
         assert_eq!(
             report.outcome,
-            WalCheckpointOutcome::Deferred(WalDeferral::Sqlite)
+            WalCheckpointOutcome::Deferred(WalDeferral::Sqlite),
+            "WAL admission diagnostic: incarnation_present={} frames=({}, {}) {:?}",
+            report.incarnation.is_some(),
+            report.log_frames,
+            report.checkpointed_frames,
+            diagnostic.snapshot()
         );
+        drop(diagnostic);
         assert!(report.log_frames >= 0);
         assert_eq!(report.log_frames, report.checkpointed_frames);
         assert_eq!(
@@ -4169,10 +4400,18 @@ pub(crate) mod wal_tests {
             writer
                 .execute("UPDATE wal_fixture SET body=zeroblob(8192)", [])
                 .unwrap();
+            let diagnostic = ObserveAdmissions::start();
+            let report = fixture.checkpoint().unwrap();
             assert_eq!(
-                fixture.checkpoint().unwrap().outcome,
-                WalCheckpointOutcome::Reset
+                report.outcome,
+                WalCheckpointOutcome::Reset,
+                "WAL admission diagnostic for {desired:?}: incarnation_present={} frames=({}, {}) {:?}",
+                report.incarnation.is_some(),
+                report.log_frames,
+                report.checkpointed_frames,
+                diagnostic.snapshot()
             );
+            drop(diagnostic);
             assert_eq!(ManagedStore::wal_len(&fixture.catalog).unwrap(), Some(0));
             assert_eq!(fixture.control.status().unwrap().desired_updates, desired);
             let state: String = writer
@@ -4336,12 +4575,25 @@ pub(crate) mod wal_tests {
                     }
                 }));
             });
+            let diagnostic = ObserveAdmissions::start();
             let report = fixture.checkpoint().unwrap();
             assert_eq!(
                 report.outcome,
                 WalCheckpointOutcome::Deferred(WalDeferral::Fence)
             );
             assert_eq!((report.log_frames, report.checkpointed_frames), (-1, -1));
+            let observed = diagnostic.snapshot();
+            let initial = observed.slots[0].unwrap();
+            let pretruncate = observed.slots[1].unwrap();
+            assert_eq!(initial.result, Some("ok"));
+            assert_eq!(pretruncate.result, Some("active_fence"));
+            assert_eq!(initial.requested_end, pretruncate.requested_end);
+            assert_eq!(initial.effective_end, pretruncate.effective_end);
+            assert!(initial.returned_remaining_us.is_some());
+            assert!(pretruncate.returned_remaining_us.is_some());
+            assert_eq!(observed.physical_attempts, 0);
+            assert!(!observed.unexpected_observation);
+            drop(diagnostic);
             assert_eq!(std::fs::read(&fixture.catalog).unwrap(), before);
             assert_eq!(
                 std::fs::read(fixture.root.join("catalog.db-wal")).unwrap(),
@@ -4420,6 +4672,8 @@ pub(crate) mod wal_tests {
         let outer = ObservePreparedCheckpoint::start(expired);
         {
             let nested = ObservePreparedCheckpoint::start(expired);
+            let previous = ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow());
+            let diagnostic = ObserveAdmissions::start();
             let report =
                 ManagedStore::checkpoint_wal(&fixture.catalog, &fixture.control, &authority, None)
                     .unwrap();
@@ -4428,6 +4682,25 @@ pub(crate) mod wal_tests {
                 WalCheckpointOutcome::Deferred(WalDeferral::Fence)
             );
             assert_eq!((report.log_frames, report.checkpointed_frames), (-1, -1));
+            let observed = diagnostic.snapshot();
+            let initial = observed.slots[0].unwrap();
+            assert_eq!(initial.requested_end, expired);
+            assert_eq!(
+                initial.effective_end,
+                SqliteControlStore::effective_runtime_deadline(expired)
+            );
+            assert_eq!(initial.result, Some("deadline"));
+            assert!(initial.entered_remaining_us <= 0);
+            assert!(
+                initial
+                    .returned_remaining_us
+                    .is_some_and(|remaining| remaining <= 0)
+            );
+            assert_eq!(observed.slots[1], None);
+            assert_eq!(observed.physical_attempts, 0);
+            assert!(!observed.unexpected_observation);
+            drop(diagnostic);
+            assert_eq!(ADMISSION_DIAGNOSTIC.with(|slot| *slot.borrow()), previous);
             assert_eq!(nested.finish(), (1, 0));
         }
         assert_eq!(CONTROL_END.with(Cell::get), Some(expired));

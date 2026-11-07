@@ -253,7 +253,28 @@ fn logical_deadline_snapshot_includes_wal_and_preserves_source_inode_db_and_wal(
     writer
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    verify_snapshot_with_deadline(&path, &next, SQLITE_256_MIB, deadline).unwrap();
+    let final_started = Instant::now();
+    let result = verify_snapshot_with_deadline(&path, &next, SQLITE_256_MIB, deadline);
+    let final_finished = Instant::now();
+    assert!(
+        result.is_ok(),
+        "phase=verify_after_checkpoint calls=1 error={:?} original_end_expired_before={} \
+         original_end_expired_after={} call_elapsed={:?}",
+        result.as_ref().err().map(|error| match error {
+            PortError::WriterBusy(_) => "writer_busy",
+            PortError::DeadlineExceeded(_) => "deadline_exceeded",
+            PortError::SnapshotChanged(_) => "snapshot_changed",
+            PortError::InvalidRequest(_) => "invalid_request",
+            PortError::GenerationMismatch(_) => "generation_mismatch",
+            PortError::SourceIo(_) => "source_io",
+            PortError::Backend(_) => "backend",
+            PortError::SchemaIncompatible(_) => "schema_incompatible",
+            PortError::NotFound(_) => "not_found",
+        }),
+        final_started >= deadline,
+        final_finished >= deadline,
+        final_finished.duration_since(final_started),
+    );
 }
 
 #[test]

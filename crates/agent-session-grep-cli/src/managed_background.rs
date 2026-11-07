@@ -16609,6 +16609,9 @@ mod control_deadline_tests {
                 .read_control(|control| control.background_status())
                 .next_cycle_seq;
             assert!(expected_next >= next);
+            let accept_started = Instant::now();
+            let accept_end = accept_started + CONTROL_BUDGET;
+            let effective_end = SqliteControlStore::effective_runtime_deadline(accept_end);
             let result = accept_idle_boundary(
                 &fixture.db,
                 &fixture.control,
@@ -16616,11 +16619,26 @@ mod control_deadline_tests {
                 &ready,
                 &mut pending,
                 &mut schedule,
-                Instant::now() + CONTROL_BUDGET,
+                accept_end,
             );
+            let accept_finished = Instant::now();
             assert!(
                 result.as_ref().is_ok_and(Option::is_none),
-                "{change}: {result:?}"
+                "phase=policy_race_accept change={change} calls=1 error={:?} \
+                 runtime_deadline={} elapsed={:?} expired_before={} expired_after={} \
+                 pending={:?} closed_idle={}",
+                result.as_ref().err().map(ScheduleTestHooks::error_label),
+                matches!(&result, Err(PortError::WriterBusy(reason))
+                    if reason == "control runtime deadline reached"),
+                accept_finished.duration_since(accept_started),
+                accept_started >= effective_end,
+                accept_finished >= effective_end,
+                pending.as_ref().map(|intent| (
+                    intent.finish,
+                    intent.observed.is_some(),
+                    intent.completion_confirmed
+                )),
+                schedule.closed_idle_at.is_some()
             );
             assert!(
                 pending
@@ -18171,7 +18189,35 @@ mod control_deadline_tests {
             .read_control(|control| control.background_status())
             .next_cycle_seq;
         let mut restarted = SourceScheduleState::default();
-        let result = resume_pending(&fixture, &mut restarted, &boot, &mut None).unwrap();
+        let mut pending = None;
+        let effective_end = SqliteControlStore::effective_runtime_deadline(fixture.scope_end);
+        let resume_started = Instant::now();
+        let result = resume_pending(&fixture, &mut restarted, &boot, &mut pending);
+        let resume_finished = Instant::now();
+        let result = result.unwrap_or_else(|error| {
+            panic!(
+                "phase=resume_without_saved_result calls=1 error={} runtime_deadline={} \
+                 elapsed={:?} expired_before={} expired_after={} remaining={:?} \
+                 observation={:?} source_phase={:?} completion_end={:?} pending={:?} \
+                 closed_idle={}",
+                ScheduleTestHooks::error_label(&error),
+                matches!(&error, PortError::WriterBusy(reason)
+                    if reason == "control runtime deadline reached"),
+                resume_finished.duration_since(resume_started),
+                resume_started >= effective_end,
+                resume_finished >= effective_end,
+                effective_end.saturating_duration_since(resume_finished),
+                restarted.hooks.observation_result.get(),
+                restarted.hooks.source_phase.get(),
+                restarted.hooks.completion_end.get(),
+                pending.as_ref().map(|intent| (
+                    intent.finish,
+                    intent.observed.is_some(),
+                    intent.completion_confirmed
+                )),
+                restarted.closed_idle_at.is_some()
+            )
+        });
         assert!(result.idle());
         assert!(result.all_sources_attempted);
         assert!(
