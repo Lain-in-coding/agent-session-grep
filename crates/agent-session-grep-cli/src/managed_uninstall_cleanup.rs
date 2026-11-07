@@ -534,6 +534,11 @@ fn verify(
         Ok(_) => {}
     }
     let current = private_proof(base, &proof.relative, policy, end)?;
+    verify_proof_image(base, proof, &current)?;
+    Ok(true)
+}
+
+fn verify_proof_image(base: &Path, proof: &OwnedFile, current: &OwnedFile) -> Result<(), Reason> {
     if current.identity != proof.identity
         || current.digest != proof.digest
         || current.size != proof.size
@@ -546,7 +551,39 @@ fn verify(
     {
         return Err(Reason::IdentityChanged);
     }
-    Ok(true)
+    Ok(())
+}
+
+/// Return the same original bytes hashed by the complete owned-file proof.
+/// A record-sized bound applies before collection and after every read.
+fn read_verified_record(
+    base: &Path,
+    proof: &OwnedFile,
+    policy: &TerminalPolicy,
+    limit: u64,
+    end: Instant,
+) -> Result<Vec<u8>, Reason> {
+    time(end)?;
+    if proof.size > limit {
+        return Err(Reason::UnclassifiedOwnedArtifact);
+    }
+    let mut bytes = Vec::new();
+    let current = owned_file_chunks(
+        base,
+        &proof.relative,
+        &|path| policy.overlaps(path),
+        end,
+        |chunk| {
+            if bytes.len() as u64 + chunk.len() as u64 > limit {
+                return Err(Reason::UnclassifiedOwnedArtifact);
+            }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        },
+    )?;
+    verify_proof_image(base, proof, &current)?;
+    time(end)?;
+    Ok(bytes)
 }
 fn copy_verified(
     source_root: &Path,

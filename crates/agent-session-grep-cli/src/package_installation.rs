@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek},
+    io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime},
 };
@@ -30,6 +30,14 @@ pub(crate) const STAGE_MANIFEST: &str = "release.manifest.json";
 pub(crate) const STAGE_CHECKSUMS: &str = "SHA256SUMS";
 pub(crate) const UPDATE_CHECK_HELPERS: [&str; 2] = ["update-check.sh", "update-check.ps1"];
 const STAGE_METADATA_LIMIT: u64 = 512 * 1024;
+#[cfg(test)]
+thread_local! {
+    static INCOMING_RECHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn incoming_recheck_count() -> u64 {
+    INCOMING_RECHECKS.with(std::cell::Cell::get)
+}
 pub(crate) const RELEASE_TARGETS: [&str; 4] = [
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
@@ -545,7 +553,19 @@ pub(crate) struct VerifiedIncomingPackage {
     directory_identity: (u64, u64),
     image: ImagePin,
     inputs: Vec<IncomingFilePin>,
+    manifest: PathBuf,
+    checksums: PathBuf,
     end: Instant,
+}
+
+/// Immutable incoming bytes, without pointer/receipt or lifecycle authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReinstallPayloadMember {
+    pub(crate) relative: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+    pub(crate) executable: bool,
 }
 
 impl VerifiedIncomingPackage {
@@ -558,6 +578,8 @@ impl VerifiedIncomingPackage {
     }
 
     pub(crate) fn recheck(&self, end: Instant) -> Result<(), CliError> {
+        #[cfg(test)]
+        INCOMING_RECHECKS.with(|count| count.set(count.get() + 1));
         let reads = PackageReadEnd::incoming(end.min(self.end));
         reads.tick()?;
         let named =
@@ -590,6 +612,178 @@ impl VerifiedIncomingPackage {
         {
             return Err(invalid_install("incoming root changed"));
         }
+        reads.tick()
+    }
+
+    /// The coordinator publishes these only under its acknowledged, held owner.
+    /// current.json and package-install.json remain the later activation boundary.
+    pub(crate) fn reinstall_payload(
+        &self,
+        end: Instant,
+    ) -> Result<Vec<ReinstallPayloadMember>, CliError> {
+        let reads = PackageReadEnd::incoming(end.min(self.end));
+        self.recheck(end)?;
+        self.payload_members(reads)
+    }
+
+    fn payload_members(
+        &self,
+        reads: PackageReadEnd,
+    ) -> Result<Vec<ReinstallPayloadMember>, CliError> {
+        let mut manifest = reads.pin(&self.source.join("PACKAGE-MANIFEST.tsv"))?;
+        let bytes = reads.bytes(&mut manifest, 65536)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != self.identity.package_inventory_sha256 {
+            return Err(invalid_install("incoming payload inventory changed"));
+        }
+        let manifest = Manifest::parse(&bytes)?;
+        let mut result: Vec<_> = manifest
+            .members
+            .into_iter()
+            .filter(|(name, _)| name != "current.json")
+            .map(|(relative, member)| ReinstallPayloadMember {
+                relative,
+                size: member.size,
+                sha256: member.sha,
+                executable: member.mode == "0755",
+            })
+            .collect();
+        for (relative, source, expected) in [
+            (
+                "PACKAGE-MANIFEST.tsv",
+                self.source.join("PACKAGE-MANIFEST.tsv"),
+                &self.identity.package_inventory_sha256,
+            ),
+            (
+                STAGE_MANIFEST,
+                self.manifest.clone(),
+                &self.identity.release_manifest_sha256,
+            ),
+            (
+                STAGE_CHECKSUMS,
+                self.checksums.clone(),
+                &self.identity.checksums_sha256,
+            ),
+        ] {
+            let input = self
+                .inputs
+                .iter()
+                .find(|input| input.path == source && input.sha256 == *expected)
+                .ok_or_else(|| invalid_install("incoming payload metadata"))?;
+            input.recheck(reads)?;
+            result.push(ReinstallPayloadMember {
+                relative: relative.into(),
+                size: input.stamp.len,
+                sha256: input.sha256.clone(),
+                executable: false,
+            });
+        }
+        result.sort_by(|left, right| left.relative.cmp(&right.relative));
+        if result.len() > 64
+            || result
+                .windows(2)
+                .any(|pair| pair[0].relative == pair[1].relative)
+            || result.iter().any(|member| {
+                !safe_member(&member.relative)
+                    || member.relative.len() > 240
+                    || matches!(
+                        member.relative.as_str(),
+                        "current.json" | "package-install.json"
+                    )
+            })
+        {
+            return Err(invalid_install("incoming payload members"));
+        }
+        reads.tick()?;
+        Ok(result)
+    }
+
+    /// Stream to the coordinator's staging inode. An interrupted copy resumes
+    /// only after its entire existing prefix matches the pinned source bytes.
+    /// No destination path, replacement, lock acquisition or executable launch.
+    pub(crate) fn copy_reinstall_payload(
+        &self,
+        member: &ReinstallPayloadMember,
+        destination: &mut File,
+        end: Instant,
+    ) -> Result<(), CliError> {
+        let reads = PackageReadEnd::incoming(end.min(self.end));
+        reads.tick()?;
+        if !self.payload_members(reads)?.contains(member) {
+            return Err(invalid_install("unbound payload member"));
+        }
+        let source = match member.relative.as_str() {
+            STAGE_MANIFEST => self.manifest.clone(),
+            STAGE_CHECKSUMS => self.checksums.clone(),
+            name => self.source.join(name),
+        };
+        let input = self
+            .inputs
+            .iter()
+            .find(|input| input.path == source && input.sha256 == member.sha256)
+            .ok_or_else(|| invalid_install("unbound payload source"))?;
+        input.recheck(reads)?;
+        incoming_single_link(destination)?;
+        let target = destination.metadata().map_err(invalid_install)?;
+        if !target.is_file()
+            || target.len() > member.size
+            || crate::native_autostart::platform::identity(destination).map_err(invalid_install)?
+                == crate::native_autostart::platform::identity(&input.file)
+                    .map_err(invalid_install)?
+        {
+            return Err(invalid_install("payload staging target"));
+        }
+        let mut source = input.file.try_clone().map_err(invalid_install)?;
+        source.rewind().map_err(invalid_install)?;
+        destination.rewind().map_err(invalid_install)?;
+        let mut digest = Sha256::new();
+        let mut copied = 0u64;
+        let mut buffer = [0; 65536];
+        let mut existing = [0; 65536];
+        loop {
+            reads.tick()?;
+            let count = source.read(&mut buffer).map_err(invalid_install)?;
+            if count == 0 {
+                break;
+            }
+            let next = copied
+                .checked_add(count as u64)
+                .ok_or_else(|| invalid_install("payload size"))?;
+            if next > member.size {
+                return Err(invalid_install("payload source grew"));
+            }
+            let compare = target.len().saturating_sub(copied).min(count as u64) as usize;
+            destination
+                .read_exact(&mut existing[..compare])
+                .map_err(invalid_install)?;
+            if existing[..compare] != buffer[..compare] {
+                return Err(invalid_install("payload staging prefix changed"));
+            }
+            reads.tick()?;
+            destination
+                .write_all(&buffer[compare..count])
+                .map_err(invalid_install)?;
+            digest.update(&buffer[..count]);
+            copied = next;
+        }
+        if copied != member.size || format!("{:x}", digest.finalize()) != member.sha256 {
+            return Err(invalid_install("payload source changed"));
+        }
+        reads.tick()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            destination
+                .set_permissions(fs::Permissions::from_mode(if member.executable {
+                    0o755
+                } else {
+                    0o644
+                }))
+                .map_err(invalid_install)?;
+        }
+        reads.tick()?;
+        destination.sync_all().map_err(invalid_install)?;
+        input.recheck(reads)?;
+        self.image.recheck()?;
         reads.tick()
     }
 }
@@ -935,8 +1129,11 @@ pub(crate) fn verify_incoming_for_handoff(
             source.join("PACKAGE-MANIFEST.tsv"),
             package.package_files_sha256.clone(),
         ),
-        (manifest, receipt.manifest_sha256.clone()),
-        (checksums, format!("{:x}", Sha256::digest(&checksums_bytes))),
+        (manifest.clone(), receipt.manifest_sha256.clone()),
+        (
+            checksums.clone(),
+            format!("{:x}", Sha256::digest(&checksums_bytes)),
+        ),
     ] {
         if expected.insert(path, digest).is_some() {
             return Err(invalid_install("incoming metadata overlaps member"));
@@ -964,6 +1161,8 @@ pub(crate) fn verify_incoming_for_handoff(
         directory_identity,
         image,
         inputs,
+        manifest,
+        checksums,
         end,
     };
     verified.recheck(end)?;
@@ -2262,6 +2461,109 @@ mod tests {
             Err(CliError(error)) if error.code == CanonicalCode::WriterBusy
         ));
         verified.recheck(end).unwrap();
+        assert!(!source.join("package-install.json").exists());
+    }
+
+    #[test]
+    fn incoming_reinstall_payload_streams_exact_bytes_and_resumes_only_matching_prefix() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let incoming =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let members = incoming.reinstall_payload(end).unwrap();
+        assert!(members.iter().all(|member| !matches!(
+            member.relative.as_str(),
+            "current.json" | "package-install.json"
+        )));
+        assert!(
+            members
+                .iter()
+                .any(|member| member.relative == STAGE_MANIFEST)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|member| member.relative == STAGE_CHECKSUMS)
+        );
+        let member = members
+            .iter()
+            .find(|member| member.relative == "README.md")
+            .unwrap();
+        let expected = fs::read(source.join(&member.relative)).unwrap();
+        assert!(!expected.is_empty());
+        let path = root.join("payload-stage");
+        let mut staged = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        staged.write_all(&expected[..expected.len() / 2]).unwrap();
+        let identity = crate::native_autostart::platform::identity(&staged).unwrap();
+        incoming
+            .copy_reinstall_payload(member, &mut staged, end)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(
+            crate::native_autostart::platform::identity(&staged).unwrap(),
+            identity
+        );
+        incoming
+            .copy_reinstall_payload(member, &mut staged, end)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+
+        let conflict = root.join("payload-conflict");
+        let mut changed = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&conflict)
+            .unwrap();
+        changed.write_all(&[expected[0] ^ 1]).unwrap();
+        let before = fs::read(&conflict).unwrap();
+        assert!(
+            incoming
+                .copy_reinstall_payload(member, &mut changed, end)
+                .is_err()
+        );
+        assert_eq!(fs::read(&conflict).unwrap(), before);
+        assert_eq!(fs::read(source.join("README.md")).unwrap(), expected);
+    }
+
+    #[test]
+    fn incoming_reinstall_payload_rejects_unbound_members_and_expiry_without_writes() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, manifest, checksums, running, _) = incoming_fixture(&root);
+        let end = Instant::now() + std::time::Duration::from_secs(30);
+        let incoming =
+            verify_incoming_for_handoff(&source, &manifest, &checksums, &running, end).unwrap();
+        let mut member = incoming.reinstall_payload(end).unwrap().remove(0);
+        let path = root.join("empty-stage");
+        let mut staged = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        member.relative = "current.json".into();
+        assert!(
+            incoming
+                .copy_reinstall_payload(&member, &mut staged, end)
+                .is_err()
+        );
+        assert_eq!(staged.metadata().unwrap().len(), 0);
+        let member = incoming.reinstall_payload(end).unwrap().remove(0);
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        assert!(
+            incoming
+                .copy_reinstall_payload(&member, &mut staged, expired)
+                .is_err()
+        );
+        assert_eq!(staged.metadata().unwrap().len(), 0);
         assert!(!source.join("package-install.json").exists());
     }
 

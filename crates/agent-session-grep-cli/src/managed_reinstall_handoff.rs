@@ -1,7 +1,9 @@
 //! Completed-only namespace consumption and fixed keep-data transfer.
-//! Recovering/catalog acknowledgement does not publish payloads or activate.
+//! Payload publication remains fenced; pointer/receipt and activation are later.
 use super::*;
-use crate::package_installation::{IncomingPackageIdentity, VerifiedIncomingPackage};
+use crate::package_installation::{
+    IncomingPackageIdentity, ReinstallPayloadMember, VerifiedIncomingPackage,
+};
 use agent_session_grep_adapters_sqlite::control::{
     ReinstallAck, ReinstallCleanupBinding, ReinstallConnectionError, ReinstallContext,
     ReinstallControlOwner, ReinstallDigest, ReinstallExpectedControl, ReinstallFileBinding,
@@ -21,6 +23,72 @@ const RECORD_LIMIT: u64 = 4 * 1024 * 1024;
 const KEEP_PREP: &str = "keep-transfer-prep";
 const KEEP_ACK: &str = "keep-transfer-ack";
 const KEEP_RECORD_LIMIT: u64 = 8192;
+const PAYLOAD_DIRECTORY: &str = ".asg-reinstall-payload";
+const PAYLOAD_SCHEMA: &str = "asg.reinstall-payload/v1";
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PayloadDirectory {
+    relative: String,
+    original: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PayloadPlan {
+    schema: String,
+    intent_sha256: String,
+    prep_sha256: String,
+    ack_sha256: String,
+    directory_identity: (u64, u64),
+    members: Vec<ReinstallPayloadMember>,
+    directories: Vec<PayloadDirectory>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PayloadEntry {
+    schema: String,
+    plan_sha256: String,
+    ordinal: usize,
+    identity: (u64, u64),
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PayloadComplete {
+    schema: String,
+    plan_sha256: String,
+    entries_sha256: String,
+    count: usize,
+}
+
+struct PayloadSnapshot {
+    overlay: BTreeMap<String, Node>,
+    boundary: usize,
+    plan_stage: Option<ReinstallPreparationStage>,
+    complete_stage: Option<ReinstallPreparationStage>,
+}
+
+/// A complete observation under the real owned locks. A payload-only batch
+/// retains those locks, revalidates each physical effect and must obtain a fresh
+/// full observation before acknowledgement. Nothing crosses an invocation.
+struct PayloadPhase<'a> {
+    view: ReinstallPublication<'a, KeepDataRetention>,
+    intent: &'a FixedHandoffIntent,
+    prep: &'a ReinstallPrep,
+    ack: &'a ReinstallAck,
+    plan: Option<PayloadPlan>,
+    snapshot: Option<PayloadSnapshot>,
+}
+
+/// Complete incoming validation borrowed only within one payload phase.
+struct PayloadInputs<'a> {
+    incoming: &'a VerifiedIncomingPackage,
+    members: Vec<ReinstallPayloadMember>,
+}
+
+type PayloadRecordImage = (Vec<u8>, ReinstallPreparationStage);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +228,10 @@ struct KeepAdopted {
 
 struct KeepAcknowledged {
     owner: ReinstallQueryOnlyCatalog<KeepDataRetention>,
+    intent: FixedHandoffIntent,
+    prep: ReinstallPrep,
+    ack: ReinstallAck,
+    end: Instant,
 }
 
 struct KeepAcknowledgement {
@@ -173,7 +245,7 @@ struct KeepAcknowledgement {
 
 enum IncomingCompletion {
     NamespaceConsumed,
-    KeepData(KeepAcknowledged),
+    KeepData(Box<KeepAcknowledged>),
 }
 
 impl IncomingHandoff {
@@ -195,9 +267,13 @@ impl IncomingHandoff {
             Self::KeepData(preparation) => {
                 let mut acknowledgement = (*preparation).adopt()?.prepare_acknowledgement()?;
                 acknowledgement.publish()?;
-                Ok(IncomingCompletion::KeepData(KeepAcknowledged {
+                Ok(IncomingCompletion::KeepData(Box::new(KeepAcknowledged {
                     owner: acknowledgement.owner,
-                }))
+                    intent: acknowledgement.intent,
+                    prep: acknowledgement.prep,
+                    ack: acknowledgement.ack,
+                    end: acknowledgement.end,
+                })))
             }
         }
     }
@@ -309,8 +385,948 @@ struct KeepDataRetention {
     locks: Vec<ExistingLockFile>,
     namespace_dirs: RefCell<Vec<File>>,
     sibling_pins: RefCell<Vec<ExistingLockFile>>,
+    payload: RefCell<Option<PayloadPlan>>,
+    payload_pins: RefCell<Vec<ExistingLockFile>>,
     active: Option<Journal>,
     records: ResolvedRecords,
+}
+
+fn payload_plan(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    ack: &ReinstallAck,
+    directory_identity: (u64, u64),
+    end: Instant,
+) -> Result<PayloadPlan, Reason> {
+    if !intent.owner.keep_data || prep.context().operation != intent.operation {
+        return Err(Reason::IdentityChanged);
+    }
+    let members = retained
+        .incoming
+        .reinstall_payload(end)
+        .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
+    payload_plan_for_members(intent, prep, ack, directory_identity, members)
+}
+
+fn payload_plan_for_members(
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    ack: &ReinstallAck,
+    directory_identity: (u64, u64),
+    members: Vec<ReinstallPayloadMember>,
+) -> Result<PayloadPlan, Reason> {
+    if !intent.owner.keep_data || prep.context().operation != intent.operation {
+        return Err(Reason::IdentityChanged);
+    }
+    let mut directories = BTreeSet::new();
+    for member in &members {
+        if member.relative.starts_with("uninstall/")
+            || member.relative.starts_with(".asg-")
+            || matches!(
+                intent
+                    .inventory
+                    .iter()
+                    .find(|entry| {
+                        entry.scope == Scope::Prefix && entry.relative == member.relative
+                    })
+                    .map(|entry| &entry.node),
+                Some(Node::File { .. } | Node::Directory { .. })
+            )
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        let mut parent = member.relative.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(name) = parent {
+            directories.insert(name.to_owned());
+            parent = name.rsplit_once('/').map(|(parent, _)| parent);
+        }
+    }
+    let directories = directories
+        .into_iter()
+        .map(|relative| {
+            let original = match intent
+                .inventory
+                .iter()
+                .find(|entry| entry.scope == Scope::Prefix && entry.relative == relative)
+                .map(|entry| &entry.node)
+            {
+                Some(Node::Directory { identity }) => Some(*identity),
+                None | Some(Node::Absent) => None,
+                _ => return Err(Reason::IdentityChanged),
+            };
+            Ok(PayloadDirectory { relative, original })
+        })
+        .collect::<Result<Vec<_>, Reason>>()?;
+    Ok(PayloadPlan {
+        schema: PAYLOAD_SCHEMA.into(),
+        intent_sha256: digest(&record_bytes(intent)?),
+        prep_sha256: digest(&prep.encode().map_err(|_| Reason::IdentityChanged)?),
+        ack_sha256: digest(&ack.encode(prep).map_err(|_| Reason::IdentityChanged)?),
+        directory_identity,
+        members,
+        directories,
+    })
+}
+
+fn payload_pair(
+    root: &Path,
+    stem: &str,
+    names: &BTreeSet<String>,
+    allowed: &mut BTreeSet<String>,
+    end: Instant,
+) -> Result<Option<PayloadRecordImage>, Reason> {
+    let pending = format!("{stem}.pending");
+    let published = format!("{stem}.json");
+    let (name, stage) = match (names.contains(&pending), names.contains(&published)) {
+        (false, false) => return Ok(None),
+        (true, false) => (pending, ReinstallPreparationStage::Pending),
+        (false, true) => (published, ReinstallPreparationStage::Published),
+        _ => return Err(Reason::IdentityChanged),
+    };
+    allowed.insert(name.clone());
+    Ok(Some((
+        read_record(&root.join(name), RECORD_LIMIT, end)?,
+        stage,
+    )))
+}
+
+fn payload_record(
+    plan: &PayloadPlan,
+    ordinal: usize,
+    identity: (u64, u64),
+) -> Result<PayloadEntry, Reason> {
+    Ok(PayloadEntry {
+        schema: "asg.reinstall-payload-entry/v1".into(),
+        plan_sha256: digest(&record_bytes(plan)?),
+        ordinal,
+        identity,
+    })
+}
+
+fn payload_target(plan: &PayloadPlan, ordinal: usize) -> (&str, Option<&ReinstallPayloadMember>) {
+    if ordinal < plan.directories.len() {
+        (&plan.directories[ordinal].relative, None)
+    } else {
+        let member = &plan.members[ordinal - plan.directories.len()];
+        (&member.relative, Some(member))
+    }
+}
+
+fn payload_file(
+    retained: &KeepDataRetention,
+    path: &Path,
+    member: &ReinstallPayloadMember,
+    expected: (u64, u64),
+    complete: bool,
+    end: Instant,
+) -> Result<(), Reason> {
+    time(end)?;
+    package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
+    let file = platform::open_file(path).map_err(|_| Reason::FileLocked)?;
+    let size = file.metadata().map_err(|_| Reason::FileLocked)?.len();
+    if !single_file(&file)?
+        || platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != expected
+        || size > member.size
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    if complete {
+        let proof = private_proof(
+            path.parent().ok_or(Reason::IdentityChanged)?,
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .ok_or(Reason::IdentityChanged)?,
+            &retained.records.seal.policy,
+            end,
+        )?;
+        if proof.identity != expected || proof.size != member.size || proof.digest != member.sha256
+        {
+            return Err(Reason::IdentityChanged);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file
+                .metadata()
+                .map_err(|_| Reason::FileLocked)?
+                .permissions()
+                .mode();
+            if mode & 0o777 != if member.executable { 0o755 } else { 0o644 } {
+                return Err(Reason::IdentityChanged);
+            }
+        }
+    }
+    time(end)
+}
+
+fn payload_complete(plan: &PayloadPlan, entries: &[Vec<u8>]) -> Result<PayloadComplete, Reason> {
+    let mut framed = Vec::new();
+    for entry in entries {
+        framed.extend_from_slice(&(entry.len() as u64).to_be_bytes());
+        framed.extend_from_slice(entry);
+    }
+    Ok(PayloadComplete {
+        schema: "asg.reinstall-payload-complete/v1".into(),
+        plan_sha256: digest(&record_bytes(plan)?),
+        entries_sha256: digest(&framed),
+        count: plan.directories.len() + plan.members.len(),
+    })
+}
+
+/// A single completed prefix plus at most its next staging inode. A visible
+/// destination without its durable entry never becomes owned by equal bytes.
+fn payload_snapshot(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    end: Instant,
+) -> Result<PayloadSnapshot, Reason> {
+    #[cfg(test)]
+    tests::record_payload_snapshot();
+    let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+    platform::validate_private(&root).map_err(|_| Reason::IdentityChanged)?;
+    if identity(&root)? != plan.directory_identity {
+        return Err(Reason::IdentityChanged);
+    }
+    for (name, expected) in [
+        ("intent.json", &plan.intent_sha256),
+        ("keep-transfer-prep.json", &plan.prep_sha256),
+        ("keep-transfer-ack.json", &plan.ack_sha256),
+    ] {
+        if digest(&read_record(
+            &retained.roots.sidecar().join(name),
+            RECORD_LIMIT,
+            end,
+        )?) != *expected
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    let names = directory_members(&root, end)?;
+    let mut allowed = BTreeSet::new();
+    let recorded_plan = payload_pair(&root, "plan", &names, &mut allowed, end)?;
+    if let Some((bytes, _)) = &recorded_plan
+        && *bytes != record_bytes(plan)?
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    let plan_stage = recorded_plan.as_ref().map(|(_, stage)| *stage);
+    let mut overlay = BTreeMap::new();
+    let mut boundary = 0;
+    let mut entries = Vec::new();
+    let count = plan.directories.len() + plan.members.len();
+    for ordinal in 0..count {
+        let stem = format!("entry-{ordinal:06}");
+        let slot_name = format!("slot-{ordinal:06}");
+        let slot = root.join(&slot_name);
+        let record = payload_pair(&root, &stem, &names, &mut allowed, end)?;
+        let entry = record
+            .as_ref()
+            .map(|(bytes, _)| {
+                let entry: PayloadEntry =
+                    serde_json::from_slice(bytes).map_err(|_| Reason::IdentityChanged)?;
+                if entry != payload_record(plan, ordinal, entry.identity)?
+                    || *bytes != record_bytes(&entry)?
+                {
+                    return Err(Reason::IdentityChanged);
+                }
+                Ok(entry)
+            })
+            .transpose()?;
+        let (relative, member) = payload_target(plan, ordinal);
+        let target = retained.roots.prefix.join(relative);
+        let staged = names.contains(&slot_name);
+        if staged {
+            allowed.insert(slot_name);
+        }
+        let original = if member.is_none() {
+            plan.directories[ordinal].original
+        } else {
+            None
+        };
+        let target_present = present(&target)?;
+        let done = if let Some(original) = original {
+            if !target_present
+                || identity(&target)? != original
+                || staged
+                || entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.identity != original)
+            {
+                return Err(Reason::IdentityChanged);
+            }
+            record
+                .as_ref()
+                .is_some_and(|(_, stage)| *stage == ReinstallPreparationStage::Published)
+        } else {
+            if staged && target_present {
+                return Err(Reason::IdentityChanged);
+            }
+            if target_present {
+                let entry = entry.as_ref().ok_or(Reason::IdentityChanged)?;
+                if record
+                    .as_ref()
+                    .is_none_or(|(_, stage)| *stage != ReinstallPreparationStage::Published)
+                {
+                    return Err(Reason::IdentityChanged);
+                }
+                if let Some(member) = member {
+                    payload_file(retained, &target, member, entry.identity, true, end)?;
+                    overlay.insert(
+                        relative.to_owned(),
+                        Node::File {
+                            identity: entry.identity,
+                            size: member.size,
+                            sha256: Some(member.sha256.clone()),
+                        },
+                    );
+                } else {
+                    platform::validate_private(&target).map_err(|_| Reason::IdentityChanged)?;
+                    if identity(&target)? != entry.identity {
+                        return Err(Reason::IdentityChanged);
+                    }
+                    overlay.insert(
+                        relative.to_owned(),
+                        Node::Directory {
+                            identity: entry.identity,
+                        },
+                    );
+                }
+                true
+            } else {
+                if entry.is_some() && !staged {
+                    return Err(Reason::IdentityChanged);
+                }
+                if staged {
+                    let expected = if let Some(entry) = &entry {
+                        entry.identity
+                    } else if member.is_some() {
+                        let file = platform::open_file(&slot).map_err(|_| Reason::FileLocked)?;
+                        platform::identity(&file).map_err(|_| Reason::IdentityChanged)?
+                    } else {
+                        identity(&slot)?
+                    };
+                    if let Some(member) = member {
+                        payload_file(retained, &slot, member, expected, false, end)?;
+                        if record
+                            .as_ref()
+                            .is_none_or(|(_, stage)| *stage != ReinstallPreparationStage::Published)
+                            && fs::metadata(&slot).map_err(|_| Reason::FileLocked)?.len() != 0
+                        {
+                            return Err(Reason::IdentityChanged);
+                        }
+                    } else {
+                        platform::validate_private(&slot).map_err(|_| Reason::IdentityChanged)?;
+                        if identity(&slot)? != expected
+                            || !directory_members(&slot, end)?.is_empty()
+                        {
+                            return Err(Reason::IdentityChanged);
+                        }
+                    }
+                }
+                false
+            }
+        };
+        if done {
+            if boundary != ordinal {
+                return Err(Reason::IdentityChanged);
+            }
+            boundary += 1;
+            entries.push(record.as_ref().ok_or(Reason::IdentityChanged)?.0.clone());
+        } else if ordinal != boundary && (record.is_some() || staged) {
+            return Err(Reason::IdentityChanged);
+        }
+        if plan_stage != Some(ReinstallPreparationStage::Published)
+            && (record.is_some() || staged || done)
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    let complete = payload_pair(&root, "complete", &names, &mut allowed, end)?;
+    if let Some((bytes, _)) = &complete
+        && (boundary != count || *bytes != record_bytes(&payload_complete(plan, &entries)?)?)
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    if names != allowed {
+        return Err(Reason::UnclassifiedOwnedArtifact);
+    }
+    // Retained pins detect same-byte replacement during this invocation, even
+    // for records whose content is deterministic and therefore reproducible.
+    for (path, held, expected) in retained.payload_pins.borrow().iter() {
+        package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
+        let named = if held.metadata().map_err(|_| Reason::FileLocked)?.is_dir() {
+            platform::directory(path)
+        } else {
+            platform::open_file(path)
+        }
+        .map_err(|_| Reason::FileLocked)?;
+        if platform::identity(held).map_err(|_| Reason::IdentityChanged)? != *expected
+            || platform::identity(&named).map_err(|_| Reason::IdentityChanged)? != *expected
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    }
+    time(end)?;
+    Ok(PayloadSnapshot {
+        overlay,
+        boundary,
+        plan_stage,
+        complete_stage: complete.map(|(_, stage)| stage),
+    })
+}
+
+fn observed_payload(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    transfer: Option<&TransferLayout>,
+    end: Instant,
+) -> Result<Option<PayloadPlan>, Reason> {
+    let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+    if !present(&root)? {
+        return Ok(None);
+    }
+    let transfer = transfer.ok_or(Reason::IdentityChanged)?;
+    let ack = transfer
+        .acknowledgement
+        .as_ref()
+        .ok_or(Reason::IdentityChanged)?;
+    if transfer.stage != ReinstallPreparationStage::Published
+        || ack.stage != ReinstallPreparationStage::Published
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    let plan = payload_plan(
+        retained,
+        intent,
+        &transfer.prep,
+        &ack.record,
+        identity(&root)?,
+        end,
+    )?;
+    payload_snapshot(retained, &plan, end)?;
+    Ok(Some(plan))
+}
+
+fn payload_overlay(
+    retained: &KeepDataRetention,
+    end: Instant,
+) -> Result<BTreeMap<String, Node>, Reason> {
+    retained
+        .payload
+        .borrow()
+        .as_ref()
+        .map(|plan| payload_snapshot(retained, plan, end).map(|snapshot| snapshot.overlay))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn keep_payload_absence(
+    retained: &KeepDataRetention,
+    current: &ResolvedRecords,
+    overlay: &BTreeMap<String, Node>,
+    end: Instant,
+) -> Result<(), Reason> {
+    if overlay.is_empty() {
+        return completed_payload_absence_at(
+            &retained.roots.prefix,
+            &retained.roots.catalog,
+            &retained.roots.journal,
+            &current.state,
+            &current.seal,
+            end,
+        );
+    }
+    // Only payload names with an entry recorded before their no-replace move
+    // leave the old absence set. All data, runner/tail and old-owner absences
+    // still use the unchanged completed-uninstall checks.
+    let mut absence: Seal = serde_json::from_slice(&record_bytes(&current.seal)?)
+        .map_err(|_| Reason::IdentityChanged)?;
+    absence
+        .package_files
+        .retain(|proof| !overlay.contains_key(&proof.relative));
+    completed_payload_absence_at(
+        &retained.roots.prefix,
+        &retained.roots.catalog,
+        &retained.roots.journal,
+        &current.state,
+        &absence,
+        end,
+    )
+}
+
+fn payload_open(path: &Path, create: bool) -> Result<File, Reason> {
+    package_installation::ordinary(path.parent().ok_or(Reason::IdentityChanged)?)
+        .map_err(|_| Reason::IdentityChanged)?;
+    if !create {
+        package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(3).custom_flags(0x00200000);
+    }
+    let file = options.open(path).map_err(|_| Reason::FileLocked)?;
+    if !file.metadata().map_err(|_| Reason::FileLocked)?.is_file() || !single_file(&file)? {
+        return Err(Reason::IdentityChanged);
+    }
+    Ok(file)
+}
+
+fn retain_payload_pin(
+    retained: &KeepDataRetention,
+    path: &Path,
+    expected: (u64, u64),
+    directory: bool,
+    end: Instant,
+) -> Result<(), Reason> {
+    time(end)?;
+    let mut pins = retained.payload_pins.borrow_mut();
+    let file = if directory {
+        platform::directory(path).map_err(|_| Reason::IdentityChanged)?
+    } else {
+        // Retain no-delete identity while permitting only the owner's explicit
+        // durability flush to open a writable handle on Windows.
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(3).custom_flags(0x00200000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        options.open(path).map_err(|_| Reason::FileLocked)?
+    };
+    if platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != expected
+        || (!directory && !single_file(&file)?)
+    {
+        return Err(Reason::IdentityChanged);
+    }
+    if let Some((_, held, identity)) = pins.iter().find(|(existing, _, _)| existing == path) {
+        if *identity != expected
+            || platform::identity(held).map_err(|_| Reason::IdentityChanged)? != expected
+        {
+            return Err(Reason::IdentityChanged);
+        }
+    } else {
+        pins.push((path.to_path_buf(), file, expected));
+    }
+    time(end)
+}
+
+fn retain_payload_state(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    end: Instant,
+) -> Result<(), Reason> {
+    let snapshot = payload_snapshot(retained, plan, end)?;
+    retain_payload_snapshot(retained, plan, &snapshot, end)
+}
+
+fn retain_payload_snapshot(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    snapshot: &PayloadSnapshot,
+    end: Instant,
+) -> Result<(), Reason> {
+    let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+    retain_payload_pin(retained, &root, plan.directory_identity, true, end)?;
+    for (name, node) in &snapshot.overlay {
+        let (expected, directory) = match node {
+            Node::Directory { identity } => (*identity, true),
+            Node::File { identity, .. } => (*identity, false),
+            Node::Absent => return Err(Reason::IdentityChanged),
+        };
+        retain_payload_pin(
+            retained,
+            &retained.roots.prefix.join(name),
+            expected,
+            directory,
+            end,
+        )?;
+    }
+    for entry in directory_members(&root, end)? {
+        if entry.ends_with(".json") {
+            let path = root.join(entry);
+            let file = platform::open_file(&path).map_err(|_| Reason::FileLocked)?;
+            let expected = platform::identity(&file).map_err(|_| Reason::IdentityChanged)?;
+            drop(file);
+            retain_payload_pin(retained, &path, expected, false, end)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_payload_prefix(
+    retained: &KeepDataRetention,
+    plan: &PayloadPlan,
+    ordinals: std::ops::Range<usize>,
+    end: Instant,
+) -> Result<(), Reason> {
+    let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+    let mut parents = BTreeSet::from([retained.roots.prefix.clone(), root.clone()]);
+    for ordinal in ordinals {
+        let (relative, member) = payload_target(plan, ordinal);
+        let target = retained.roots.prefix.join(relative);
+        let record_path = root.join(format!("entry-{ordinal:06}.json"));
+        let bytes = read_record(&record_path, RECORD_LIMIT, end)?;
+        let entry: PayloadEntry =
+            serde_json::from_slice(&bytes).map_err(|_| Reason::IdentityChanged)?;
+        if entry != payload_record(plan, ordinal, entry.identity)? {
+            return Err(Reason::IdentityChanged);
+        }
+        if let Some(member) = member {
+            payload_file(retained, &target, member, entry.identity, true, end)?;
+            let file = payload_open(&target, false)?;
+            if platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != entry.identity {
+                return Err(Reason::IdentityChanged);
+            }
+            time(end)?;
+            file.sync_all().map_err(|_| Reason::FileLocked)?;
+        } else {
+            sync_bound_directory(&target, entry.identity, end)?;
+        }
+        sync_record(&record_path, &bytes, end)?;
+        parents.insert(
+            target
+                .parent()
+                .ok_or(Reason::IdentityChanged)?
+                .to_path_buf(),
+        );
+    }
+    for parent in parents {
+        let expected = identity(&parent)?;
+        sync_bound_directory(&parent, expected, end)?;
+    }
+    time(end)
+}
+
+impl KeepAcknowledged {
+    #[cfg(test)]
+    fn payload_pass(&mut self) -> Result<(), Reason> {
+        self.payload_phase().map(drop)
+    }
+
+    fn payload_phase(&mut self) -> Result<PayloadPhase<'_>, Reason> {
+        time(SqliteControlStore::effective_runtime_deadline(self.end))?;
+        #[cfg(test)]
+        let mut measured = tests::PayloadPhaseObservation::start(self.end);
+        let mut view = self
+            .owner
+            .acknowledgement_publication()
+            .map_err(|error| journal_control_error(error, self.end, Instant::now()))?;
+        #[cfg(test)]
+        tests::record_payload_borrow();
+        #[cfg(test)]
+        measured.mark(0);
+        self.end = self.end.min(view.end);
+        let inputs = PayloadInputs {
+            incoming: &view.retained.incoming,
+            members: view
+                .retained
+                .incoming
+                .reinstall_payload(view.end)
+                .map_err(|error| incoming_package_error(error, view.end, Instant::now()))?,
+        };
+        #[cfg(test)]
+        measured.mark(1);
+        let snapshot = acknowledgement_evidence_observed(
+            &mut view,
+            &self.intent,
+            &self.prep,
+            Some(&AckLayout {
+                record: self.ack.clone(),
+                stage: ReinstallPreparationStage::Published,
+            }),
+            Some(&inputs),
+        )?;
+        #[cfg(test)]
+        measured.mark(2);
+        let plan = view.retained.payload.borrow().clone();
+        if let Some(plan) = plan.as_ref() {
+            if *plan
+                != payload_plan_for_members(
+                    &self.intent,
+                    &self.prep,
+                    &self.ack,
+                    plan.directory_identity,
+                    inputs.members,
+                )?
+            {
+                return Err(Reason::IdentityChanged);
+            }
+            retain_payload_snapshot(
+                view.retained,
+                plan,
+                snapshot.as_ref().ok_or(Reason::IdentityChanged)?,
+                view.end,
+            )?;
+        }
+        #[cfg(test)]
+        {
+            measured.mark(3);
+            measured.complete();
+        }
+        Ok(PayloadPhase {
+            view,
+            intent: &self.intent,
+            prep: &self.prep,
+            ack: &self.ack,
+            plan,
+            snapshot,
+        })
+    }
+
+    /// Real production continuation; it retains both connections, every lease
+    /// and source/destination pin and never publishes pointer/installation receipt.
+    fn publish_payloads(&mut self) -> Result<(), Reason> {
+        {
+            let phase = self.payload_phase()?;
+            let view = phase.view;
+            let retained = view.retained;
+            #[cfg(test)]
+            let _measured = tests::PayloadWorkObservation::start(
+                tests::PayloadWorkStage::CreateRoot,
+                None,
+                view.end,
+            );
+            if retained.payload.borrow().is_none() {
+                let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+                time(view.end)?;
+                if !platform::create_private_directory(&root).map_err(|_| Reason::FileLocked)? {
+                    return Err(Reason::IdentityChanged);
+                }
+                let plan = payload_plan(
+                    retained,
+                    phase.intent,
+                    phase.prep,
+                    phase.ack,
+                    identity(&root)?,
+                    view.end,
+                )?;
+                *retained.payload.borrow_mut() = Some(plan);
+                sync_bound_directory(
+                    &retained.roots.prefix,
+                    retained.roots.roots.prefix,
+                    view.end,
+                )?;
+            }
+        }
+        {
+            let phase = self.payload_phase()?;
+            let view = phase.view;
+            let plan = phase.plan.ok_or(Reason::IdentityChanged)?;
+            let snapshot = phase.snapshot.ok_or(Reason::IdentityChanged)?;
+            let root = view.retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+            #[cfg(test)]
+            let _measured = tests::PayloadWorkObservation::start(
+                tests::PayloadWorkStage::PreparePlan,
+                None,
+                view.end,
+            );
+            let bytes = record_bytes(&plan)?;
+            if snapshot.plan_stage.is_none() {
+                time(view.end)?;
+                update_state::write_new(&root.join("plan.pending"), &bytes)
+                    .map_err(|_| Reason::FileLocked)?;
+                #[cfg(test)]
+                fault(Fault::PayloadPlanPending)?;
+            }
+            publish_record(&root, "plan", &bytes, view.end)?;
+            // Recovery must persist every already-published source/destination
+            // parent before another move, including the all-published case.
+            sync_payload_prefix(view.retained, &plan, 0..snapshot.boundary, view.end)?;
+        }
+        {
+            let phase = self.payload_phase()?;
+            let mut view = phase.view;
+            let retained = view.retained;
+            let plan = phase.plan.ok_or(Reason::IdentityChanged)?;
+            let snapshot = phase.snapshot.ok_or(Reason::IdentityChanged)?;
+            let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+            let count = plan.directories.len() + plan.members.len();
+            for ordinal in snapshot.boundary..count {
+                time(view.end)?;
+                {
+                    let mut guards = keep_guards(retained, &mut view.guards);
+                    retained_guards(&retained.roots, &retained.records, &mut guards, view.end)?;
+                }
+                validate_existing_lock_files(&retained.locks, view.end)?;
+                let snapshot = payload_snapshot(retained, &plan, view.end)?;
+                if snapshot.boundary != ordinal {
+                    return Err(Reason::IdentityChanged);
+                }
+                retain_payload_snapshot(retained, &plan, &snapshot, view.end)?;
+                #[cfg(test)]
+                let mut measured = tests::PayloadWorkObservation::start(
+                    tests::PayloadWorkStage::PrepareEntry,
+                    Some(ordinal),
+                    view.end,
+                );
+                let stem = format!("entry-{ordinal:06}");
+                let slot = root.join(format!("slot-{ordinal:06}"));
+                let (relative, member) = payload_target(&plan, ordinal);
+                let target = retained.roots.prefix.join(relative);
+                let original = if member.is_none() {
+                    plan.directories[ordinal].original
+                } else {
+                    None
+                };
+                let expected = if let Some(original) = original {
+                    original
+                } else {
+                    if !present(&slot)? {
+                        time(view.end)?;
+                        if member.is_some() {
+                            let file = payload_open(&slot, true)?;
+                            time(view.end)?;
+                            file.sync_all().map_err(|_| Reason::FileLocked)?;
+                        } else if !platform::create_private_directory(&slot)
+                            .map_err(|_| Reason::FileLocked)?
+                        {
+                            return Err(Reason::IdentityChanged);
+                        }
+                    }
+                    if member.is_some() {
+                        let file = platform::open_file(&slot).map_err(|_| Reason::FileLocked)?;
+                        platform::identity(&file).map_err(|_| Reason::IdentityChanged)?
+                    } else {
+                        identity(&slot)?
+                    }
+                };
+                time(view.end)?;
+                let bytes = record_bytes(&payload_record(&plan, ordinal, expected)?)?;
+                if !present(&root.join(format!("{stem}.pending")))?
+                    && !present(&root.join(format!("{stem}.json")))?
+                {
+                    time(view.end)?;
+                    update_state::write_new(&root.join(format!("{stem}.pending")), &bytes)
+                        .map_err(|_| Reason::FileLocked)?;
+                }
+                #[cfg(test)]
+                measured.mark(tests::PayloadWorkStage::PublishEntry);
+                publish_record(&root, &stem, &bytes, view.end)?;
+                #[cfg(test)]
+                fault(Fault::PayloadEntry(ordinal))?;
+                #[cfg(test)]
+                measured.mark(tests::PayloadWorkStage::ReadEntry);
+                payload_snapshot(retained, &plan, view.end)?;
+                if let Some(member) = member {
+                    #[cfg(test)]
+                    measured.mark(tests::PayloadWorkStage::Copy);
+                    let mut file = payload_open(&slot, false)?;
+                    if platform::identity(&file).map_err(|_| Reason::IdentityChanged)? != expected {
+                        return Err(Reason::IdentityChanged);
+                    }
+                    retained
+                        .incoming
+                        .copy_reinstall_payload(member, &mut file, view.end)
+                        .map_err(|error| incoming_package_error(error, view.end, Instant::now()))?;
+                    drop(file);
+                    #[cfg(test)]
+                    measured.mark(tests::PayloadWorkStage::VerifyCopy);
+                    payload_file(retained, &slot, member, expected, true, view.end)?;
+                }
+                #[cfg(test)]
+                measured.mark(tests::PayloadWorkStage::Move);
+                if original.is_none() {
+                    time(view.end)?;
+                    if present(&target)? {
+                        return Err(Reason::IdentityChanged);
+                    }
+                    let parent = target.parent().ok_or(Reason::IdentityChanged)?;
+                    let expected_parent = if parent == retained.roots.prefix {
+                        retained.roots.roots.prefix
+                    } else {
+                        let relative_parent =
+                            relative.rsplit_once('/').ok_or(Reason::IdentityChanged)?.0;
+                        let parent_ordinal = plan
+                            .directories
+                            .iter()
+                            .position(|directory| directory.relative == relative_parent)
+                            .ok_or(Reason::IdentityChanged)?;
+                        let parent_bytes = read_record(
+                            &root.join(format!("entry-{parent_ordinal:06}.json")),
+                            RECORD_LIMIT,
+                            view.end,
+                        )?;
+                        let parent_record: PayloadEntry = serde_json::from_slice(&parent_bytes)
+                            .map_err(|_| Reason::IdentityChanged)?;
+                        parent_record.identity
+                    };
+                    if identity(parent)? != expected_parent {
+                        return Err(Reason::IdentityChanged);
+                    }
+                    platform::move_new(&slot, &target).map_err(|_| Reason::FileLocked)?;
+                    #[cfg(test)]
+                    fault(Fault::PayloadMoved(ordinal))?;
+                }
+                #[cfg(test)]
+                measured.mark(tests::PayloadWorkStage::SyncEntry);
+                sync_payload_prefix(retained, &plan, ordinal..ordinal + 1, view.end)?;
+                #[cfg(test)]
+                observe(HandoffEvent::AfterPayloadMember(ordinal), view.end)?;
+                #[cfg(test)]
+                tests::expire_payload_batch_if_requested(ordinal, &mut view.end);
+                time(view.end)?;
+            }
+        }
+        {
+            // Release the borrowed batch before validating its complete control,
+            // original history and incoming package again. No prior snapshot
+            // authorizes this acknowledgement.
+            let phase = self.payload_phase()?;
+            let view = phase.view;
+            let retained = view.retained;
+            let plan = phase.plan.ok_or(Reason::IdentityChanged)?;
+            let snapshot = phase.snapshot.ok_or(Reason::IdentityChanged)?;
+            let root = retained.roots.prefix.join(PAYLOAD_DIRECTORY);
+            let count = plan.directories.len() + plan.members.len();
+            if snapshot.boundary != count {
+                return Err(Reason::IdentityChanged);
+            }
+            #[cfg(test)]
+            let _measured = tests::PayloadWorkObservation::start(
+                tests::PayloadWorkStage::Complete,
+                None,
+                view.end,
+            );
+            let entries = (0..count)
+                .map(|ordinal| {
+                    read_record(
+                        &root.join(format!("entry-{ordinal:06}.json")),
+                        RECORD_LIMIT,
+                        view.end,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let bytes = record_bytes(&payload_complete(&plan, &entries)?)?;
+            sync_payload_prefix(retained, &plan, 0..count, view.end)?;
+            if snapshot.complete_stage.is_none() {
+                time(view.end)?;
+                update_state::write_new(&root.join("complete.pending"), &bytes)
+                    .map_err(|_| Reason::FileLocked)?;
+                #[cfg(test)]
+                fault(Fault::PayloadCompletePending)?;
+            }
+            // The final durable payload acknowledgement is still partial:
+            // no fallible post-ACK check, close, fence clear or setup follows.
+            publish_record(&root, "complete", &bytes, view.end)
+        }
+    }
 }
 
 enum KeepHandoffError {
@@ -367,6 +1383,8 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn read_record(path: &Path, limit: u64, end: Instant) -> Result<Vec<u8>, Reason> {
+    #[cfg(test)]
+    tests::record_history_read(path);
     time(end)?;
     let bytes = update_state::read(path, limit)
         .map_err(|_| Reason::IdentityChanged)?
@@ -647,6 +1665,8 @@ fn archive_proof(
     policy: &TerminalPolicy,
     end: Instant,
 ) -> Result<(), Reason> {
+    #[cfg(test)]
+    tests::record_history_read(path);
     let Node::File {
         identity,
         size,
@@ -667,6 +1687,44 @@ fn archive_proof(
         digest: sha256.clone(),
     };
     verify(base, &proof, policy, end, false).map(|_| ())
+}
+
+fn archive_record(
+    roots: &PinnedRoots,
+    intent: &FixedHandoffIntent,
+    name: &str,
+    policy: &TerminalPolicy,
+    limit: u64,
+    end: Instant,
+) -> Result<Vec<u8>, Reason> {
+    let path = intent.resolve(roots, name, end)?;
+    let Node::File {
+        identity,
+        size,
+        sha256: Some(sha256),
+    } = &intent.entry(Scope::Prefix, name)?.node
+    else {
+        return Err(Reason::IdentityChanged);
+    };
+    let proof = OwnedFile {
+        relative: path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or(Reason::IdentityChanged)?
+            .into(),
+        identity: *identity,
+        size: *size,
+        digest: sha256.clone(),
+    };
+    #[cfg(test)]
+    tests::record_history_read(&path);
+    read_verified_record(
+        path.parent().ok_or(Reason::IdentityChanged)?,
+        &proof,
+        policy,
+        limit,
+        end,
+    )
 }
 
 struct ResolvedRecords {
@@ -770,14 +1828,14 @@ fn resolved_history(
     {
         return Err(Reason::IdentityChanged);
     }
-    for name in &intent.leaves {
-        archive_proof(
-            &intent.resolve(roots, name, end)?,
-            intent.entry(Scope::Prefix, name)?,
-            &seal.policy,
-            end,
-        )?;
-    }
+    // The parser consumes the complete proof reader's bytes. This set is local
+    // to one effect-free history observation and stores no reusable authority.
+    let proved = RefCell::new(BTreeSet::new());
+    let read = |name: &str, limit| {
+        let bytes = archive_record(roots, intent, name, &seal.policy, limit, end)?;
+        proved.borrow_mut().insert(name.to_owned());
+        Ok(bytes)
+    };
     completion_history_records(&state, &seal, end, |sequence| {
         read(
             &format!("uninstall/state-{sequence:06}.json"),
@@ -812,6 +1870,16 @@ fn resolved_history(
         }
     }
     completed_receipt_records(&state, &seal, end, tail)?;
+    for name in &intent.leaves {
+        if !proved.borrow().contains(name) {
+            archive_proof(
+                &intent.resolve(roots, name, end)?,
+                intent.entry(Scope::Prefix, name)?,
+                &seal.policy,
+                end,
+            )?;
+        }
+    }
     Ok(ResolvedRecords { state, seal })
 }
 
@@ -858,13 +1926,17 @@ pub(super) fn intercept(args: &[OsString]) -> Option<i32> {
         .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
         let handoff =
             prepare_incoming_handoff(Path::new(prefix), Path::new(catalog), incoming, end)?;
-        handoff.finish()
+        let mut completed = handoff.finish()?;
+        if let IncomingCompletion::KeepData(acknowledged) = &mut completed {
+            acknowledged.publish_payloads()?;
+        }
+        Ok::<_, KeepHandoffError>(completed)
     })();
     match _checkpoint {
         Ok(IncomingCompletion::NamespaceConsumed) => {}
         Ok(IncomingCompletion::KeepData(completed)) => {
-            // The acknowledged Recovering catalog remains held until the
-            // private CLI exits. Payload/lifecycle activation is still pending.
+            // The same ACK owner holds the new payload and all guards until
+            // private CLI exit. Pointer/receipt and activation remain pending.
             drop(completed.owner);
         }
         Err(KeepHandoffError::Refused(reason)) => {
@@ -899,6 +1971,15 @@ fn incoming_current(
     incoming
         .recheck(end)
         .map_err(|error| incoming_package_error(error, end, Instant::now()))?;
+    incoming_overlap(roots, incoming, policy, end)
+}
+
+fn incoming_overlap(
+    roots: &PinnedRoots,
+    incoming: &VerifiedIncomingPackage,
+    policy: &TerminalPolicy,
+    end: Instant,
+) -> Result<(), Reason> {
     let source = incoming.source_root();
     for target in [&roots.prefix, &roots.data] {
         if source.starts_with(target) || target.starts_with(source) || policy.overlaps(target)? {
@@ -1319,6 +2400,15 @@ fn keep_context(
     intent: &FixedHandoffIntent,
     end: Instant,
 ) -> Result<ReinstallContext, Reason> {
+    keep_context_observed(retained, intent, end, None).map(|(context, _)| context)
+}
+
+fn keep_context_observed(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    end: Instant,
+    incoming: Option<&PayloadInputs<'_>>,
+) -> Result<(ReinstallContext, Option<PayloadSnapshot>), Reason> {
     let roots = &retained.roots;
     intent.validate(roots, &retained.incoming, end)?;
     if !intent.owner.keep_data || partition_boundary(roots, intent, end)? != intent.leaves.len() {
@@ -1359,16 +2449,30 @@ fn keep_context(
     {
         return Err(Reason::IdentityChanged);
     }
-    completed_payload_absence_at(
-        &roots.prefix,
-        &roots.catalog,
-        &roots.journal,
-        &current.state,
-        &current.seal,
+    let payload = retained
+        .payload
+        .borrow()
+        .as_ref()
+        .map(|plan| payload_snapshot(retained, plan, end))
+        .transpose()?;
+    let empty = BTreeMap::new();
+    keep_payload_absence(
+        retained,
+        &current,
+        payload
+            .as_ref()
+            .map_or(&empty, |snapshot| &snapshot.overlay),
         end,
     )?;
-    incoming_current(roots, &retained.incoming, &current.seal.policy, end)?;
-    Ok(ReinstallContext {
+    if let Some(incoming) = incoming {
+        if !std::ptr::eq(incoming.incoming, &retained.incoming) {
+            return Err(Reason::IdentityChanged);
+        }
+        incoming_overlap(roots, incoming.incoming, &current.seal.policy, end)?;
+    } else {
+        incoming_current(roots, &retained.incoming, &current.seal.policy, end)?;
+    }
+    let context = ReinstallContext {
         operation: intent.operation.clone(),
         intent_sha256: ReinstallDigest::of_bytes(&intent_bytes),
         ready_sha256: ReinstallDigest::of_bytes(&ready_bytes),
@@ -1391,7 +2495,8 @@ fn keep_context(
         user_version: 2,
         schema_sha256: ReinstallContext::current_schema_digest(),
         sqlite_policy: "no-close-checkpoint/v1".into(),
-    })
+    };
+    Ok((context, payload))
 }
 
 fn validate_preparation_files(
@@ -1497,6 +2602,19 @@ fn transfer_inventory(
     stage: ReinstallPreparationStage,
     end: Instant,
 ) -> Result<(), Reason> {
+    let overlay = payload_overlay(retained, end)?;
+    transfer_inventory_observed(retained, intent, prep, writer, stage, &overlay, end)
+}
+
+fn transfer_inventory_observed(
+    retained: &KeepDataRetention,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    writer: &OwnedFile,
+    stage: ReinstallPreparationStage,
+    overlay: &BTreeMap<String, Node>,
+    end: Instant,
+) -> Result<(), Reason> {
     let roots = &retained.roots;
     let siblings = [
         "control.db-wal".to_owned(),
@@ -1513,6 +2631,12 @@ fn transfer_inventory(
         let path = roots.base(entry.scope).join(&entry.relative);
         if entry.scope == Scope::Prefix && intent.leaves.contains(&entry.relative) {
             if present(&path)? {
+                return Err(Reason::IdentityChanged);
+            }
+            continue;
+        }
+        if entry.scope == Scope::Prefix && overlay.contains_key(&entry.relative) {
+            if !matches!(entry.node, Node::Absent) {
                 return Err(Reason::IdentityChanged);
             }
             continue;
@@ -1542,6 +2666,10 @@ fn transfer_inventory(
             _ => return Err(Reason::IdentityChanged),
         }
     }
+    expected
+        .get_mut(&Scope::Prefix)
+        .ok_or(Reason::IdentityChanged)?
+        .extend(overlay.keys().cloned());
     for (index, name) in siblings.iter().enumerate() {
         time(end)?;
         let path = roots.data.join(name);
@@ -1623,14 +2751,23 @@ fn transfer_inventory(
                 if scope == Scope::Prefix && name == SIDECAR {
                     continue;
                 }
+                if scope == Scope::Prefix
+                    && name == PAYLOAD_DIRECTORY
+                    && retained.payload.borrow().is_some()
+                {
+                    continue;
+                }
                 if actual.len() >= MAX_ENTRIES || !expected[&scope].contains(&name) {
                     return Err(Reason::UnclassifiedOwnedArtifact);
                 }
-                if intent.inventory.iter().any(|entry| {
-                    entry.scope == scope
-                        && entry.relative == name
-                        && matches!(entry.node, Node::Directory { .. })
-                }) {
+                if matches!(overlay.get(&name), Some(Node::Directory { .. }))
+                    && scope == Scope::Prefix
+                    || intent.inventory.iter().any(|entry| {
+                        entry.scope == scope
+                            && entry.relative == name
+                            && matches!(entry.node, Node::Directory { .. })
+                    })
+                {
                     pending.push(name.clone());
                 }
                 actual.insert(name);
@@ -1764,13 +2901,24 @@ fn acknowledgement_evidence(
     intent: &FixedHandoffIntent,
     prep: &ReinstallPrep,
     acknowledgement: Option<&AckLayout>,
-) -> Result<(), Reason> {
+) -> Result<Option<PayloadSnapshot>, Reason> {
+    acknowledgement_evidence_observed(view, intent, prep, acknowledgement, None)
+}
+
+fn acknowledgement_evidence_observed(
+    view: &mut ReinstallPublication<'_, KeepDataRetention>,
+    intent: &FixedHandoffIntent,
+    prep: &ReinstallPrep,
+    acknowledgement: Option<&AckLayout>,
+    incoming: Option<&PayloadInputs<'_>>,
+) -> Result<Option<PayloadSnapshot>, Reason> {
     let retained = view.retained;
     let end = view.end;
     let mut guards = keep_guards(retained, &mut view.guards);
     let writer = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
     validate_existing_lock_files(&retained.locks, end)?;
-    if keep_context(retained, intent, end)? != *prep.context() {
+    let (context, payload) = keep_context_observed(retained, intent, end, incoming)?;
+    if context != *prep.context() {
         return Err(Reason::IdentityChanged);
     }
     validate_preparation_files(intent, prep.files())?;
@@ -1806,12 +2954,16 @@ fn acknowledgement_evidence(
         }
     }
     exact_members(&sidecar, &names, end)?;
-    transfer_inventory(
+    let empty = BTreeMap::new();
+    transfer_inventory_observed(
         retained,
         intent,
         prep,
         &writer,
         ReinstallPreparationStage::Published,
+        payload
+            .as_ref()
+            .map_or(&empty, |snapshot| &snapshot.overlay),
         end,
     )?;
     let after = retained_guards(&retained.roots, &retained.records, &mut guards, end)?;
@@ -1821,7 +2973,8 @@ fn acknowledgement_evidence(
     {
         return Err(Reason::IdentityChanged);
     }
-    time(end)
+    time(end)?;
+    Ok(payload)
 }
 
 fn publish_acknowledgement(
@@ -1959,9 +3112,16 @@ fn prepare_incoming_handoff(
         locks,
         namespace_dirs: RefCell::new(Vec::new()),
         sibling_pins: RefCell::new(Vec::new()),
+        payload: RefCell::new(None),
+        payload_pins: RefCell::new(Vec::new()),
         active,
         records,
     };
+    if present(&retained.roots.prefix.join(PAYLOAD_DIRECTORY))? {
+        let intent = resumed.as_ref().ok_or(Reason::IdentityChanged)?;
+        let payload = observed_payload(&retained, intent, transfer.as_ref(), end)?;
+        *retained.payload.borrow_mut() = payload;
+    }
     if let (Some(intent), Some(layout)) = (&resumed, &transfer) {
         // Select and validate transfer recovery BEFORE the first control open.
         // No old-mode byte read or old Uninstalling check precedes this route.
@@ -1970,6 +3130,9 @@ fn prepare_incoming_handoff(
         }
         validate_preparation_files(intent, layout.prep.files())?;
         pin_transfer_directories(&retained, intent, layout.prep.context(), end)?;
+        if let Some(plan) = retained.payload.borrow().as_ref() {
+            retain_payload_state(&retained, plan, end)?;
+        }
     }
     let input = keep_owned_input(
         retained,
@@ -2590,6 +3753,7 @@ fn directory_members(path: &Path, end: Instant) -> Result<BTreeSet<String>, Reas
     time(end)?;
     package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
     let pin = platform::directory(path).map_err(|_| Reason::IdentityChanged)?;
+    let expected = platform::identity(&pin).map_err(|_| Reason::IdentityChanged)?;
     let mut result = BTreeSet::new();
     for entry in fs::read_dir(path).map_err(|_| Reason::FileLocked)? {
         time(end)?;
@@ -2597,7 +3761,19 @@ fn directory_members(path: &Path, end: Instant) -> Result<BTreeSet<String>, Reas
             return Err(Reason::UnclassifiedOwnedArtifact);
         }
         let entry = entry.map_err(|_| Reason::FileLocked)?;
-        package_installation::ordinary(&entry.path()).map_err(|_| Reason::IdentityChanged)?;
+        // The same parent chain is checked at both ends of this read-only
+        // enumeration. Each child needs only its own no-follow metadata check;
+        // callers revalidate the bound record/path before any later effect.
+        let meta = fs::symlink_metadata(entry.path()).map_err(|_| Reason::IdentityChanged)?;
+        let linked = meta.file_type().is_symlink();
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            linked || meta.file_attributes() & 0x400 != 0
+        };
+        if linked {
+            return Err(Reason::IdentityChanged);
+        }
         let name = entry
             .file_name()
             .into_string()
@@ -2606,9 +3782,19 @@ fn directory_members(path: &Path, end: Instant) -> Result<BTreeSet<String>, Reas
             return Err(Reason::IdentityChanged);
         }
     }
-    if platform::identity(&pin).map_err(|_| Reason::IdentityChanged)? != identity(path)? {
+    #[cfg(test)]
+    observe(
+        HandoffEvent::BeforeDirectoryReadback(path.to_path_buf()),
+        end,
+    )?;
+    time(end)?;
+    package_installation::ordinary(path).map_err(|_| Reason::IdentityChanged)?;
+    if platform::identity(&pin).map_err(|_| Reason::IdentityChanged)? != expected
+        || identity(path)? != expected
+    {
         return Err(Reason::IdentityChanged);
     }
+    time(end)?;
     Ok(result)
 }
 
@@ -3337,11 +4523,17 @@ enum Fault {
     ConsumedPending,
     KeepPrepPending,
     KeepAckPending,
+    PayloadPlanPending,
+    PayloadEntry(usize),
+    PayloadMoved(usize),
+    PayloadCompletePending,
 }
 
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HandoffEvent {
+    AfterPayloadMember(usize),
+    BeforeDirectoryReadback(PathBuf),
     BeforeDirectorySync(PathBuf),
     DirectorySynced(PathBuf),
     BeforeMove(usize),
@@ -3388,6 +4580,251 @@ mod tests {
         control::{BackgroundControl, DesiredUpdates, ScopeRegion, SelectionRequest},
     };
     use serde_json::json;
+
+    #[derive(Clone, Debug)]
+    struct PayloadPhaseSample {
+        borrows: u64,
+        incoming: u64,
+        snapshots: u64,
+        elapsed: std::time::Duration,
+        remaining: std::time::Duration,
+        complete: bool,
+        stages: [Option<Duration>; 4],
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) enum PayloadWorkStage {
+        CreateRoot,
+        PreparePlan,
+        PrepareEntry,
+        PublishEntry,
+        ReadEntry,
+        Copy,
+        VerifyCopy,
+        Move,
+        SyncEntry,
+        Complete,
+    }
+
+    #[derive(Debug)]
+    struct PayloadWorkSample {
+        stage: PayloadWorkStage,
+        ordinal: Option<usize>,
+        elapsed: Duration,
+        remaining: Duration,
+    }
+
+    thread_local! {
+        static HISTORY_READ: RefCell<Option<(PathBuf, usize)>> = const { RefCell::new(None) };
+        static PAYLOAD_PHASE_SAMPLES: RefCell<Vec<PayloadPhaseSample>> = const { RefCell::new(Vec::new()) };
+        static PAYLOAD_WORK_SAMPLES: RefCell<Vec<PayloadWorkSample>> = const { RefCell::new(Vec::new()) };
+        static PAYLOAD_BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static PAYLOAD_SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static PAYLOAD_BATCH_EXPIRY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct HistoryReadObservation(Option<(PathBuf, usize)>);
+
+    impl HistoryReadObservation {
+        fn start(path: PathBuf) -> Self {
+            Self(HISTORY_READ.with_borrow_mut(|observed| observed.replace((path, 0))))
+        }
+
+        fn count(&self) -> usize {
+            HISTORY_READ.with_borrow(|observed| observed.as_ref().unwrap().1)
+        }
+    }
+
+    impl Drop for HistoryReadObservation {
+        fn drop(&mut self) {
+            HISTORY_READ.with_borrow_mut(|observed| *observed = self.0.take());
+        }
+    }
+
+    pub(super) fn record_history_read(path: &Path) {
+        HISTORY_READ.with_borrow_mut(|observed| {
+            if let Some((expected, count)) = observed
+                && expected == path
+            {
+                *count += 1;
+            }
+        });
+    }
+
+    pub(super) fn record_payload_borrow() {
+        PAYLOAD_BORROWS.with(|count| count.set(count.get() + 1));
+    }
+    pub(super) fn record_payload_snapshot() {
+        PAYLOAD_SNAPSHOTS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn expire_payload_batch_if_requested(ordinal: usize, end: &mut Instant) {
+        if ordinal == 0 && PAYLOAD_BATCH_EXPIRY.with(|request| request.replace(false)) {
+            *end = (*end).min(Instant::now());
+        }
+    }
+
+    pub(super) struct PayloadPhaseObservation {
+        started: Instant,
+        previous: Instant,
+        end: Instant,
+        borrows: u64,
+        incoming: u64,
+        snapshots: u64,
+        complete: bool,
+        stages: [Option<Duration>; 4],
+    }
+
+    impl PayloadPhaseObservation {
+        pub(super) fn start(end: Instant) -> Self {
+            let started = Instant::now();
+            Self {
+                started,
+                previous: started,
+                end,
+                borrows: PAYLOAD_BORROWS.with(std::cell::Cell::get),
+                incoming: package_installation::incoming_recheck_count(),
+                snapshots: PAYLOAD_SNAPSHOTS.with(std::cell::Cell::get),
+                complete: false,
+                stages: [None; 4],
+            }
+        }
+
+        pub(super) fn mark(&mut self, index: usize) {
+            let now = Instant::now();
+            self.stages[index] = Some(now.duration_since(self.previous));
+            self.previous = now;
+        }
+
+        pub(super) fn complete(mut self) {
+            self.complete = true;
+        }
+    }
+
+    impl Drop for PayloadPhaseObservation {
+        fn drop(&mut self) {
+            let finished = Instant::now();
+            PAYLOAD_PHASE_SAMPLES.with_borrow_mut(|samples| {
+                if samples.len() < 256 {
+                    samples.push(PayloadPhaseSample {
+                        borrows: PAYLOAD_BORROWS.with(std::cell::Cell::get) - self.borrows,
+                        incoming: package_installation::incoming_recheck_count() - self.incoming,
+                        snapshots: PAYLOAD_SNAPSHOTS.with(std::cell::Cell::get) - self.snapshots,
+                        elapsed: finished.duration_since(self.started),
+                        remaining: self.end.saturating_duration_since(finished),
+                        complete: self.complete,
+                        stages: self.stages,
+                    });
+                }
+            });
+        }
+    }
+
+    /// Non-overlapping work spans between full validation phases. A failed
+    /// operation is recorded by Drop under the original end, without retry.
+    pub(super) struct PayloadWorkObservation {
+        started: Instant,
+        end: Instant,
+        stage: PayloadWorkStage,
+        ordinal: Option<usize>,
+    }
+
+    impl PayloadWorkObservation {
+        pub(super) fn start(stage: PayloadWorkStage, ordinal: Option<usize>, end: Instant) -> Self {
+            Self {
+                started: Instant::now(),
+                end,
+                stage,
+                ordinal,
+            }
+        }
+
+        fn record(&self, finished: Instant) {
+            PAYLOAD_WORK_SAMPLES.with_borrow_mut(|samples| {
+                if samples.len() < 512 {
+                    samples.push(PayloadWorkSample {
+                        stage: self.stage,
+                        ordinal: self.ordinal,
+                        elapsed: finished.duration_since(self.started),
+                        remaining: self.end.saturating_duration_since(finished),
+                    });
+                }
+            });
+        }
+
+        pub(super) fn mark(&mut self, next: PayloadWorkStage) {
+            let now = Instant::now();
+            self.record(now);
+            self.started = now;
+            self.stage = next;
+        }
+    }
+
+    impl Drop for PayloadWorkObservation {
+        fn drop(&mut self) {
+            self.record(Instant::now());
+        }
+    }
+
+    fn publish_payload(owner: &mut KeepAcknowledged) {
+        PAYLOAD_PHASE_SAMPLES.with_borrow_mut(Vec::clear);
+        PAYLOAD_WORK_SAMPLES.with_borrow_mut(Vec::clear);
+        let started = Instant::now();
+        let remaining_at_entry = owner.end.saturating_duration_since(started);
+        let result = owner.publish_payloads();
+        let samples = PAYLOAD_PHASE_SAMPLES.with_borrow_mut(std::mem::take);
+        let work = PAYLOAD_WORK_SAMPLES.with_borrow_mut(std::mem::take);
+        let stage_totals = std::array::from_fn::<_, 4, _>(|index| {
+            samples
+                .iter()
+                .filter_map(|sample| sample.stages[index])
+                .sum::<Duration>()
+        });
+        eprintln!(
+            "payload_phase_cost phases={} stages={stage_totals:?}",
+            samples.len()
+        );
+        let mut work_totals = BTreeMap::new();
+        for sample in &work {
+            let (count, total, longest, ordinal) = work_totals.entry(sample.stage).or_insert((
+                0u64,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+            ));
+            *count += 1;
+            *total += sample.elapsed;
+            if sample.elapsed > *longest {
+                *longest = sample.elapsed;
+                *ordinal = sample.ordinal;
+            }
+        }
+        eprintln!(
+            "payload_work_cost elapsed={:?} remaining_at_entry={remaining_at_entry:?} \
+             stages=(count,total,longest,ordinal){work_totals:?} last={:?}",
+            started.elapsed(),
+            work.last()
+                .map(|sample| (sample.stage, sample.ordinal, sample.remaining))
+        );
+        assert!(
+            result.is_ok(),
+            "payload result={result:?} phases={samples:?}"
+        );
+        assert_eq!(
+            samples.len(),
+            4,
+            "root, plan, held batch and final acknowledgement each validate once"
+        );
+        for sample in samples {
+            assert!(sample.complete, "{sample:?}");
+            assert_eq!(sample.borrows, 1, "{sample:?}");
+            assert_eq!(sample.incoming, 1, "{sample:?}");
+            assert!(sample.snapshots <= 1, "{sample:?}");
+            assert!(sample.elapsed <= Duration::from_secs(30), "{sample:?}");
+            assert!(sample.remaining > Duration::ZERO, "{sample:?}");
+            assert!(sample.stages.iter().all(Option::is_some), "{sample:?}");
+        }
+    }
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -3395,6 +4832,81 @@ mod tests {
 
     fn end() -> Instant {
         Instant::now() + BUDGET
+    }
+
+    #[test]
+    fn directory_inventory_retains_child_link_and_parent_readback_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("inventory");
+        assert!(platform::create_private_directory(&root).unwrap());
+        for ordinal in 0..48 {
+            update_state::write_new(&root.join(format!("item-{ordinal:02}")), b"synthetic")
+                .unwrap();
+        }
+        let before = directory_members(&root, end()).unwrap();
+        assert_eq!(before.len(), 48);
+        let observed_root = root.clone();
+        assert_eq!(
+            with_observer(
+                move |event, _| {
+                    if event == HandoffEvent::BeforeDirectoryReadback(observed_root.clone()) {
+                        Err(Reason::Deadline)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || directory_members(&root, end())
+            ),
+            Err(Reason::Deadline)
+        );
+        assert_eq!(directory_members(&root, end()).unwrap(), before);
+        #[cfg(unix)]
+        {
+            let link = root.join("alias");
+            std::os::unix::fs::symlink(root.join("item-00"), &link).unwrap();
+            assert_eq!(
+                directory_members(&root, end()),
+                Err(Reason::IdentityChanged)
+            );
+            fs::remove_file(link).unwrap();
+            let observed_root = root.clone();
+            let moved = root.with_file_name("moved-inventory");
+            let actual_moved = moved.clone();
+            assert_eq!(
+                with_observer(
+                    move |event, _| {
+                        if event == HandoffEvent::BeforeDirectoryReadback(observed_root.clone()) {
+                            fs::rename(&observed_root, &actual_moved).unwrap();
+                            assert!(platform::create_private_directory(&observed_root).unwrap());
+                        }
+                        Ok(())
+                    },
+                    || directory_members(&root, end())
+                ),
+                Err(Reason::IdentityChanged)
+            );
+            assert_eq!(directory_members(&moved, end()).unwrap(), before);
+        }
+        #[cfg(windows)]
+        {
+            let link = root.join("alias");
+            let target = root.with_file_name("outside-inventory");
+            assert!(platform::create_private_directory(&target).unwrap());
+            match std::os::windows::fs::symlink_dir(&target, &link) {
+                Ok(()) => {
+                    assert_eq!(
+                        directory_members(&root, end()),
+                        Err(Reason::IdentityChanged)
+                    );
+                    fs::remove_dir(link).unwrap();
+                }
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(1314), "{error}");
+                    assert!(!link.exists());
+                    assert_eq!(directory_members(&root, end()).unwrap(), before);
+                }
+            }
+        }
     }
     fn id(value: &str) -> ControlId {
         ControlId::parse(value).unwrap()
@@ -3630,6 +5142,14 @@ mod tests {
             before_fence: impl FnOnce(&SqliteControlStore, Instant),
         ) -> Self {
             let temp = agent_session_grep_testkit::tempdir().unwrap();
+            Self::with_temp(keep, before_fence, temp)
+        }
+
+        fn with_temp(
+            keep: bool,
+            before_fence: impl FnOnce(&SqliteControlStore, Instant),
+            temp: tempfile::TempDir,
+        ) -> Self {
             let base = temp.path().canonicalize().unwrap();
             let prefix = base.join("old-package");
             package(&prefix, true);
@@ -3947,6 +5467,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn archived_history_state_has_one_fresh_proof_read_per_observation() {
+        let fixture = Fixture::new(true);
+        assert_eq!(fixture.run().unwrap(), HandoffCheckpoint::NamespaceConsumed);
+        let roots = fixture.roots();
+        let intent = fixture.intent();
+        assert!(intent.sequence > 1);
+        let path = intent
+            .resolve(&roots, "uninstall/state-000001.json", end())
+            .unwrap();
+        let before = snapshot(&fixture);
+        let reads = HistoryReadObservation::start(path);
+        for count in 1..=2 {
+            let records = resolved_history(&roots, &intent, end()).unwrap();
+            assert!(records.state.owner == intent.owner);
+            assert_eq!(
+                reads.count(),
+                count,
+                "each observation must verify and parse the same archived state bytes once"
+            );
+        }
+        assert_eq!(snapshot(&fixture), before);
+    }
+
+    #[test]
+    fn archived_history_proof_rejects_changed_bytes_and_same_bytes_new_inode() {
+        let fixture = Fixture::new(true);
+        assert_eq!(fixture.run().unwrap(), HandoffCheckpoint::NamespaceConsumed);
+        let roots = fixture.roots();
+        let intent = fixture.intent();
+        let name = "uninstall/state-000001.json";
+        let path = intent.resolve(&roots, name, end()).unwrap();
+        let original = fs::read(&path).unwrap();
+        let original_identity = file_identity(&path);
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        fs::write(&path, changed).unwrap();
+        let mutated = snapshot(&fixture);
+        assert!(matches!(
+            resolved_history(&roots, &intent, end()),
+            Err(Reason::FileChanged)
+        ));
+        assert_eq!(snapshot(&fixture), mutated);
+
+        fs::write(&path, &original).unwrap();
+        let records = resolved_history(&roots, &intent, end()).unwrap();
+        assert_eq!(
+            archive_record(
+                &roots,
+                &intent,
+                name,
+                &records.seal.policy,
+                original.len() as u64 - 1,
+                end(),
+            ),
+            Err(Reason::UnclassifiedOwnedArtifact)
+        );
+        let moved = fixture.source.parent().unwrap().join("original-state");
+        fs::rename(&path, &moved).unwrap();
+        update_state::write_new(&path, &original).unwrap();
+        assert_ne!(file_identity(&path), original_identity);
+        assert_eq!(file_identity(&moved), original_identity);
+        let replaced = snapshot(&fixture);
+        assert!(matches!(
+            resolved_history(&roots, &intent, end()),
+            Err(Reason::FileChanged)
+        ));
+        assert_eq!(snapshot(&fixture), replaced);
+        assert_eq!(fs::read(&moved).unwrap(), original);
+    }
+
     fn adopted(prepared: KeepPreparation) -> KeepAdopted {
         match prepared.adopt() {
             Ok(adopted) => adopted,
@@ -4132,6 +5723,468 @@ mod tests {
             assert_eq!(snapshot(&fixture), before);
             contenders.assert_available_except(None);
         }
+    }
+
+    fn payload_owner(fixture: &Fixture) -> KeepAcknowledged {
+        match fixture
+            .incoming_handoff(end())
+            .and_then(IncomingHandoff::finish)
+        {
+            Ok(IncomingCompletion::KeepData(owner)) => *owner,
+            Ok(_) => panic!("payload continuation bypassed keep-data"),
+            Err(KeepHandoffError::Refused(reason)) => {
+                panic!("payload admission refused: {reason:?}")
+            }
+            Err(KeepHandoffError::Owned(error)) => panic!("payload owner refused: {error:?}"),
+        }
+    }
+
+    fn assert_payload_partial(fixture: &Fixture, owner: &mut KeepAcknowledged) {
+        owner.payload_pass().unwrap();
+        assert_eq!(
+            owner.owner.identity().installation.as_str(),
+            fixture.old_owner.installation_id
+        );
+        let view = owner.owner.acknowledgement_publication().unwrap();
+        let plan = view.retained.payload.borrow();
+        let plan = plan.as_ref().unwrap();
+        let observed = payload_snapshot(view.retained, plan, view.end).unwrap();
+        assert_eq!(
+            observed.boundary,
+            plan.directories.len() + plan.members.len()
+        );
+        assert!(observed.complete_stage == Some(ReinstallPreparationStage::Published));
+        for member in &plan.members {
+            let path = fixture.prefix.join(&member.relative);
+            assert_eq!(fs::metadata(&path).unwrap().len(), member.size);
+            assert_eq!(digest(&fs::read(path).unwrap()), member.sha256);
+        }
+        for absent in [
+            "current.json",
+            "package-install.json",
+            "uninstall/owner.json",
+        ] {
+            assert!(!fixture.prefix.join(absent).exists(), "{absent}");
+        }
+        assert!(!fixture.prefix.join("uninstall/helper/runner.exe").exists());
+        assert!(!fixture.prefix.join("uninstall/helper/runner").exists());
+        assert!(!fixture.prefix.join("uninstall/helper/tail.ps1").exists());
+    }
+
+    #[test]
+    fn keep_payload_real_ack_owner_publishes_fenced_members_and_recovers_without_replacement() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let before = snapshot_with_lock_bytes(&fixture, false);
+        contenders.assert_excluded();
+        publish_payload(&mut owner);
+        assert_payload_partial(&fixture, &mut owner);
+        assert_transfer_preserves_old_files(&fixture, &before);
+        contenders.assert_excluded();
+        let published = snapshot_with_lock_bytes(&fixture, false);
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+
+        let mut resumed = payload_owner(&fixture);
+        publish_payload(&mut resumed);
+        assert_payload_partial(&fixture, &mut resumed);
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), published);
+        contenders.assert_excluded();
+        drop(resumed.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_payload_pending_plan_entry_move_and_complete_resume_exact_prefix() {
+        for checkpoint in 0..4 {
+            let fixture = Fixture::new(true);
+            let contenders = NativeContenders::new(&fixture);
+            let mut owner = payload_owner(&fixture);
+            let (directories, total) = {
+                let view = owner.owner.acknowledgement_publication().unwrap();
+                let plan = payload_plan(
+                    view.retained,
+                    &owner.intent,
+                    &owner.prep,
+                    &owner.ack,
+                    (0, 0),
+                    view.end,
+                )
+                .unwrap();
+                (
+                    plan.directories.len(),
+                    plan.directories.len() + plan.members.len(),
+                )
+            };
+            let point = match checkpoint {
+                0 => Fault::PayloadPlanPending,
+                1 => Fault::PayloadEntry(directories),
+                2 => Fault::PayloadMoved(directories),
+                _ => Fault::PayloadCompletePending,
+            };
+            assert_eq!(
+                stop_at_consumed(point, || owner.publish_payloads()),
+                Err(Reason::Deadline)
+            );
+            {
+                let view = owner.owner.acknowledgement_publication().unwrap();
+                let plan = view.retained.payload.borrow();
+                let plan = plan.as_ref().unwrap();
+                let observed = payload_snapshot(view.retained, plan, view.end).unwrap();
+                match checkpoint {
+                    0 => {
+                        assert_eq!(observed.boundary, 0);
+                        assert!(observed.plan_stage == Some(ReinstallPreparationStage::Pending));
+                    }
+                    1 => {
+                        assert_eq!(observed.boundary, directories);
+                        assert!(observed.complete_stage.is_none());
+                    }
+                    2 => {
+                        assert_eq!(observed.boundary, directories + 1);
+                        assert!(observed.complete_stage.is_none());
+                    }
+                    _ => {
+                        assert_eq!(observed.boundary, total);
+                        assert!(
+                            observed.complete_stage == Some(ReinstallPreparationStage::Pending)
+                        );
+                    }
+                }
+            }
+            contenders.assert_excluded();
+            let interrupted = snapshot_with_lock_bytes(&fixture, false);
+            drop(owner.owner.close().unwrap().into_resources());
+            contenders.assert_available_except(None);
+            let mut resumed = payload_owner(&fixture);
+            publish_payload(&mut resumed);
+            assert_payload_partial(&fixture, &mut resumed);
+            let after = snapshot_with_lock_bytes(&fixture, false);
+            for (name, expected) in &interrupted {
+                if name.ends_with(".pending") || name.contains("/slot-") {
+                    continue;
+                }
+                assert_eq!(after.get(name), Some(expected), "{name}");
+            }
+            contenders.assert_excluded();
+            drop(resumed.owner.close().unwrap().into_resources());
+        }
+    }
+
+    #[test]
+    fn keep_payload_unbound_changed_and_both_layouts_refuse_before_reopen_or_copy() {
+        for conflict in 0..4 {
+            let fixture = Fixture::new(true);
+            let mut owner = payload_owner(&fixture);
+            publish_payload(&mut owner);
+            let (first, last) = {
+                let view = owner.owner.acknowledgement_publication().unwrap();
+                let plan = view.retained.payload.borrow();
+                let plan = plan.as_ref().unwrap();
+                (
+                    plan.members[0].relative.clone(),
+                    plan.members.last().unwrap().relative.clone(),
+                )
+            };
+            drop(owner.owner.close().unwrap().into_resources());
+            let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+            match conflict {
+                0 => {
+                    let bytes = fs::read(root.join("plan.json")).unwrap();
+                    update_state::write_new(&root.join("plan.pending"), &bytes).unwrap();
+                }
+                1 => {
+                    // Keep the old inode alive while placing identical bytes at
+                    // the same name: digest equality is insufficient ownership.
+                    let path = fixture.prefix.join(&first);
+                    let retained = fixture.source.parent().unwrap().join("retained-payload");
+                    fs::rename(&path, &retained).unwrap();
+                    fs::copy(&retained, &path).unwrap();
+                }
+                2 => {
+                    fs::remove_file(fixture.prefix.join(&last)).unwrap();
+                }
+                _ => {
+                    update_state::write_new(&root.join("unknown.json"), b"{}").unwrap();
+                }
+            }
+            let before = snapshot_with_lock_bytes(&fixture, false);
+            match fixture.incoming_handoff(end()) {
+                Err(KeepHandoffError::Refused(_)) => {}
+                Err(KeepHandoffError::Owned(_)) => panic!("bad payload layout reached SQLite"),
+                Ok(_) => panic!("bad payload layout admitted"),
+            }
+            assert_eq!(snapshot_with_lock_bytes(&fixture, false), before);
+            assert!(!fixture.prefix.join("current.json").exists());
+        }
+    }
+
+    #[test]
+    fn keep_payload_batch_revalidates_original_history_before_complete() {
+        let fixture = Rc::new(Fixture::new(true));
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let roots = fixture.roots();
+        let intent = fixture.intent();
+        let path = intent
+            .resolve(&roots, "uninstall/state-000001.json", end())
+            .unwrap();
+        let changed = path.clone();
+        let injected = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&injected);
+        let unchanged = Rc::new(RefCell::new(None));
+        let captured_unchanged = Rc::clone(&unchanged);
+        let captured_fixture = Rc::clone(&fixture);
+        let last = {
+            let view = owner.owner.acknowledgement_publication().unwrap();
+            let plan = payload_plan(
+                view.retained,
+                &intent,
+                &owner.prep,
+                &owner.ack,
+                (0, 0),
+                view.end,
+            )
+            .unwrap();
+            plan.directories.len() + plan.members.len() - 1
+        };
+        let result = with_observer(
+            move |event, _| {
+                if event == HandoffEvent::AfterPayloadMember(last) {
+                    let mut bytes = fs::read(&changed).unwrap();
+                    bytes[0] ^= 1;
+                    fs::write(&changed, bytes).unwrap();
+                    observed.set(true);
+                    *captured_unchanged.borrow_mut() =
+                        Some(snapshot_with_lock_bytes(&captured_fixture, false));
+                }
+                Ok(())
+            },
+            || owner.publish_payloads(),
+        );
+        assert!(injected.get());
+        assert_eq!(result, Err(Reason::FileChanged));
+        assert_eq!(
+            snapshot_with_lock_bytes(&fixture, false),
+            unchanged.borrow_mut().take().unwrap()
+        );
+        for name in [
+            ".asg-reinstall-payload/complete.pending",
+            ".asg-reinstall-payload/complete.json",
+            "current.json",
+            "package-install.json",
+        ] {
+            assert!(!fixture.prefix.join(name).exists(), "{name}");
+        }
+        contenders.assert_excluded();
+        let before = snapshot_with_lock_bytes(&fixture, false);
+        assert_eq!(owner.publish_payloads(), Err(Reason::FileChanged));
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), before);
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_payload_batch_interruption_stops_before_next_member() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&observed);
+        let at_expiry = Rc::new(RefCell::new(None));
+        let captured_expiry = Rc::clone(&at_expiry);
+        let result = with_observer(
+            move |event, actual_end| {
+                if let HandoffEvent::AfterPayloadMember(ordinal) = event {
+                    captured.borrow_mut().push(ordinal);
+                    *captured_expiry.borrow_mut() = Some(actual_end);
+                    // Inject interruption at the actual member boundary. This
+                    // proves no suffix effect, not elapsed-time enforcement.
+                    return Err(Reason::Deadline);
+                }
+                Ok(())
+            },
+            || owner.publish_payloads(),
+        );
+        assert_eq!(result, Err(Reason::Deadline));
+        assert_eq!(*observed.borrow(), [0]);
+        assert_eq!(*at_expiry.borrow(), Some(owner.end));
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        assert!(root.join("entry-000000.json").is_file());
+        assert!(!root.join("entry-000001.pending").exists());
+        assert!(!root.join("entry-000001.json").exists());
+        assert!(!root.join("complete.json").exists());
+        contenders.assert_excluded();
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    #[test]
+    fn keep_payload_batch_expired_boundary_starts_no_next_member() {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PAYLOAD_BATCH_EXPIRY.with(|request| request.set(self.0));
+            }
+        }
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let _restore = Restore(PAYLOAD_BATCH_EXPIRY.with(|request| request.replace(true)));
+        // Shorten only the local batch end at a real post-member boundary.
+        // The real next deadline check must refuse; the adapter owner retains
+        // its unmodified end for explicit test cleanup. This is a deterministic
+        // deadline-boundary test, not a measured wall-clock acceptance result.
+        assert_eq!(owner.publish_payloads(), Err(Reason::Deadline));
+        assert!(!PAYLOAD_BATCH_EXPIRY.with(Cell::get));
+        let root = fixture.prefix.join(PAYLOAD_DIRECTORY);
+        assert!(root.join("entry-000000.json").is_file());
+        assert!(!root.join("entry-000001.pending").exists());
+        assert!(!root.join("entry-000001.json").exists());
+        assert!(!root.join("complete.json").exists());
+        contenders.assert_excluded();
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
+    }
+
+    const PAYLOAD_CHILD_ROOT: &str = "asg-payload-child-root=";
+
+    #[test]
+    fn keep_payload_batch_changed_control_child() {
+        let args: Vec<_> = std::env::args_os().collect();
+        let Some(base) = args.windows(2).find_map(|pair| {
+            (pair[0] == "--skip")
+                .then(|| pair[1].to_str()?.strip_prefix(PAYLOAD_CHILD_ROOT))
+                .flatten()
+        }) else {
+            return;
+        };
+        let temp = tempfile::Builder::new().tempdir_in(base).unwrap();
+        let fixture = Rc::new(Fixture::with_temp(true, |_, _| {}, temp));
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let intent = fixture.intent();
+        let last = {
+            let view = owner.owner.acknowledgement_publication().unwrap();
+            let plan = payload_plan(
+                view.retained,
+                &intent,
+                &owner.prep,
+                &owner.ack,
+                (0, 0),
+                view.end,
+            )
+            .unwrap();
+            plan.directories.len() + plan.members.len() - 1
+        };
+        // An uncooperative writer deliberately ignores ASG's owned guards.
+        // Keep its SQLite connection alive so the test does not checkpoint on
+        // close; final admission must reject the changed WAL/logical image.
+        let actor = rusqlite::Connection::open(SqliteControlStore::path(&fixture.data)).unwrap();
+        actor
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+        let actor = Rc::new(actor);
+        let changed = Rc::clone(&actor);
+        let changed_fixture = Rc::clone(&fixture);
+        let snapshot_after = Rc::new(RefCell::new(None));
+        let captured = Rc::clone(&snapshot_after);
+        let result = with_observer(
+            move |event, _| {
+                if event == HandoffEvent::AfterPayloadMember(last) {
+                    assert_eq!(
+                        changed
+                            .execute(
+                                "UPDATE control_meta SET desired_updates='running' WHERE singleton=1",
+                                [],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                    *captured.borrow_mut() =
+                        Some(snapshot_with_lock_bytes(&changed_fixture, false));
+                }
+                Ok(())
+            },
+            || owner.publish_payloads(),
+        );
+        assert_eq!(result, Err(Reason::IdentityChanged));
+        let changed = snapshot_after.borrow_mut().take().unwrap();
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), changed);
+        for name in [
+            ".asg-reinstall-payload/complete.pending",
+            ".asg-reinstall-payload/complete.json",
+            "current.json",
+            "package-install.json",
+        ] {
+            assert!(!fixture.prefix.join(name).exists(), "{name}");
+        }
+        contenders.assert_excluded();
+        assert_eq!(owner.publish_payloads(), Err(Reason::IdentityChanged));
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), changed);
+        // The failed owner and actor remain retained until this actual exit.
+        // The parent owns the directory and verifies exit/pipe cleanup first.
+        let mut output = std::io::stdout().lock();
+        output
+            .write_all(b"asg-payload-changed-control-refused\n")
+            .unwrap();
+        output.flush().unwrap();
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn keep_payload_batch_rejects_changed_control_before_complete() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let image = std::env::current_exe().unwrap();
+        let _pin = package_installation::pinned(&image).unwrap();
+        let root = format!("{PAYLOAD_CHILD_ROOT}{}", temp.path().display());
+        let args = [
+            OsStr::new("--exact"),
+            OsStr::new(
+                "uninstall_command::managed_uninstall_cleanup::managed_reinstall_handoff::tests::keep_payload_batch_changed_control_child",
+            ),
+            OsStr::new("--nocapture"),
+            OsStr::new("--test-threads=1"),
+            OsStr::new("--skip"),
+            OsStr::new(&root),
+        ];
+        let result =
+            setup_hosts::capture_local(&image, &args, Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        assert!(
+            result.success,
+            "isolated control mutation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout)
+                .matches("asg-payload-changed-control-refused")
+                .count(),
+            1,
+            "the exact isolated refusal branch must execute"
+        );
+    }
+
+    #[test]
+    fn keep_payload_expired_entry_preserves_ack_and_starts_no_payload_effect() {
+        let fixture = Fixture::new(true);
+        let contenders = NativeContenders::new(&fixture);
+        let mut owner = payload_owner(&fixture);
+        let before = snapshot_with_lock_bytes(&fixture, false);
+        // Shorten only the caller's end; the healthy retained owner can still
+        // close explicitly for fixture cleanup. No SQL entry is needed.
+        owner.end = Instant::now() - Duration::from_millis(1);
+        assert_eq!(owner.publish_payloads(), Err(Reason::Deadline));
+        assert_eq!(snapshot_with_lock_bytes(&fixture, false), before);
+        assert!(!fixture.prefix.join(PAYLOAD_DIRECTORY).exists());
+        contenders.assert_excluded();
+        drop(owner.owner.close().unwrap().into_resources());
+        contenders.assert_available_except(None);
     }
 
     #[test]
@@ -4454,6 +6507,17 @@ mod tests {
         let value = operation();
         drop(restore);
         value
+    }
+
+    fn stop_at_consumed<T>(point: Fault, operation: impl FnOnce() -> T) -> T {
+        stop_at(point, || {
+            let value = operation();
+            assert!(
+                INTERRUPT.with(|slot| slot.get().is_none()),
+                "payload fault was not reached"
+            );
+            value
+        })
     }
 
     fn with_observer<T>(

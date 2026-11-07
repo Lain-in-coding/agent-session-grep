@@ -1878,6 +1878,18 @@ fn owned_file_with_overlap(
     overlaps: &impl Fn(&Path) -> Result<bool, Reason>,
     end: Instant,
 ) -> Result<OwnedFile, Reason> {
+    owned_file_chunks(base, relative, overlaps, end, |_| Ok(()))
+}
+
+/// A bounded consumer may use the exact chunks already read for this proof.
+/// No bytes become verified until the complete file and identity checks pass.
+fn owned_file_chunks(
+    base: &Path,
+    relative: &str,
+    overlaps: &impl Fn(&Path) -> Result<bool, Reason>,
+    end: Instant,
+    mut visit: impl FnMut(&[u8]) -> Result<(), Reason>,
+) -> Result<OwnedFile, Reason> {
     time(end)?;
     if !package_installation::safe_member(relative) {
         return Err(Reason::IdentityChanged);
@@ -1931,6 +1943,7 @@ fn owned_file_with_overlap(
             return Err(Reason::UnclassifiedOwnedArtifact);
         }
         digest.update(&bytes[..count]);
+        visit(&bytes[..count])?;
     }
     if size != metadata.len()
         || file.metadata().map_err(|_| Reason::FileChanged)?.len() != metadata.len()
