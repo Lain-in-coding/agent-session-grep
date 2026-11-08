@@ -561,21 +561,40 @@ impl<R: 'static> Bundle<R> {
         self.close_control()
     }
 
-    fn commit_final(&mut self) -> PortResult<ReinstallTerminalCommit> {
+    fn commit_final(
+        &mut self,
+        validate: impl for<'a> FnOnce(
+            ReinstallPublication<'a, R>,
+            ReinstallTerminalMatch,
+        ) -> PortResult<()>,
+    ) -> PortResult<ReinstallTerminalCommit> {
         let (_, matched) = self.read_final_control()?;
         if matched == ReinstallTerminalMatch::Final {
+            validate(self.publication(), matched)?;
             return Ok(ReinstallTerminalCommit::AlreadyCommitted);
         }
         if self.catalog.is_none() {
             return Err(invalid());
         }
         self.require_final_publication(true)?;
+        #[cfg(test)]
+        super::tests::after_final_validation_boundary(
+            super::tests::FinalValidationBoundary::Durable,
+        );
         if !self.store()?.writable {
             self.close_control()?;
             self.open_control(true)?;
+            #[cfg(test)]
+            super::tests::after_final_validation_boundary(
+                super::tests::FinalValidationBoundary::ControlReopened,
+            );
         }
-        self.read_final_control()?;
+        let (_, matched) = self.read_final_control()?;
         self.require_final_publication(false)?;
+        // The caller revalidates generic retained resources after every
+        // durability/reopen boundary, inside the same pessimistic owned scope.
+        // The borrow cannot escape or replace the terminal SQL comparison.
+        validate(self.publication(), matched)?;
         let store = self.store()?;
         let owner = store.bind_control_root(&self.input.guards.policy_owner)?;
         let installation = self.installation();
@@ -637,18 +656,77 @@ impl<R: 'static> ReinstallFinalOwner<R> {
     }
 
     pub fn readback(
-        mut self,
+        self,
     ) -> Result<(Self, ReinstallTerminalMatch), Box<ReinstallConnectionError<R>>> {
-        match self.owned.scoped(Bundle::read_final_control) {
-            Ok((_, matched)) => Ok((self, matched)),
+        self.readback_with(|_, _| Ok(()))
+    }
+
+    /// Recheck caller-owned domain evidence after the complete terminal
+    /// comparison, with the original guards and effective end still borrowed.
+    /// Refusal or unwind permanently retains the complete failed owner.
+    pub fn readback_verified(
+        self,
+        validate: impl for<'a> FnOnce(
+            ReinstallPublication<'a, R>,
+            ReinstallTerminalMatch,
+        ) -> PortResult<()>,
+    ) -> Result<(Self, ReinstallTerminalMatch), Box<ReinstallConnectionError<R>>> {
+        self.readback_with(|publication, matched| {
+            let end = publication.end;
+            validate(publication, matched)?;
+            preparation_tick(end)
+        })
+    }
+
+    fn readback_with(
+        mut self,
+        validate: impl for<'a> FnOnce(
+            ReinstallPublication<'a, R>,
+            ReinstallTerminalMatch,
+        ) -> PortResult<()>,
+    ) -> Result<(Self, ReinstallTerminalMatch), Box<ReinstallConnectionError<R>>> {
+        match self.owned.scoped(|bundle| {
+            let (_, matched) = bundle.read_final_control()?;
+            validate(bundle.publication(), matched)?;
+            Ok(matched)
+        }) {
+            Ok(matched) => Ok((self, matched)),
             Err(error) => Err(self.owned.failed(error)),
         }
     }
 
     pub fn commit(
-        mut self,
+        self,
     ) -> Result<(Self, ReinstallTerminalCommit), Box<ReinstallConnectionError<R>>> {
-        match self.owned.scoped(Bundle::commit_final) {
+        self.commit_with(|_, _| Ok(()))
+    }
+
+    /// Validate generic retained domains immediately before the terminal SQL
+    /// call, or before acknowledging an already committed image. The callback
+    /// runs once inside the owned deadline scope and never after COMMIT.
+    /// This storage bridge alone does not authorize ordinary installer success.
+    pub fn commit_verified(
+        self,
+        validate: impl for<'a> FnOnce(
+            ReinstallPublication<'a, R>,
+            ReinstallTerminalMatch,
+        ) -> PortResult<()>,
+    ) -> Result<(Self, ReinstallTerminalCommit), Box<ReinstallConnectionError<R>>> {
+        self.commit_with(|publication, matched| {
+            let end = publication.end;
+            validate(publication, matched)?;
+            preparation_tick(end)
+        })
+    }
+
+    fn commit_with(
+        mut self,
+        validate: impl for<'a> FnOnce(
+            ReinstallPublication<'a, R>,
+            ReinstallTerminalMatch,
+        ) -> PortResult<()>,
+    ) -> Result<(Self, ReinstallTerminalCommit), Box<ReinstallConnectionError<R>>> {
+        match self.owned.scoped(|bundle| bundle.commit_final(validate)) {
             Ok(committed) => Ok((self, committed)),
             Err(error) => Err(self.owned.failed(error)),
         }

@@ -245,6 +245,23 @@ pub struct ReinstallPublication<'a, R: 'static> {
     pub retained: &'a R,
     pub guards: ReinstallInspectionGuards<'a>,
     pub end: Instant,
+    published_preparation: Option<&'a PublishedPreparation>,
+}
+
+impl<R: 'static> ReinstallPublication<'_, R> {
+    /// Original held comparison bindings from this publication's preparation
+    /// proof. This performs no IO and grants neither file nor SQL authority.
+    /// ACK ownership remains with the caller; paths and unknown names are absent.
+    pub fn recorded_file(&self, name: &str) -> Option<&ReinstallFileBinding> {
+        let index = match name {
+            "intent.json" => 0,
+            "ready.json" => 1,
+            "consumed.json" => 2,
+            PREPARATION_FILE => 3,
+            _ => return None,
+        };
+        Some(&self.published_preparation?.records[index].binding)
+    }
 }
 
 /// Comparison mode, not publication authority. The private coordinator verifies
@@ -918,7 +935,9 @@ impl<R: 'static> Bundle<R> {
         self.tick()
     }
 
-    fn require_published_preparation(&mut self) -> PortResult<()> {
+    /// Capture original comparison pins once. Retaining an existing slot never
+    /// refreshes its identity or substitutes for validation before an effect.
+    fn retain_published_preparation(&mut self) -> PortResult<()> {
         self.tick()?;
         let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
         if prepared.stage != ReinstallPreparationStage::Published {
@@ -936,6 +955,12 @@ impl<R: 'static> Bundle<R> {
                 self.end,
             )?);
         }
+        self.tick()
+    }
+
+    fn require_published_preparation(&mut self) -> PortResult<()> {
+        self.retain_published_preparation()?;
+        let prepared = self.preparation.as_ref().ok_or_else(invalid)?;
         self.published_preparation
             .as_mut()
             .ok_or_else(invalid)?
@@ -1274,6 +1299,7 @@ impl<R: 'static> Bundle<R> {
                 },
             },
             end: self.end,
+            published_preparation: self.published_preparation.as_ref(),
         }
     }
 
@@ -1486,7 +1512,13 @@ impl<R: 'static> ReinstallControlOwner<R> {
             stage: ReinstallPreparationStage::Published,
         });
         owned.bundle_mut().acknowledgement = Some(ack);
-        match owned.scoped(|bundle| bundle.open_control(false)) {
+        match owned.scoped(|bundle| {
+            bundle.open_control(false)?;
+            // CLI recovery inspects ACK evidence before calling adopt_prepared.
+            // Keep original comparison pins available for that first view;
+            // the later adoption boundary still performs durability work.
+            bundle.retain_published_preparation()
+        }) {
             Ok(()) => Ok(Self { owned }),
             Err(error) => Err(owned.failed(error)),
         }
@@ -2540,6 +2572,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum FinalValidationBoundary {
+        Durable,
+        ControlReopened,
+    }
+
+    type FinalValidationHook = Box<dyn FnMut(FinalValidationBoundary)>;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum PreparationSync {
         Record(&'static str),
         #[cfg(unix)]
@@ -2609,6 +2649,9 @@ mod tests {
         static FAIL_AFTER_FINAL_COMMIT: Cell<bool> = const { Cell::new(false) };
         static PANIC_FINAL_PUBLICATION: Cell<bool> = const { Cell::new(false) };
         static FINAL_COMMITS: Cell<usize> = const { Cell::new(0) };
+        static FINAL_VALIDATION_HOOK: RefCell<Option<FinalValidationHook>> = const { RefCell::new(None) };
+        static FINAL_DURABLES: Cell<usize> = const { Cell::new(0) };
+        static FINAL_REOPENS: Cell<usize> = const { Cell::new(0) };
         static ADOPTION_COMMITS: Cell<usize> = const { Cell::new(0) };
         static WRITABLE_CONTROL_OPENS: Cell<usize> = const { Cell::new(0) };
         static COMMITMENT_COMPARISONS: Cell<usize> = const { Cell::new(0) };
@@ -2711,6 +2754,37 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn after_final_validation_boundary(point: FinalValidationBoundary) {
+        match point {
+            FinalValidationBoundary::Durable => {
+                FINAL_DURABLES.with(|count| count.set(count.get() + 1))
+            }
+            FinalValidationBoundary::ControlReopened => {
+                FINAL_REOPENS.with(|count| count.set(count.get() + 1))
+            }
+        }
+        FINAL_VALIDATION_HOOK.with_borrow_mut(|slot| {
+            if let Some(hook) = slot.as_mut() {
+                hook(point);
+            }
+        });
+    }
+
+    fn with_final_validation_hook<T>(
+        hook: impl FnMut(FinalValidationBoundary) + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<FinalValidationHook>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FINAL_VALIDATION_HOOK.with_borrow_mut(|slot| *slot = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(FINAL_VALIDATION_HOOK.with_borrow_mut(|slot| slot.replace(Box::new(hook))));
+        run()
     }
 
     pub(super) fn before_final_publication_return() {
@@ -3415,6 +3489,97 @@ mod tests {
         contenders(temp.path(), false);
     }
 
+    #[test]
+    fn reinstall_publication_recorded_files_are_available_before_ack_recovery_adoption() {
+        for pending in [false, true] {
+            check_ack_recovery_original_bindings(pending);
+        }
+    }
+
+    fn check_ack_recovery_original_bindings(pending: bool) {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let root = input.root.clone();
+        let sidecar = input.prefix.join(PREPARATION_DIRECTORY);
+        let until = Instant::now() + Duration::from_secs(30);
+        let (mut catalog, prep, ack) = acknowledged_fixture(input, until);
+        let names = [
+            "intent.json",
+            "ready.json",
+            "consumed.json",
+            PREPARATION_FILE,
+        ];
+        let bindings = {
+            let view = catalog.acknowledgement_publication().unwrap();
+            names.map(|name| view.recorded_file(name).unwrap().clone())
+        };
+        let before = durable_snapshot(&root);
+        let commits = ADOPTION_COMMITS.with(Cell::get);
+        let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        let ReinstallClosedResources {
+            input,
+            control_handles,
+            _observed,
+        } = catalog.close().unwrap().into_resources();
+        drop(control_handles);
+        if pending {
+            fs::rename(
+                sidecar.join("keep-transfer-ack.json"),
+                sidecar.join("keep-transfer-ack.pending"),
+            )
+            .unwrap();
+        }
+        let recovered =
+            ReinstallControlOwner::open_acknowledged_read_only(input, prep.clone(), ack, until)
+                .unwrap();
+        let (mut recovered, matched) = recovered
+            .compare_preparation(&prep, ReinstallPreparationStage::Published)
+            .unwrap();
+        assert_eq!(matched, ReinstallImageMatch::After);
+        let mut addresses = None;
+        for _ in 0..2 {
+            let view = recovered.preparation_publication().unwrap();
+            assert_eq!(view.end, until);
+            let current = names.map(|name| {
+                view.recorded_file(name)
+                    .unwrap_or_else(|| panic!("recovery view omitted original binding: {name}"))
+            });
+            for (recorded, expected) in current.into_iter().zip(&bindings) {
+                assert!(recorded == expected);
+            }
+            let current_addresses = current.map(std::ptr::from_ref);
+            if let Some(expected) = addresses {
+                assert_eq!(current_addresses, expected);
+            }
+            addresses = Some(current_addresses);
+        }
+        assert!(
+            !recovered
+                .owned
+                .bundle()
+                .published_preparation
+                .as_ref()
+                .unwrap()
+                .durability_confirmed,
+            "read-only recovery must not perform preparation durability work"
+        );
+        let mut recovered = recovered.adopt_prepared().unwrap();
+        let view = recovered.preparation_publication().unwrap();
+        assert_eq!(
+            names.map(|name| std::ptr::from_ref(view.recorded_file(name).unwrap())),
+            addresses.unwrap(),
+            "adoption must validate the original recovery pins without replacing them"
+        );
+        assert_eq!(ADOPTION_COMMITS.with(Cell::get), commits);
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+        assert_eq!(durable_snapshot(&root), before);
+        drop(recovered.close().unwrap().into_resources());
+        drop(_observed);
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        contenders(temp.path(), false);
+    }
+
     fn acknowledged_fixture(
         input: ReinstallOwnedInput<Retained>,
         until: Instant,
@@ -3531,6 +3696,189 @@ mod tests {
                 activation,
             },
         )
+    }
+
+    fn retained_image_binding(retained: &Retained) -> ReinstallFileBinding {
+        // The incoming executable is an ordinary retained input, not a private
+        // data file. Observe its original handle without applying data ACLs.
+        let mut image = &retained._image;
+        let identity = reinstall_file_identity(image).unwrap();
+        image.rewind().unwrap();
+        let mut bytes = Vec::new();
+        image.read_to_end(&mut bytes).unwrap();
+        let binding = ReinstallFileBinding {
+            identity,
+            size: bytes.len() as u64,
+            sha256: ReinstallDigest::of_bytes(&bytes),
+        };
+        validate_retained_image(retained, &binding).unwrap();
+        binding
+    }
+
+    fn validate_retained_image(
+        retained: &Retained,
+        expected: &ReinstallFileBinding,
+    ) -> PortResult<()> {
+        let mut image = &retained._image;
+        if reinstall_file_identity(image)? != expected.identity {
+            return Err(conflict());
+        }
+        image.rewind().map_err(io_error)?;
+        let mut bytes = Vec::new();
+        image.read_to_end(&mut bytes).map_err(io_error)?;
+        if reinstall_file_identity(image)? != expected.identity
+            || bytes.len() as u64 != expected.size
+            || ReinstallDigest::of_bytes(&bytes) != expected.sha256
+        {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+
+    fn reopen_final_fixture(
+        owner: ReinstallFinalOwner<Retained>,
+        records: &ReinstallFinalRecords,
+        end: Instant,
+    ) -> (ReinstallFinalOwner<Retained>, ClosedPins) {
+        let ReinstallClosedResources {
+            input,
+            control_handles,
+            _observed,
+        } = owner.close().unwrap().into_resources();
+        drop(control_handles);
+        let owner = ReinstallFinalOwner::open_read_only(input, records.clone(), end).unwrap();
+        assert!(!owner.owned.bundle().store().unwrap().writable);
+        (owner, _observed)
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_callbacks_keep_original_guards_end_and_once_order() {
+        let temp = agent_session_grep_testkit::tempdir().unwrap();
+        let input = fixture(temp.path(), false, true);
+        let root = input.root.clone();
+        let prefix = input.prefix.clone();
+        let image = retained_image_binding(&input.retained);
+        let end = Instant::now() + Duration::from_secs(30);
+        let (catalog, prep, ack) = acknowledged_fixture(input, end);
+        let (catalog, records) = final_fixture(catalog, prep, ack);
+        let owner = catalog
+            .into_final_owner(records.terminal.clone(), records.activation.clone())
+            .unwrap();
+        let input = &owner.owned.bundle().input;
+        let retained = &input.retained as *const Retained;
+        let guard_addresses = [
+            &input.guards.prefix,
+            &input.guards.policy_owner,
+            &input.guards.emission,
+            &input.guards.supervisor,
+            &input.guards.background,
+            &input.guards.purge,
+            &input.guards.history_readers,
+            &input.guards.catalog_handles,
+        ]
+        .map(std::ptr::from_ref);
+        let writer = std::ptr::from_ref(&input.guards.writer);
+        let data_identity = input.guards.policy_owner.root_identity();
+        let prefix_identity = input.guards.prefix.root_identity();
+        let effective_end = end - Duration::from_millis(1);
+        let calls = Cell::new(0);
+        let check = |view: ReinstallPublication<'_, Retained>| {
+            calls.set(calls.get() + 1);
+            assert!(std::ptr::eq(view.retained, retained));
+            assert_eq!(view.end, effective_end);
+            assert_eq!(runtime_deadline(), Some(effective_end));
+            let guards = [
+                view.guards.prefix,
+                view.guards.policy_owner,
+                view.guards.emission,
+                view.guards.supervisor,
+                view.guards.background,
+                view.guards.purge,
+                view.guards.history_readers,
+                view.guards.catalog_handles,
+            ];
+            for (index, (guard, original)) in guards.into_iter().zip(guard_addresses).enumerate() {
+                assert!(std::ptr::eq(guard, original));
+                let (path, identity) = if index == 0 {
+                    (&prefix, prefix_identity)
+                } else {
+                    (&root, data_identity)
+                };
+                assert_eq!(guard.root_identity(), identity);
+                guard.validate_current(path).unwrap();
+            }
+            assert!(std::ptr::eq(&*view.guards.writer.lease, writer));
+            view.guards.writer.validate_current(&root).unwrap();
+            validate_retained_image(view.retained, &image).unwrap();
+        };
+        let commits = FINAL_COMMITS.with(Cell::get);
+        let before = durable_snapshot(&root);
+        let outer =
+            RuntimeDeadlineScope::enter_with_busy(effective_end, Duration::from_millis(7)).unwrap();
+        let (owner, matched) = owner
+            .readback_verified(|view, matched| {
+                assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                assert_eq!(
+                    RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                    Duration::from_millis(7)
+                );
+                assert_eq!(FINAL_COMMITS.with(Cell::get), commits);
+                check(view);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(durable_snapshot(&root), before);
+        drop(outer);
+        assert_eq!(runtime_deadline(), None);
+        assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+        let (owner, committed) = owner
+            .commit_verified(|view, matched| {
+                assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                assert_eq!(FINAL_COMMITS.with(Cell::get), commits);
+                check(view);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(committed, ReinstallTerminalCommit::Committed);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(FINAL_COMMITS.with(Cell::get), commits + 1);
+        let (owner, matched) = owner.readback().unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        let committed_bytes = durable_snapshot(&root);
+        let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+        let durables = FINAL_DURABLES.with(Cell::get);
+        let reopens = FINAL_REOPENS.with(Cell::get);
+        let (owner, matched) = owner
+            .readback_verified(|view, matched| {
+                assert_eq!(matched, ReinstallTerminalMatch::Final);
+                check(view);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(matched, ReinstallTerminalMatch::Final);
+        assert_eq!(calls.get(), 3);
+        let (owner, committed) = owner
+            .commit_verified(|view, matched| {
+                assert_eq!(matched, ReinstallTerminalMatch::Final);
+                assert_eq!(FINAL_COMMITS.with(Cell::get), commits + 1);
+                check(view);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(committed, ReinstallTerminalCommit::AlreadyCommitted);
+        assert_eq!(calls.get(), 4);
+        assert_eq!(FINAL_COMMITS.with(Cell::get), commits + 1);
+        assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+        assert_eq!(FINAL_DURABLES.with(Cell::get), durables);
+        assert_eq!(FINAL_REOPENS.with(Cell::get), reopens);
+        assert_eq!(durable_snapshot(&root), committed_bytes);
+        assert_eq!(runtime_deadline(), None);
+        let resources = owner.close().unwrap().into_resources();
+        contenders(temp.path(), true);
+        drop(resources);
+        contenders(temp.path(), false);
     }
 
     #[test]
@@ -3713,6 +4061,154 @@ mod tests {
         let root = input.root.clone();
         let prefix = input.prefix.clone();
         let (catalog, prep, ack) = acknowledged_fixture(input, until);
+        if mode == "final-ack-proof-missing" {
+            let ReinstallClosedResources {
+                input,
+                control_handles,
+                _observed,
+            } = catalog.close().unwrap().into_resources();
+            drop(control_handles);
+            drop(_observed);
+            let path = prefix.join(PREPARATION_DIRECTORY).join(PREPARATION_FILE);
+            fs::remove_file(&path).unwrap();
+            let before = durable_snapshot(&root);
+            let writable = WRITABLE_CONTROL_OPENS.with(Cell::get);
+            let adoptions = ADOPTION_COMMITS.with(Cell::get);
+            let final_commits = FINAL_COMMITS.with(Cell::get);
+            let syncs = PREPARATION_SYNCS.with_borrow(Vec::len);
+            let error =
+                match ReinstallControlOwner::open_acknowledged_read_only(input, prep, ack, until) {
+                    Ok(_) => panic!("ACK recovery admitted a missing original preparation"),
+                    Err(error) => error,
+                };
+            assert!(matches!(error.error(), PortError::InvalidRequest(_)));
+            assert!(!error.owned.bundle().store().unwrap().writable);
+            assert!(error.requires_process_exit());
+            assert!(!error.close_attempted());
+            assert!(!error.owned.bundle().adoption_attempted);
+            assert_eq!(error.owned.bundle().end, until);
+            assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), writable);
+            assert_eq!(ADOPTION_COMMITS.with(Cell::get), adoptions);
+            assert_eq!(FINAL_COMMITS.with(Cell::get), final_commits);
+            assert_eq!(PREPARATION_SYNCS.with_borrow(Vec::len), syncs);
+            assert_eq!(durable_snapshot(&root), before);
+            assert!(!path.exists());
+            drop(error);
+            assert!(!base.join("retained-dropped").exists());
+            assert_eq!(runtime_deadline(), None);
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+            signal("unconfirmed-and-retained");
+            requests.receive();
+            requests.finish();
+            std::process::exit(23);
+        }
+        if mode == "final-recorded-preparation-replacement" {
+            let before = durable_snapshot(&root);
+            let mut catalog = catalog;
+            let names = [
+                "intent.json",
+                "ready.json",
+                "consumed.json",
+                PREPARATION_FILE,
+            ];
+            let sidecar = prefix.join(PREPARATION_DIRECTORY);
+            let original = catalog
+                .owned
+                .bundle()
+                .published_preparation
+                .as_ref()
+                .unwrap();
+            let bindings: [_; 4] = std::array::from_fn(|index| {
+                let pin = &original.records[index];
+                let bytes = fs::read(sidecar.join(names[index])).unwrap();
+                assert_eq!(
+                    reinstall_file_identity(&pin.file).unwrap(),
+                    pin.binding.identity
+                );
+                assert_eq!(bytes.len() as u64, pin.binding.size);
+                assert!(ReinstallDigest::of_bytes(&bytes) == pin.binding.sha256);
+                (pin.binding.clone(), std::ptr::from_ref(&pin.binding))
+            });
+            let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+            for _ in 0..2 {
+                let view = catalog.acknowledgement_publication().unwrap();
+                assert_eq!(view.end, until);
+                for (name, (expected, address)) in names.iter().zip(&bindings) {
+                    let recorded = view.recorded_file(name).unwrap();
+                    assert!(recorded == expected);
+                    assert!(std::ptr::eq(recorded, *address));
+                }
+                for name in [
+                    "keep-transfer-ack.pending",
+                    "keep-transfer-ack.json",
+                    "../intent.json",
+                    ".asg-reinstall/intent.json",
+                    "INTENT.JSON",
+                    "",
+                ] {
+                    assert!(view.recorded_file(name).is_none());
+                }
+            }
+            let path = sidecar.join("intent.json");
+            let displaced = base.join("displaced-original-preparation");
+            #[cfg(unix)]
+            {
+                let bytes = fs::read(&path).unwrap();
+                fs::rename(&path, &displaced).unwrap();
+                write_preparation_fixture_record(&path, &bytes);
+                assert_ne!(binding(&path).1.identity, bindings[0].0.identity);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                // This view exports comparison data, not current filesystem
+                // authority. The CLI consumer rejects the replacement before
+                // its effect; repeated views must never adopt the new inode.
+                for _ in 0..2 {
+                    let view = catalog.acknowledgement_publication().unwrap();
+                    for (name, (expected, address)) in names.iter().zip(&bindings) {
+                        let recorded = view.recorded_file(name).unwrap();
+                        assert!(recorded == expected);
+                        assert!(std::ptr::eq(recorded, *address));
+                    }
+                }
+                let pin = &catalog
+                    .owned
+                    .bundle()
+                    .published_preparation
+                    .as_ref()
+                    .unwrap()
+                    .records[0];
+                assert!(pin.binding == bindings[0].0);
+                assert!(std::ptr::eq(&pin.binding, bindings[0].1));
+                assert_eq!(
+                    reinstall_file_identity(&pin.file).unwrap(),
+                    bindings[0].0.identity
+                );
+            }
+            #[cfg(windows)]
+            {
+                let error = fs::rename(&path, &displaced).unwrap_err();
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+                assert!(!displaced.exists());
+                assert_eq!(binding(&path).1.identity, bindings[0].0.identity);
+                let view = catalog.acknowledgement_publication().unwrap();
+                assert!(std::ptr::eq(
+                    view.recorded_file("intent.json").unwrap(),
+                    bindings[0].1
+                ));
+            }
+            assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+            assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+            assert_eq!(durable_snapshot(&root), before);
+            // The existing child harness proves exclusion until actual exit,
+            // including Unix replacement without repairing or refreshing a pin.
+            drop(catalog);
+            assert!(!base.join("retained-dropped").exists());
+            assert_eq!(runtime_deadline(), None);
+            assert_eq!(RUNTIME_BUSY_ALLOWANCE.with(Cell::get), BUSY_TIMEOUT);
+            signal("unconfirmed-and-retained");
+            requests.receive();
+            requests.finish();
+            std::process::exit(23);
+        }
         let (catalog, records) = final_fixture(catalog, prep, ack);
         let before = durable_snapshot(&root);
         if matches!(mode, "final-replaced-pointer" | "final-replaced-intent") {
@@ -3775,6 +4271,9 @@ mod tests {
                 .into_final_owner(records.terminal.clone(), records.activation.clone())
                 .unwrap();
             match mode {
+                mode if mode.starts_with("final-verified-") => {
+                    verified_final_child(mode, base, owner, &records, &before, until);
+                }
                 "final-replaced-pending-ack" => {
                     let (owner, _) = owner.commit().unwrap();
                     let path = prefix.join(".asg-reinstall/activation/ack.pending");
@@ -3983,6 +4482,229 @@ mod tests {
         requests.receive();
         requests.finish();
         std::process::exit(23);
+    }
+
+    fn verified_final_child(
+        mode: &str,
+        base: &Path,
+        owner: ReinstallFinalOwner<Retained>,
+        records: &ReinstallFinalRecords,
+        before: &BTreeMap<String, Vec<u8>>,
+        until: Instant,
+    ) {
+        let root = base.join("data");
+        let image_path = base.join("incoming-image");
+        let image = retained_image_binding(&owner.owned.bundle().input.retained);
+        let calls = Cell::new(0);
+        match mode {
+            "final-verified-durable-mutation" | "final-verified-reopen-mutation" => {
+                let point = if mode == "final-verified-durable-mutation" {
+                    FinalValidationBoundary::Durable
+                } else {
+                    FinalValidationBoundary::ControlReopened
+                };
+                let (owner, previous_pins) = if point == FinalValidationBoundary::ControlReopened {
+                    let (owner, pins) = reopen_final_fixture(owner, records, until);
+                    (owner, Some(pins))
+                } else {
+                    (owner, None)
+                };
+                let identity = image.identity;
+                let size = image.size;
+                let hits = Arc::new(AtomicUsize::new(0));
+                let observed = hits.clone();
+                let durables = FINAL_DURABLES.with(Cell::get);
+                let reopens = FINAL_REOPENS.with(Cell::get);
+                let result = with_final_validation_hook(
+                    move |boundary| {
+                        if boundary == point {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            let mut file = fs::OpenOptions::new()
+                                .write(true)
+                                .open(&image_path)
+                                .unwrap();
+                            assert_eq!(reinstall_file_identity(&file).unwrap(), identity);
+                            file.write_all(b"X").unwrap();
+                            file.sync_all().unwrap();
+                            assert_eq!(file.metadata().unwrap().len(), size);
+                            assert_eq!(reinstall_file_identity(&file).unwrap(), identity);
+                        }
+                    },
+                    || {
+                        owner.commit_verified(|view, matched| {
+                            calls.set(calls.get() + 1);
+                            assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                            assert_eq!(view.end, until);
+                            assert_eq!(hits.load(Ordering::SeqCst), 1);
+                            validate_retained_image(view.retained, &image)
+                        })
+                    },
+                );
+                let error = match result {
+                    Ok(_) => panic!("changed generic retained bytes reached terminal SQL"),
+                    Err(error) => error,
+                };
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                assert_eq!(calls.get(), 1);
+                assert_eq!(FINAL_DURABLES.with(Cell::get), durables + 1);
+                if point == FinalValidationBoundary::ControlReopened {
+                    assert_eq!(FINAL_REOPENS.with(Cell::get), reopens + 1);
+                }
+                assert!(matches!(error.error(), PortError::GenerationMismatch(_)));
+                assert!(error.owned.bundle().final_failed);
+                assert!(error.requires_process_exit());
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                assert_eq!(&durable_snapshot(&root), before);
+                drop(error);
+                drop(previous_pins);
+            }
+            "final-verified-refused" => {
+                let mut error = match owner.commit_verified(|view, matched| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                    validate_retained_image(view.retained, &image)?;
+                    Err(PortError::Backend(
+                        "synthetic consuming validator refusal".into(),
+                    ))
+                }) {
+                    Ok(_) => panic!("refused validator allowed terminal SQL"),
+                    Err(error) => error,
+                };
+                assert_eq!(calls.get(), 1);
+                assert!(matches!(error.error(), PortError::Backend(_)));
+                assert!(error.owned.bundle().final_failed);
+                assert!(error.requires_process_exit());
+                assert!(
+                    error
+                        .owned
+                        .scoped(|_| -> PortResult<()> { panic!("failed owner was reused") })
+                        .is_err()
+                );
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                assert_eq!(&durable_snapshot(&root), before);
+                drop(error);
+            }
+            "final-verified-unwind" => {
+                struct FinalValidatorUnwind;
+                let unwind = catch_unwind(AssertUnwindSafe(|| {
+                    let _ = owner.commit_verified(|view, matched| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                        validate_retained_image(view.retained, &image).unwrap();
+                        std::panic::panic_any(FinalValidatorUnwind);
+                    });
+                }));
+                match unwind {
+                    Err(payload) => assert!(payload.is::<FinalValidatorUnwind>()),
+                    Ok(()) => panic!("dedicated consuming validator unwind did not run"),
+                }
+                assert_eq!(calls.get(), 1);
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                assert_eq!(&durable_snapshot(&root), before);
+            }
+            "final-verified-q2-refused" | "final-verified-readback-refused" => {
+                let (owner, committed) = owner.commit().unwrap();
+                assert_eq!(committed, ReinstallTerminalCommit::Committed);
+                let (owner, previous_pins) = reopen_final_fixture(owner, records, until);
+                let committed_bytes = durable_snapshot(&root);
+                let opens = WRITABLE_CONTROL_OPENS.with(Cell::get);
+                let durables = FINAL_DURABLES.with(Cell::get);
+                let reopens = FINAL_REOPENS.with(Cell::get);
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&image_path)
+                    .unwrap();
+                assert_eq!(reinstall_file_identity(&file).unwrap(), image.identity);
+                file.write_all(b"X").unwrap();
+                file.sync_all().unwrap();
+                drop(file);
+                let validate = |view: ReinstallPublication<'_, Retained>, matched| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(matched, ReinstallTerminalMatch::Final);
+                    assert_eq!(view.end, until);
+                    validate_retained_image(view.retained, &image)
+                };
+                let error = if mode == "final-verified-q2-refused" {
+                    match owner.commit_verified(validate) {
+                        Ok(_) => panic!("q+2 skipped the consuming validator"),
+                        Err(error) => error,
+                    }
+                } else {
+                    match owner.readback_verified(validate) {
+                        Ok(_) => panic!("readback skipped the consuming validator"),
+                        Err(error) => error,
+                    }
+                };
+                assert_eq!(calls.get(), 1);
+                assert!(matches!(error.error(), PortError::GenerationMismatch(_)));
+                assert!(error.owned.bundle().final_failed);
+                assert!(error.requires_process_exit());
+                assert!(!error.owned.bundle().store().unwrap().writable);
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                assert_eq!(WRITABLE_CONTROL_OPENS.with(Cell::get), opens);
+                assert_eq!(FINAL_DURABLES.with(Cell::get), durables);
+                assert_eq!(FINAL_REOPENS.with(Cell::get), reopens);
+                assert_eq!(durable_snapshot(&root), committed_bytes);
+                drop(error);
+                drop(previous_pins);
+            }
+            "final-verified-lost-ack" => {
+                FAIL_AFTER_FINAL_COMMIT.with(|flag| flag.set(true));
+                let error = match owner.commit_verified(|view, matched| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(matched, ReinstallTerminalMatch::Recovering);
+                    assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                    validate_retained_image(view.retained, &image)
+                }) {
+                    Ok(_) => panic!("lost terminal acknowledgement was ignored"),
+                    Err(error) => error,
+                };
+                assert_eq!(calls.get(), 1);
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 1);
+                assert!(matches!(error.error(), PortError::Backend(_)));
+                assert!(error.owned.bundle().final_failed);
+                assert!(error.requires_process_exit());
+                let store = error.owned.bundle().store().unwrap();
+                let status = store
+                    .with_runtime_deadline(until, || store.lifecycle_status())
+                    .unwrap();
+                assert_eq!(status.policy.maintenance.state, MaintenanceState::Idle);
+                assert_eq!(
+                    status.policy.control_seq.get(),
+                    records.prep.context().old_control_seq + 2
+                );
+                drop(error);
+            }
+            "final-verified-expired" => {
+                let expired = until.min(Instant::now() + Duration::from_millis(50));
+                let outer =
+                    RuntimeDeadlineScope::enter_with_busy(expired, Duration::from_millis(7))
+                        .unwrap();
+                std::thread::sleep(expired.saturating_duration_since(Instant::now()));
+                let error = match owner.commit_verified(|_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                }) {
+                    Ok(_) => panic!("expired consuming validator entry succeeded"),
+                    Err(error) => error,
+                };
+                assert_eq!(calls.get(), 0);
+                assert!(matches!(error.error(), PortError::WriterBusy(_)));
+                assert!(error.owned.bundle().final_failed);
+                assert!(error.requires_process_exit());
+                assert_eq!(error.owned.bundle().end, expired);
+                assert_eq!(runtime_deadline(), Some(expired));
+                assert_eq!(
+                    RUNTIME_BUSY_ALLOWANCE.with(Cell::get),
+                    Duration::from_millis(7)
+                );
+                assert_eq!(FINAL_COMMITS.with(Cell::get), 0);
+                assert_eq!(&durable_snapshot(&root), before);
+                drop(error);
+                drop(outer);
+            }
+            _ => panic!("unknown verified final owner child mode"),
+        }
     }
 
     fn arm_busy<R: 'static>(bundle: &mut Bundle<R>, catalog: bool) {
@@ -5466,6 +6188,53 @@ mod tests {
         for mode in ["final-preopen-missing", "final-preopen-expired"] {
             retained_case_with_control(mode, false);
         }
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_retained_mutation_after_durability_and_reopen_refuses_sql() {
+        for mode in [
+            "final-verified-durable-mutation",
+            "final-verified-reopen-mutation",
+        ] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_refusal_and_dedicated_unwind_retain_until_exit() {
+        for mode in ["final-verified-refused", "final-verified-unwind"] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_q2_and_readback_refusal_never_reopen_or_mutate() {
+        for mode in [
+            "final-verified-q2-refused",
+            "final-verified-readback-refused",
+        ] {
+            retained_case(mode);
+        }
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_lost_ack_never_calls_validator_after_commit() {
+        retained_case("final-verified-lost-ack");
+    }
+
+    #[test]
+    fn reinstall_final_owner_verified_expired_entry_never_calls_validator() {
+        retained_case("final-verified-expired");
+    }
+
+    #[test]
+    fn reinstall_publication_recorded_files_borrow_original_pins_without_refreshing_replacement() {
+        retained_case("final-recorded-preparation-replacement");
+    }
+
+    #[test]
+    fn reinstall_publication_recorded_files_capture_failure_retains_until_exit() {
+        retained_case("final-ack-proof-missing");
     }
 
     #[test]
